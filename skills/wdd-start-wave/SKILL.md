@@ -1,34 +1,67 @@
 ---
 name: wdd-start-wave
-description: Start the next available WDD wave by generating controller state and implementation briefs, then hand off to subagent orchestration without coding in the controller thread.
+description: Start the next pending WDD wave by writing controller state and implementation briefs, then hand off to subagent orchestration while the controller remains non-coding.
 ---
 
 # WDD Start Wave
 
-Use this when the user asks to start or continue WDD implementation.
+Use this when the user asks to start, continue, or resume implementation for a WDD epic.
+
+## User Input
+
+If the user names an epic or wave, use it. Otherwise choose the first epic with `wave-plan.md` and a pending wave.
+
+## Preconditions
+
+- `wave-plan.md` exists.
+- Validation passed for the tickets in the target wave.
+- The controller must not implement code.
+- A subagent orchestration mechanism must be available, or controller state must record that execution is blocked.
 
 ## Workflow
 
-1. Run `wdd start-wave <epic> --json`.
-2. Read the generated `controller-state.yaml`.
-3. Read each generated implementation brief.
-4. Invoke `subagent-pr-orchestration`.
-5. Dispatch one implementation subagent per active-wave ticket.
+1. Load:
+   - Constitution.
+   - Epic.
+   - Wave plan.
+   - Tickets in the first pending wave.
+   - Existing controller state if present.
 
-## Controller Rule
+2. Select wave:
+   - Choose the first wave whose status is not `done`.
+   - If a wave is `in_progress`, resume it.
+   - Do not skip to later waves unless the user explicitly instructs and dependencies are satisfied.
 
-The wave controller must not implement code. It manages ticket state, subagents, PRs, reviews, verification evidence, and reconciliation.
+3. Update artifacts:
+   - Set selected wave status to `in_progress` in `wave-plan.md`.
+   - Set selected ticket statuses to `in_progress`.
+   - Create or update `controller-state.md`.
 
-## Handoff Requirements
+4. Write implementation briefs:
+   - Path: `briefs/<ticket-id>-<slug>.md`
+   - Include YAML frontmatter with `kind: implementation_brief`, epic, ticket, wave, branch, status.
+   - Include deliverable, context, scope, out-of-scope, TDD requirement, verification commands, branch, PR title, and final response contract.
 
-Each subagent prompt must include:
+5. Controller state must track each ticket:
+   - Ticket ID.
+   - Brief path.
+   - Branch.
+   - Implementation thread ID if known.
+   - Review thread ID if known.
+   - PR URL if known.
+   - Gate: `no_pr`, `needs_review`, `reviewing`, `needs_fixes`, `merge_ready`, `merged`, or `blocked`.
+   - Open P1/P2 feedback.
+   - Verification result.
 
-- one brief only,
-- exact branch,
-- deliverable,
-- out-of-scope,
-- RED/GREEN TDD requirement,
-- verification commands,
-- commit/push/PR requirement when Git is available,
-- final status token: `DONE`, `DONE_WITH_CONCERNS`, `NEEDS_CONTEXT`, or `BLOCKED`.
+6. Handoff:
+   - Invoke `subagent-pr-orchestration`.
+   - Dispatch one implementation agent per active-wave ticket.
+   - Give each agent exactly one brief.
+
+## Done When
+
+- Active wave is marked `in_progress`.
+- `controller-state.md` exists.
+- Every active-wave ticket has an implementation brief.
+- Subagent orchestration has been started or controller state records why it is blocked.
 

@@ -1,24 +1,80 @@
 ---
 name: wdd-reconcile-wave
-description: Reconcile a completed WDD wave after PRs merge by comparing planned and actual architecture, updating later tickets, and marking the wave done.
+description: Reconcile a completed WDD wave by inspecting merged work, verification, review findings, architecture drift, ticket status, and next-wave readiness before marking the wave done.
 ---
 
 # WDD Reconcile Wave
 
-Use this after all active wave tickets have passed review and merged.
+Use this after all active-wave implementation PRs or patches have passed their merge gates.
+
+## User Input
+
+If the user names a wave, reconcile that wave. Otherwise reconcile the active wave from `controller-state.md`.
+
+## Preconditions
+
+- `controller-state.md` exists.
+- Every ticket in the wave is merged or explicitly closed as not needed.
+- Verification evidence exists for each ticket.
+- Open P1/P2 feedback is resolved or explicitly accepted by the user.
 
 ## Workflow
 
-1. Inspect merged PRs, changed files, verification evidence, and review findings.
-2. Compare actual architecture against `epic.md`, `design.md`, and `wave-plan.yaml`.
-3. Update later tickets for drift, new dependencies, or new conflict domains.
-4. Update `controller-state.yaml` with merge and cleanup state.
-5. Run `wdd reconcile <epic> --wave <n> --done`.
-6. Report whether the next wave is ready.
+1. Load:
+   - Constitution.
+   - Epic.
+   - Design.
+   - Wave plan.
+   - Controller state.
+   - Tickets in the wave.
+   - PR links, commits, review notes, and verification evidence when available.
 
-## Rules
+2. Verify merge gates:
+   - Deliverable met.
+   - Tests/checks passed or non-blocking failures documented.
+   - High-rigor review completed when required.
+   - No unresolved P1/P2 feedback.
+   - Branch/PR cleanup status known.
 
-- Do not mark a wave done before merge/review/verification gates are complete.
-- Record drift in ticket updates, decision notes, or the epic body.
-- Start the next wave only after reconciliation.
+3. Compare planned and actual work:
+   - Files actually changed.
+   - Architecture/design changes.
+   - New dependencies.
+   - New conflict domains.
+   - Follow-up risks.
+
+4. Update tickets:
+   - Mark completed tickets `done`.
+   - Add PR/adapter links if available.
+   - Record verification evidence in the ticket body or controller state.
+
+5. Update `wave-plan.md`:
+   - Mark wave `done`.
+   - Add completion date.
+   - Add drift notes.
+   - Update known conflict risks for future waves.
+
+6. Update future tickets:
+   - Adjust context, dependencies, conflict domains, verification, or scope based on actual merged architecture.
+   - Do not start the next wave until these updates are made.
+
+7. Update `controller-state.md`:
+   - Mark all wave ticket gates `merged` or closed status.
+   - Add cleanup result.
+   - Add next-wave recommendation.
+
+8. Report:
+   - Wave status.
+   - Tickets completed.
+   - Verification evidence.
+   - Drift found.
+   - Future-ticket updates.
+   - Whether the next wave is ready.
+
+## Done When
+
+- Wave is marked `done`.
+- Completed tickets are marked `done`.
+- Future tickets reflect drift and new conflict risks.
+- The next phase is `wdd-start-wave` for the next pending wave or final epic closure.
 

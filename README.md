@@ -1,129 +1,110 @@
 # WDD
 
-Wave-Driven Development is a local-first workflow for planning and executing
-agentic software work in dependency-aware waves.
+Wave-Driven Development is a skill-driven workflow for coding agents.
 
-It gives coding agents a durable project structure:
+The runtime is the agent skill pack, not a project-management CLI. Agents create
+and update local markdown artifacts directly under `.wdd/`, using YAML
+frontmatter for machine-readable state and Markdown bodies for human and agent
+context.
 
-- a project constitution for boundaries and prerequisites,
-- epics and tickets stored as Markdown with mandatory YAML frontmatter,
-- validation before execution,
-- a dependency/conflict-aware wave plan,
-- controller state and implementation briefs for subagent orchestration.
+This makes the workflow portable across local agents, cloud agents, and hosted
+coding environments where installing or running a custom CLI is not practical.
 
-GitHub is optional. Local `.wdd/` files are the default source of truth; external
-trackers can be added later through `adapter_links` metadata.
+## What WDD Provides
 
-## Install
+- A project constitution for boundaries, prerequisites, verification, and agent roles.
+- Local epics with PRD/design context.
+- Local tickets with YAML frontmatter, dependencies, conflict domains, verification, and review handoff.
+- Ticket validation as an agent skill.
+- Dependency and conflict-domain wave planning as an agent skill.
+- Controller state and implementation briefs for subagent orchestration.
+- Reconciliation after every wave before the next wave starts.
 
-```bash
-npm install -g @ivo-toby/wdd
+## Skill Pack
+
+Install or copy the directories in `skills/` into the agent's skill directory.
+
+For Codex-style local skills, that means:
+
+```text
+~/.agents/skills/
+  wave-driven-development/
+  wdd-init-project/
+  wdd-constitution/
+  wdd-start-epic/
+  wdd-write-tickets/
+  wdd-validate-tickets/
+  wdd-plan-waves/
+  wdd-start-wave/
+  subagent-pr-orchestration/
+  wdd-reconcile-wave/
+  wdd-status/
 ```
 
-From a checkout of this repo:
+Each skill is self-contained enough to run from repository files. The root
+`templates/` folder provides canonical artifact templates, but the skills also
+describe the required artifact shapes.
 
-```bash
-npm install
-npm link
-```
+## Workflow
 
-## Initialize A Project
+1. `wdd-init-project`
+   - Creates `.wdd/`, `.wdd/templates/`, and `.wdd/constitution.md`.
 
-```bash
-wdd init --agent codex
-wdd install-skills
-```
+2. `wdd-constitution`
+   - Defines project boundaries, prerequisites, verification rules, agent roles, ticket rules, wave rules, and governance.
 
-`wdd init` creates:
+3. `wdd-start-epic`
+   - Creates `.wdd/epics/<epic-id>-<slug>/` with `epic.md`, `prd.md`, `design.md`, and support folders.
+
+4. `wdd-write-tickets`
+   - Creates self-contained ticket files under `tickets/`.
+
+5. `wdd-validate-tickets`
+   - Validates frontmatter, dependencies, ticket body sections, semantic readiness, verification, and conflict domains.
+
+6. `wdd-plan-waves`
+   - Writes `wave-plan.md` with a dependency grid, conflict grid, and safe parallel waves.
+
+7. `wdd-start-wave`
+   - Writes `controller-state.md` and implementation briefs.
+
+8. `subagent-pr-orchestration`
+   - Dispatches one implementation subagent per active-wave brief and manages review/merge gates.
+
+9. `wdd-reconcile-wave`
+   - Marks the wave done only after merge/review/verification gates pass and later tickets are updated for drift.
+
+10. `wdd-status`
+    - Read-only dashboard over `.wdd/` artifacts.
+
+## Artifact Layout
 
 ```text
 .wdd/
-  config.yaml
   constitution.md
+  templates/
   epics/
-```
-
-`wdd install-skills` copies the packaged skills into `~/.agents/skills` by
-default. Use `--target <path>` to install somewhere else.
-
-The package installs step-level skills for coding agents:
-
-- `wdd-init-project`
-- `wdd-constitution`
-- `wdd-start-epic`
-- `wdd-write-tickets`
-- `wdd-validate-tickets`
-- `wdd-plan-waves`
-- `wdd-start-wave`
-- `wdd-reconcile-wave`
-- `wave-driven-development`
-- `subagent-pr-orchestration`
-
-The step skills make individual phases discoverable to an agent. The two broad
-skills remain as the overview/planning and execution-controller workflows.
-
-## Plan A Feature Or Spike
-
-```bash
-wdd new feature auth-refresh --title "Auth Refresh"
-wdd ticket create WDD-0001 token-contract \
-  --title "Token Contract" \
-  --verify "npm test -- auth"
-wdd validate WDD-0001
-wdd waves plan WDD-0001
-```
-
-The agent should then inspect and refine:
-
-```text
-.wdd/epics/WDD-0001-auth-refresh/
-  epic.md
-  prd.md
-  design.md
-  tickets/
-    WDD-0001-T001-token-contract.md
-  wave-plan.yaml
-```
-
-## Start A Wave
-
-```bash
-wdd start-wave WDD-0001 --json
-```
-
-This does not implement code. It writes:
-
-```text
-.wdd/epics/WDD-0001-auth-refresh/
-  controller-state.yaml
-  briefs/
-    WDD-0001-T001-token-contract.md
-```
-
-The controller agent reads those files and uses the
-`subagent-pr-orchestration` skill to dispatch implementation subagents.
-
-After a wave is merged and reconciled:
-
-```bash
-wdd reconcile WDD-0001 --wave 1 --done
-```
-
-## Useful Commands
-
-```bash
-wdd status --json
-wdd validate WDD-0001 --json
-wdd waves plan WDD-0001 --json
-wdd schema --json
-wdd doctor --json
+    WDD-0001-auth-refresh/
+      epic.md
+      prd.md
+      design.md
+      validation-checklist.md
+      wave-plan.md
+      controller-state.md
+      tickets/
+        WDD-0001-T001-token-contract.md
+      briefs/
+        WDD-0001-T001-token-contract.md
+      decisions/
+      archive/
 ```
 
 ## Development
 
+The repository contains one development-only validation script. It checks that
+the skill pack and templates are structurally complete. It is not part of the
+runtime workflow.
+
 ```bash
 npm test
-npm run lint
 ```
-
-The CLI is plain Node.js ESM with one runtime dependency, `yaml`.

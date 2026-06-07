@@ -1,8 +1,24 @@
 # WDD Artifact Schema
 
-WDD stores durable planning and controller state in local files. Markdown
-artifacts use YAML frontmatter for metadata and Markdown bodies for human and
-agent-readable instructions.
+WDD artifacts are local markdown files. YAML frontmatter carries structured
+state; markdown bodies carry context and instructions.
+
+## Constitution
+
+Path:
+
+```text
+.wdd/constitution.md
+```
+
+Required sections:
+
+- Boundaries
+- Prerequisites
+- Agent Roles
+- Ticket Rules
+- Wave Rules
+- Governance
 
 ## Epic
 
@@ -22,17 +38,24 @@ type: feature
 slug: auth-refresh
 title: Auth Refresh
 status: draft
-created_at: "2026-06-07T18:00:00.000Z"
-updated_at: "2026-06-07T18:00:00.000Z"
-constitution_version: 1
+created_at: "2026-06-07"
+updated_at: "2026-06-07"
+constitution_version: 1.0.0
+ticket_count: 0
 adapter_links:
   github_issue: null
-  github_project: null
+  jira_epic: null
 ---
 ```
 
-Body sections should cover the product brief, design direction, ticket strategy,
-and wave strategy. `prd.md` and `design.md` can hold longer supporting text.
+Required body sections:
+
+- Product Brief / PRD
+- Design Direction
+- Acceptance Strategy
+- Ticket Strategy
+- Wave Strategy
+- Open Questions
 
 ## Ticket
 
@@ -67,69 +90,69 @@ adapter_links:
 
 Required body sections:
 
-- `## Context`
-- `## End Goal / Deliverable`
-- `## Scope`
-- `## RED/GREEN TDD`
-- `## Acceptance Criteria`
-- `## Verification`
-- `## Review Handoff`
-- `## Out of Scope`
+- Context
+- End Goal / Deliverable
+- Scope
+- RED/GREEN TDD
+- Acceptance Criteria
+- Verification
+- Review Handoff
+- Out of Scope
 
 ## Wave Plan
 
 Path:
 
 ```text
-.wdd/epics/WDD-0001-auth-refresh/wave-plan.yaml
+.wdd/epics/WDD-0001-auth-refresh/wave-plan.md
 ```
 
-Shape:
+The wave plan is markdown with frontmatter. It must include:
 
-```yaml
-epic: WDD-0001
-status: planned
-generated_at: "2026-06-07T18:10:00.000Z"
-waves:
-  - wave: 1
-    status: pending
-    tickets:
-      - WDD-0001-T001
-    conflict_domains:
-      - src/auth/**
-    reason: Dependencies satisfied without overlapping conflict domains.
-```
-
-The planner groups dependency-ready tickets together when their
-`conflict_domains` do not overlap. Tickets delayed for conflict avoidance are
-pushed to later waves with a reason.
+- Ticket inventory.
+- Dependency grid.
+- Conflict grid or conflict notes.
+- One section per wave.
+- Grouping rationale for each wave.
+- Stop condition after each wave.
+- Known conflict risks.
 
 ## Controller State
 
 Path:
 
 ```text
-.wdd/epics/WDD-0001-auth-refresh/controller-state.yaml
+.wdd/epics/WDD-0001-auth-refresh/controller-state.md
 ```
 
-Shape:
+The controller state is markdown with frontmatter. It must track:
 
-```yaml
-epic: WDD-0001
-current_wave:
-  wave: 1
-  status: in_progress
-controller_rule: The wave controller manages state and subagents; it does not implement code.
-tickets:
-  - id: WDD-0001-T001
-    title: Token Contract
-    branch: codex/wdd-0001-t001-token-contract
-    brief_path: .wdd/epics/WDD-0001-auth-refresh/briefs/WDD-0001-T001-token-contract.md
-    current_gate: no_pr
-    verification:
-      - npm test -- auth
+- Active wave.
+- Ticket gates.
+- Brief paths.
+- Branches.
+- PR or patch references.
+- Implementation and review thread IDs when available.
+- Open P1/P2 feedback.
+- Verification result.
+- Cleanup state.
+
+## Implementation Brief
+
+Path:
+
+```text
+.wdd/epics/WDD-0001-auth-refresh/briefs/WDD-0001-T001-token-contract.md
 ```
 
-Controllers update this file as subagents open PRs, reviews run, fixes land,
-verification passes, and waves are reconciled.
+The brief is the implementation subagent's source of truth. It must include:
+
+- Deliverable.
+- Required context.
+- Scope.
+- Out of scope.
+- RED/GREEN requirement.
+- Verification commands.
+- PR or patch requirements.
+- Required final status token.
 

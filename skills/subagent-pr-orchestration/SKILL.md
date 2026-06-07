@@ -1,72 +1,101 @@
 ---
 name: subagent-pr-orchestration
-description: Coordinate implementation subagents from WDD local ticket briefs or external issues, monitor PR/review gates, route P1/P2 feedback, merge only after verification, and persist compact controller state.
+description: Coordinate WDD implementation subagents from local implementation briefs, monitor PR or patch gates, route review feedback, update controller state, and merge only after verification and review pass.
 ---
 
 # Subagent PR Orchestration
 
-Use this when a WDD wave or a single bounded ticket is ready for delegated implementation.
+Use this when `wdd-start-wave` has created `controller-state.md` and implementation briefs, or when a single local ticket brief is ready for delegated implementation.
 
-## Core Rule
+## User Input
 
-The controller owns orchestration. The user must not relay messages between subagents, PRs, review comments, local ticket files, or external trackers.
+Use any named epic, wave, ticket, branch, PR URL, or subagent thread ID. If none is provided, read the active controller state.
 
-When started from WDD, read `.wdd/epics/<epic>/controller-state.yaml` and the referenced `briefs/*.md`. Those local briefs are the source of truth. GitHub issues may exist, but they are adapter links.
+## Preconditions
 
-## Start A Wave
+- Controller state exists or a single implementation brief is provided.
+- Each implementation agent receives exactly one brief.
+- The controller does not implement ticket code.
+- GitHub is optional. If no PR system exists, use branches, patches, or local status notes and preserve the same gates.
 
-1. Run or read the result of `wdd start-wave <epic> --json`.
-2. For each returned ticket, read its implementation brief.
-3. Dispatch only the tickets in the active wave.
-4. Give each implementation subagent exactly one ticket.
-5. Keep controller state compact and durable in `controller-state.yaml`; mirror to GitHub/Jira/PR comments only when adapters are in use.
+## Workflow
 
-## Implementation Subagent Prompt Must Include
+1. Load controller context:
+   - `.wdd/constitution.md`
+   - active epic `epic.md`
+   - active `wave-plan.md`
+   - `controller-state.md`
+   - active implementation briefs
 
-- One ticket brief only.
-- Exact branch from ticket frontmatter.
-- Explicit deliverable and out-of-scope sections.
-- RED/GREEN TDD requirement.
-- Verification commands from frontmatter.
-- Commit, push, and full PR requirement when Git is available.
-- Instruction to monitor and address PR feedback.
-- Required final status: `DONE`, `DONE_WITH_CONCERNS`, `NEEDS_CONTEXT`, or `BLOCKED`.
+2. For each active ticket, ensure controller state tracks:
+   - ticket ID and brief path,
+   - implementation thread ID,
+   - review thread ID,
+   - branch,
+   - PR or patch reference,
+   - latest commit,
+   - current gate,
+   - open P1/P2 feedback,
+   - verification result,
+   - cleanup state.
 
-## Gate Loop
+3. Dispatch implementation subagents:
+   - One ticket per subagent.
+   - Include only the implementation brief plus required repo instructions.
+   - Require RED/GREEN TDD.
+   - Require branch, commit, verification, and PR or patch output.
+   - Require final status token: `DONE`, `DONE_WITH_CONCERNS`, `NEEDS_CONTEXT`, or `BLOCKED`.
 
-Track every active ticket with:
+4. Implementation prompt contract:
+   - Read the assigned brief first.
+   - Inspect named files/domains before broad discovery.
+   - Do not work outside ticket scope.
+   - Do not start dependent tickets.
+   - Produce verification evidence.
+   - Return PR URL or patch reference.
+   - Monitor and address routed P1/P2 feedback.
 
-- ticket id and local path,
-- implementation thread id,
-- review thread id,
-- branch and PR URL when available,
-- latest commit,
-- current gate: `no_pr`, `needs_review`, `reviewing`, `needs_fixes`, `merge_ready`, `merged`, or `blocked`,
-- open P1/P2 feedback,
-- verification result,
-- cleanup status.
+5. Review gate:
+   - When an implementation PR or patch exists, start a separate high-rigor reviewer when available.
+   - Reviewer checks brief compliance, correctness, tests, security, dependency boundaries, maintainability, and conflict domains.
+   - Reviewer labels findings P1/P2/P3.
+   - P1 and P2 block merge.
 
-On each heartbeat:
+6. Heartbeat loop:
+   - no_pr: inspect implementation state and nudge with the exact missing deliverable.
+   - needs_review: start or request high-rigor review.
+   - reviewing: poll review state and comments.
+   - needs_fixes: route all current P1/P2 feedback directly to the owning implementation subagent.
+   - merge_ready: verify evidence, then merge or mark ready according to repo policy.
+   - merged: update local ticket and controller state.
+   - blocked: record blocker, owner, and next required input.
 
-- If no PR exists, inspect/nudge the implementation subagent.
-- If a PR exists and no high-rigor review exists, spawn the strongest reviewer available.
-- If review has P1/P2 feedback, route it directly to the implementation subagent.
-- If fixes were pushed, re-check unresolved review threads and verification evidence.
-- If no P1/P2 remain and verification/checks are acceptable, merge promptly.
+7. Update `controller-state.md` after every meaningful event:
+   - subagent started,
+   - PR or patch created,
+   - review started,
+   - P1/P2 found,
+   - fix pushed,
+   - verification passed or failed,
+   - merge completed,
+   - cleanup completed,
+   - blocker encountered.
 
-## Review
+8. Merge rules:
+   - Deliverable is met.
+   - Verification passes or non-blocking failures are explicitly documented.
+   - High-rigor review has no unresolved P1/P2.
+   - CI/checks are green or explicitly non-blocking.
+   - Linked local ticket is updated.
 
-Use a separate high-rigor reviewer for each implementation PR when available. The reviewer must check the ticket brief, spec compliance, correctness, tests, security, dependency boundaries, and maintainability. P1 and P2 findings block merge.
+9. Completion handoff:
+   - When all active-wave tickets are merged or closed, invoke `wdd-reconcile-wave`.
+   - Do not start the next wave before reconciliation.
 
-## Reconcile
+## Done When
 
-After all tickets in a wave merge:
-
-1. Run relevant verification locally or read trusted CI evidence.
-2. Update `controller-state.yaml`.
-3. Run `wdd reconcile <epic> --wave <n> --done`.
-4. Update later tickets if merged architecture drifted from the plan.
-5. Start the next wave only after reconciliation.
-
-If direct subagent, heartbeat, GitHub, or review tooling is unavailable, preserve the same gates in local controller state and resume from there later.
+- Every active ticket has a current gate in `controller-state.md`.
+- P1/P2 feedback is routed to the owning implementation subagent.
+- Merge happens only after verification and review gates pass.
+- Completed wave is ready for `wdd-reconcile-wave`.
 

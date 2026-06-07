@@ -1,30 +1,11 @@
 {
-  "name": "@ivo-toby/wdd",
-  "version": "0.1.0",
-  "description": "Local-first Wave-Driven Development CLI for agent-managed epics, tickets, and execution waves.",
+  "name": "wdd-skill-pack",
+  "version": "0.2.0",
+  "description": "Skill-driven Wave-Driven Development pack for portable coding-agent workflows.",
   "type": "module",
-  "bin": {
-    "wdd": "./bin/wdd.js"
-  },
-  "files": [
-    "bin/",
-    "src/",
-    "skills/",
-    "README.md",
-    "docs/"
-  ],
+  "private": true,
   "scripts": {
-    "test": "vitest run",
-    "lint": "node --check bin/wdd.js && find src -name '*.js' -print0 | xargs -0 -n1 node --check"
-  },
-  "dependencies": {
-    "yaml": "^2.7.0"
-  },
-  "devDependencies": {
-    "vitest": "^4.1.8"
-  },
-  "engines": {
-    "node": ">=20"
+    "test": "node scripts/validate-skill-pack.mjs"
   },
   "license": "MIT"
 }
