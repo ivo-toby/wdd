@@ -1,4 +1,4 @@
-import { cp, readFile } from "node:fs/promises";
+import { cp, readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -46,6 +46,15 @@ function print(stdout, value, json) {
     return;
   }
   stdout.write(`${value}\n`);
+}
+
+async function packagedSkills() {
+  const sourceRoot = new URL("../skills/", import.meta.url);
+  const entries = await readdir(sourceRoot, { withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
 }
 
 function help() {
@@ -202,7 +211,7 @@ export async function runCli(argv, io = {}) {
     if (command === "install-skills") {
       const flags = parseFlags([subcommand, ...rest].filter(Boolean));
       const target = flags.target || join(homedir(), ".agents", "skills");
-      const skills = ["wave-driven-development", "subagent-pr-orchestration"];
+      const skills = await packagedSkills();
       const sourceRoot = new URL("../skills/", import.meta.url);
       for (const skill of skills) {
         await cp(new URL(`${skill}/`, sourceRoot), join(target, skill), {

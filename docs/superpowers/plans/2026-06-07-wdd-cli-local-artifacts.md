@@ -103,7 +103,7 @@ Explain local-first storage, frontmatter metadata, optional adapters, and the co
 
 - [x] **Step 2: Update packaged skills**
 
-Make WDD read/write `.wdd` artifacts and make subagent orchestration accept local ticket briefs as the source of truth.
+Make WDD read/write `.wdd` artifacts, make subagent orchestration accept local ticket briefs as the source of truth, and include step-level skills for init, constitution, epic start, ticket writing, validation, wave planning, wave start, and reconciliation.
 
 - [x] **Step 3: Verify complete project**
 

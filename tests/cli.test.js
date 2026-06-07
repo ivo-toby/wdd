@@ -60,8 +60,20 @@ describe("wdd CLI", () => {
     const { stdout } = await wdd(["install-skills", "--target", target, "--json"]);
     const result = JSON.parse(stdout);
 
-    expect(result.installed).toEqual(["wave-driven-development", "subagent-pr-orchestration"]);
+    expect(result.installed).toEqual([
+      "subagent-pr-orchestration",
+      "wave-driven-development",
+      "wdd-constitution",
+      "wdd-init-project",
+      "wdd-plan-waves",
+      "wdd-reconcile-wave",
+      "wdd-start-epic",
+      "wdd-start-wave",
+      "wdd-validate-tickets",
+      "wdd-write-tickets",
+    ]);
     await expect(readFile(join(target, "wave-driven-development", "SKILL.md"), "utf8")).resolves.toContain("local-first");
     await expect(readFile(join(target, "subagent-pr-orchestration", "SKILL.md"), "utf8")).resolves.toContain("controller");
+    await expect(readFile(join(target, "wdd-start-wave", "SKILL.md"), "utf8")).resolves.toContain("must not implement code");
   });
 });

@@ -46,6 +46,22 @@ wdd install-skills
 `wdd install-skills` copies the packaged skills into `~/.agents/skills` by
 default. Use `--target <path>` to install somewhere else.
 
+The package installs step-level skills for coding agents:
+
+- `wdd-init-project`
+- `wdd-constitution`
+- `wdd-start-epic`
+- `wdd-write-tickets`
+- `wdd-validate-tickets`
+- `wdd-plan-waves`
+- `wdd-start-wave`
+- `wdd-reconcile-wave`
+- `wave-driven-development`
+- `subagent-pr-orchestration`
+
+The step skills make individual phases discoverable to an agent. The two broad
+skills remain as the overview/planning and execution-controller workflows.
+
 ## Plan A Feature Or Spike
 
 ```bash
