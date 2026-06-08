@@ -10,6 +10,51 @@ machine state is useful.
 This keeps the workflow usable across local agents, cloud agents, and hosted
 coding environments such as Claude Code Cloud and Codex Cloud.
 
+## Vision
+
+AI coding agents are getting better at implementation, but large bodies of work still fail for boring engineering reasons: missing context, unclear scope, weak review loops, merge chaos, forgotten decisions, and agents losing track after context compression.
+
+WDD treats agentic development as an engineering workflow, not a prompt trick.
+
+The core idea is simple: humans define intent, agents do focused work, and the workflow preserves enough durable state for the whole system to remain understandable, reviewable, and resumable.
+
+Epics provide the strategic boundary. Tickets group related work. Tasks are the executable unit. Waves maximize safe parallelism. Shared context carries durable knowledge across workers. Reviews, validation, and branch gates keep the system honest.
+
+WDD is intentionally text-only. Markdown skills are the runtime. Local artifacts are the source of truth. JSON is used only where machines need resumable state. There is no required CLI, daemon, package, or hosted service.
+
+That makes the workflow portable across local coding agents, cloud agents, and whatever agent runtime comes next.
+
+The goal is not to make agents faster at blindly editing files.
+
+The goal is to make parallel agent work controlled enough that a senior engineer can trust the process, inspect the state, interrupt it, resume it, and review the final result.
+
+## Principles
+
+- Durable state over hidden context — if the workflow needs to remember something, it belongs in .wdd/.
+- Tasks are the execution unit — workers get focused task files, not vague tickets or whole epics.
+- Parallelism needs control — waves should maximize concurrency without pretending merge conflicts do not exist.
+- Review is part of execution — worker self-review is useful, but separate review agents and human review remain first-class gates.
+- Agents should preserve discoveries — durable worker memory keeps later tasks from rediscovering the same constraints.
+- Text beats infrastructure — the workflow should work anywhere a coding agent can read and write Markdown.
+- Humans own intent and final judgment — WDD helps agents execute, but it does not remove engineering accountability.
+
+## Who WDD Is For
+
+WDD is for engineers who want to use coding agents on work larger than a single prompt or isolated bug fix.
+
+It is especially useful for:
+
+- multi-step features
+- refactors
+- migrations
+- architectural changes
+- test expansion
+- bug clusters
+- parallel agent experiments
+- cloud-agent workflows where context compression and resumability matter
+
+It is probably overkill for small one-shot edits.
+
 ## What WDD Provides
 
 - A project constitution for setup, model aliases, storage mode, branch policy,
