@@ -116,6 +116,10 @@ state and orchestration state.
      repository policy requires human merge.
 
 10. Heartbeat loop:
+    - Treat each heartbeat as one bounded, idempotent controller tick.
+    - Start every tick by reading current `orchestration.json`,
+      `controller-state.md`, task files, and relevant PR or patch state.
+    - Do not depend on hidden conversation context from a prior tick.
     - not_started: dispatch if eligible.
     - no_pr: inspect worker state and nudge exact missing deliverable.
     - needs_review: start or request review.
@@ -124,6 +128,13 @@ state and orchestration state.
     - merge_ready: verify evidence, branch freshness, and merge policy.
     - merged: update task file, orchestration state, and controller state.
     - blocked: record blocker, owner, and next required input.
+    - At the end of each tick, update monitoring last check, next check, status,
+      scheduler reference, and fallback prompt.
+    - If all active-wave tasks are merged, closed, blocked, or cancelled, stop
+      or deactivate the monitor and hand off to `wdd-reconcile-wave`.
+    - If monitoring cannot be scheduled or resumed, set mode to `manual` and
+      record the exact prompt and due time needed for a human or fresh agent to
+      run the next tick.
 
 11. Update state after every meaningful event:
     - Worker started.
@@ -138,6 +149,7 @@ state and orchestration state.
     - Merge or merge-ready decision completed.
     - Shared-context reconciliation completed or queued.
     - Blocker encountered.
+    - Monitoring tick completed, rescheduled, stopped, or downgraded to manual.
 
 12. Completion handoff:
     - When all active-wave tasks are merged, closed, blocked, or cancelled,

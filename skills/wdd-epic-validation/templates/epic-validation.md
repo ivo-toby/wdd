@@ -42,6 +42,14 @@ State whether the epic is ready for final PR review.
 - Shared-context index is coherent:
 - Pending reconciliations:
 
+## Monitoring Audit
+
+- Monitoring mode:
+- Monitoring status:
+- Last check:
+- Stop or blocker reason:
+- Durable next action:
+
 ## Integration Risks
 
 - Risk:

@@ -45,6 +45,11 @@ created_at: YYYY-MM-DD
 - [ ] Every planned task appears in orchestration state.
 - [ ] Branch, PR or patch, gate, branch freshness, feedback, and verification
       fields are represented.
+- [ ] Monitoring mode is recorded as `codex_thread_heartbeat`, `claude_loop`,
+      `external_scheduler`, or `manual`.
+- [ ] Monitoring fallback prompt is durable enough for a fresh controller to run
+      the next heartbeat tick.
+- [ ] Monitoring stop condition and next check are recorded.
 
 ## Shared Context
 

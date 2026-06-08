@@ -85,10 +85,14 @@ wave from `controller-state.md` and `orchestration.json`.
    - Verification result.
    - Feedback state.
    - Shared-context reconciliation state.
+   - Monitoring status set to `inactive`, `stopped`, or `blocked` with the
+     reason recorded.
    - Next-wave readiness.
 
 9. Update `controller-state.md`:
    - Mark wave outcome.
+   - Record that monitoring is stopped, inactive, or blocked before closing the
+     wave.
    - Add cleanup result.
    - Record drift and future-task updates.
    - Add next-wave or epic-validation recommendation.
@@ -98,6 +102,8 @@ wave from `controller-state.md` and `orchestration.json`.
 - Wave outcome is recorded.
 - Completed tasks are in `done/`.
 - Shared-context updates are reconciled or explicitly queued.
+- Active-wave monitoring is stopped, inactive, or explicitly blocked with a
+  durable next action.
 - Future tasks reflect drift and new conflict risks.
 - The next phase is `wdd-start-wave` for the next pending wave, or
   `wdd-epic-validation` when all waves are complete.

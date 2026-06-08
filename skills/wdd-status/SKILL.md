@@ -1,6 +1,6 @@
 ---
 name: wdd-status
-description: Show current Wave-Driven Development state from local .wdd text artifacts, including constitution status, epics, tickets, tasks, waves, orchestration gates, shared-context reconciliation, validation, and next action.
+description: Show current Wave-Driven Development state from local .wdd text artifacts, including constitution status, epics, tickets, tasks, waves, orchestration gates, monitoring, shared-context reconciliation, validation, and next action.
 ---
 
 # WDD Status
@@ -43,6 +43,8 @@ scan all `.wdd/epics/*/` folders.
    - Wave plan status.
    - Active wave if any.
    - Active task gates.
+   - Monitoring mode, cadence, status, scheduler reference, last check, next
+     check, and whether manual fallback is required.
    - Branch freshness issues.
    - Open P1/P2 feedback.
    - Shared-context reconciliation status.
@@ -56,6 +58,9 @@ scan all `.wdd/epics/*/` folders.
    - Planning artifacts incomplete: `wdd-plan-epic`.
    - Pending wave: `wdd-start-wave`.
    - Active wave with open gates: `subagent-pr-orchestration`.
+   - Active wave with stale or missing monitoring: resume
+     `subagent-pr-orchestration` using the fallback prompt in
+     `controller-state.md`.
    - Completed active wave: `wdd-reconcile-wave`.
    - All waves complete without validation: `wdd-epic-validation`.
    - Validation passed without final PR draft: `wdd-final-pr`.
