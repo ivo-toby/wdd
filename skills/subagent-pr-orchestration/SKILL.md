@@ -130,8 +130,9 @@ state and orchestration state.
     - blocked: record blocker, owner, and next required input.
     - At the end of each tick, update monitoring last check, next check, status,
       scheduler reference, and fallback prompt.
-    - If all active-wave tasks are merged, closed, blocked, or cancelled, stop
-      or deactivate the monitor and hand off to `wdd-reconcile-wave`.
+    - If all active-wave tasks are merged, `merge_ready`, closed, blocked,
+      cancelled, or otherwise ready for wave reconciliation, stop or deactivate
+      the monitor and hand off to `wdd-reconcile-wave`.
     - If monitoring cannot be scheduled or resumed, set mode to `manual` and
       record the exact prompt and due time needed for a human or fresh agent to
       run the next tick.
@@ -152,8 +153,9 @@ state and orchestration state.
     - Monitoring tick completed, rescheduled, stopped, or downgraded to manual.
 
 12. Completion handoff:
-    - When all active-wave tasks are merged, closed, blocked, or cancelled,
-      invoke `wdd-reconcile-wave`.
+    - When all active-wave tasks are merged, `merge_ready`, closed, blocked,
+      cancelled, or otherwise ready for wave reconciliation, invoke
+      `wdd-reconcile-wave`.
     - Do not start the next wave before reconciliation.
 
 ## Done When
