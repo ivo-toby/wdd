@@ -166,13 +166,17 @@ The existing `wdd-write-tickets`, `wdd-validate-tickets`, and `wdd-plan-waves`
 skills should become compatibility wrappers that point users to `wdd-plan-epic`
 and explain how their former responsibilities are now handled.
 
-`wdd-start-wave` selects the next pending wave, marks it in progress, and hands
-one task file at a time to `subagent-pr-orchestration`. Task files are the
-implementation briefs; the workflow should not create a separate canonical
-brief artifact.
+`wdd-start-wave` selects the next pending wave as a batch of concurrently
+eligible tasks. It marks the wave in progress and dispatches every task in the
+active wave that has no unresolved dependency, no active conflict-domain
+blocker, no stale prerequisite, and no explicit blocked status. Each worker
+still receives exactly one task file, but multiple worker agents may run at the
+same time. Task files are the implementation briefs; the workflow should not
+create a separate canonical brief artifact.
 
 `subagent-pr-orchestration` coordinates workers and reviewers from task files
-and orchestration state. It does not implement task code.
+and orchestration state. It tracks each active task independently and does not
+implement task code.
 
 `wdd-reconcile-wave` runs after all active-wave tasks are merged, closed,
 blocked, or cancelled. It updates future tasks for drift before the next wave
@@ -205,6 +209,13 @@ Worker agents never merge their own PRs.
 The controller/orchestrator owns the task merge gate. After verification and
 review gates pass, it either merges the task PR into the epic branch or records
 the task as `merge_ready` when repository policy requires a human to merge.
+
+Before merging a task PR into the epic branch, the controller must check whether
+the task branch is stale relative to the current epic branch. If stale, the
+controller must require the worker or feedback-fix agent to rebase onto the
+latest epic branch or merge the latest epic branch into the task branch, rerun
+relevant verification, and rerun review when touched areas changed materially.
+No stale task branch should be merged blindly.
 
 The final epic PR targets the original target branch and is created only after
 epic-level validation passes.
@@ -271,13 +282,34 @@ Each durable memory item uses this shape:
 Workers may append to an existing resource file, create a focused new resource,
 and update `shared-context/index.md` with a short pointer.
 
+Because workers may run concurrently, shared-context writes follow lightweight
+discipline:
+
+- Workers may propose shared-context updates in their task branch.
+- The controller owns reconciliation of those updates into the epic branch.
+- If two workers update the same shared-context resource, the controller
+  resolves the conflict during review or wave reconciliation.
+- Workers should prefer focused resource files over editing large shared files.
+
 ## Orchestration State
 
 `orchestration.json` must be sufficient for a new controller instance to resume
 without hidden conversation context.
 
+It includes a schema version:
+
+```json
+{
+  "schemaVersion": 1
+}
+```
+
+Future workflow pivots should be able to migrate or at least detect old
+orchestration state.
+
 It tracks:
 
+- schema version
 - epic ID and title
 - target branch
 - epic base branch
@@ -296,6 +328,7 @@ It tracks:
 - branch
 - PR or patch reference
 - latest commit
+- branch freshness relative to the epic branch
 - unresolved P1/P2 feedback
 - verification result
 - current gate
@@ -316,6 +349,11 @@ The framework must not require:
 - shell helpers
 - generated workflow files
 - local-only automation
+
+Repository-native checks can still be referenced as optional or repo-specific
+verification when available. Examples include `git diff --check`, test
+commands, linters, type checks, builds, and CI status. The workflow itself must
+remain text-only and portable.
 
 Repo verification for this pivot should use manual/static inspection:
 
@@ -349,3 +387,11 @@ Repo verification for this pivot should use manual/static inspection:
 - Make the controller/orchestrator the worker PR merge gatekeeper.
 - Make all skills text-only and avoid scripts so the framework remains
   portable to cloud agents.
+- Dispatch active-wave tasks concurrently when dependencies, conflict domains,
+  prerequisites, and blocked status allow it.
+- Version `orchestration.json` with `schemaVersion: 1`.
+- Require a stale-branch/rebase gate before task PR merge.
+- Let workers propose shared-context updates while the controller reconciles
+  concurrent shared-context writes.
+- Allow repo-native verification commands as optional checks without making the
+  workflow depend on a CLI or scripts.
