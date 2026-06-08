@@ -93,6 +93,9 @@ to operate the WDD framework itself.
 ## Skill Pack
 
 Install or copy the directories in `skills/` into the agent's skill directory.
+Copy the full directories recursively, including their `templates/` and
+`agents/` subdirectories where present. The skill folders are the installable
+runtime; users should not need a separate repository-root `templates/` folder.
 
 For Codex-style local skills, that means:
 
@@ -100,14 +103,22 @@ For Codex-style local skills, that means:
 ~/.agents/skills/
   wave-driven-development/
   wdd-init-project/
+    templates/
   wdd-constitution/
+    templates/
   wdd-start-epic/
+    templates/
   wdd-plan-epic/
+    templates/
   wdd-start-wave/
+    templates/
   subagent-pr-orchestration/
   wdd-reconcile-wave/
+    templates/
   wdd-epic-validation/
+    templates/
   wdd-final-pr/
+    templates/
   wdd-status/
 ```
 
@@ -127,7 +138,8 @@ orchestration state in one coherent pass.
 
 1. `wdd-init-project`
    - Creates `.wdd/`, `.wdd/templates/`, `.wdd/epics/`, and the initial
-     constitution if missing.
+     constitution if missing, using the templates bundled inside the
+     `wdd-init-project` skill folder.
 
 2. `wdd-constitution`
    - Records setup choices: model aliases, model usage preferences, storage

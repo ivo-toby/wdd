@@ -22,6 +22,8 @@ active epic whose waves are complete and whose final validation has not passed.
 - All completed tasks have verification evidence.
 - No unresolved P1/P2 feedback remains unless explicitly accepted by the user.
 - The controller must not implement new task code during epic validation.
+- Use this skill folder's `templates/epic-validation.md` as the starting point
+  when creating `epic-validation.md`. Do not require `.wdd/templates/` to exist.
 
 ## Workflow
 
@@ -79,6 +81,8 @@ active epic whose waves are complete and whose final validation has not passed.
    - Future follow-up tasks are named when needed.
 
 9. Write or update `epic-validation.md`:
+   - Start from `templates/epic-validation.md` in this skill folder when
+     creating a new validation report.
    - Validation summary.
    - Definition of done checklist.
    - Deliverable checklist.

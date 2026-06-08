@@ -16,7 +16,9 @@ workflow non-goals.
 ## Preconditions
 
 - `.wdd/` must exist. If missing, use `wdd-init-project`.
-- Read existing `.wdd/constitution.md`.
+- Read existing `.wdd/constitution.md`. If `.wdd/` exists but
+  `.wdd/constitution.md` is missing, create it from this skill folder's
+  `templates/constitution.md`.
 - Read relevant repo docs before asking the user for information.
 - Do not require scripts or CLI commands to create or validate the constitution.
 

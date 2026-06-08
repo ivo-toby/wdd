@@ -22,6 +22,10 @@ information that blocks planning or architecture.
   shape.
 - Do not create task files yet unless the user explicitly asks and the epic is
   ready for planning.
+- Use this skill folder's `templates/epic.md`,
+  `templates/shared-context-index.md`, and
+  `templates/shared-context-resource.md` as starting points when creating those
+  artifacts. Do not require `.wdd/templates/` to exist.
 
 ## Workflow
 
@@ -45,6 +49,7 @@ information that blocks planning or architecture.
    ```
 
 3. Write `epic.md` with frontmatter and sections:
+   - Start from `templates/epic.md` in this skill folder when available.
    - Summary.
    - Goal.
    - Background.
@@ -63,11 +68,15 @@ information that blocks planning or architecture.
    - Planning Notes.
 
 4. Create `shared-context/index.md`:
+   - Start from `templates/shared-context-index.md` in this skill folder when
+     available.
    - Keep it short.
    - List available or expected resource files.
    - Record key decisions, warnings, constraints, and recent durable memory.
 
 5. Create focused shared-context resources when useful:
+   - Start from `templates/shared-context-resource.md` in this skill folder when
+     available.
    - `architecture.md`
    - `discovered-conventions.md`
    - `testing-strategy.md`

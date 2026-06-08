@@ -22,6 +22,8 @@ GitHub adapter or local text-only PR draft.
 - Epic branch exists or the artifact records why PR creation must be manual.
 - Final PR targets the original target branch, not another task branch.
 - The controller must not implement new task code during final PR preparation.
+- Use this skill folder's `templates/final-pr.md` as the starting point when
+  creating `final-pr.md`. Do not require `.wdd/templates/` to exist.
 
 ## Workflow
 
@@ -44,6 +46,8 @@ GitHub adapter or local text-only PR draft.
    - Target branch is the constitution or epic target branch.
 
 3. Draft `final-pr.md`:
+   - Start from `templates/final-pr.md` in this skill folder when creating a new
+     draft.
    - PR title.
    - Epic summary.
    - Completed deliverables.
