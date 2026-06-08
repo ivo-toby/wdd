@@ -1,78 +1,99 @@
 ---
 name: wave-driven-development
-description: Prepare large architecture, refactor, migration, feature, or spike work with local-first WDD artifacts: constitution, epic markdown, YAML-frontmatter tickets, validation, dependency waves, and controller state before implementation agents start.
+description: Run the full text-only Wave-Driven Development workflow using local markdown/json artifacts, epic-ticket-task hierarchy, concurrent task waves, controller gates, review, validation, and final PR handoff.
 ---
 
 # Wave-Driven Development
 
-Use this before implementation when work is too broad, risky, or interconnected for one agent to safely code directly.
+Use this as the overview skill for large features, spikes, migrations, refactors,
+hardening work, bug clusters, or any multi-task implementation that benefits
+from planned parallel agent execution.
 
-## Core Rule
+## User Input
 
-The main agent plans and manages. It does not implement wave tickets. Implementation starts only after the epic, tickets, validation result, and wave plan exist under `.wdd/`.
+Treat the user's request as the workflow goal. If the request names a phase, use
+the matching WDD phase skill. If the request is broad, start at the earliest
+missing phase.
 
-Local markdown is the default source of truth. GitHub, Jira, Linear, or other trackers are adapters recorded in frontmatter, not required storage.
+## Preconditions
 
-## Required Local Artifacts
-
-- `.wdd/constitution.md`: project boundaries, prerequisites, verification rules, non-goals, safety rules.
-- `.wdd/epics/<epic-id>-<slug>/epic.md`: parent epic with mandatory YAML frontmatter.
-- `.wdd/epics/<epic-id>-<slug>/tickets/<ticket-id>-<slug>.md`: one bounded ticket per file with mandatory YAML frontmatter.
-- `.wdd/epics/<epic-id>-<slug>/wave-plan.yaml`: dependency-aware execution waves.
-- `.wdd/epics/<epic-id>-<slug>/controller-state.yaml`: active controller state for resumability.
-- `.wdd/epics/<epic-id>-<slug>/briefs/*.md`: implementation briefs for subagents.
+- Work from the repository root.
+- Read repo instructions such as `AGENTS.md`, `README.md`, and project-specific
+  docs.
+- Use `.wdd/` as the durable local source of truth.
+- Do not rely on a runtime CLI, script, package manager, generated validator, or
+  local binary.
+- Keep GitHub, Jira, Linear, Postgram, and similar systems as adapters or
+  mirrors, not required storage.
 
 ## Workflow
 
-1. Initialize or inspect WDD:
-   - Run `wdd init --agent codex` when `.wdd/` does not exist.
-   - Read `.wdd/constitution.md` before proposing the target shape.
-   - Run `wdd status --json` to understand active epics.
+1. Determine current WDD state:
+   - If `.wdd/constitution.md` is missing, use `wdd-init-project`, then
+     `wdd-constitution`.
+   - If the constitution has blocking setup gaps, use `wdd-constitution`.
+   - If no epic exists for the requested work, use `wdd-start-epic`.
+   - If the epic lacks ticket folders, task files, shared context, waves, or
+     orchestration state, use `wdd-plan-epic`.
+   - If a wave should start or resume, use `wdd-start-wave`, then
+     `subagent-pr-orchestration`.
+   - If an active wave completed, use `wdd-reconcile-wave`.
+   - If all waves completed, use `wdd-epic-validation`.
+   - If epic validation passed, use `wdd-final-pr`.
+   - If the user asks where things stand, use `wdd-status`.
 
-2. Shape the epic:
-   - Create with `wdd new feature <slug>` or `wdd new spike <slug>`.
-   - Fill `epic.md`, `prd.md`, and `design.md` enough for tickets to be self-contained.
-   - Keep external tracker links in frontmatter `adapter_links`.
+2. Enforce role separation:
+   - The controller plans, activates waves, dispatches workers, monitors gates,
+     routes feedback, merges or marks merge-ready, and reconciles drift.
+   - Worker agents execute exactly one task file each.
+   - Reviewer agents review one task PR or patch and classify P1/P2/P3
+     findings.
+   - The controller does not implement task code.
+   - Workers do not merge their own PRs.
 
-3. Write tickets:
-   - Use `wdd ticket create <epic> <slug> --title "<title>" --verify "<cmd>"` for scaffolding.
-   - Edit each ticket body so it has clear context, end goal, scope, RED/GREEN TDD guidance, acceptance criteria, verification, review handoff, and out-of-scope sections.
-   - Use frontmatter for machine-readable state: `id`, `kind`, `epic`, `status`, `wave`, `depends_on`, `conflict_domains`, `branch`, `verification`, and `adapter_links`.
+3. Maintain artifact locality:
+   - Constitution: `.wdd/constitution.md`
+   - Epic folder: `.wdd/epics/<epic-id>/`
+   - Epic: `epic.md`
+   - Shared context: `shared-context/index.md` and
+     `shared-context/resources/*.md`
+   - Ticket container: `<ticket-id>/ticket.md`
+   - Task files: `<ticket-id>/<status>/<task-id>.md`
+   - Wave plan: `wave-plan.md`
+   - Machine state: `orchestration.json` with `schemaVersion: 1`
+   - Human controller state: `controller-state.md`
+   - Epic validation: `epic-validation.md`
+   - Final PR draft: `final-pr.md`
 
-4. Validate:
-   - Run `wdd validate <epic> --json`.
-   - Do not plan waves until validation passes.
-   - Fix missing dependencies, weak verification, ambiguous deliverables, or missing required sections.
+4. Treat tasks as executable units:
+   - Tickets group related tasks.
+   - Waves schedule tasks, not tickets.
+   - Task files are the implementation briefs.
+   - Task files move through `todo/`, `in-progress/`, `review/`, `done/`,
+     `blocked/`, or `cancelled/`.
 
-5. Plan waves:
-   - Run `wdd waves plan <epic>`.
-   - Inspect `wave-plan.yaml`.
-   - Prefer fewer high-quality parallel tickets over conflict-heavy parallelism.
-   - Conflict domains should name shared files, packages, schemas, config, path aliases, migrations, and shared tests.
+5. Activate waves safely:
+   - A wave is activated as a batch of concurrently eligible tasks.
+   - Dispatch every task in the active wave that has no unresolved dependency,
+     no active conflict-domain blocker, no stale prerequisite, and no explicit
+     blocked status.
+   - Track every active task independently in `orchestration.json` and
+     `controller-state.md`.
 
-6. Start execution:
-   - Run `wdd start-wave <epic> --json`.
-   - This writes controller state and subagent briefs.
-   - Hand off to `subagent-pr-orchestration`.
+6. Preserve merge discipline:
+   - Task branches branch from the epic branch.
+   - Task PRs target the epic branch.
+   - No task work merges directly to the target branch.
+   - Before merge, check branch freshness relative to the epic branch.
+   - If stale, rebase or merge latest epic branch, rerun relevant verification,
+     and rerun review when touched areas changed materially.
+   - Final merge to the target branch happens through the final epic PR after
+     epic validation and human review.
 
-7. Reconcile after each wave:
-   - Inspect merged work, changed files, verification, review findings, and architecture drift.
-   - Update later tickets before starting the next wave.
-   - Run `wdd reconcile <epic> --wave <n> --done` only after merge/review gates are complete.
+## Done When
 
-## Ticket Quality Gate
-
-Each ticket must be pick-up-ready for one implementation agent:
-
-- The deliverable is explicit and observable.
-- Dependencies are frontmatter IDs, not prose.
-- Conflict domains are named.
-- Verification commands are concrete.
-- RED/GREEN TDD guidance says what failure should be proven first.
-- Out-of-scope prevents opportunistic expansion.
-- Review handoff says what the high-rigor reviewer should verify.
-
-## Output To User
-
-When reporting a prepared plan, include the epic path, ticket paths, wave breakdown, known conflict domains, and the next safe wave. If external tracker sync exists, include adapter links as secondary references.
-
+- The current phase has updated concrete text artifacts.
+- The next valid phase is named.
+- Any blocker is recorded in the relevant artifact.
+- No WDD phase required a CLI, script, package manager, generated validator, or
+  local binary.

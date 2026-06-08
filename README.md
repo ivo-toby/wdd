@@ -1,113 +1,175 @@
 # WDD
 
-Wave-Driven Development is a local-first workflow for planning and executing
-agentic software work in dependency-aware waves.
+Wave-Driven Development is a portable, text-only skill pack for coding agents.
 
-It gives coding agents a durable project structure:
+The runtime is the Markdown skill pack, not a CLI, script, package, or local
+binary. Agents create and update local artifacts directly under `.wdd/`, using
+Markdown for human and agent context plus hand-editable JSON where resumable
+machine state is useful.
 
-- a project constitution for boundaries and prerequisites,
-- epics and tickets stored as Markdown with mandatory YAML frontmatter,
-- validation before execution,
-- a dependency/conflict-aware wave plan,
-- controller state and implementation briefs for subagent orchestration.
+This keeps the workflow usable across local agents, cloud agents, and hosted
+coding environments such as Claude Code Cloud and Codex Cloud.
 
-GitHub is optional. Local `.wdd/` files are the default source of truth; external
-trackers can be added later through `adapter_links` metadata.
+## What WDD Provides
 
-## Install
+- A project constitution for setup, model aliases, storage mode, branch policy,
+  review policy, verification expectations, and governance.
+- Epic definition from vague product, technical, refactor, migration, or bug
+  cluster input.
+- Ticket folders that group related work.
+- Task files that are the independently executable worker-agent units.
+- Kanban task movement through `todo/`, `in-progress/`, `review/`, `done/`,
+  `blocked/`, and `cancelled/`.
+- Progressive-disclosure shared context for architecture, conventions, testing,
+  validation, and durable worker discoveries.
+- Dependency-aware and conflict-aware wave planning.
+- Wave activation as a batch of concurrently eligible tasks.
+- Persistent `orchestration.json` with `schemaVersion: 1` for resumability.
+- Controller-managed worker PRs, review gates, feedback routing, stale-branch
+  checks, merges into the epic branch, wave reconciliation, epic validation,
+  and final PR preparation.
 
-```bash
-npm install -g @ivo-toby/wdd
+## Text-Only Runtime
+
+WDD does not require:
+
+- a CLI command
+- scripts
+- Node.js
+- npm
+- generated validators
+- local-only automation
+
+Repository-native checks can still be referenced as optional verification when
+available, such as tests, linters, type checks, builds, CI status, or
+`git diff --check`. Those checks prove the target project; they are not required
+to operate the WDD framework itself.
+
+## Skill Pack
+
+Install or copy the directories in `skills/` into the agent's skill directory.
+
+For Codex-style local skills, that means:
+
+```text
+~/.agents/skills/
+  wave-driven-development/
+  wdd-init-project/
+  wdd-constitution/
+  wdd-start-epic/
+  wdd-plan-epic/
+  wdd-start-wave/
+  subagent-pr-orchestration/
+  wdd-reconcile-wave/
+  wdd-epic-validation/
+  wdd-final-pr/
+  wdd-status/
 ```
 
-From a checkout of this repo:
+Compatibility wrapper skills are also included for older phase names:
 
-```bash
-npm install
-npm link
+```text
+  wdd-write-tickets/
+  wdd-validate-tickets/
+  wdd-plan-waves/
 ```
 
-## Initialize A Project
+These wrappers route old intents into `wdd-plan-epic`, because planning now
+creates tickets, tasks, validation notes, waves, shared context, and
+orchestration state in one coherent pass.
 
-```bash
-wdd init --agent codex
-wdd install-skills
-```
+## Workflow
 
-`wdd init` creates:
+1. `wdd-init-project`
+   - Creates `.wdd/`, `.wdd/templates/`, `.wdd/epics/`, and the initial
+     constitution if missing.
+
+2. `wdd-constitution`
+   - Records setup choices: model aliases, model usage preferences, storage
+     mode, branch conventions, review policy, merge policy, verification
+     expectations, and governance.
+
+3. `wdd-start-epic`
+   - Turns vague input into an implementation-ready epic and initializes
+     `shared-context/`.
+
+4. `wdd-plan-epic`
+   - Builds shared context, ticket folders, task files, dependency and conflict
+     grids, `wave-plan.md`, `orchestration.json`, and initial
+     `controller-state.md`.
+
+5. `wdd-start-wave`
+   - Activates the next pending wave as a batch of concurrently eligible tasks.
+
+6. `subagent-pr-orchestration`
+   - Dispatches one worker per task file, tracks every active task
+     independently, starts review agents, routes P1/P2 feedback, enforces
+     stale-branch checks, and merges or marks merge-ready according to policy.
+
+7. `wdd-reconcile-wave`
+   - Confirms merged or closed task state, reconciles drift, updates shared
+     context, adjusts future tasks, and decides whether the next wave can start.
+
+8. `wdd-epic-validation`
+   - Validates the completed epic branch against the epic definition of done,
+     task evidence, reviews, shared context, and integration state.
+
+9. `wdd-final-pr`
+   - Prepares the final epic PR from `epic/[epic-slug]` into the target branch
+     with a comprehensive human-review description.
+
+10. `wdd-status`
+    - Reports actual `.wdd/` state without modifying files by default.
+
+## Artifact Layout
 
 ```text
 .wdd/
-  config.yaml
   constitution.md
+  templates/
   epics/
+    EPIC-auth-refresh/
+      epic.md
+      wave-plan.md
+      orchestration.json
+      controller-state.md
+      epic-validation.md
+      final-pr.md
+      shared-context/
+        index.md
+        resources/
+          architecture.md
+          discovered-conventions.md
+          testing-strategy.md
+          validation-strategy.md
+          task-findings.md
+      TICKET-001-token-contract/
+        ticket.md
+        todo/
+          TASK-001-token-types.md
+        in-progress/
+        review/
+        done/
+        blocked/
+        cancelled/
 ```
 
-`wdd install-skills` copies the packaged skills into `~/.agents/skills` by
-default. Use `--target <path>` to install somewhere else.
+Task files are the worker implementation briefs. The workflow does not create a
+separate canonical brief artifact.
 
-## Plan A Feature Or Spike
+## Branching Model
 
-```bash
-wdd new feature auth-refresh --title "Auth Refresh"
-wdd ticket create WDD-0001 token-contract \
-  --title "Token Contract" \
-  --verify "npm test -- auth"
-wdd validate WDD-0001
-wdd waves plan WDD-0001
-```
-
-The agent should then inspect and refine:
+Task work never merges directly to the target branch.
 
 ```text
-.wdd/epics/WDD-0001-auth-refresh/
-  epic.md
-  prd.md
-  design.md
-  tickets/
-    WDD-0001-T001-token-contract.md
-  wave-plan.yaml
+main
+└── epic/auth-refresh
+    ├── task/TASK-001-token-types
+    ├── task/TASK-002-refresh-route
+    └── task/TASK-003-session-ui
 ```
 
-## Start A Wave
-
-```bash
-wdd start-wave WDD-0001 --json
-```
-
-This does not implement code. It writes:
-
-```text
-.wdd/epics/WDD-0001-auth-refresh/
-  controller-state.yaml
-  briefs/
-    WDD-0001-T001-token-contract.md
-```
-
-The controller agent reads those files and uses the
-`subagent-pr-orchestration` skill to dispatch implementation subagents.
-
-After a wave is merged and reconciled:
-
-```bash
-wdd reconcile WDD-0001 --wave 1 --done
-```
-
-## Useful Commands
-
-```bash
-wdd status --json
-wdd validate WDD-0001 --json
-wdd waves plan WDD-0001 --json
-wdd schema --json
-wdd doctor --json
-```
-
-## Development
-
-```bash
-npm test
-npm run lint
-```
-
-The CLI is plain Node.js ESM with one runtime dependency, `yaml`.
+Worker task PRs target the epic branch. Workers do not merge their own PRs.
+The controller owns the merge gate, including review status, verification,
+branch freshness, and shared-context reconciliation. The final epic PR targets
+the original target branch after epic validation passes.
