@@ -1,37 +1,69 @@
 ---
-id: WDD-0001-CONTROLLER
+id: EPIC-example-feature-CONTROLLER
 kind: controller_state
-epic: WDD-0001
-active_wave: 1
+epic: EPIC-example-feature
+active_wave: WAVE-001
 status: in_progress
 updated_at: YYYY-MM-DD
 ---
 
-# Controller State: WDD-0001
+# Controller State: EPIC-example-feature
 
 ## Controller Rule
 
-The controller manages waves, subagents, PRs, review feedback, verification evidence, and reconciliation. The controller does not implement code.
+The controller manages waves, workers, reviewers, PRs or patches, feedback,
+verification evidence, stale-branch checks, merges or merge-ready decisions,
+shared-context reconciliation, and wave reconciliation. The controller does not
+implement task code.
 
 ## Active Wave
 
-Wave: 1
+Wave: WAVE-001
 
-| Ticket | Brief | Branch | PR | Gate | Verification |
-|--------|-------|--------|----|------|--------------|
-| WDD-0001-T001 | briefs/WDD-0001-T001-example-ticket.md | codex/wdd-0001-t001-example-ticket | None | no_pr | Not run |
+Activation: batch dispatch of concurrently eligible tasks.
+
+## Active Task Gates
+
+| Task | Ticket | Branch | PR/Patch | Gate | Worker | Reviewer |
+|------|--------|--------|----------|------|--------|----------|
+| TASK-001-example-task | TICKET-001-example-ticket | task/TASK-001-example-task | None | not_started | None | None |
 
 ## Gate Definitions
 
+- not_started: task has not been dispatched.
 - no_pr: implementation has not produced a PR or equivalent patch.
-- needs_review: PR exists and high-rigor review is not complete.
+- needs_review: PR or patch exists and review is not complete.
 - reviewing: review is active.
-- needs_fixes: P1/P2 feedback exists.
-- merge_ready: verification and P1/P2 gates are clear.
-- merged: ticket is merged and cleaned up.
+- needs_fixes: unresolved P1/P2 feedback exists.
+- merge_ready: verification, branch freshness, and P1/P2 gates are clear.
+- merged: task is merged into the epic branch or accepted according to policy.
 - blocked: controller cannot progress without user or external input.
+- cancelled: task was intentionally abandoned or replaced.
+
+## Branch Freshness
+
+| Task | Epic Branch | Task Branch | Freshness | Required Action |
+|------|-------------|-------------|-----------|-----------------|
+| TASK-001-example-task | epic/example-feature | task/TASK-001-example-task | unknown | Check before merge |
+
+## Open P1/P2 Feedback
+
+- None.
+
+## Verification Status
+
+| Task | Verification | Result | Evidence |
+|------|--------------|--------|----------|
+| TASK-001-example-task | project-specific verification command | not_run | None |
+
+## Shared Context Reconciliation
+
+- No pending shared-context updates.
 
 ## Event Log
 
-- YYYY-MM-DD: Wave 1 started.
+- YYYY-MM-DD: WAVE-001 activated.
 
+## Next Action
+
+- Dispatch eligible tasks or resume active gates.

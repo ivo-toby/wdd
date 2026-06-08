@@ -1,67 +1,89 @@
 ---
 name: wdd-start-wave
-description: Start the next pending WDD wave by writing controller state and implementation briefs, then hand off to subagent orchestration while the controller remains non-coding.
+description: Activate the next pending WDD wave as a concurrent batch of eligible task files, update orchestration and controller state, then hand off to subagent-pr-orchestration.
 ---
 
 # WDD Start Wave
 
-Use this when the user asks to start, continue, or resume implementation for a WDD epic.
+Use this when the user asks to start, continue, resume, or activate
+implementation for a planned WDD epic. This skill activates the next pending wave
+as a concurrent task batch when dependencies and conflict domains allow it.
 
 ## User Input
 
-If the user names an epic or wave, use it. Otherwise choose the first epic with `wave-plan.md` and a pending wave.
+If the user names an epic, wave, ticket, task, branch, or PR, use it. Otherwise
+choose the first epic with a planned wave that is not done.
 
 ## Preconditions
 
 - `wave-plan.md` exists.
-- Validation passed for the tickets in the target wave.
-- The controller must not implement code.
-- A subagent orchestration mechanism must be available, or controller state must record that execution is blocked.
+- `orchestration.json` exists with `schemaVersion: 1`.
+- `controller-state.md` exists or can be created from orchestration state.
+- Task files for the target wave exist in status folders.
+- The controller must not implement task code.
+- A subagent orchestration mechanism must be available, or controller state must
+  record that execution is blocked.
 
 ## Workflow
 
 1. Load:
    - Constitution.
    - Epic.
+   - Shared-context index.
    - Wave plan.
-   - Tickets in the first pending wave.
-   - Existing controller state if present.
+   - `orchestration.json`.
+   - Controller state.
+   - Task files in the first pending or active wave.
 
-2. Select wave:
-   - Choose the first wave whose status is not `done`.
+2. Select wave to activate or resume:
    - If a wave is `in_progress`, resume it.
-   - Do not skip to later waves unless the user explicitly instructs and dependencies are satisfied.
+   - Otherwise choose the first wave whose status is not `done`.
+   - Do not skip to later waves unless the user explicitly instructs and
+     dependencies are satisfied.
 
-3. Update artifacts:
-   - Set selected wave status to `in_progress` in `wave-plan.md`.
-   - Set selected ticket statuses to `in_progress`.
-   - Create or update `controller-state.md`.
+3. Determine concurrently eligible tasks:
+   - Dependency status is resolved.
+   - No active conflict-domain blocker exists.
+   - No stale prerequisite blocks work.
+   - Task status is not `blocked` or `cancelled`.
+   - Task is in `todo/`, or already `in-progress/` or `review/` and needs
+     resumed orchestration.
 
-4. Write implementation briefs:
-   - Path: `briefs/<ticket-id>-<slug>.md`
-   - Include YAML frontmatter with `kind: implementation_brief`, epic, ticket, wave, branch, status.
-   - Include deliverable, context, scope, out-of-scope, TDD requirement, verification commands, branch, PR title, and final response contract.
+4. Activate the wave as a batch:
+   - Mark the wave `in_progress` in `wave-plan.md`.
+   - Move eligible new task files from `todo/` to `in-progress/`.
+   - Keep resumed `in-progress/` and `review/` tasks in their current folders.
+   - Do not imply sequential task execution.
+   - Worker agents may run at the same time.
+   - Record non-eligible tasks and the reason they were not dispatched.
 
-5. Controller state must track each ticket:
-   - Ticket ID.
-   - Brief path.
-   - Branch.
-   - Implementation thread ID if known.
-   - Review thread ID if known.
-   - PR URL if known.
-   - Gate: `no_pr`, `needs_review`, `reviewing`, `needs_fixes`, `merge_ready`, `merged`, or `blocked`.
+5. Update `orchestration.json`:
+   - Set wave status.
+   - Set each active task status and current gate.
+   - Record task file path after any movement.
+   - Record branch, PR or patch, worker reference, reviewer reference, branch
+     freshness, feedback, and verification when known.
+
+6. Update `controller-state.md`:
+   - Active wave.
+   - Active task gates.
+   - Branch freshness table.
    - Open P1/P2 feedback.
-   - Verification result.
+   - Verification status.
+   - Shared-context reconciliation status.
+   - Event log entry for activation or resume.
 
-6. Handoff:
+7. Handoff:
    - Invoke `subagent-pr-orchestration`.
-   - Dispatch one implementation agent per active-wave ticket.
-   - Give each agent exactly one brief.
+   - Dispatch one worker per eligible active task.
+   - Give each worker exactly one task file plus relevant repo instructions.
+   - Task files are the implementation briefs. Do not create a separate
+     canonical brief artifact.
 
 ## Done When
 
 - Active wave is marked `in_progress`.
-- `controller-state.md` exists.
-- Every active-wave ticket has an implementation brief.
-- Subagent orchestration has been started or controller state records why it is blocked.
-
+- Every eligible active-wave task is dispatched or recorded with a blocker.
+- `orchestration.json` and `controller-state.md` reflect current gates.
+- Subagent orchestration has started, or controller state records why it is
+  blocked.

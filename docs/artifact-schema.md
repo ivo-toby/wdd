@@ -1,7 +1,10 @@
 # WDD Artifact Schema
 
-WDD artifacts are local markdown files. YAML frontmatter carries structured
-state; markdown bodies carry context and instructions.
+WDD artifacts are local text files. Markdown carries human and agent context.
+Hand-editable JSON carries resumable orchestration state where structured state
+is useful.
+
+The canonical root is `.wdd/`.
 
 ## Constitution
 
@@ -11,37 +14,64 @@ Path:
 .wdd/constitution.md
 ```
 
-Required sections:
+Required frontmatter:
 
-- Boundaries
-- Prerequisites
+```yaml
+---
+id: WDD-CONSTITUTION
+kind: constitution
+version: 1.0.0
+status: active
+ratified: YYYY-MM-DD
+last_amended: YYYY-MM-DD
+---
+```
+
+Required body sections:
+
+- Project Scope
+- Setup Configuration
+- Model Usage
+- Storage Mode
+- Branching Policy
+- Review Policy
+- Verification Policy
 - Agent Roles
-- Ticket Rules
+- Planning Rules
+- Task Rules
 - Wave Rules
+- Shared Context Rules
 - Governance
+
+The constitution stores user choices that must not be rediscovered by later
+agents, including model aliases, target branch, branch naming conventions,
+review blocking policy, feedback-fix preference, and patch fallback policy.
 
 ## Epic
 
 Path:
 
 ```text
-.wdd/epics/WDD-0001-auth-refresh/epic.md
+.wdd/epics/EPIC-auth-refresh/epic.md
 ```
 
-Frontmatter:
+Required frontmatter:
 
 ```yaml
 ---
-id: WDD-0001
+id: EPIC-auth-refresh
 kind: epic
 type: feature
 slug: auth-refresh
 title: Auth Refresh
 status: draft
-created_at: "2026-06-07"
-updated_at: "2026-06-07"
-constitution_version: 1.0.0
+created_at: YYYY-MM-DD
+updated_at: YYYY-MM-DD
+target_branch: main
+epic_branch: epic/auth-refresh
+schema_version: 1
 ticket_count: 0
+task_count: 0
 adapter_links:
   github_issue: null
   jira_epic: null
@@ -50,109 +80,355 @@ adapter_links:
 
 Required body sections:
 
-- Product Brief / PRD
-- Design Direction
-- Acceptance Strategy
-- Ticket Strategy
-- Wave Strategy
+- Summary
+- Goal
+- Background
+- Product Context
+- Technical Context
+- Deliverables
+- Non-Goals
+- Assumptions
+- Constraints
+- Risks
+- Dependencies
+- Affected Areas
+- Validation Strategy
+- Definition of Done
 - Open Questions
+- Planning Notes
 
-## Ticket
+The epic is ready for planning only when deliverables are concrete, scope
+boundaries are explicit, and the definition of done is testable.
+
+## Ticket Folder
 
 Path:
 
 ```text
-.wdd/epics/WDD-0001-auth-refresh/tickets/WDD-0001-T001-token-contract.md
+.wdd/epics/EPIC-auth-refresh/TICKET-001-token-contract/ticket.md
 ```
 
-Frontmatter:
+Required frontmatter:
 
 ```yaml
 ---
-id: WDD-0001-T001
+id: TICKET-001-token-contract
 kind: ticket
-epic: WDD-0001
+epic: EPIC-auth-refresh
 slug: token-contract
 title: Token Contract
-status: todo
-wave: null
+status: planned
+task_count: 2
 depends_on: []
 conflict_domains:
   - src/auth/**
-branch: codex/wdd-0001-t001-token-contract
-verification:
-  - npm test -- auth
 adapter_links:
   github_issue: null
-  pull_request: null
 ---
 ```
 
 Required body sections:
 
-- Context
-- End Goal / Deliverable
+- Summary
+- Objective
 - Scope
-- RED/GREEN TDD
-- Acceptance Criteria
-- Verification
-- Review Handoff
-- Out of Scope
+- Non-Scope
+- Shared Context References
+- Task Inventory
+- Dependencies
+- Conflict Domains
+- Validation Expectations
+- Review Focus
+- Completion Criteria
+
+Tickets are containers. They group related tasks but are not assigned directly
+to worker agents.
+
+## Task
+
+Path:
+
+```text
+.wdd/epics/EPIC-auth-refresh/TICKET-001-token-contract/todo/TASK-001-token-types.md
+```
+
+Required frontmatter:
+
+```yaml
+---
+id: TASK-001-token-types
+kind: task
+epic: EPIC-auth-refresh
+ticket: TICKET-001-token-contract
+wave: WAVE-001
+slug: token-types
+title: Token Types
+status: todo
+depends_on: []
+conflict_domains:
+  - src/auth/token-types.ts
+assigned_model_class: simple-implementation
+review_model_class: review
+branch: task/TASK-001-token-types
+pr: null
+current_gate: not_started
+branch_freshness: unknown
+verification:
+  - project-specific verification command
+---
+```
+
+Required body sections:
+
+- Status
+- Parent Ticket
+- Wave
+- Objective
+- Scope
+- Non-Scope
+- Relevant Context
+- Likely Files / Areas
+- Dependencies
+- Conflict Domains
+- Assigned Model Class
+- Branch
+- PR / Patch Reference
+- RED-GREEN TDD Plan
+- Implementation Notes
+- Durable Memory Notes To Consider
+- Task-Level Definition of Done
+- Validation Steps
+- Verification Evidence
+- Review Feedback
+- Completion Notes
+
+Task files are the worker implementation briefs. A task file moves through
+`todo/`, `in-progress/`, `review/`, `done/`, `blocked/`, and `cancelled/` as
+the durable visible state.
+
+## Shared Context
+
+Index path:
+
+```text
+.wdd/epics/EPIC-auth-refresh/shared-context/index.md
+```
+
+Resource path:
+
+```text
+.wdd/epics/EPIC-auth-refresh/shared-context/resources/architecture.md
+```
+
+The index must include:
+
+- Overview
+- Resource Index
+- When To Read Each Resource
+- Key Decisions
+- Key Warnings
+- Known Constraints
+- Recent Durable Memory
+
+Resource files are focused and scannable. Worker agents may propose updates in
+their task branches. The controller reconciles shared-context changes into the
+epic branch, especially when concurrent workers touch the same resource.
+
+Durable memory items use:
+
+```markdown
+### Short Title
+
+- Source task: TASK-001-token-types
+- Source PR/branch: task/TASK-001-token-types
+- Status: confirmed | inferred | needs verification
+- Summary:
+- Why it matters:
+- Affected files or areas:
+- Follow-up implications:
+```
 
 ## Wave Plan
 
 Path:
 
 ```text
-.wdd/epics/WDD-0001-auth-refresh/wave-plan.md
+.wdd/epics/EPIC-auth-refresh/wave-plan.md
 ```
 
-The wave plan is markdown with frontmatter. It must include:
+Required frontmatter:
 
-- Ticket inventory.
-- Dependency grid.
-- Conflict grid or conflict notes.
-- One section per wave.
-- Grouping rationale for each wave.
-- Stop condition after each wave.
-- Known conflict risks.
+```yaml
+---
+id: EPIC-auth-refresh-WAVES
+kind: wave_plan
+epic: EPIC-auth-refresh
+status: planned
+created_at: YYYY-MM-DD
+updated_at: YYYY-MM-DD
+---
+```
+
+Required body sections:
+
+- Task Inventory
+- Dependency Grid
+- Conflict Grid
+- Waves
+- Activation Rules
+- Stop Conditions
+- Known Conflict Risks
+- Manual Adjustments
+
+Waves schedule tasks, not tickets. A wave is activated as a batch of
+concurrently eligible tasks. Eligibility requires no unresolved dependency, no
+active conflict-domain blocker, no stale prerequisite, and no explicit blocked
+status.
+
+## Orchestration JSON
+
+Path:
+
+```text
+.wdd/epics/EPIC-auth-refresh/orchestration.json
+```
+
+Required top-level field:
+
+```json
+{
+  "schemaVersion": 1
+}
+```
+
+Minimum structure:
+
+```json
+{
+  "schemaVersion": 1,
+  "epic": {
+    "id": "EPIC-auth-refresh",
+    "name": "Auth Refresh",
+    "targetBranch": "main",
+    "baseBranch": "epic/auth-refresh"
+  },
+  "configuration": {
+    "storageMode": "local-markdown",
+    "models": {
+      "planning": "configured-model-key",
+      "implementationSimple": "configured-model-key",
+      "implementationComplex": "configured-model-key",
+      "review": "configured-model-key",
+      "feedbackFix": "configured-model-key",
+      "epicValidation": "configured-model-key",
+      "prDescription": "configured-model-key"
+    }
+  },
+  "waves": [
+    {
+      "id": "WAVE-001",
+      "status": "planned",
+      "tasks": [
+        {
+          "id": "TASK-001-token-types",
+          "ticket": "TICKET-001-token-contract",
+          "path": "TICKET-001-token-contract/todo/TASK-001-token-types.md",
+          "status": "todo",
+          "dependsOn": [],
+          "conflictDomains": ["src/auth/token-types.ts"],
+          "assignedModel": "configured-model-key",
+          "reviewModel": "configured-model-key",
+          "workerThreadId": null,
+          "reviewThreadId": null,
+          "branch": "task/TASK-001-token-types",
+          "pr": null,
+          "latestCommit": null,
+          "branchFreshness": "unknown",
+          "blockingFeedback": [],
+          "verification": null,
+          "currentGate": "not_started"
+        }
+      ]
+    }
+  ]
+}
+```
+
+The controller updates this file after task assignment, task movement, branch
+creation, PR or patch creation, review start, P1/P2 feedback, feedback routing,
+verification, stale-branch checks, merge, blocker, wave completion, and
+reconciliation.
 
 ## Controller State
 
 Path:
 
 ```text
-.wdd/epics/WDD-0001-auth-refresh/controller-state.md
+.wdd/epics/EPIC-auth-refresh/controller-state.md
 ```
 
-The controller state is markdown with frontmatter. It must track:
+Required body sections:
 
-- Active wave.
-- Ticket gates.
-- Brief paths.
-- Branches.
-- PR or patch references.
-- Implementation and review thread IDs when available.
-- Open P1/P2 feedback.
-- Verification result.
-- Cleanup state.
+- Controller Rule
+- Active Wave
+- Active Task Gates
+- Branch Freshness
+- Open P1/P2 Feedback
+- Verification Status
+- Shared Context Reconciliation
+- Event Log
+- Next Action
 
-## Implementation Brief
+The controller state is human-readable. `orchestration.json` is the
+machine-readable resume surface.
+
+## Epic Validation
 
 Path:
 
 ```text
-.wdd/epics/WDD-0001-auth-refresh/briefs/WDD-0001-T001-token-contract.md
+.wdd/epics/EPIC-auth-refresh/epic-validation.md
 ```
 
-The brief is the implementation subagent's source of truth. It must include:
+Required body sections:
 
-- Deliverable.
-- Required context.
-- Scope.
-- Out of scope.
-- RED/GREEN requirement.
-- Verification commands.
-- PR or patch requirements.
-- Required final status token.
+- Validation Summary
+- Epic Definition Of Done
+- Deliverable Checklist
+- Task State Audit
+- Review Audit
+- Verification Evidence
+- Shared Context Audit
+- Integration Risks
+- Branch State
+- Result
 
+Epic validation happens only after all waves are complete.
+
+## Final PR
+
+Path:
+
+```text
+.wdd/epics/EPIC-auth-refresh/final-pr.md
+```
+
+Required body sections:
+
+- PR Title
+- Epic Summary
+- Completed Deliverables
+- Definition Of Done Checklist
+- Validation Evidence
+- Test Results
+- Wave Summary
+- Task Summary
+- Review Summary
+- Known Limitations
+- Risks
+- Follow-Up Tasks
+- Documentation Updates
+- References
+
+The final PR targets the original target branch and is prepared only after
+epic validation passes.

@@ -1,24 +1,49 @@
 # WDD
 
-Wave-Driven Development is a skill-driven workflow for coding agents.
+Wave-Driven Development is a portable, text-only skill pack for coding agents.
 
-The runtime is the agent skill pack, not a project-management CLI. Agents create
-and update local markdown artifacts directly under `.wdd/`, using YAML
-frontmatter for machine-readable state and Markdown bodies for human and agent
-context.
+The runtime is the Markdown skill pack, not a CLI, script, package, or local
+binary. Agents create and update local artifacts directly under `.wdd/`, using
+Markdown for human and agent context plus hand-editable JSON where resumable
+machine state is useful.
 
-This makes the workflow portable across local agents, cloud agents, and hosted
-coding environments where installing or running a custom CLI is not practical.
+This keeps the workflow usable across local agents, cloud agents, and hosted
+coding environments such as Claude Code Cloud and Codex Cloud.
 
 ## What WDD Provides
 
-- A project constitution for boundaries, prerequisites, verification, and agent roles.
-- Local epics with PRD/design context.
-- Local tickets with YAML frontmatter, dependencies, conflict domains, verification, and review handoff.
-- Ticket validation as an agent skill.
-- Dependency and conflict-domain wave planning as an agent skill.
-- Controller state and implementation briefs for subagent orchestration.
-- Reconciliation after every wave before the next wave starts.
+- A project constitution for setup, model aliases, storage mode, branch policy,
+  review policy, verification expectations, and governance.
+- Epic definition from vague product, technical, refactor, migration, or bug
+  cluster input.
+- Ticket folders that group related work.
+- Task files that are the independently executable worker-agent units.
+- Kanban task movement through `todo/`, `in-progress/`, `review/`, `done/`,
+  `blocked/`, and `cancelled/`.
+- Progressive-disclosure shared context for architecture, conventions, testing,
+  validation, and durable worker discoveries.
+- Dependency-aware and conflict-aware wave planning.
+- Wave activation as a batch of concurrently eligible tasks.
+- Persistent `orchestration.json` with `schemaVersion: 1` for resumability.
+- Controller-managed worker PRs, review gates, feedback routing, stale-branch
+  checks, merges into the epic branch, wave reconciliation, epic validation,
+  and final PR preparation.
+
+## Text-Only Runtime
+
+WDD does not require:
+
+- a CLI command
+- scripts
+- Node.js
+- npm
+- generated validators
+- local-only automation
+
+Repository-native checks can still be referenced as optional verification when
+available, such as tests, linters, type checks, builds, CI status, or
+`git diff --check`. Those checks prove the target project; they are not required
+to operate the WDD framework itself.
 
 ## Skill Pack
 
@@ -32,50 +57,69 @@ For Codex-style local skills, that means:
   wdd-init-project/
   wdd-constitution/
   wdd-start-epic/
-  wdd-write-tickets/
-  wdd-validate-tickets/
-  wdd-plan-waves/
+  wdd-plan-epic/
   wdd-start-wave/
   subagent-pr-orchestration/
   wdd-reconcile-wave/
+  wdd-epic-validation/
+  wdd-final-pr/
   wdd-status/
 ```
 
-Each skill is self-contained enough to run from repository files. The root
-`templates/` folder provides canonical artifact templates, but the skills also
-describe the required artifact shapes.
+Compatibility wrapper skills are also included for older phase names:
+
+```text
+  wdd-write-tickets/
+  wdd-validate-tickets/
+  wdd-plan-waves/
+```
+
+These wrappers route old intents into `wdd-plan-epic`, because planning now
+creates tickets, tasks, validation notes, waves, shared context, and
+orchestration state in one coherent pass.
 
 ## Workflow
 
 1. `wdd-init-project`
-   - Creates `.wdd/`, `.wdd/templates/`, and `.wdd/constitution.md`.
+   - Creates `.wdd/`, `.wdd/templates/`, `.wdd/epics/`, and the initial
+     constitution if missing.
 
 2. `wdd-constitution`
-   - Defines project boundaries, prerequisites, verification rules, agent roles, ticket rules, wave rules, and governance.
+   - Records setup choices: model aliases, model usage preferences, storage
+     mode, branch conventions, review policy, merge policy, verification
+     expectations, and governance.
 
 3. `wdd-start-epic`
-   - Creates `.wdd/epics/<epic-id>-<slug>/` with `epic.md`, `prd.md`, `design.md`, and support folders.
+   - Turns vague input into an implementation-ready epic and initializes
+     `shared-context/`.
 
-4. `wdd-write-tickets`
-   - Creates self-contained ticket files under `tickets/`.
+4. `wdd-plan-epic`
+   - Builds shared context, ticket folders, task files, dependency and conflict
+     grids, `wave-plan.md`, `orchestration.json`, and initial
+     `controller-state.md`.
 
-5. `wdd-validate-tickets`
-   - Validates frontmatter, dependencies, ticket body sections, semantic readiness, verification, and conflict domains.
+5. `wdd-start-wave`
+   - Activates the next pending wave as a batch of concurrently eligible tasks.
 
-6. `wdd-plan-waves`
-   - Writes `wave-plan.md` with a dependency grid, conflict grid, and safe parallel waves.
+6. `subagent-pr-orchestration`
+   - Dispatches one worker per task file, tracks every active task
+     independently, starts review agents, routes P1/P2 feedback, enforces
+     stale-branch checks, and merges or marks merge-ready according to policy.
 
-7. `wdd-start-wave`
-   - Writes `controller-state.md` and implementation briefs.
+7. `wdd-reconcile-wave`
+   - Confirms merged or closed task state, reconciles drift, updates shared
+     context, adjusts future tasks, and decides whether the next wave can start.
 
-8. `subagent-pr-orchestration`
-   - Dispatches one implementation subagent per active-wave brief and manages review/merge gates.
+8. `wdd-epic-validation`
+   - Validates the completed epic branch against the epic definition of done,
+     task evidence, reviews, shared context, and integration state.
 
-9. `wdd-reconcile-wave`
-   - Marks the wave done only after merge/review/verification gates pass and later tickets are updated for drift.
+9. `wdd-final-pr`
+   - Prepares the final epic PR from `epic/[epic-slug]` into the target branch
+     with a comprehensive human-review description.
 
 10. `wdd-status`
-    - Read-only dashboard over `.wdd/` artifacts.
+    - Reports actual `.wdd/` state without modifying files by default.
 
 ## Artifact Layout
 
@@ -84,27 +128,48 @@ describe the required artifact shapes.
   constitution.md
   templates/
   epics/
-    WDD-0001-auth-refresh/
+    EPIC-auth-refresh/
       epic.md
-      prd.md
-      design.md
-      validation-checklist.md
       wave-plan.md
+      orchestration.json
       controller-state.md
-      tickets/
-        WDD-0001-T001-token-contract.md
-      briefs/
-        WDD-0001-T001-token-contract.md
-      decisions/
-      archive/
+      epic-validation.md
+      final-pr.md
+      shared-context/
+        index.md
+        resources/
+          architecture.md
+          discovered-conventions.md
+          testing-strategy.md
+          validation-strategy.md
+          task-findings.md
+      TICKET-001-token-contract/
+        ticket.md
+        todo/
+          TASK-001-token-types.md
+        in-progress/
+        review/
+        done/
+        blocked/
+        cancelled/
 ```
 
-## Development
+Task files are the worker implementation briefs. The workflow does not create a
+separate canonical brief artifact.
 
-The repository contains one development-only validation script. It checks that
-the skill pack and templates are structurally complete. It is not part of the
-runtime workflow.
+## Branching Model
 
-```bash
-npm test
+Task work never merges directly to the target branch.
+
+```text
+main
+└── epic/auth-refresh
+    ├── task/TASK-001-token-types
+    ├── task/TASK-002-refresh-route
+    └── task/TASK-003-session-ui
 ```
+
+Worker task PRs target the epic branch. Workers do not merge their own PRs.
+The controller owns the merge gate, including review status, verification,
+branch freshness, and shared-context reconciliation. The final epic PR targets
+the original target branch after epic validation passes.

@@ -1,5 +1,5 @@
 ---
-id: WDD-0001
+id: EPIC-example-feature
 kind: epic
 type: feature
 slug: example-feature
@@ -7,8 +7,11 @@ title: Example Feature
 status: draft
 created_at: YYYY-MM-DD
 updated_at: YYYY-MM-DD
-constitution_version: 1.0.0
+target_branch: main
+epic_branch: epic/example-feature
+schema_version: 1
 ticket_count: 0
+task_count: 0
 adapter_links:
   github_issue: null
   jira_epic: null
@@ -16,27 +19,72 @@ adapter_links:
 
 # Example Feature
 
-## Product Brief / PRD
+## Summary
 
-State the user problem, target users, desired outcome, constraints, and non-goals.
+State the epic in one concise paragraph.
 
-## Design Direction
+## Goal
 
-State the recommended technical shape, affected domains, alternatives considered, and decision rationale.
+Describe the outcome this epic must produce.
 
-## Acceptance Strategy
+## Background
 
-State how the epic will be proven complete.
+Capture the origin of the work and why it matters now.
 
-## Ticket Strategy
+## Product Context
 
-Describe the ticket boundaries that should exist before wave planning.
+Describe users, workflows, operational scenarios, or product constraints.
 
-## Wave Strategy
+## Technical Context
 
-Describe likely foundation work, parallelizable domains, conflict risks, and pause points.
+Describe relevant architecture, code areas, interfaces, data models, tests, and
+external dependencies.
+
+## Deliverables
+
+- Deliverable 1:
+- Deliverable 2:
+
+## Non-Goals
+
+- Work intentionally excluded from this epic.
+
+## Assumptions
+
+- Assumption:
+
+## Constraints
+
+- Constraint:
+
+## Risks
+
+- Risk:
+
+## Dependencies
+
+- Dependency:
+
+## Affected Areas
+
+- Area:
+
+## Validation Strategy
+
+Describe how the completed epic branch will be proven correct.
+
+## Definition of Done
+
+- [ ] Deliverables are complete.
+- [ ] Task reviews have no unresolved P1/P2 findings.
+- [ ] Epic validation passes.
+- [ ] Final PR is ready for human review.
 
 ## Open Questions
 
 - None.
 
+## Planning Notes
+
+Capture ticket boundaries, likely task waves, conflict risks, and shared-context
+resources the planner should create.

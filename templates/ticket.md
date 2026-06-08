@@ -1,56 +1,67 @@
 ---
-id: WDD-0001-T001
+id: TICKET-001-example-ticket
 kind: ticket
-epic: WDD-0001
+epic: EPIC-example-feature
 slug: example-ticket
 title: Example Ticket
-status: todo
-wave: null
+status: planned
+task_count: 1
 depends_on: []
 conflict_domains:
   - path/or/domain/**
-branch: codex/wdd-0001-t001-example-ticket
-verification:
-  - command proving the ticket works
 adapter_links:
   github_issue: null
-  pull_request: null
 ---
 
 # Example Ticket
 
-## Context
+## Summary
 
-Explain the relevant repo context, files, contracts, decisions, and constraints.
+Describe the coherent slice of the epic this ticket groups.
 
-## End Goal / Deliverable
+## Objective
 
-State the exact deliverable in one or two sentences.
+State the ticket-level outcome.
 
 ## Scope
 
-- Include:
-- Exclude:
+- Included:
+- Excluded:
 
-## RED/GREEN TDD
+## Non-Scope
 
-- First failing check:
-- Expected failure before implementation:
-- Expected passing evidence after implementation:
+- Work this ticket must not include.
 
-## Acceptance Criteria
+## Shared Context References
 
-- [ ] Observable acceptance criterion.
+- `../shared-context/index.md`
+- `../shared-context/resources/example.md`
 
-## Verification
+## Task Inventory
 
-- `command proving the ticket works`
+| Task | Status | Wave | Summary |
+|------|--------|------|---------|
+| TASK-001-example-task | todo | WAVE-001 | Example task summary |
 
-## Review Handoff
+## Dependencies
 
-Tell the reviewer what risks, boundaries, and evidence to inspect.
+- Depends on:
+- Blocks:
 
-## Out of Scope
+## Conflict Domains
 
-- Work not allowed in this ticket.
+- `path/or/domain/**`
 
+## Validation Expectations
+
+- Ticket is complete when all child tasks are done or explicitly cancelled.
+
+## Review Focus
+
+- Reviewers should inspect:
+
+## Completion Criteria
+
+- [ ] All child tasks have resolved review and verification gates.
+- [ ] Shared context updates were reconciled.
+- [ ] Ticket status matches child task state.

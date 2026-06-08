@@ -1,47 +1,63 @@
 ---
-id: WDD-0001-WAVES
+id: EPIC-example-feature-WAVES
 kind: wave_plan
-epic: WDD-0001
+epic: EPIC-example-feature
 status: planned
 created_at: YYYY-MM-DD
 updated_at: YYYY-MM-DD
 ---
 
-# Wave Plan: WDD-0001
+# Wave Plan: EPIC-example-feature
 
-## Ticket Inventory
+## Task Inventory
 
-| Ticket | Depends On | Conflict Domains | Status |
-|--------|------------|------------------|--------|
-| WDD-0001-T001 | None | path/or/domain/** | todo |
+| Task | Ticket | Depends On | Conflict Domains | Status |
+|------|--------|------------|------------------|--------|
+| TASK-001-example-task | TICKET-001-example-ticket | None | path/or/domain/** | todo |
 
 ## Dependency Grid
 
-| Ticket | Blocks | Blocked By | Parallel Candidates | Conflict Notes |
-|--------|--------|------------|---------------------|----------------|
-| WDD-0001-T001 | None | None | None | None |
+| Task | Blocks | Blocked By |
+|------|--------|------------|
+| TASK-001-example-task | None | None |
+
+## Conflict Grid
+
+| Task Pair | Conflict Domains | Risk | Decision |
+|-----------|------------------|------|----------|
+| TASK-001 / TASK-002 | None | low | Can run together |
 
 ## Waves
 
-### Wave 1
+### WAVE-001
 
-Status: pending
+Status: planned
 
-Tickets:
+Tasks:
 
-- WDD-0001-T001
+- TASK-001-example-task
 
 Why this grouping is safe:
 
 - Dependencies are satisfied.
-- Conflict domains do not overlap in a way that should force sequential work.
+- Conflict-domain blockers are clear.
+- Prerequisites are fresh.
+- No task is explicitly blocked.
+
+Activation rule:
+
+- Activate this wave as a batch of concurrently eligible tasks.
+- Dispatch every eligible task in the wave; do not imply sequential execution.
 
 Stop condition:
 
-- Merge/review/verification gates complete.
-- Reconcile actual architecture against the epic before starting Wave 2.
+- All active tasks are done, blocked, cancelled, or explicitly closed.
+- Wave reconciliation is complete before the next wave starts.
 
 ## Known Conflict Risks
 
 - None.
 
+## Manual Adjustments
+
+- None.

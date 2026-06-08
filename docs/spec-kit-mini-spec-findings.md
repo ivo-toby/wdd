@@ -11,7 +11,8 @@ Observed patterns:
 - Commands are phase-specific: constitution, specify, clarify, plan, tasks, analyze, implement.
 - Each command has user input handling, pre-execution checks, workflow outline, validation, completion report, and handoff metadata.
 - Artifacts are local markdown files under a spec directory.
-- Scripts are helpers for setup and path discovery, not the conceptual source of truth.
+- Helper scripts can be useful in other ecosystems, but WDD should not require
+  them. The workflow authority lives in portable text instructions.
 - Codex integration installs commands as skills under `.agents/skills`.
 - Constitution is a governance artifact that propagates into templates and command behavior.
 
@@ -52,10 +53,10 @@ WDD keeps its distinct feature:
 - controller-managed subagent execution,
 - reconciliation after each wave.
 
-But the runtime model is now skill-driven:
+But the runtime model is now text-only and skill-driven:
 
 - `skills/` contains the executable agent workflow.
 - `templates/` contains optional starting points.
 - `.wdd/` is the durable project state.
-- No WDD phase depends on a runtime CLI.
-
+- No WDD phase depends on a runtime CLI, package manager, validator script, or
+  local binary.

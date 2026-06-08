@@ -9,35 +9,112 @@ last_amended: YYYY-MM-DD
 
 # Project Constitution
 
-## Boundaries
+## Project Scope
 
-- This project owns: [PROJECT_OWNERSHIP_BOUNDARIES]
-- This project must not change: [OUT_OF_SCOPE_BOUNDARIES]
+- Owned areas:
+- Out-of-scope areas:
+- External systems treated as adapters:
 
-## Prerequisites
+## Setup Configuration
 
-- Required runtimes and package managers: [RUNTIMES]
-- Required services, secrets, or data: [SERVICES_SECRETS_DATA]
-- Required local verification commands: [VERIFICATION_COMMANDS]
+- Storage mode: local-markdown
+- Target branch: main
+- Epic branch convention: epic/[epic-slug]
+- Task branch convention: task/[task-id]-[task-slug]
+- Task PRs required: yes
+- Local patches allowed when PRs are unavailable: yes
+
+## Model Usage
+
+Record user-configured model aliases. Do not hardcode provider model names
+unless the user chose them.
+
+```json
+{
+  "models": {
+    "planning": "configured-model-key",
+    "implementationSimple": "configured-model-key",
+    "implementationComplex": "configured-model-key",
+    "review": "configured-model-key",
+    "feedbackFix": "configured-model-key",
+    "epicValidation": "configured-model-key",
+    "prDescription": "configured-model-key"
+  }
+}
+```
+
+## Branching Policy
+
+- Task branches branch from the epic branch.
+- Task PRs target the epic branch.
+- Task work must not merge directly to the target branch.
+- The controller checks branch freshness before merging or marking merge-ready.
+- The final epic PR targets the original target branch.
+
+## Review Policy
+
+- P1 findings block merge.
+- P2 findings block merge by default.
+- P3 findings do not block merge by default.
+- Review comments are written to PRs when available, otherwise to task files or
+  local review notes.
+- Feedback fixes may use the original worker or a fresh worker, whichever is
+  safer.
+
+## Verification Policy
+
+- Tasks follow RED/GREEN TDD unless explicitly test-inapplicable.
+- Repository-native checks may be referenced when available.
+- The WDD framework itself does not require a CLI, scripts, Node.js, npm, or
+  generated validators.
+- `git diff --check` is allowed as an optional whitespace sanity check.
 
 ## Agent Roles
 
-- The WDD controller plans, validates, schedules waves, monitors state, and reconciles drift.
-- Implementation agents work only from assigned implementation briefs.
-- The controller must not implement wave tickets.
+- Controller: plans, activates waves, dispatches workers, starts reviewers,
+  routes feedback, merges or marks merge-ready, updates orchestration state, and
+  reconciles waves.
+- Worker: executes exactly one task file at a time and does not merge its own
+  PR.
+- Reviewer: reviews one task PR or patch and classifies findings as P1, P2, or
+  P3.
+- Feedback-fix worker: addresses routed feedback without broadening scope.
+- Epic validator: validates the completed epic branch after all waves.
+- Human reviewer: reviews the final epic PR into the target branch.
 
-## Ticket Rules
+## Planning Rules
 
-- Tickets must be self-contained and independently understandable.
-- Tickets must declare dependencies in YAML frontmatter.
-- Tickets must declare conflict domains for files, schemas, config, migrations, or tests likely to collide.
-- Tickets must include concrete verification evidence.
+- Epics must have concrete deliverables and a testable definition of done before
+  planning.
+- Tickets group related tasks.
+- Tasks are independently executable worker units.
+- Waves schedule tasks, not tickets.
+- `orchestration.json` must include `schemaVersion: 1`.
+
+## Task Rules
+
+- Task files are the implementation briefs.
+- Task files move through `todo/`, `in-progress/`, `review/`, `done/`,
+  `blocked/`, and `cancelled/`.
+- Workers inspect named files and shared context before broad discovery.
+- Workers stay within scope and do not start dependent tasks.
+- Workers write durable shared-context memory when discoveries matter to later
+  work.
 
 ## Wave Rules
 
-- A wave may contain multiple tickets only when dependencies are satisfied and conflict risk is acceptable.
-- Prefer smaller safe waves over parallel work that will create merge conflict cleanup.
-- After each wave, reconcile actual merged work against planned architecture before starting the next wave.
+- A wave is activated as a batch of concurrently eligible tasks.
+- A task is eligible only when dependencies are resolved, conflict-domain
+  blockers are clear, prerequisites are fresh, and status is not blocked.
+- Do not start the next wave before reconciliation.
+- Prefer safe parallelism over maximum parallelism when conflict risk is unclear.
+
+## Shared Context Rules
+
+- `shared-context/index.md` is an index, not a dump.
+- Resource files should be focused and scannable.
+- Workers may propose shared-context updates in task branches.
+- The controller reconciles shared-context changes into the epic branch.
 
 ## Governance
 
@@ -46,4 +123,3 @@ last_amended: YYYY-MM-DD
   - MAJOR: role, artifact, or gate changes that break existing epics.
   - MINOR: new required sections, checks, or gates.
   - PATCH: clarifications that do not change behavior.
-
