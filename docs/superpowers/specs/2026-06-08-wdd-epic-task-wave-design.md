@@ -166,7 +166,7 @@ The existing `wdd-write-tickets`, `wdd-validate-tickets`, and `wdd-plan-waves`
 skills should become compatibility wrappers that point users to `wdd-plan-epic`
 and explain how their former responsibilities are now handled.
 
-`wdd-start-wave` selects the next pending wave as a batch of concurrently
+`wdd-start-wave` activates the next pending wave as a batch of concurrently
 eligible tasks. It marks the wave in progress and dispatches every task in the
 active wave that has no unresolved dependency, no active conflict-domain
 blocker, no stale prerequisite, and no explicit blocked status. Each worker
