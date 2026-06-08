@@ -70,6 +70,8 @@ It is probably overkill for small one-shot edits.
 - Dependency-aware and conflict-aware wave planning.
 - Wave activation as a batch of concurrently eligible tasks.
 - Persistent `orchestration.json` with `schemaVersion: 1` for resumability.
+- Active-wave monitoring through the best available scheduler, with a durable
+  manual fallback prompt when no scheduler is supported.
 - Controller-managed worker PRs, review gates, feedback routing, stale-branch
   checks, merges into the epic branch, wave reconciliation, epic validation,
   and final PR preparation.
@@ -157,11 +159,15 @@ orchestration state in one coherent pass.
 
 5. `wdd-start-wave`
    - Activates the next pending wave as a batch of concurrently eligible tasks.
+   - Records monitoring mode and fallback prompt, preferring Codex thread
+     heartbeats, then Claude Code `/loop`, then external schedulers, then manual
+     fallback.
 
 6. `subagent-pr-orchestration`
    - Dispatches one worker per task file, tracks every active task
      independently, starts review agents, routes P1/P2 feedback, enforces
-     stale-branch checks, and merges or marks merge-ready according to policy.
+     stale-branch checks, runs bounded idempotent monitor ticks, and merges or
+     marks merge-ready according to policy.
 
 7. `wdd-reconcile-wave`
    - Confirms merged or closed task state, reconciles drift, updates shared

@@ -350,7 +350,16 @@ Minimum structure:
         }
       ]
     }
-  ]
+  ],
+  "monitoring": {
+    "mode": "manual",
+    "cadence": "5m",
+    "status": "inactive",
+    "lastCheckedAt": null,
+    "nextCheckDueAt": null,
+    "schedulerRef": null,
+    "fallbackPrompt": "Run subagent-pr-orchestration for EPIC-auth-refresh WAVE-001. Read orchestration.json and controller-state.md, inspect every active worker and reviewer reference, update task gates, and stop when all active tasks are merged, blocked, cancelled, or ready for wdd-reconcile-wave."
+  }
 }
 ```
 
@@ -358,6 +367,24 @@ The controller updates this file after task assignment, task movement, branch
 creation, PR or patch creation, review start, P1/P2 feedback, feedback routing,
 verification, stale-branch checks, merge, blocker, wave completion, and
 reconciliation.
+
+The `monitoring` object records how the controller heartbeat is driven. Allowed
+`mode` values are:
+
+- `codex_thread_heartbeat`: Codex thread automation attached to the active
+  controller conversation.
+- `claude_loop`: Claude Code `/loop` or scheduled task in the active local
+  session.
+- `external_scheduler`: durable external runner such as a desktop scheduled
+  task, cloud routine, GitHub Actions schedule, or equivalent project adapter.
+- `manual`: no scheduler is available; the controller records an exact fallback
+  prompt and due time for a human or fresh agent to resume.
+
+Every heartbeat tick must be bounded and idempotent: load current artifacts,
+poll worker and reviewer references, advance gates, update artifacts, and stop
+or deactivate monitoring when all active-wave tasks are merged, blocked,
+cancelled, or ready for wave reconciliation. Monitoring must not depend on
+hidden conversation state.
 
 ## Controller State
 
@@ -371,6 +398,7 @@ Required body sections:
 
 - Controller Rule
 - Active Wave
+- Monitoring
 - Active Task Gates
 - Branch Freshness
 - Open P1/P2 Feedback
@@ -399,6 +427,7 @@ Required body sections:
 - Review Audit
 - Verification Evidence
 - Shared Context Audit
+- Monitoring Audit
 - Integration Risks
 - Branch State
 - Result

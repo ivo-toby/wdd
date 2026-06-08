@@ -21,6 +21,8 @@ active epic whose waves are complete and whose final validation has not passed.
 - `controller-state.md` exists.
 - All completed tasks have verification evidence.
 - No unresolved P1/P2 feedback remains unless explicitly accepted by the user.
+- No active-wave monitoring remains active unless it is explicitly blocked with
+  a durable next action.
 - The controller must not implement new task code during epic validation.
 - Use this skill folder's `templates/epic-validation.md` as the starting point
   when creating `epic-validation.md`. Do not require `.wdd/templates/` to exist.
@@ -69,18 +71,23 @@ active epic whose waves are complete and whose final validation has not passed.
    - Stale branch gates were handled before merges.
    - Epic branch is ready to compare against the target branch.
 
-7. Validate shared context:
+7. Validate monitoring state:
+   - No active-wave monitor is still running after the wave is complete.
+   - Any stopped, inactive, blocked, or manual monitoring state is recorded with
+     a durable reason and next action.
+
+8. Validate shared context:
    - Worker discoveries are reconciled or explicitly queued.
    - `shared-context/index.md` points to focused resources.
    - No large unindexed shared-context dump was introduced.
 
-8. Validate implementation coherence:
+9. Validate implementation coherence:
    - Merged tasks work together as a coherent epic.
    - No obvious integration gaps remain.
    - Architecture drift is recorded.
    - Future follow-up tasks are named when needed.
 
-9. Write or update `epic-validation.md`:
+10. Write or update `epic-validation.md`:
    - Start from `templates/epic-validation.md` in this skill folder when
      creating a new validation report.
    - Validation summary.
@@ -90,11 +97,12 @@ active epic whose waves are complete and whose final validation has not passed.
    - Review audit.
    - Verification evidence.
    - Shared-context audit.
+   - Monitoring audit.
    - Integration risks.
    - Branch state.
    - Result: `passed`, `failed`, or `blocked`.
 
-10. Update orchestration and controller state:
+11. Update orchestration and controller state:
     - Record validation result.
     - Record blockers.
     - Name next action.

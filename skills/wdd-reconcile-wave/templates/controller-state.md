@@ -22,6 +22,29 @@ Wave: WAVE-001
 
 Activation: batch dispatch of concurrently eligible tasks.
 
+## Monitoring
+
+Mode: manual
+
+Cadence: 5m
+
+Status: inactive
+
+Last check: None
+
+Next check due: None
+
+Scheduler reference: None
+
+Fallback prompt:
+
+```text
+Run subagent-pr-orchestration for EPIC-example-feature WAVE-001. Read orchestration.json and controller-state.md, inspect every active worker and reviewer reference, update task gates, and stop when all active tasks are merged, blocked, cancelled, or ready for wdd-reconcile-wave.
+```
+
+Stop condition: all active-wave tasks are merged, blocked, cancelled, or ready
+for `wdd-reconcile-wave`.
+
 ## Active Task Gates
 
 | Task | Ticket | Branch | PR/Patch | Gate | Worker | Reviewer |

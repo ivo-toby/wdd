@@ -59,5 +59,14 @@
   "sharedContext": {
     "index": "shared-context/index.md",
     "pendingReconciliation": []
+  },
+  "monitoring": {
+    "mode": "manual",
+    "cadence": "5m",
+    "status": "inactive",
+    "lastCheckedAt": null,
+    "nextCheckDueAt": null,
+    "schedulerRef": null,
+    "fallbackPrompt": "Run subagent-pr-orchestration for EPIC-example-feature WAVE-001. Read orchestration.json and controller-state.md, inspect every active worker and reviewer reference, update task gates, and stop when all active tasks are merged, blocked, cancelled, or ready for wdd-reconcile-wave."
   }
 }

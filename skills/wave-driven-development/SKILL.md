@@ -79,6 +79,12 @@ missing phase.
      blocked status.
    - Track every active task independently in `orchestration.json` and
      `controller-state.md`.
+   - Establish monitoring for active waves when available, preferring Codex
+     thread heartbeat automation, then Claude Code `/loop`, then an external
+     scheduler, then a manual fallback prompt recorded in artifacts.
+   - Every monitoring tick must be bounded and idempotent: read current
+     artifacts, poll worker and reviewer references, advance gates, update
+     state, and stop when wave reconciliation is ready.
 
 6. Preserve merge discipline:
    - Task branches branch from the epic branch.

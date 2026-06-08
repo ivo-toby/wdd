@@ -129,11 +129,15 @@ epic or shared-context artifacts.
       assigned models, review models, worker/review references, branches, PRs,
       latest commits, branch freshness, blocking feedback, verification, and
       current gates.
+    - Include `monitoring` with mode, cadence, status, last check, next check,
+      scheduler reference, and a durable fallback prompt.
 
 12. Write initial `controller-state.md`:
     - Start from `templates/controller-state.md` in this skill folder.
     - State controller rule.
     - List pending waves.
+    - Include monitoring mode, cadence, status, scheduler reference, fallback
+      prompt, and stop condition.
     - Track current gates for planned tasks.
     - Include branch freshness table.
     - Include shared-context reconciliation notes.
@@ -162,7 +166,9 @@ epic or shared-context artifacts.
 - Task files exist under ticket `todo/` folders.
 - `wave-plan.md` schedules tasks.
 - `orchestration.json` exists with `schemaVersion: 1`.
+- `orchestration.json` records monitoring mode and fallback prompt.
 - `controller-state.md` exists.
+- `controller-state.md` includes a monitoring section.
 - `validation-checklist.md` records current planning readiness.
 - The next phase is `wdd-start-wave`, or planning blockers are recorded with
   specific user-needed questions.

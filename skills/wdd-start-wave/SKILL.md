@@ -69,6 +69,8 @@ choose the first epic with a planned wave that is not done.
 
 6. Update `controller-state.md`:
    - Active wave.
+   - Monitoring mode, cadence, status, scheduler reference, fallback prompt,
+     next check, and stop condition.
    - Active task gates.
    - Branch freshness table.
    - Open P1/P2 feedback.
@@ -83,10 +85,31 @@ choose the first epic with a planned wave that is not done.
    - Task files are the implementation briefs. Do not create a separate
      canonical brief artifact.
 
+8. Establish monitoring:
+   - Prefer Codex thread heartbeat automation when available and the controller
+     should keep returning to the same conversation.
+   - Otherwise prefer Claude Code `/loop` when running in a Claude Code session
+     that supports scheduled tasks.
+   - Otherwise use an external scheduler such as a desktop scheduled task, cloud
+     routine, GitHub Actions schedule, or project-specific adapter when one is
+     available and authorized.
+   - If no scheduler is available, set monitoring mode to `manual`, record the
+     next check due time, and write an exact fallback prompt that a human or
+     fresh controller can run.
+   - The fallback prompt must instruct the controller to read
+     `orchestration.json` and `controller-state.md`, inspect every active worker
+     and reviewer reference, update gates, and stop when tasks are ready for
+     `wdd-reconcile-wave`.
+   - Record the selected monitoring mode, cadence, status, scheduler reference,
+     last check, next check, and fallback prompt in both `orchestration.json`
+     and `controller-state.md`.
+
 ## Done When
 
 - Active wave is marked `in_progress`.
 - Every eligible active-wave task is dispatched or recorded with a blocker.
 - `orchestration.json` and `controller-state.md` reflect current gates.
+- Monitoring is active, externally delegated, or recorded as manual fallback
+  with a durable resume prompt.
 - Subagent orchestration has started, or controller state records why it is
   blocked.

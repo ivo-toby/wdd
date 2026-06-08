@@ -107,9 +107,10 @@ worker discoveries.
 `wave-plan.md` is the human-readable task wave plan.
 
 `orchestration.json` is the machine-readable resume surface for active waves,
-task gates, branches, PRs, reviews, verification, and blockers.
+task gates, branches, PRs, reviews, verification, monitoring, and blockers.
 
-`controller-state.md` is the human-readable operational log and heartbeat state.
+`controller-state.md` is the human-readable operational log and heartbeat state,
+including the selected monitor mode and manual fallback prompt.
 
 ## Skill Workflow
 
@@ -334,6 +335,8 @@ It tracks:
 - unresolved P1/P2 feedback
 - verification result
 - current gate
+- monitoring mode, scheduler reference, last check, next check, and fallback
+  prompt
 
 The controller updates this file after every meaningful event.
 
