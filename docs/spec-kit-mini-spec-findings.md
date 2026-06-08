@@ -55,8 +55,8 @@ WDD keeps its distinct feature:
 
 But the runtime model is now text-only and skill-driven:
 
-- `skills/` contains the executable agent workflow.
-- `templates/` contains optional starting points.
+- `skills/` contains the executable agent workflow and the template files
+  bundled inside the phase skills that create artifacts.
 - `.wdd/` is the durable project state.
 - No WDD phase depends on a runtime CLI, package manager, validator script, or
   local binary.

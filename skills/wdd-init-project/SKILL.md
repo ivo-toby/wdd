@@ -21,6 +21,8 @@ defaults from repository docs and code.
 - If `.wdd/constitution.md` already exists, do not overwrite it.
 - If `.wdd/` exists, inspect it and update only missing scaffolding.
 - Do not run or require a WDD CLI, script, package manager, or validator.
+- Use this skill's local `templates/` directory as the source for starter
+  artifacts. Do not rely on a repository-root `templates/` directory.
 
 ## Workflow
 
@@ -39,7 +41,7 @@ defaults from repository docs and code.
    ```
 
 3. Create `.wdd/constitution.md` if missing:
-   - Use the root `templates/constitution.md` when available.
+   - Use `templates/constitution.md` from this skill folder.
    - Fill only values that can be inferred safely.
    - Leave explicit questions in the body for values that require user choice.
 
@@ -56,6 +58,8 @@ defaults from repository docs and code.
    - `orchestration.json`
    - `epic-validation.md`
    - `final-pr.md`
+   - Prefer exact copies from this skill folder's `templates/` directory, then
+     let later phase skills specialize generated artifacts for the project.
 
 5. Create `.wdd/README.md`:
    - Explain that `.wdd/` is the durable source of truth.

@@ -23,6 +23,9 @@ epic or shared-context artifacts.
 - The controller is still planning and must not implement task code.
 - WDD operation remains text-only. Do not depend on a CLI, scripts, generated
   validators, Node.js, npm, or local binaries.
+- Use this skill folder's `templates/` directory when creating ticket, task,
+  shared-context, wave, orchestration, controller-state, and validation
+  artifacts. Do not require `.wdd/templates/` to exist.
 
 ## Workflow
 
@@ -35,6 +38,9 @@ epic or shared-context artifacts.
    - Existing task or ticket artifacts if this is a replan.
 
 2. Build or update progressive shared context:
+   - Use `templates/shared-context-index.md` and
+     `templates/shared-context-resource.md` from this skill folder as starting
+     points when creating new shared-context files.
    - Keep `shared-context/index.md` concise.
    - Create focused `shared-context/resources/*.md` files for architecture,
      conventions, testing, validation, API contracts, SDK notes, migration
@@ -50,6 +56,8 @@ epic or shared-context artifacts.
    - Each ticket folder is `.wdd/epics/<epic-id>/<ticket-id>/`.
 
 4. Break tickets into task files:
+   - Use `templates/task.md` from this skill folder as the starting point for
+     each new task file.
    - Each task is independently executable by one worker.
    - Each task fits in one focused implementation loop.
    - Each task has objective, scope, non-scope, local context, shared-context
@@ -59,6 +67,8 @@ epic or shared-context artifacts.
    - Place new task files in the ticket's `todo/` folder.
 
 5. Create every ticket folder with kanban folders:
+   - Use `templates/ticket.md` from this skill folder as the starting point for
+     each `ticket.md`.
 
    ```text
    <ticket-id>/
@@ -101,6 +111,7 @@ epic or shared-context artifacts.
    - Record stop conditions requiring reconciliation before the next wave.
 
 10. Write `wave-plan.md`:
+    - Start from `templates/wave-plan.md` in this skill folder.
     - Task inventory.
     - Dependency grid.
     - Conflict grid.
@@ -111,6 +122,7 @@ epic or shared-context artifacts.
     - Manual adjustments and rationale.
 
 11. Write `orchestration.json`:
+    - Start from `templates/orchestration.json` in this skill folder.
     - Include `"schemaVersion": 1`.
     - Track epic ID, target branch, epic branch, model configuration, storage
       mode, waves, task order, task file paths, dependencies, conflict domains,
@@ -119,6 +131,7 @@ epic or shared-context artifacts.
       current gates.
 
 12. Write initial `controller-state.md`:
+    - Start from `templates/controller-state.md` in this skill folder.
     - State controller rule.
     - List pending waves.
     - Track current gates for planned tasks.
@@ -127,6 +140,8 @@ epic or shared-context artifacts.
     - Include next action.
 
 13. Write or update `validation-checklist.md`:
+    - Start from `templates/validation-checklist.md` in this skill folder when
+      creating a new checklist.
     - Validate epic readiness.
     - Validate ticket and task structure.
     - Validate dependency graph.

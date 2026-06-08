@@ -21,6 +21,9 @@ wave from `controller-state.md` and `orchestration.json`.
   explicitly closed according to policy.
 - Verification evidence exists for completed tasks.
 - Open P1/P2 feedback is resolved or explicitly accepted by the user.
+- Use this skill folder's `templates/` directory as the starting point when
+  creating controller-state or shared-context files during recovery or
+  reconciliation. Do not require `.wdd/templates/` to exist.
 
 ## Workflow
 

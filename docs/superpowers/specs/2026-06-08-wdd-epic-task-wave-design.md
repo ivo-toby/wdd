@@ -35,7 +35,9 @@ folders.
 
 ## Recommended Approach
 
-Evolve the existing skill pack and templates in place.
+Evolve the existing skill pack in place. Template files live inside the skill
+folders that create the corresponding artifacts, so copying `skills/`
+recursively is enough to install the runtime.
 
 This preserves useful existing behavior:
 
@@ -126,8 +128,8 @@ wdd-final-pr
 wdd-status
 ```
 
-`wdd-init-project` creates `.wdd/`, copies text templates, and explains that
-external trackers are adapters.
+`wdd-init-project` creates `.wdd/`, copies text templates from its own skill
+folder, and explains that external trackers are adapters.
 
 `wdd-constitution` asks for setup decisions and records them:
 
@@ -337,8 +339,9 @@ The controller updates this file after every meaningful event.
 
 ## Text-Only Portability
 
-All workflow behavior must be expressible in Markdown skills, Markdown
-templates, hand-editable JSON templates, and local artifacts.
+All workflow behavior must be expressible in Markdown skills, skill-local
+Markdown templates, skill-local hand-editable JSON templates, and local
+artifacts.
 
 The framework must not require:
 
@@ -358,10 +361,10 @@ remain text-only and portable.
 Repo verification for this pivot should use manual/static inspection:
 
 - required skill files exist
-- required templates exist
+- required skill-local templates exist
 - skills describe the task-based artifact model
 - skills do not require scripts or CLI commands
-- templates match the approved `.wdd/epics/...` structure
+- skill-local templates match the approved `.wdd/epics/...` structure
 - branching and merge policy is explicit
 - `git diff --check` passes for whitespace sanity
 

@@ -23,6 +23,9 @@ choose the first epic with a planned wave that is not done.
 - The controller must not implement task code.
 - A subagent orchestration mechanism must be available, or controller state must
   record that execution is blocked.
+- If `controller-state.md` must be created, use this skill folder's
+  `templates/controller-state.md` as the starting point. Do not require
+  `.wdd/templates/` to exist.
 
 ## Workflow
 
