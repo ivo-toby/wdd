@@ -45,7 +45,14 @@ missing phase.
 2. Enforce role separation:
    - The controller plans, activates waves, dispatches workers, monitors gates,
      routes feedback, merges or marks merge-ready, and reconciles drift.
+   - Before any worker starts, the controller creates or verifies the epic
+     branch that task PRs or patches will merge into.
+   - Before dispatching parallel repository-writing workers, the controller
+     creates or verifies one isolated worktree per task and records the assigned
+     path.
    - Worker agents execute exactly one task file each.
+   - Worker agents start in the assigned worktree and must not switch branches
+     in the controller checkout.
    - Reviewer agents review one task PR or patch and classify P1/P2/P3
      findings.
    - The controller does not implement task code.
@@ -77,6 +84,9 @@ missing phase.
    - Dispatch every task in the active wave that has no unresolved dependency,
      no active conflict-domain blocker, no stale prerequisite, and no explicit
      blocked status.
+   - Do not dispatch workers until the epic branch exists and each
+     repository-writing task has a dedicated worktree checked out on its task
+     branch.
    - Track every active task independently in `orchestration.json` and
      `controller-state.md`.
    - Establish monitoring for active waves when available, preferring Codex
@@ -87,7 +97,11 @@ missing phase.
      state, and stop when wave reconciliation is ready.
 
 6. Preserve merge discipline:
+   - The controller creates or verifies the epic branch from the target branch
+     before worker dispatch.
    - Task branches branch from the epic branch.
+   - Task branches are checked out in task-specific worktrees before workers
+     start.
    - Task PRs target the epic branch.
    - No task work merges directly to the target branch.
    - Before merge, check branch freshness relative to the epic branch.

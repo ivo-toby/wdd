@@ -20,6 +20,11 @@ state and orchestration state.
   provided.
 - Each worker receives exactly one task file.
 - The controller does not implement task code.
+- The controller creates or verifies the epic branch before any worker starts.
+- The controller creates or verifies one isolated worktree per
+  repository-writing task before dispatch.
+- Workers start in their assigned worktree and must not switch branches in the
+  controller checkout.
 - Workers do not merge their own PRs.
 - GitHub is optional. If no PR system exists, use branches, patches, or local
   status notes while preserving the same gates.
@@ -41,6 +46,8 @@ state and orchestration state.
    - Worker reference.
    - Reviewer reference.
    - Branch.
+   - Assigned worker worktree path.
+   - Worktree status.
    - PR or patch reference.
    - Latest commit.
    - Branch freshness.
@@ -52,9 +59,20 @@ state and orchestration state.
 
 3. Dispatch implementation workers:
    - One task file per worker.
+   - Before dispatch, verify the epic branch exists or create it from the
+     target branch. If this cannot be done, record `blocked` and do not start
+     workers.
+   - Before dispatch, create or verify the task branch from the current epic
+     branch for each repository-writing task.
+   - Before dispatch, create or verify one isolated worktree per
+     repository-writing task, checked out on its task branch.
+   - Record the assigned worktree path before starting the worker.
    - Require the worker to read the task file first.
    - Require the worker to inspect named files/domains before broad discovery.
    - Require the worker to read only relevant shared-context resources.
+   - Tell the worker the exact worktree path and task branch to use.
+   - Tell the worker to start in that worktree and never switch branches in the
+     controller checkout.
    - Require RED/GREEN TDD unless the task explains why it is inapplicable.
    - Require branch, commit, verification evidence, and PR or patch output.
    - Require proposed shared-context updates when durable discoveries matter.
@@ -62,6 +80,9 @@ state and orchestration state.
      `NEEDS_CONTEXT`, or `BLOCKED`.
 
 4. Worker prompt contract:
+   - Start in the assigned worktree path provided by the controller.
+   - Confirm the worktree is on the assigned task branch before editing.
+   - Do not switch, create, or reset branches in the controller checkout.
    - Move the task file from `todo/` to `in-progress/` when starting.
    - Stay within task scope.
    - Do not start dependent tasks.
@@ -120,7 +141,8 @@ state and orchestration state.
     - Start every tick by reading current `orchestration.json`,
       `controller-state.md`, task files, and relevant PR or patch state.
     - Do not depend on hidden conversation context from a prior tick.
-    - not_started: dispatch if eligible.
+    - not_started: create or verify the epic branch, task branch, and assigned
+      isolated worktree, then dispatch if eligible.
     - no_pr: inspect worker state and nudge exact missing deliverable.
     - needs_review: start or request review.
     - reviewing: poll review state and comments.
@@ -138,6 +160,9 @@ state and orchestration state.
       run the next tick.
 
 11. Update state after every meaningful event:
+    - Epic branch created or verified.
+    - Task branch created or verified.
+    - Worker worktree created or verified.
     - Worker started.
     - Task moved.
     - PR or patch created.

@@ -13,6 +13,8 @@ conflict_domains:
 assigned_model_class: simple-implementation
 review_model_class: review
 branch: task/TASK-001-example-task
+worker_worktree: null
+worktree_status: unassigned
 pr: null
 current_gate: not_started
 branch_freshness: unknown
@@ -78,6 +80,12 @@ simple-implementation
 
 task/TASK-001-example-task
 
+## Worker Worktree
+
+None assigned yet. The controller must create or verify an isolated worktree for
+this task before dispatching a repository-writing worker, then provide that path
+to the worker.
+
 ## PR / Patch Reference
 
 None yet.
@@ -99,6 +107,8 @@ State cleanup allowed after green.
 ## Implementation Notes
 
 - Worker must inspect named files before broad discovery.
+- Worker must start in the assigned worktree path provided by the controller.
+- Worker must not switch branches in the controller checkout.
 - Worker must stay within this task scope.
 - Worker must not start dependent tasks.
 

@@ -170,6 +170,8 @@ conflict_domains:
 assigned_model_class: simple-implementation
 review_model_class: review
 branch: task/TASK-001-token-types
+worker_worktree: null
+worktree_status: unassigned
 pr: null
 current_gate: not_started
 branch_freshness: unknown
@@ -192,6 +194,7 @@ Required body sections:
 - Conflict Domains
 - Assigned Model Class
 - Branch
+- Worker Worktree
 - PR / Patch Reference
 - RED-GREEN TDD Plan
 - Implementation Notes
@@ -322,6 +325,15 @@ Minimum structure:
       "feedbackFix": "configured-model-key",
       "epicValidation": "configured-model-key",
       "prDescription": "configured-model-key"
+    },
+    "branching": {
+      "epicBranchConvention": "epic/[epic-slug]",
+      "taskBranchConvention": "task/[task-id]-[task-slug]",
+      "taskPrTarget": "epic branch",
+      "finalPrTarget": "target branch",
+      "epicBranchRequiredBeforeWorkerDispatch": true,
+      "isolatedWorktreePerRepositoryTask": true,
+      "workersMaySwitchControllerCheckout": false
     }
   },
   "waves": [
@@ -341,6 +353,8 @@ Minimum structure:
           "workerThreadId": null,
           "reviewThreadId": null,
           "branch": "task/TASK-001-token-types",
+          "workerWorktree": null,
+          "worktreeStatus": "unassigned",
           "pr": null,
           "latestCommit": null,
           "branchFreshness": "unknown",
@@ -358,15 +372,21 @@ Minimum structure:
     "lastCheckedAt": null,
     "nextCheckDueAt": null,
     "schedulerRef": null,
-    "fallbackPrompt": "Run subagent-pr-orchestration for EPIC-auth-refresh WAVE-001. Read orchestration.json and controller-state.md, inspect every active worker and reviewer reference, update task gates, and stop when all active tasks are merged, blocked, cancelled, or ready for wdd-reconcile-wave."
+    "fallbackPrompt": "Run subagent-pr-orchestration for EPIC-auth-refresh WAVE-001. Read orchestration.json and controller-state.md, verify the epic branch and assigned worker worktrees, inspect every active worker and reviewer reference, update task gates, and stop when all active tasks are merged, blocked, cancelled, or ready for wdd-reconcile-wave."
   }
 }
 ```
 
-The controller updates this file after task assignment, task movement, branch
-creation, PR or patch creation, review start, P1/P2 feedback, feedback routing,
-verification, stale-branch checks, merge, blocker, wave completion, and
-reconciliation.
+The controller updates this file after task assignment, task movement, epic
+branch creation or verification, task branch creation or verification, worker
+worktree creation or verification, PR or patch creation, review start, P1/P2
+feedback, feedback routing, verification, stale-branch checks, merge, blocker,
+wave completion, and reconciliation.
+
+Before any worker starts, the controller must create or verify the epic branch.
+Before dispatching parallel repository-writing workers, it must create or verify
+one isolated worktree per task, record the assigned path, and tell each worker
+to start there. Workers must not switch branches in the controller checkout.
 
 The `monitoring` object records how the controller heartbeat is driven. Allowed
 `mode` values are:
@@ -400,6 +420,7 @@ Required body sections:
 - Active Wave
 - Monitoring
 - Active Task Gates
+- Worker Worktrees
 - Branch Freshness
 - Open P1/P2 Feedback
 - Verification Status
@@ -407,8 +428,9 @@ Required body sections:
 - Event Log
 - Next Action
 
-The controller state is human-readable. `orchestration.json` is the
-machine-readable resume surface.
+The controller state is human-readable. It must show the assigned worktree path
+for every active repository-writing task before that worker starts.
+`orchestration.json` is the machine-readable resume surface.
 
 ## Epic Validation
 

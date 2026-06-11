@@ -26,7 +26,10 @@
       "epicBranchConvention": "epic/[epic-slug]",
       "taskBranchConvention": "task/[task-id]-[task-slug]",
       "taskPrTarget": "epic branch",
-      "finalPrTarget": "target branch"
+      "finalPrTarget": "target branch",
+      "epicBranchRequiredBeforeWorkerDispatch": true,
+      "isolatedWorktreePerRepositoryTask": true,
+      "workersMaySwitchControllerCheckout": false
     }
   },
   "waves": [
@@ -46,6 +49,8 @@
           "workerThreadId": null,
           "reviewThreadId": null,
           "branch": "task/TASK-001-example-task",
+          "workerWorktree": null,
+          "worktreeStatus": "unassigned",
           "pr": null,
           "latestCommit": null,
           "branchFreshness": "unknown",
@@ -67,6 +72,6 @@
     "lastCheckedAt": null,
     "nextCheckDueAt": null,
     "schedulerRef": null,
-    "fallbackPrompt": "Run subagent-pr-orchestration for EPIC-example-feature WAVE-001. Read orchestration.json and controller-state.md, inspect every active worker and reviewer reference, update task gates, and stop when all active tasks are merged, blocked, cancelled, or ready for wdd-reconcile-wave."
+    "fallbackPrompt": "Run subagent-pr-orchestration for EPIC-example-feature WAVE-001. Read orchestration.json and controller-state.md, verify the epic branch and assigned worker worktrees, inspect every active worker and reviewer reference, update task gates, and stop when all active tasks are merged, blocked, cancelled, or ready for wdd-reconcile-wave."
   }
 }
