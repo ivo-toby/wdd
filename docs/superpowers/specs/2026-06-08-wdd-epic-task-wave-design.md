@@ -234,10 +234,11 @@ Each worker receives exactly one task.
 
 The worker must:
 
-1. Move the task file from `todo/` to `in-progress/`.
-2. Read the task file and relevant shared context.
-3. Start in the assigned worktree and confirm it is on the assigned task branch
+1. Start in the assigned worktree and confirm it is on the assigned task branch
    with the current task file and orchestration state present.
+2. Move or verify the task file status transition from `todo/` to
+   `in-progress/` inside the assigned worktree.
+3. Read the task file and relevant shared context from the assigned worktree.
 4. Inspect named files and domains before broad discovery.
 5. Stay within scope.
 6. Avoid starting dependent tasks.

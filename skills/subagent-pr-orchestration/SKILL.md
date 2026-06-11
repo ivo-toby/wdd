@@ -93,7 +93,8 @@ state and orchestration state.
    - Confirm the assigned task file path and orchestration state exist in that
      worktree before editing.
    - Do not switch, create, or reset branches in the controller checkout.
-   - Move the task file from `todo/` to `in-progress/` when starting.
+   - Move or verify the task file status transition from `todo/` to
+     `in-progress/` when starting, inside the assigned worktree.
    - Stay within task scope.
    - Do not start dependent tasks.
    - Do not merge your own PR.
