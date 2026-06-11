@@ -43,8 +43,13 @@ created_at: YYYY-MM-DD
 - [ ] `orchestration.json` exists.
 - [ ] `orchestration.json` includes `schemaVersion: 1`.
 - [ ] Every planned task appears in orchestration state.
-- [ ] Branch, PR or patch, gate, branch freshness, feedback, and verification
-      fields are represented.
+- [ ] Branch, worker worktree, PR or patch, gate, branch freshness, feedback,
+      and verification fields are represented.
+- [ ] Epic branch creation or verification before worker dispatch is recorded.
+- [ ] Activation artifact state is required to sync to the epic branch before
+      task branches and worktrees are created.
+- [ ] One isolated worktree per repository-writing task is required before
+      dispatch.
 - [ ] Monitoring mode is recorded as `codex_thread_heartbeat`, `claude_loop`,
       `external_scheduler`, or `manual`.
 - [ ] Monitoring fallback prompt is durable enough for a fresh controller to run
@@ -69,6 +74,8 @@ created_at: YYYY-MM-DD
 
 - [ ] P1/P2 review policy is explicit.
 - [ ] Workers do not merge their own PRs.
+- [ ] Workers receive an assigned worktree path before starting.
+- [ ] Workers must not switch branches in the controller checkout.
 - [ ] Task PRs target the epic branch.
 - [ ] Stale task branches are rebased or merged with the latest epic branch
       before merge.

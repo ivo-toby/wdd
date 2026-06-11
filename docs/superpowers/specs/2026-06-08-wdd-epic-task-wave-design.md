@@ -204,10 +204,15 @@ target branch, usually main
     └── task/[task-id]-[task-slug]
 ```
 
-Worker agents create task branches from the epic branch. Task PRs target the
-epic branch.
+Before any worker starts, the controller/orchestrator creates or verifies the
+epic branch. Before dispatching repository-writing workers, it creates or
+verifies one isolated worktree per task from an epic branch state that already
+contains the activation artifact updates, then tells each worker the exact path
+to use. Task PRs target the epic branch.
 
 Worker agents never merge their own PRs.
+Worker agents start in the assigned task worktree and must not switch branches
+in the controller checkout.
 
 The controller/orchestrator owns the task merge gate. After verification and
 review gates pass, it either merges the task PR into the epic branch or records
@@ -229,9 +234,11 @@ Each worker receives exactly one task.
 
 The worker must:
 
-1. Move the task file from `todo/` to `in-progress/`.
-2. Read the task file and relevant shared context.
-3. Create or use the task branch from the epic branch.
+1. Start in the assigned worktree and confirm it is on the assigned task branch
+   with the current task file and orchestration state present.
+2. Move or verify the task file status transition from `todo/` to
+   `in-progress/` inside the assigned worktree.
+3. Read the task file and relevant shared context from the assigned worktree.
 4. Inspect named files and domains before broad discovery.
 5. Stay within scope.
 6. Avoid starting dependent tasks.

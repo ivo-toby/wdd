@@ -127,8 +127,11 @@ epic or shared-context artifacts.
     - Track epic ID, target branch, epic branch, model configuration, storage
       mode, waves, task order, task file paths, dependencies, conflict domains,
       assigned models, review models, worker/review references, branches, PRs,
-      latest commits, branch freshness, blocking feedback, verification, and
-      current gates.
+      assigned worker worktrees, latest commits, branch freshness, blocking
+      feedback, verification, and current gates.
+    - Represent the controller-owned rule that the epic branch is created or
+      verified before worker dispatch, and that each repository-writing task
+      gets one isolated worktree before its worker starts.
     - Include `monitoring` with mode, cadence, status, last check, next check,
       scheduler reference, and a durable fallback prompt.
 
@@ -139,6 +142,7 @@ epic or shared-context artifacts.
     - Include monitoring mode, cadence, status, scheduler reference, fallback
       prompt, and stop condition.
     - Track current gates for planned tasks.
+    - Include worker worktree assignments and isolation status.
     - Include branch freshness table.
     - Include shared-context reconciliation notes.
     - Include next action.

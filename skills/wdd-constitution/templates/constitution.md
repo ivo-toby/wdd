@@ -45,7 +45,15 @@ unless the user chose them.
 
 ## Branching Policy
 
+- The controller creates or verifies the epic branch from the target branch
+  before any worker starts.
+- The controller syncs activation artifact changes to the epic branch before
+  task branches or task worktrees are created.
 - Task branches branch from the epic branch.
+- The controller creates or verifies one isolated worktree per
+  repository-writing task from the synced epic branch before dispatch.
+- Workers start in their assigned task worktree and must not switch branches in
+  the controller checkout.
 - Task PRs target the epic branch.
 - Task work must not merge directly to the target branch.
 - The controller checks branch freshness before merging or marking merge-ready.
@@ -71,11 +79,12 @@ unless the user chose them.
 
 ## Agent Roles
 
-- Controller: plans, activates waves, dispatches workers, starts reviewers,
-  routes feedback, merges or marks merge-ready, updates orchestration state, and
-  reconciles waves.
+- Controller: plans, activates waves, creates or verifies epic branches and
+  task worktrees, dispatches workers, starts reviewers, routes feedback, merges
+  or marks merge-ready, updates orchestration state, and reconciles waves.
 - Worker: executes exactly one task file at a time and does not merge its own
-  PR.
+  PR. The worker starts in the assigned task worktree and must not switch
+  branches in the controller checkout.
 - Reviewer: reviews one task PR or patch and classifies findings as P1, P2, or
   P3.
 - Feedback-fix worker: addresses routed feedback without broadening scope.
