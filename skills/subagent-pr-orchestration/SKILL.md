@@ -62,10 +62,18 @@ state and orchestration state.
    - Before dispatch, verify the epic branch exists or create it from the
      target branch. If this cannot be done, record `blocked` and do not start
      workers.
+   - Before creating task branches or worktrees, verify the epic branch contains
+     the current activation artifact state: moved task paths, active gates,
+     planned task branches, and assigned worktree paths. If not, sync those
+     controller-owned artifact changes to the epic branch first, or record
+     `blocked`.
    - Before dispatch, create or verify the task branch from the current epic
-     branch for each repository-writing task.
+     branch for each repository-writing task. Task branches must start from the
+     epic branch commit that contains the current activation artifact state.
    - Before dispatch, create or verify one isolated worktree per
      repository-writing task, checked out on its task branch.
+   - Verify the assigned task file path and current orchestration state exist in
+     the worker worktree before starting the worker.
    - Record the assigned worktree path before starting the worker.
    - Require the worker to read the task file first.
    - Require the worker to inspect named files/domains before broad discovery.
@@ -82,6 +90,8 @@ state and orchestration state.
 4. Worker prompt contract:
    - Start in the assigned worktree path provided by the controller.
    - Confirm the worktree is on the assigned task branch before editing.
+   - Confirm the assigned task file path and orchestration state exist in that
+     worktree before editing.
    - Do not switch, create, or reset branches in the controller checkout.
    - Move the task file from `todo/` to `in-progress/` when starting.
    - Stay within task scope.
@@ -141,8 +151,9 @@ state and orchestration state.
     - Start every tick by reading current `orchestration.json`,
       `controller-state.md`, task files, and relevant PR or patch state.
     - Do not depend on hidden conversation context from a prior tick.
-    - not_started: create or verify the epic branch, task branch, and assigned
-      isolated worktree, then dispatch if eligible.
+    - not_started: create or verify the epic branch, sync activation artifacts,
+      create or verify the task branch and assigned isolated worktree from that
+      synced state, then dispatch if eligible.
     - no_pr: inspect worker state and nudge exact missing deliverable.
     - needs_review: start or request review.
     - reviewing: poll review state and comments.

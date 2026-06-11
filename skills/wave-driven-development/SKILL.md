@@ -48,7 +48,8 @@ missing phase.
    - Before any worker starts, the controller creates or verifies the epic
      branch that task PRs or patches will merge into.
    - Before dispatching parallel repository-writing workers, the controller
-     creates or verifies one isolated worktree per task and records the assigned
+     syncs activation artifacts to the epic branch, creates or verifies one
+     isolated worktree per task from that synced state, and records the assigned
      path.
    - Worker agents execute exactly one task file each.
    - Worker agents start in the assigned worktree and must not switch branches
@@ -84,9 +85,9 @@ missing phase.
    - Dispatch every task in the active wave that has no unresolved dependency,
      no active conflict-domain blocker, no stale prerequisite, and no explicit
      blocked status.
-   - Do not dispatch workers until the epic branch exists and each
-     repository-writing task has a dedicated worktree checked out on its task
-     branch.
+   - Do not dispatch workers until the epic branch contains the current
+     activation artifact state and each repository-writing task has a dedicated
+     worktree checked out from that state on its task branch.
    - Track every active task independently in `orchestration.json` and
      `controller-state.md`.
    - Establish monitoring for active waves when available, preferring Codex
@@ -99,6 +100,8 @@ missing phase.
 6. Preserve merge discipline:
    - The controller creates or verifies the epic branch from the target branch
      before worker dispatch.
+   - Activation artifact changes are synced to the epic branch before task
+     branches and worktrees are created.
    - Task branches branch from the epic branch.
    - Task branches are checked out in task-specific worktrees before workers
      start.

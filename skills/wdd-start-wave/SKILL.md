@@ -55,30 +55,43 @@ choose the first epic with a planned wave that is not done.
    - Task is in `todo/`, or already `in-progress/` or `review/` and needs
      resumed orchestration.
 
-4. Prepare branch and worktree isolation before dispatch:
+4. Allocate branch and worktree isolation before dispatch:
    - Identify the target branch, epic branch, and task branch convention from
      the constitution, epic, and `orchestration.json`.
    - Create or verify the epic branch before any worker starts. If the epic
      branch cannot be created or verified, block worker dispatch and record the
      exact reason in `orchestration.json` and `controller-state.md`.
-   - For each eligible task that will change repository files, create or verify
-     a dedicated task branch from the current epic branch.
-   - Create or verify one isolated worktree per eligible task, checked out on
-     that task branch.
-   - Record each task's branch, worktree path, and worktree status before
-     dispatch.
-   - Do not ask workers to switch branches in the controller checkout. Workers
-     start only in their assigned worktree.
+   - For each eligible task that will change repository files, allocate a task
+     branch name and isolated worktree path.
+   - Do not create task branches or task worktrees yet. They must branch from an
+     epic branch commit that already contains the activation artifact updates.
 
-5. Activate the wave as a batch:
+5. Activate the wave as a batch and sync controller state:
    - Mark the wave `in_progress` in `wave-plan.md`.
    - Move eligible new task files from `todo/` to `in-progress/`.
    - Keep resumed `in-progress/` and `review/` tasks in their current folders.
    - Do not imply sequential task execution.
    - Worker agents may run at the same time.
    - Record non-eligible tasks and the reason they were not dispatched.
+   - Update `orchestration.json` and `controller-state.md` with the moved task
+     paths, task branches, assigned worktree paths, and pending worktree status.
+   - Commit, merge, apply, or otherwise sync these activation artifact changes
+     to the epic branch before creating task branches or worktrees.
 
-6. Update `orchestration.json`:
+6. Create or verify task branches and worktrees:
+   - For each eligible task that will change repository files, create or verify
+     a dedicated task branch from the synced epic branch.
+   - Create or verify one isolated worktree per eligible task, checked out on
+     that task branch.
+   - Verify each task worktree contains the current `in-progress/...` task file,
+     `orchestration.json`, and `controller-state.md` from the synced epic branch.
+   - If any controller-owned activation state changes after task branch or
+     worktree creation, sync that state into the epic branch and each affected
+     task branch before dispatch.
+   - Do not ask workers to switch branches in the controller checkout. Workers
+     start only in their assigned worktree.
+
+7. Finalize `orchestration.json`:
    - Set wave status.
    - Set each active task status and current gate.
    - Record task file path after any movement.
@@ -86,7 +99,7 @@ choose the first epic with a planned wave that is not done.
      reference, reviewer reference, branch freshness, feedback, and
      verification when known.
 
-7. Update `controller-state.md`:
+8. Finalize `controller-state.md`:
    - Active wave.
    - Monitoring mode, cadence, status, scheduler reference, fallback prompt,
      next check, and stop condition.
@@ -98,7 +111,7 @@ choose the first epic with a planned wave that is not done.
    - Shared-context reconciliation status.
    - Event log entry for activation or resume.
 
-8. Handoff:
+9. Handoff:
    - Invoke `subagent-pr-orchestration`.
    - Dispatch one worker per eligible active task.
    - Give each worker exactly one task file, the exact assigned worktree path,
@@ -108,7 +121,7 @@ choose the first epic with a planned wave that is not done.
    - Task files are the implementation briefs. Do not create a separate
      canonical brief artifact.
 
-9. Establish monitoring:
+10. Establish monitoring:
    - Prefer Codex thread heartbeat automation when available and the controller
      should keep returning to the same conversation.
    - Otherwise prefer Claude Code `/loop` when running in a Claude Code session
@@ -132,6 +145,8 @@ choose the first epic with a planned wave that is not done.
 - Active wave is marked `in_progress`.
 - Every eligible active-wave task is dispatched or recorded with a blocker.
 - The epic branch is created or verified before any worker starts.
+- Activation artifact changes are synced to the epic branch before task
+  branches and worktrees are created.
 - Each dispatched repository-writing task has a dedicated recorded worktree.
 - `orchestration.json` and `controller-state.md` reflect current gates.
 - Monitoring is active, externally delegated, or recorded as manual fallback

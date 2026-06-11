@@ -46,6 +46,8 @@ created_at: YYYY-MM-DD
 - [ ] Branch, worker worktree, PR or patch, gate, branch freshness, feedback,
       and verification fields are represented.
 - [ ] Epic branch creation or verification before worker dispatch is recorded.
+- [ ] Activation artifact state is required to sync to the epic branch before
+      task branches and worktrees are created.
 - [ ] One isolated worktree per repository-writing task is required before
       dispatch.
 - [ ] Monitoring mode is recorded as `codex_thread_heartbeat`, `claude_loop`,

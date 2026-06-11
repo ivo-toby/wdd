@@ -15,10 +15,10 @@ The controller manages waves, workers, reviewers, PRs or patches, feedback,
 verification evidence, stale-branch checks, merges or merge-ready decisions,
 shared-context reconciliation, and wave reconciliation. The controller does not
 implement task code. Before any worker starts, the controller creates or
-verifies the epic branch. Before dispatching repository-writing workers, the
-controller creates or verifies one isolated worktree per task and tells each
-worker its assigned path. Workers must not switch branches in the controller
-checkout.
+verifies the epic branch and syncs activation artifact changes to it. Before
+dispatching repository-writing workers, the controller creates or verifies one
+isolated worktree per task from that synced epic state and tells each worker its
+assigned path. Workers must not switch branches in the controller checkout.
 
 ## Active Wave
 
@@ -43,7 +43,7 @@ Scheduler reference: None
 Fallback prompt:
 
 ```text
-Run subagent-pr-orchestration for EPIC-example-feature WAVE-001. Read orchestration.json and controller-state.md, verify the epic branch and assigned worker worktrees, inspect every active worker and reviewer reference, update task gates, and stop when all active tasks are merged, blocked, cancelled, or ready for wdd-reconcile-wave.
+Run subagent-pr-orchestration for EPIC-example-feature WAVE-001. Read orchestration.json and controller-state.md, verify the epic branch contains current activation artifact state before assigned worker worktrees branch from it, inspect every active worker and reviewer reference, update task gates, and stop when all active tasks are merged, blocked, cancelled, or ready for wdd-reconcile-wave.
 ```
 
 Stop condition: all active-wave tasks are merged, blocked, cancelled, or ready
@@ -99,5 +99,6 @@ for `wdd-reconcile-wave`.
 
 ## Next Action
 
-- Create or verify the epic branch and isolated task worktrees, then dispatch
-  eligible tasks or resume active gates.
+- Sync activation artifacts to the epic branch, create or verify isolated task
+  worktrees from that state, then dispatch eligible tasks or resume active
+  gates.

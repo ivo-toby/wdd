@@ -108,6 +108,8 @@ State cleanup allowed after green.
 
 - Worker must inspect named files before broad discovery.
 - Worker must start in the assigned worktree path provided by the controller.
+- Worker must confirm this task file and current orchestration state exist in
+  the assigned worktree before editing.
 - Worker must not switch branches in the controller checkout.
 - Worker must stay within this task scope.
 - Worker must not start dependent tasks.

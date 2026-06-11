@@ -234,9 +234,10 @@ main
 
 Worker task PRs target the epic branch. Workers do not merge their own PRs.
 Before any worker starts, the controller creates or verifies the epic branch.
-Before dispatching parallel repository-writing workers, the controller creates
-or verifies one isolated worktree per task, checked out on that task branch, and
-tells each worker the exact path to use. Workers must not switch branches in the
-controller checkout. The controller owns the merge gate, including review
-status, verification, branch freshness, and shared-context reconciliation. The
-final epic PR targets the original target branch after epic validation passes.
+Before dispatching parallel repository-writing workers, the controller syncs
+activation artifact changes to the epic branch, creates or verifies one isolated
+worktree per task from that synced state, and tells each worker the exact path
+to use. Workers must not switch branches in the controller checkout. The
+controller owns the merge gate, including review status, verification, branch
+freshness, and shared-context reconciliation. The final epic PR targets the
+original target branch after epic validation passes.

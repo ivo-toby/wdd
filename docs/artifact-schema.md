@@ -332,6 +332,7 @@ Minimum structure:
       "taskPrTarget": "epic branch",
       "finalPrTarget": "target branch",
       "epicBranchRequiredBeforeWorkerDispatch": true,
+      "activationArtifactsSyncedBeforeTaskWorktrees": true,
       "isolatedWorktreePerRepositoryTask": true,
       "workersMaySwitchControllerCheckout": false
     }
@@ -372,7 +373,7 @@ Minimum structure:
     "lastCheckedAt": null,
     "nextCheckDueAt": null,
     "schedulerRef": null,
-    "fallbackPrompt": "Run subagent-pr-orchestration for EPIC-auth-refresh WAVE-001. Read orchestration.json and controller-state.md, verify the epic branch and assigned worker worktrees, inspect every active worker and reviewer reference, update task gates, and stop when all active tasks are merged, blocked, cancelled, or ready for wdd-reconcile-wave."
+    "fallbackPrompt": "Run subagent-pr-orchestration for EPIC-auth-refresh WAVE-001. Read orchestration.json and controller-state.md, verify the epic branch contains current activation artifact state before assigned worker worktrees branch from it, inspect every active worker and reviewer reference, update task gates, and stop when all active tasks are merged, blocked, cancelled, or ready for wdd-reconcile-wave."
   }
 }
 ```
@@ -384,9 +385,10 @@ feedback, feedback routing, verification, stale-branch checks, merge, blocker,
 wave completion, and reconciliation.
 
 Before any worker starts, the controller must create or verify the epic branch.
-Before dispatching parallel repository-writing workers, it must create or verify
-one isolated worktree per task, record the assigned path, and tell each worker
-to start there. Workers must not switch branches in the controller checkout.
+Before dispatching parallel repository-writing workers, it must sync activation
+artifact changes to the epic branch, create or verify one isolated worktree per
+task from that synced state, record the assigned path, and tell each worker to
+start there. Workers must not switch branches in the controller checkout.
 
 The `monitoring` object records how the controller heartbeat is driven. Allowed
 `mode` values are:

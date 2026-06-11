@@ -47,9 +47,11 @@ unless the user chose them.
 
 - The controller creates or verifies the epic branch from the target branch
   before any worker starts.
+- The controller syncs activation artifact changes to the epic branch before
+  task branches or task worktrees are created.
 - Task branches branch from the epic branch.
 - The controller creates or verifies one isolated worktree per
-  repository-writing task before dispatch.
+  repository-writing task from the synced epic branch before dispatch.
 - Workers start in their assigned task worktree and must not switch branches in
   the controller checkout.
 - Task PRs target the epic branch.
