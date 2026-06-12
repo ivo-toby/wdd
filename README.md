@@ -122,6 +122,9 @@ For Codex-style local skills, that means:
   wdd-final-pr/
     templates/
   wdd-status/
+  wdd-sync-github-project/
+    scripts/
+    references/
 ```
 
 Compatibility wrapper skills are also included for older phase names:
@@ -184,6 +187,15 @@ orchestration state in one coherent pass.
 10. `wdd-status`
     - Reports actual `.wdd/` state without modifying files by default.
 
+Optional adapter:
+
+- `wdd-sync-github-project`
+  - Mirrors a GitHub Project with one local WDD epic, imports GitHub Project
+    items as tickets and tasks, emits dry-run plans for local-to-GitHub updates,
+    and records sync fingerprints in an epic-local adapter manifest.
+  - GitHub Projects remain an external planning mirror. `.wdd/` artifacts remain
+    the WDD execution source of truth.
+
 ## Artifact Layout
 
 ```text
@@ -193,6 +205,8 @@ orchestration state in one coherent pass.
   epics/
     EPIC-auth-refresh/
       epic.md
+      adapters/
+        github-project.json
       wave-plan.md
       orchestration.json
       controller-state.md

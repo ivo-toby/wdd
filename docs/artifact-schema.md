@@ -100,6 +100,55 @@ Required body sections:
 The epic is ready for planning only when deliverables are concrete, scope
 boundaries are explicit, and the definition of done is testable.
 
+## GitHub Project Adapter Manifest
+
+Optional path:
+
+```text
+.wdd/epics/EPIC-auth-refresh/adapters/github-project.json
+```
+
+Required shape when present:
+
+```json
+{
+  "schemaVersion": 1,
+  "updatedAt": "YYYY-MM-DDTHH:MM:SSZ",
+  "epic": {
+    "id": "EPIC-auth-refresh"
+  },
+  "project": {
+    "owner": "OWNER",
+    "number": 4,
+    "id": "PVT_...",
+    "title": "Auth Refresh",
+    "url": "https://github.com/orgs/OWNER/projects/4",
+    "repo": "OWNER/REPO",
+    "wdd_id": "EPIC-auth-refresh"
+  },
+  "items": {
+    "TICKET-001-token-contract": {
+      "kind": "ticket",
+      "localPath": "TICKET-001-token-contract/ticket.md",
+      "github": {
+        "itemId": "PVTI_...",
+        "issueNumber": 123,
+        "url": "https://github.com/OWNER/REPO/issues/123"
+      },
+      "fingerprints": {
+        "local": "sha256:...",
+        "remote": "sha256:..."
+      }
+    }
+  }
+}
+```
+
+The manifest belongs to optional adapter state. It records GitHub Project links
+and sync fingerprints so `wdd-sync-github-project` can detect local-only,
+remote-only, and conflicting changes without making GitHub Projects the WDD
+source of truth.
+
 ## Ticket Folder
 
 Path:
