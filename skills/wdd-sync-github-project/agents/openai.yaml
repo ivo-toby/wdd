@@ -1,0 +1,4 @@
+interface:
+  display_name: "WDD Sync GitHub Project"
+  short_description: "Mirror WDD epics with GitHub Projects"
+  default_prompt: "Use $wdd-sync-github-project to compare a GitHub Project with my local WDD epic and produce a dry-run sync plan."
