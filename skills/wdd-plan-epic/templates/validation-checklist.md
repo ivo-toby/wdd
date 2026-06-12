@@ -52,6 +52,9 @@ created_at: YYYY-MM-DD
       dispatch.
 - [ ] Monitoring mode is recorded as `codex_thread_heartbeat`, `claude_loop`,
       `external_scheduler`, or `manual`.
+- [ ] Codex heartbeat automation is created or verified when monitoring mode is
+      `codex_thread_heartbeat`; otherwise scheduler failure is recorded and the
+      mode is delegated or downgraded.
 - [ ] Monitoring fallback prompt is durable enough for a fresh controller to run
       the next heartbeat tick.
 - [ ] Monitoring stop condition and next check are recorded.

@@ -165,6 +165,8 @@ orchestration state in one coherent pass.
    - Records monitoring mode and fallback prompt, preferring Codex thread
      heartbeats, then Claude Code `/loop`, then external schedulers, then manual
      fallback.
+   - In Codex, creates or verifies the active thread heartbeat before the
+     controller ends the turn, or records the scheduler failure and fallback.
 
 6. `subagent-pr-orchestration`
    - Dispatches one worker per task file, tracks every active task

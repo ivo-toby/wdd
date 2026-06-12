@@ -121,17 +121,34 @@ choose the first epic with a planned wave that is not done.
    - Task files are the implementation briefs. Do not create a separate
      canonical brief artifact.
 
-10. Establish monitoring:
+10. Establish monitoring before ending the controller turn:
+   - This is a hard completion gate. Before sending the final response, do not
+     mark wave start done or rely on human memory until monitoring is active,
+     delegated, or downgraded with a durable manual fallback.
    - Prefer Codex thread heartbeat automation when available and the controller
      should keep returning to the same conversation.
+   - In Codex, use `tool_search` to expose `codex_app.automation_update`.
+     Create or update a heartbeat automation with `kind` `heartbeat`,
+     `destination` `thread`, `status` `ACTIVE`, a minute cadence such as
+     `FREQ=MINUTELY;INTERVAL=5`, and a self-contained prompt to run
+     `subagent-pr-orchestration` for the active epic and wave. Prefer updating
+     an existing matching heartbeat over creating a duplicate.
+   - Verify the Codex automation result or existing automation config before
+     recording `mode` as `codex_thread_heartbeat`. The recorded
+     `schedulerRef` must identify the active heartbeat automation by id or
+     stable name.
+   - If the Codex automation tool is unavailable, creation or update fails, or
+     no active scheduler reference can be verified in the current turn, try the
+     next scheduler option. Record the failed Codex attempt in the event log
+     and do not leave monitoring mode as `codex_thread_heartbeat`.
    - Otherwise prefer Claude Code `/loop` when running in a Claude Code session
      that supports scheduled tasks.
    - Otherwise use an external scheduler such as a desktop scheduled task, cloud
      routine, GitHub Actions schedule, or project-specific adapter when one is
      available and authorized.
-   - If no scheduler is available, set monitoring mode to `manual`, record the
-     next check due time, and write an exact fallback prompt that a human or
-     fresh controller can run.
+   - If no scheduler is available, downgrade to `manual`, record the next check
+     due time, and write an exact fallback prompt that a human or fresh
+     controller can run.
    - The fallback prompt must instruct the controller to read
      `orchestration.json` and `controller-state.md`, inspect every active worker
      and reviewer reference, update gates, and stop when tasks are ready for
@@ -139,6 +156,8 @@ choose the first epic with a planned wave that is not done.
    - Record the selected monitoring mode, cadence, status, scheduler reference,
      last check, next check, and fallback prompt in both `orchestration.json`
      and `controller-state.md`.
+   - The final response must name the active scheduler reference, delegated
+     scheduler, or manual fallback due time.
 
 ## Done When
 
@@ -150,6 +169,8 @@ choose the first epic with a planned wave that is not done.
 - Each dispatched repository-writing task has a dedicated recorded worktree.
 - `orchestration.json` and `controller-state.md` reflect current gates.
 - Monitoring is active, externally delegated, or recorded as manual fallback
-  with a durable resume prompt.
+  with a durable resume prompt. If monitoring mode is `codex_thread_heartbeat`,
+  the active Codex heartbeat automation has been created or verified before
+  sending the final response.
 - Subagent orchestration has started, or controller state records why it is
   blocked.

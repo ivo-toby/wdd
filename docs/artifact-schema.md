@@ -451,6 +451,12 @@ The `monitoring` object records how the controller heartbeat is driven. Allowed
 - `manual`: no scheduler is available; the controller records an exact fallback
   prompt and due time for a human or fresh agent to resume.
 
+When `mode` is `codex_thread_heartbeat`, `schedulerRef` must identify a
+verified active Codex heartbeat automation. If the controller cannot create,
+update, or verify that heartbeat before ending its turn, it must select the next
+scheduler option or downgrade to `manual` and record the failed scheduler
+attempt in controller state.
+
 Every heartbeat tick must be bounded and idempotent: load current artifacts,
 poll worker and reviewer references, advance gates, update artifacts, and stop
 or deactivate monitoring when all active-wave tasks are merged, blocked,
