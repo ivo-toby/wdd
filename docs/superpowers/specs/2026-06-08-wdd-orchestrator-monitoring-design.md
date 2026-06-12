@@ -67,6 +67,13 @@ needed for a human or fresh agent to run the next tick. This keeps WDD portable
 when the agent runtime has no scheduler, when a scheduler tool is unavailable,
 or when scheduled monitoring fails.
 
+In Codex, selecting `codex_thread_heartbeat` requires creating or updating a
+thread heartbeat through the Codex automation tool, verifying the active
+automation id or stable name, and recording that value as `schedulerRef` before
+the controller sends its final response. If the heartbeat cannot be verified in
+the same turn, the controller must record the failed attempt and choose the next
+scheduler option or the manual fallback.
+
 ## Artifact Contract
 
 `orchestration.json` contains:

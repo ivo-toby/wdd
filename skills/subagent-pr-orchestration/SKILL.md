@@ -152,6 +152,14 @@ state and orchestration state.
     - Start every tick by reading current `orchestration.json`,
       `controller-state.md`, task files, and relevant PR or patch state.
     - Do not depend on hidden conversation context from a prior tick.
+    - If an active wave has missing, inactive, stale, or failed monitoring and
+      tasks are not yet ready for reconciliation, repair monitoring before
+      ending the tick. In Codex, create or update a thread heartbeat through
+      `codex_app.automation_update` when available; otherwise delegate to the
+      next scheduler option or downgrade to `manual` with a durable fallback
+      prompt and due time.
+    - Do not record or preserve `codex_thread_heartbeat` unless the active
+      scheduler reference is verified in the current tick.
     - not_started: create or verify the epic branch, sync activation artifacts,
       create or verify the task branch and assigned isolated worktree from that
       synced state, then dispatch if eligible.
