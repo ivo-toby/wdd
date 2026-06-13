@@ -55,10 +55,50 @@ It is especially useful for:
 
 It is probably overkill for small one-shot edits.
 
+## Which WDD Mode Should I Use?
+
+Start with `wdd-info` when unsure. It is the read-only front door: describe the
+work, and the agent recommends whether to skip WDD, use a micro-wave, start a
+profiled epic, or resume existing WDD state.
+
+| Situation | Use | What You Get |
+|---|---|---|
+| One small code change | No WDD | Normal agent work with repo-native verification |
+| One chunky ticket that can split into 2-5 parallel tasks | `micro` | A compact work brief, task briefs, `state.json`, and one finish handoff |
+| Small feature or refactor with limited risk | `lite` | Compact epic artifacts, adaptive monitoring, and risk-based review |
+| Multi-ticket feature, migration, or refactor | `standard` | The normal WDD epic flow with trimmed ceremony where safe |
+| Auth, persistence, public API, data migration, security, or risky parallel work | `full` | Maximum review, validation, and monitoring discipline |
+
+Copy-paste prompts:
+
+```text
+Should I use WDD for this? Recommend the mode and next step.
+```
+
+```text
+Use WDD micro for this ticket. Split it into parallel tasks only if worthwhile.
+```
+
+```text
+Use WDD lite for this epic. Keep artifacts compact and use risk-based review.
+```
+
+```text
+Use WDD full for this migration. Prioritize review and validation over speed.
+```
+
+The project constitution sets the default profile. Individual epics or
+micro-waves record their chosen profile so future agents do not have to infer
+it again.
+
 ## What WDD Provides
 
 - A project constitution for setup, model aliases, storage mode, branch policy,
-  review policy, verification expectations, and governance.
+  profile defaults, review policy, verification expectations, and governance.
+- A `wdd-info` front door for mode choice, resume guidance, and ceremony/cost
+  tradeoffs.
+- Micro-waves under `.wdd/work/` for bounded ticket-sized work that benefits
+  from limited parallelism without full epic ceremony.
 - Epic definition from vague product, technical, refactor, migration, or bug
   cluster input.
 - Ticket folders that group related work.
@@ -104,10 +144,17 @@ For Codex-style local skills, that means:
 ```text
 ~/.agents/skills/
   wave-driven-development/
+  wdd-info/
   wdd-init-project/
     templates/
   wdd-constitution/
     templates/
+  wdd-start-work/
+    templates/
+  wdd-plan-work/
+    templates/
+  wdd-run-work/
+  wdd-finish-work/
   wdd-start-epic/
     templates/
   wdd-plan-epic/
@@ -141,52 +188,63 @@ orchestration state in one coherent pass.
 
 ## Workflow
 
+0. `wdd-info`
+   - Recommends no WDD, `micro`, `lite`, `standard`, `full`, or resuming
+     existing work. It does not modify files.
+
 1. `wdd-init-project`
-   - Creates `.wdd/`, `.wdd/templates/`, `.wdd/epics/`, and the initial
-     constitution if missing, using the templates bundled inside the
+   - Creates `.wdd/`, `.wdd/work/`, `.wdd/templates/`, `.wdd/epics/`, and the
+     initial constitution if missing, using the templates bundled inside the
      `wdd-init-project` skill folder.
 
 2. `wdd-constitution`
    - Records setup choices: model aliases, model usage preferences, storage
-     mode, branch conventions, review policy, merge policy, verification
-     expectations, and governance.
+     mode, default profile, branch conventions, review policy, merge policy,
+     verification expectations, and governance.
 
-3. `wdd-start-epic`
+3. Micro-wave flow for a chunky ticket:
+   - `wdd-start-work` creates `.wdd/work/<work-id>/brief.md`.
+   - `wdd-plan-work` creates compact task briefs and `state.json`.
+   - `wdd-run-work` dispatches or resumes the micro-wave.
+   - `wdd-finish-work` reconciles verification, review, and final handoff.
+
+4. `wdd-start-epic`
    - Turns vague input into an implementation-ready epic and initializes
-     `shared-context/`.
+     `shared-context/`. The epic records `profile: lite`, `standard`, or `full`
+     from user input or the constitution default.
 
-4. `wdd-plan-epic`
+5. `wdd-plan-epic`
    - Builds shared context, ticket folders, task files, dependency and conflict
      grids, `wave-plan.md`, `orchestration.json`, and initial
-     `controller-state.md`.
+     `controller-state.md`. The selected profile controls artifact detail,
+     monitoring cadence, and review strictness.
 
-5. `wdd-start-wave`
+6. `wdd-start-wave`
    - Activates the next pending wave as a batch of concurrently eligible tasks.
-   - Records monitoring mode and fallback prompt, preferring Codex thread
-     heartbeats, then Claude Code `/loop`, then external schedulers, then manual
-     fallback.
+   - Records monitoring mode and fallback prompt. `lite` and `standard` use
+     adaptive cadence by default; `full` may keep tighter monitoring.
    - In Codex, creates or verifies the active thread heartbeat before the
      controller ends the turn, or records the scheduler failure and fallback.
 
-6. `subagent-pr-orchestration`
+7. `subagent-pr-orchestration`
    - Dispatches one worker per task file, tracks every active task
-     independently, starts review agents, routes P1/P2 feedback, enforces
+     independently, starts required reviews, routes P1/P2 feedback, enforces
      stale-branch checks, runs bounded idempotent monitor ticks, and merges or
-     marks merge-ready according to policy.
+     marks merge-ready according to profile and policy.
 
-7. `wdd-reconcile-wave`
+8. `wdd-reconcile-wave`
    - Confirms merged or closed task state, reconciles drift, updates shared
      context, adjusts future tasks, and decides whether the next wave can start.
 
-8. `wdd-epic-validation`
+9. `wdd-epic-validation`
    - Validates the completed epic branch against the epic definition of done,
      task evidence, reviews, shared context, and integration state.
 
-9. `wdd-final-pr`
+10. `wdd-final-pr`
    - Prepares the final epic PR from `epic/[epic-slug]` into the target branch
      with a comprehensive human-review description.
 
-10. `wdd-status`
+11. `wdd-status`
     - Reports actual `.wdd/` state without modifying files by default.
 
 Optional adapter:
@@ -204,6 +262,14 @@ Optional adapter:
 .wdd/
   constitution.md
   templates/
+  work/
+    WORK-filter-builder/
+      brief.md
+      state.json
+      tasks/
+        TASK-001-api-contract.md
+        TASK-002-ui-state.md
+        TASK-003-tests.md
   epics/
     EPIC-auth-refresh/
       epic.md

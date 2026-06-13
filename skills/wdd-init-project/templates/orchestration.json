@@ -8,6 +8,9 @@
   },
   "configuration": {
     "storageMode": "local-markdown",
+    "profile": "standard",
+    "reviewMode": "risk_based",
+    "monitoringMode": "adaptive",
     "models": {
       "planning": "configured-model-key",
       "implementationSimple": "configured-model-key",
@@ -68,7 +71,7 @@
   },
   "monitoring": {
     "mode": "manual",
-    "cadence": "5m",
+    "cadence": "adaptive",
     "status": "inactive",
     "lastCheckedAt": null,
     "nextCheckDueAt": null,

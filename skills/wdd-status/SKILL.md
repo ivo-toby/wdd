@@ -1,6 +1,6 @@
 ---
 name: wdd-status
-description: Show current Wave-Driven Development state from local .wdd text artifacts, including constitution status, epics, tickets, tasks, waves, orchestration gates, monitoring, shared-context reconciliation, validation, and next action.
+description: Show current Wave-Driven Development state from local .wdd text artifacts, including constitution status, micro-wave work packets, epics, tickets, tasks, waves, orchestration gates, monitoring, shared-context reconciliation, validation, and next action.
 ---
 
 # WDD Status
@@ -10,8 +10,9 @@ blockers, task gates, or a dashboard view.
 
 ## User Input
 
-If the user names an epic, report that epic. If the user asks for all state,
-scan all `.wdd/epics/*/` folders.
+If the user names a work packet, report that micro-wave. If the user names an
+epic, report that epic. If the user asks for all state, scan `.wdd/work/*/` and
+`.wdd/epics/*/` folders.
 
 ## Preconditions
 
@@ -26,7 +27,14 @@ scan all `.wdd/epics/*/` folders.
      `wdd-init-project`.
    - If present, read `.wdd/constitution.md`.
 
-2. Scan epics:
+2. Scan micro-wave work packets:
+   - Read each `.wdd/work/*/brief.md`.
+   - Count `tasks/*.md`.
+   - Read `state.json` if present.
+   - Report profile, status, task gates, monitoring, review blockers,
+     verification blockers, and finish readiness.
+
+3. Scan epics:
    - Read each `epic.md`.
    - Detect ticket folders.
    - Count task files by status folder.
@@ -35,8 +43,9 @@ scan all `.wdd/epics/*/` folders.
    - Read `controller-state.md` if present.
    - Check for `epic-validation.md` and `final-pr.md`.
 
-3. For each relevant epic, report:
+4. For each relevant epic, report:
    - Epic ID, title, and status.
+   - Profile, review mode, and monitoring mode.
    - Target branch and epic branch.
    - Ticket count.
    - Task count by status.
@@ -52,8 +61,11 @@ scan all `.wdd/epics/*/` folders.
    - Final PR state.
    - Blockers.
 
-4. Determine next action:
+5. Determine next action:
    - Missing constitution: `wdd-constitution`.
+   - Micro-wave draft without task state: `wdd-plan-work`.
+   - Micro-wave active with open gates: `wdd-run-work`.
+   - Micro-wave tasks ready to close: `wdd-finish-work`.
    - Epic draft without planning artifacts: `wdd-plan-epic`.
    - Planning artifacts incomplete: `wdd-plan-epic`.
    - Pending wave: `wdd-start-wave`.
@@ -65,7 +77,7 @@ scan all `.wdd/epics/*/` folders.
    - All waves complete without validation: `wdd-epic-validation`.
    - Validation passed without final PR draft: `wdd-final-pr`.
 
-5. Output:
+6. Output:
    - Keep concise by default.
    - Use tables only when multiple epics, tasks, or gates are present.
    - Include exact artifact paths.

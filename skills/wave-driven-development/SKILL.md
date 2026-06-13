@@ -1,19 +1,21 @@
 ---
 name: wave-driven-development
-description: Run the full text-only Wave-Driven Development workflow using local markdown/json artifacts, epic-ticket-task hierarchy, concurrent task waves, controller gates, review, validation, and final PR handoff.
+description: Run the text-only Wave-Driven Development workflow using local markdown/json artifacts, including wdd-info routing, micro-wave work packets, profiled epics, concurrent task waves, controller gates, review, validation, and final PR handoff.
 ---
 
 # Wave-Driven Development
 
 Use this as the overview skill for large features, spikes, migrations, refactors,
 hardening work, bug clusters, or any multi-task implementation that benefits
-from planned parallel agent execution.
+from planned parallel agent execution. Use `wdd-info` first when the user is
+asking whether WDD is appropriate or which mode to choose.
 
 ## User Input
 
 Treat the user's request as the workflow goal. If the request names a phase, use
 the matching WDD phase skill. If the request is broad, start at the earliest
-missing phase.
+missing phase. If the request is one bounded ticket that may split into a few
+parallel tasks, prefer the micro-wave path over a full epic.
 
 ## Preconditions
 
@@ -21,6 +23,8 @@ missing phase.
 - Read repo instructions such as `AGENTS.md`, `README.md`, and project-specific
   docs.
 - Use `.wdd/` as the durable local source of truth.
+- Honor the constitution default profile and any artifact-level `profile`
+  override.
 - Do not rely on a runtime CLI, script, package manager, generated validator, or
   local binary.
 - Keep GitHub, Jira, Linear, Postgram, and similar systems as adapters or
@@ -29,9 +33,14 @@ missing phase.
 ## Workflow
 
 1. Determine current WDD state:
+   - If the user asks for orientation, mode choice, ceremony/cost tradeoffs, or
+     whether WDD is appropriate, use `wdd-info`.
    - If `.wdd/constitution.md` is missing, use `wdd-init-project`, then
      `wdd-constitution`.
    - If the constitution has blocking setup gaps, use `wdd-constitution`.
+   - If the work is one bounded ticket that can split into 2-5 parallel tasks,
+     use `wdd-start-work`, then `wdd-plan-work`, `wdd-run-work`, and
+     `wdd-finish-work`.
    - If no epic exists for the requested work, use `wdd-start-epic`.
    - If the epic lacks ticket folders, task files, shared context, waves, or
      orchestration state, use `wdd-plan-epic`.
@@ -54,13 +63,25 @@ missing phase.
    - Worker agents execute exactly one task file each.
    - Worker agents start in the assigned worktree and must not switch branches
      in the controller checkout.
-   - Reviewer agents review one task PR or patch and classify P1/P2/P3
-     findings.
+   - Reviewer agents review one task PR or patch when required and classify
+     P1/P2/P3 findings.
    - The controller does not implement task code.
    - Workers do not merge their own PRs.
 
-3. Maintain artifact locality:
+3. Choose ceremony by profile:
+   - `micro`: use `.wdd/work/` and skip ticket containers, wave plans, epic
+     validation, and final PR artifacts unless the user upgrades the work.
+   - `lite`: keep epic artifacts compact, use adaptive monitoring, and use
+     risk-based review.
+   - `standard`: use the normal epic workflow with token-conscious defaults.
+   - `full`: preserve strict review, validation, monitoring, and auditability.
+
+4. Maintain artifact locality:
    - Constitution: `.wdd/constitution.md`
+   - Micro-wave folder: `.wdd/work/<work-id>/`
+   - Micro-wave brief: `brief.md`
+   - Micro-wave state: `state.json`
+   - Micro-wave tasks: `tasks/<task-id>.md`
    - Epic folder: `.wdd/epics/<epic-id>/`
    - Epic: `epic.md`
    - Shared context: `shared-context/index.md` and
@@ -73,14 +94,14 @@ missing phase.
    - Epic validation: `epic-validation.md`
    - Final PR draft: `final-pr.md`
 
-4. Treat tasks as executable units:
+5. Treat tasks as executable units:
    - Tickets group related tasks.
    - Waves schedule tasks, not tickets.
    - Task files are the implementation briefs.
    - Task files move through `todo/`, `in-progress/`, `review/`, `done/`,
      `blocked/`, or `cancelled/`.
 
-5. Activate waves safely:
+6. Activate waves safely:
    - A wave is activated as a batch of concurrently eligible tasks.
    - Dispatch every task in the active wave that has no unresolved dependency,
      no active conflict-domain blocker, no stale prerequisite, and no explicit
@@ -90,14 +111,15 @@ missing phase.
      worktree checked out from that state on its task branch.
    - Track every active task independently in `orchestration.json` and
      `controller-state.md`.
-   - Establish monitoring for active waves when available, preferring Codex
-     thread heartbeat automation, then Claude Code `/loop`, then an external
-     scheduler, then a manual fallback prompt recorded in artifacts.
+   - Establish monitoring for active waves when available. Adaptive monitoring
+     may use slower cadence during worker execution and faster cadence during
+     review, fixes, or merge-ready gates while preserving scheduler
+     verification.
    - Every monitoring tick must be bounded and idempotent: read current
      artifacts, poll worker and reviewer references, advance gates, update
      state, and stop when wave reconciliation is ready.
 
-6. Preserve merge discipline:
+7. Preserve merge discipline:
    - The controller creates or verifies the epic branch from the target branch
      before worker dispatch.
    - Activation artifact changes are synced to the epic branch before task

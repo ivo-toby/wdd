@@ -24,13 +24,19 @@ assigned path. Workers must not switch branches in the controller checkout.
 
 Wave: WAVE-001
 
+Profile: standard
+
+Review mode: risk_based
+
+Monitoring mode: adaptive
+
 Activation: batch dispatch of concurrently eligible tasks.
 
 ## Monitoring
 
 Mode: manual
 
-Cadence: 5m
+Cadence: adaptive
 
 Status: inactive
 

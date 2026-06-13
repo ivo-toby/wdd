@@ -35,9 +35,10 @@ defaults from repository docs and code.
 2. Create directories if missing:
 
    ```text
-   .wdd/
-     epics/
-     templates/
+	   .wdd/
+	     work/
+	     epics/
+	     templates/
    ```
 
 3. Create `.wdd/constitution.md` if missing:
@@ -48,23 +49,27 @@ defaults from repository docs and code.
 4. Copy or create local templates under `.wdd/templates/`:
    - `constitution.md`
    - `epic.md`
-   - `ticket.md`
-   - `task.md`
-   - `wave-plan.md`
+	   - `ticket.md`
+	   - `task.md`
+	   - `task-compact.md`
+	   - `wave-plan.md`
    - `controller-state.md`
    - `validation-checklist.md`
    - `shared-context-index.md`
-   - `shared-context-resource.md`
-   - `orchestration.json`
-   - `epic-validation.md`
-   - `final-pr.md`
+	   - `shared-context-resource.md`
+	   - `orchestration.json`
+	   - `work-brief.md`
+	   - `work-task.md`
+	   - `work-state.json`
+	   - `epic-validation.md`
+	   - `final-pr.md`
    - Prefer exact copies from this skill folder's `templates/` directory, then
      let later phase skills specialize generated artifacts for the project.
 
 5. Create `.wdd/README.md`:
    - Explain that `.wdd/` is the durable source of truth.
-   - List phase order: constitution, epic, plan epic, start wave,
-     orchestration, reconcile, epic validation, final PR.
+   - List phase order: constitution, micro-wave or epic, planning, execution,
+     reconciliation, validation when applicable, and final handoff.
    - State that external trackers are adapters.
    - State that WDD itself is text-only and does not require scripts.
 
@@ -77,6 +82,7 @@ defaults from repository docs and code.
 ## Done When
 
 - `.wdd/` exists.
+- `.wdd/work/` exists.
 - `.wdd/epics/` exists.
 - `.wdd/constitution.md` exists and was not overwritten.
 - `.wdd/templates/` contains the text templates.

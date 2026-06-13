@@ -32,6 +32,7 @@ Required body sections:
 - Project Scope
 - Setup Configuration
 - Model Usage
+- WDD Profile Defaults
 - Storage Mode
 - Branching Policy
 - Review Policy
@@ -45,7 +46,28 @@ Required body sections:
 
 The constitution stores user choices that must not be rediscovered by later
 agents, including model aliases, target branch, branch naming conventions,
-review blocking policy, feedback-fix preference, and patch fallback policy.
+default WDD profile, review blocking policy, feedback-fix preference, and patch
+fallback policy.
+
+Recommended profile fields in the body:
+
+```yaml
+wdd_profile_default: standard
+allowed_profiles:
+  - micro
+  - lite
+  - standard
+  - full
+review_mode_default: risk_based
+monitoring_default: adaptive
+```
+
+Profiles mean:
+
+- `micro`: bounded ticket-sized work under `.wdd/work/`.
+- `lite`: compact epic artifacts, adaptive monitoring, risk-based review.
+- `standard`: normal epic workflow with token-conscious defaults.
+- `full`: maximum ceremony for high-risk work.
 
 ## Epic
 
@@ -69,6 +91,9 @@ created_at: YYYY-MM-DD
 updated_at: YYYY-MM-DD
 target_branch: main
 epic_branch: epic/auth-refresh
+profile: standard
+review_mode: risk_based
+monitoring_mode: adaptive
 schema_version: 1
 ticket_count: 0
 task_count: 0
@@ -98,7 +123,129 @@ Required body sections:
 - Planning Notes
 
 The epic is ready for planning only when deliverables are concrete, scope
-boundaries are explicit, and the definition of done is testable.
+boundaries are explicit, and the definition of done is testable. The `profile`
+field records the chosen ceremony level. User input overrides the constitution
+default when creating the epic; later agents honor the recorded epic value.
+
+## Micro-Wave Work Packet
+
+Use micro-waves for a single chunky ticket or bounded request that can split
+into 2-5 parallel tasks but does not need epic, ticket, wave-plan, validation,
+and final-PR ceremony.
+
+Path:
+
+```text
+.wdd/work/WORK-filter-builder/brief.md
+```
+
+Required frontmatter:
+
+```yaml
+---
+id: WORK-filter-builder
+kind: work_packet
+profile: micro
+slug: filter-builder
+title: Filter Builder
+status: draft
+created_at: YYYY-MM-DD
+updated_at: YYYY-MM-DD
+target_branch: main
+base_branch: work/filter-builder
+schema_version: 1
+task_count: 0
+adapter_links:
+  github_issue: null
+  jira_issue: null
+---
+```
+
+Required body sections:
+
+- Summary
+- Goal
+- Scope
+- Non-Scope
+- Relevant Context
+- Parallelization Notes
+- Validation Strategy
+- Definition of Done
+- Open Questions
+- Finish Notes
+
+Micro-wave task path:
+
+```text
+.wdd/work/WORK-filter-builder/tasks/TASK-001-api-contract.md
+```
+
+Micro-wave task files are compact implementation briefs. Required body sections:
+
+- Objective
+- Scope
+- Context To Read
+- Likely Files
+- Dependencies
+- Conflict Domains
+- Validation
+- Done
+- Evidence
+
+Micro-wave state path:
+
+```text
+.wdd/work/WORK-filter-builder/state.json
+```
+
+Minimum structure:
+
+```json
+{
+  "schemaVersion": 1,
+  "kind": "micro_wave_state",
+  "profile": "micro",
+  "work": {
+    "id": "WORK-filter-builder",
+    "title": "Filter Builder",
+    "targetBranch": "main",
+    "baseBranch": "work/filter-builder"
+  },
+  "configuration": {
+    "reviewMode": "risk_based",
+    "monitoringMode": "adaptive",
+    "maxParallelTasks": 5
+  },
+  "tasks": [
+    {
+      "id": "TASK-001-api-contract",
+      "path": "tasks/TASK-001-api-contract.md",
+      "status": "todo",
+      "branch": "work/TASK-001-api-contract",
+      "workerWorktree": null,
+      "currentGate": "not_started",
+      "risk": "low",
+      "reviewRequired": false,
+      "verification": null
+    }
+  ],
+  "monitoring": {
+    "mode": "manual",
+    "cadence": "adaptive",
+    "status": "inactive",
+    "lastCheckedAt": null,
+    "nextCheckDueAt": null,
+    "schedulerRef": null,
+    "fallbackPrompt": "Run wdd-run-work for WORK-filter-builder. Read state.json and task files, inspect active worker or PR references, update gates, and stop when tasks are ready for wdd-finish-work."
+  }
+}
+```
+
+Micro-waves keep the WDD safety core: bounded scope, branch/worktree isolation
+for repository-writing workers, verification evidence, no worker self-merge,
+and a final controller handoff. They intentionally omit ticket containers,
+separate wave plans, epic validation, and final PR artifacts unless the user
+asks to upgrade the work packet into an epic.
 
 ## GitHub Project Adapter Manifest
 
@@ -229,7 +376,7 @@ verification:
 ---
 ```
 
-Required body sections:
+Required body sections for `standard` and `full` task files:
 
 - Status
 - Parent Ticket
@@ -253,6 +400,17 @@ Required body sections:
 - Verification Evidence
 - Review Feedback
 - Completion Notes
+
+Allowed compact body sections for `lite` task files:
+
+- Objective
+- Scope
+- Context To Read
+- Likely Files
+- Dependencies And Conflicts
+- TDD And Validation
+- Done
+- Evidence
 
 Task files are the worker implementation briefs. A task file moves through
 `todo/`, `in-progress/`, `review/`, `done/`, `blocked/`, and `cancelled/` as
@@ -366,6 +524,9 @@ Minimum structure:
   },
   "configuration": {
     "storageMode": "local-markdown",
+    "profile": "standard",
+    "reviewMode": "risk_based",
+    "monitoringMode": "adaptive",
     "models": {
       "planning": "configured-model-key",
       "implementationSimple": "configured-model-key",
@@ -417,7 +578,7 @@ Minimum structure:
   ],
   "monitoring": {
     "mode": "manual",
-    "cadence": "5m",
+    "cadence": "adaptive",
     "status": "inactive",
     "lastCheckedAt": null,
     "nextCheckDueAt": null,
@@ -462,6 +623,16 @@ poll worker and reviewer references, advance gates, update artifacts, and stop
 or deactivate monitoring when all active-wave tasks are merged, blocked,
 cancelled, or ready for wave reconciliation. Monitoring must not depend on
 hidden conversation state.
+
+When monitoring mode is `adaptive`, default cadence is based on gate activity:
+
+- `no_pr`: slower polling, usually 15-30 minutes.
+- `needs_review`, `reviewing`, `needs_fixes`, or `merge_ready`: faster polling,
+  usually around 5 minutes.
+- repeated no-change ticks: downgrade to manual fallback when safe.
+
+The cadence changes do not relax heartbeat verification. A recorded
+`codex_thread_heartbeat` still requires a verified scheduler reference.
 
 ## Controller State
 
