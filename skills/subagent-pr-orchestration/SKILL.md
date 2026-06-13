@@ -7,6 +7,8 @@ description: Coordinate WDD task worker agents from task files, track each activ
 
 Use this when `wdd-start-wave` has activated a wave, or when a single task file
 is ready for delegated implementation.
+Honor `profile`, `reviewMode`, and `monitoringMode` from `orchestration.json`
+or micro-wave `state.json` when present.
 
 ## User Input
 
@@ -39,6 +41,7 @@ state and orchestration state.
    - `orchestration.json`.
    - `controller-state.md`.
    - Active task files.
+   - Profile, review mode, and monitoring mode.
 
 2. Ensure each active task has independent state:
    - Task ID and path.
@@ -103,6 +106,14 @@ state and orchestration state.
 
 5. Review gate:
    - When a task PR or patch exists, start a separate reviewer where available.
+   - If review mode is `risk_based`, require separate review for high-risk
+     tasks: auth, security, persistence, migrations, public APIs, generated
+     code, broad shared contracts, or tasks marked high risk.
+   - If review mode is `risk_based`, allow controller checklist review for
+     low-risk docs, tests, isolated cleanup, or narrow internal changes when the
+     constitution allows it.
+   - If profile is `full`, prefer separate reviewer coverage for every
+     repository-writing task.
    - Reviewer checks task compliance, correctness, tests, security,
      maintainability, dependency boundaries, conflict domains, scope control,
      and whether durable shared context should be extracted.
@@ -152,6 +163,10 @@ state and orchestration state.
     - Start every tick by reading current `orchestration.json`,
       `controller-state.md`, task files, and relevant PR or patch state.
     - Do not depend on hidden conversation context from a prior tick.
+    - If monitoring mode is `adaptive`, use slower cadence, usually 15-30
+      minutes, while workers have no PR or patch; use faster cadence, usually 5
+      minutes, during review, fixes, branch freshness, or merge-ready gates.
+      Repeated no-change ticks may downgrade to manual fallback when safe.
     - If an active wave has missing, inactive, stale, or failed monitoring and
       tasks are not yet ready for reconciliation, repair monitoring before
       ending the tick. In Codex, create or update a thread heartbeat through

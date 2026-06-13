@@ -10,8 +10,8 @@ Use this when creating, reviewing, or amending `.wdd/constitution.md`.
 ## User Input
 
 Consider user-provided principles, boundaries, model availability, branch
-preferences, review gates, storage preferences, verification commands, and
-workflow non-goals.
+preferences, WDD profile defaults, review gates, storage preferences,
+verification commands, and workflow non-goals.
 
 ## Preconditions
 
@@ -39,6 +39,10 @@ workflow non-goals.
    - Model usage for epic definition, planning, simple implementation, complex
      implementation, review, feedback-fix, epic validation, and PR description.
    - Storage mode: local Markdown, GitHub Projects, or both when supported.
+   - WDD profile default, usually `standard`.
+   - Allowed profiles, usually `micro`, `lite`, `standard`, and `full`.
+   - Review mode default, usually `risk_based`.
+   - Monitoring mode default, usually `adaptive`.
    - Target branch, defaulting to `main` only if repo evidence does not name
      another branch.
    - Epic branch convention, defaulting to `epic/[epic-slug]`.
@@ -54,6 +58,7 @@ workflow non-goals.
    - Project Scope.
    - Setup Configuration.
    - Model Usage.
+   - WDD Profile Defaults.
    - Branching Policy.
    - Review Policy.
    - Verification Policy.
@@ -84,8 +89,8 @@ workflow non-goals.
 
 ## Done When
 
-- `.wdd/constitution.md` records setup, branch, review, verification, role,
-  task, wave, shared-context, and governance rules.
+- `.wdd/constitution.md` records setup, branch, profile, review, verification,
+  role, task, wave, shared-context, and governance rules.
 - Version and dates are updated correctly.
 - Open user-needed questions are explicit.
 - The next phase is `wdd-start-epic`.

@@ -23,6 +23,10 @@ last_amended: YYYY-MM-DD
 - Task branch convention: task/[task-id]-[task-slug]
 - Task PRs required: yes
 - Local patches allowed when PRs are unavailable: yes
+- WDD profile default: standard
+- Allowed profiles: micro, lite, standard, full
+- Review mode default: risk_based
+- Monitoring default: adaptive
 
 ## Model Usage
 
@@ -42,6 +46,16 @@ unless the user chose them.
   }
 }
 ```
+
+## WDD Profile Defaults
+
+- Default profile: standard
+- Allowed profiles: micro, lite, standard, full
+- Default review mode: risk_based
+- Default monitoring mode: adaptive
+- Use `micro` for bounded ticket-sized work under `.wdd/work/`.
+- Use `lite`, `standard`, or `full` for epics according to risk and ceremony
+  needs.
 
 ## Branching Policy
 

@@ -11,9 +11,9 @@ definition of done, and planning notes.
 ## User Input
 
 Respect user constraints such as maximum parallelism, preferred review cadence,
-model usage, storage mode, high-risk areas, sequencing constraints, and scope
-exclusions. Do not require the user to repeat context already present in the
-epic or shared-context artifacts.
+model usage, storage mode, WDD profile, high-risk areas, sequencing constraints,
+and scope exclusions. Do not require the user to repeat context already present
+in the epic or shared-context artifacts.
 
 ## Preconditions
 
@@ -25,7 +25,8 @@ epic or shared-context artifacts.
   validators, Node.js, npm, or local binaries.
 - Use this skill folder's `templates/` directory when creating ticket, task,
   shared-context, wave, orchestration, controller-state, and validation
-  artifacts. Do not require `.wdd/templates/` to exist.
+  artifacts. For `lite`, prefer `templates/task-compact.md`; otherwise use
+  `templates/task.md`. Do not require `.wdd/templates/` to exist.
 
 ## Workflow
 
@@ -37,6 +38,10 @@ epic or shared-context artifacts.
    - Relevant docs and tests.
    - Existing task or ticket artifacts if this is a replan.
 
+   Determine the active profile from epic frontmatter first, then constitution
+   default. `lite`, `standard`, and `full` are valid for epics. If the epic says
+   `micro`, stop and route to `wdd-start-work` or `wdd-plan-work`.
+
 2. Build or update progressive shared context:
    - Use `templates/shared-context-index.md` and
      `templates/shared-context-resource.md` from this skill folder as starting
@@ -47,6 +52,9 @@ epic or shared-context artifacts.
      notes, or other useful planning context.
    - Record key decisions, warnings, constraints, and recent durable memory in
      the index.
+   - In `lite`, create only resources the active tasks are likely to read.
+   - In `full`, include the extra resources needed for auditability and high-risk
+     review.
 
 3. Identify ticket containers:
    - Tickets group related work.
@@ -54,16 +62,22 @@ epic or shared-context artifacts.
      migration, UI, integration, tests, docs, or refactor phase.
    - Tickets are not assigned directly to workers.
    - Each ticket folder is `.wdd/epics/<epic-id>/<ticket-id>/`.
+   - In `lite`, keep ticket files short and avoid extra ticket containers when a
+     single ticket cleanly groups the work.
 
 4. Break tickets into task files:
-   - Use `templates/task.md` from this skill folder as the starting point for
-     each new task file.
+   - Use `templates/task-compact.md` for `lite` tasks and `templates/task.md`
+     for `standard` or `full` tasks.
    - Each task is independently executable by one worker.
    - Each task fits in one focused implementation loop.
    - Each task has objective, scope, non-scope, local context, shared-context
      references, likely files, dependencies, conflict domains, model class,
      RED/GREEN TDD plan, definition of done, validation steps, branch, and PR
      expectations.
+   - In `lite`, keep task bodies compact and rely on `orchestration.json` for
+     branch, gate, and monitoring state.
+   - In `full`, include additional review focus and validation detail for risky
+     areas.
    - Place new task files in the ticket's `todo/` folder.
 
 5. Create every ticket folder with kanban folders:
@@ -100,6 +114,8 @@ epic or shared-context artifacts.
      risky, and epic validation.
    - Implementation tasks should use the cheapest capable model class unless
      complexity or risk requires more.
+   - Routine `lite` status, artifact, and monitor work should use the cheapest
+     capable model class and low-effort reasoning when the runtime supports it.
 
 9. Build wave plan:
    - Waves schedule tasks, not tickets.
@@ -124,6 +140,7 @@ epic or shared-context artifacts.
 11. Write `orchestration.json`:
     - Start from `templates/orchestration.json` in this skill folder.
     - Include `"schemaVersion": 1`.
+    - Include profile, review mode, and monitoring mode in `configuration`.
     - Track epic ID, target branch, epic branch, model configuration, storage
       mode, waves, task order, task file paths, dependencies, conflict domains,
       assigned models, review models, worker/review references, branches, PRs,
@@ -134,6 +151,8 @@ epic or shared-context artifacts.
       gets one isolated worktree before its worker starts.
     - Include `monitoring` with mode, cadence, status, last check, next check,
       scheduler reference, and a durable fallback prompt.
+    - Use adaptive monitoring by default for `lite` and `standard`; `full` may
+      choose tighter cadence when risk justifies the token cost.
 
 12. Write initial `controller-state.md`:
     - Start from `templates/controller-state.md` in this skill folder.
@@ -146,6 +165,8 @@ epic or shared-context artifacts.
     - Include branch freshness table.
     - Include shared-context reconciliation notes.
     - Include next action.
+    - Keep `lite` controller state as a dashboard rather than duplicating every
+      field already in `orchestration.json`.
 
 13. Write or update `validation-checklist.md`:
     - Start from `templates/validation-checklist.md` in this skill folder when
@@ -170,6 +191,7 @@ epic or shared-context artifacts.
 - Task files exist under ticket `todo/` folders.
 - `wave-plan.md` schedules tasks.
 - `orchestration.json` exists with `schemaVersion: 1`.
+- `orchestration.json` records profile, review mode, and monitoring mode.
 - `orchestration.json` records monitoring mode and fallback prompt.
 - `controller-state.md` exists.
 - `controller-state.md` includes a monitoring section.

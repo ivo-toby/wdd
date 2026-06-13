@@ -8,6 +8,8 @@ description: Activate the next pending WDD wave as a concurrent batch of eligibl
 Use this when the user asks to start, continue, resume, or activate
 implementation for a planned WDD epic. This skill activates the next pending wave
 as a concurrent task batch when dependencies and conflict domains allow it.
+Honor the epic `profile`, review mode, and monitoring mode recorded in
+`epic.md` and `orchestration.json`.
 
 ## User Input
 
@@ -40,6 +42,7 @@ choose the first epic with a planned wave that is not done.
    - `orchestration.json`.
    - Controller state.
    - Task files in the first pending or active wave.
+   - Active profile, review mode, and monitoring mode.
 
 2. Select wave to activate or resume:
    - If a wave is `in_progress`, resume it.
@@ -110,6 +113,8 @@ choose the first epic with a planned wave that is not done.
    - Verification status.
    - Shared-context reconciliation status.
    - Event log entry for activation or resume.
+   - For `lite`, keep this file as a concise dashboard and avoid duplicating
+     detailed state that already lives in `orchestration.json`.
 
 9. Handoff:
    - Invoke `subagent-pr-orchestration`.
@@ -127,6 +132,11 @@ choose the first epic with a planned wave that is not done.
      delegated, or downgraded with a durable manual fallback.
    - Prefer Codex thread heartbeat automation when available and the controller
      should keep returning to the same conversation.
+   - Use adaptive cadence when `monitoring_mode` is `adaptive`: slower cadence,
+     usually 15-30 minutes, while active workers have no PR or patch; faster
+     cadence, usually 5 minutes, during review, fixes, branch freshness, or
+     merge-ready gates.
+   - Use tighter cadence for `full` only when risk justifies the token cost.
    - In Codex, use `tool_search` to expose `codex_app.automation_update`.
      Create or update a heartbeat automation with `kind` `heartbeat`,
      `destination` `thread`, `status` `ACTIVE`, a minute cadence such as

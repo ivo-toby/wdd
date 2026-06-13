@@ -1,18 +1,20 @@
 ---
 name: wdd-start-epic
-description: Start a WDD epic by turning vague input into an implementation-ready epic specification and progressive shared-context scaffold under .wdd/epics.
+description: Start a profiled WDD epic by turning broad feature, migration, refactor, hardening, or bug-cluster input into an implementation-ready epic specification and progressive shared-context scaffold under .wdd/epics. Use wdd-start-work instead for single chunky tickets that fit micro-wave scope.
 ---
 
 # WDD Start Epic
 
 Use this when the user wants to start a feature, spike, migration, refactor,
-hardening effort, bug cluster, or other broad work item.
+hardening effort, bug cluster, or other broad work item. If the request is one
+bounded ticket that can split into only a few tasks, recommend `wdd-start-work`
+instead unless the user explicitly wants an epic.
 
 ## User Input
 
 Treat the user request as the epic seed. Extract desired outcome, type,
-constraints, non-goals, risks, and definition of done. Ask only for missing
-information that blocks planning or architecture.
+constraints, non-goals, risks, preferred WDD profile, and definition of done.
+Ask only for missing information that blocks planning or architecture.
 
 ## Preconditions
 
@@ -37,6 +39,11 @@ information that blocks planning or architecture.
    - Folder: `.wdd/epics/<epic-id>/`.
    - Epic branch: apply constitution convention, usually `epic/[epic-slug]`.
    - Target branch: use constitution target branch.
+   - Profile: use explicit user choice, otherwise constitution default. Valid
+     epic profiles are `lite`, `standard`, and `full`; use `wdd-start-work` for
+     `micro`.
+   - Review mode: use epic or constitution default, usually `risk_based`.
+   - Monitoring mode: use epic or constitution default, usually `adaptive`.
 
 2. Create folder structure:
 
@@ -66,6 +73,7 @@ information that blocks planning or architecture.
    - Definition of Done.
    - Open Questions.
    - Planning Notes.
+   - Frontmatter must include `profile`, `review_mode`, and `monitoring_mode`.
 
 4. Create `shared-context/index.md`:
    - Start from `templates/shared-context-index.md` in this skill folder when
@@ -87,6 +95,7 @@ information that blocks planning or architecture.
 6. Push back where needed:
    - Vague goals.
    - Unrealistic scope.
+   - Work that should be a micro-wave instead of an epic.
    - Unsafe assumptions.
    - Missing validation.
    - Hidden architecture or migration risks.
@@ -103,6 +112,7 @@ information that blocks planning or architecture.
 
 - Epic folder exists under `.wdd/epics/`.
 - `epic.md` is implementation-ready or records explicit blockers.
+- `epic.md` records `profile`, `review_mode`, and `monitoring_mode`.
 - `shared-context/index.md` exists.
 - Initial focused shared-context resources exist when useful.
 - The next phase is `wdd-plan-epic`, or the user is asked a specific blocking

@@ -14,6 +14,8 @@ created_at: YYYY-MM-DD
 - [ ] Definition of done is testable.
 - [ ] Non-goals are explicit.
 - [ ] Major risks and constraints are recorded.
+- [ ] Epic profile is recorded as `lite`, `standard`, or `full`.
+- [ ] Review mode and monitoring mode are recorded.
 
 ## Ticket And Task Structure
 
@@ -42,6 +44,7 @@ created_at: YYYY-MM-DD
 
 - [ ] `orchestration.json` exists.
 - [ ] `orchestration.json` includes `schemaVersion: 1`.
+- [ ] `orchestration.json` records profile, review mode, and monitoring mode.
 - [ ] Every planned task appears in orchestration state.
 - [ ] Branch, worker worktree, PR or patch, gate, branch freshness, feedback,
       and verification fields are represented.

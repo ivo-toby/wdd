@@ -9,6 +9,9 @@ created_at: YYYY-MM-DD
 updated_at: YYYY-MM-DD
 target_branch: main
 epic_branch: epic/example-feature
+profile: standard
+review_mode: risk_based
+monitoring_mode: adaptive
 schema_version: 1
 ticket_count: 0
 task_count: 0
