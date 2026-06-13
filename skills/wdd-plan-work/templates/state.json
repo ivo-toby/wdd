@@ -13,6 +13,30 @@
     "monitoringMode": "adaptive",
     "maxParallelTasks": 5
   },
+  "strategy": {
+    "profile": "micro",
+    "executionMode": "bundled",
+    "reviewMode": "risk_based",
+    "monitoringMode": "adaptive",
+    "recommendedBy": "wdd-plan-work",
+    "confirmedBy": null,
+    "requiresUserConfirmation": false,
+    "confidence": "high",
+    "rationale": [
+      "Micro-waves default to bundled execution to minimize coordination overhead."
+    ],
+    "bundleGroups": [
+      {
+        "id": "BUNDLE-001",
+        "tasks": ["TASK-001-example-task"],
+        "branch": "work/WORK-example-ticket-bundle",
+        "workerThreadId": null,
+        "reviewThreadId": null,
+        "currentGate": "not_started"
+      }
+    ],
+    "overrideHistory": []
+  },
   "tasks": [
     {
       "id": "TASK-001-example-task",

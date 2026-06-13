@@ -40,6 +40,22 @@
     {
       "id": "WAVE-001",
       "status": "planned",
+      "strategy": {
+        "profile": "standard",
+        "executionMode": "parallel",
+        "reviewMode": "risk_based",
+        "monitoringMode": "adaptive",
+        "recommendedBy": "wdd-plan-epic",
+        "confirmedBy": null,
+        "requiresUserConfirmation": true,
+        "confidence": "medium",
+        "rationale": [
+          "Tasks appear independently executable.",
+          "Parallel execution may reduce wall-clock time."
+        ],
+        "bundleGroups": [],
+        "overrideHistory": []
+      },
       "tasks": [
         {
           "id": "TASK-001-example-task",

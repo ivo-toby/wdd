@@ -1,6 +1,6 @@
 ---
 name: wdd-start-work
-description: Start a WDD micro-wave work packet for one bounded ticket or request that may split into a few parallel tasks without full epic ceremony. Use when the user asks for WDD micro, micro-wave, ticket-sized WDD, or controlled parallelism for a single chunky task.
+description: Start a WDD micro-wave work packet for one bounded ticket or request that may split into a few compact tasks without full epic ceremony. Use when the user asks for WDD micro, micro-wave, ticket-sized WDD, or controlled execution for a single chunky task.
 ---
 
 # WDD Start Work

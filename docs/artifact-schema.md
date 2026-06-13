@@ -130,7 +130,7 @@ default when creating the epic; later agents honor the recorded epic value.
 ## Micro-Wave Work Packet
 
 Use micro-waves for a single chunky ticket or bounded request that can split
-into 2-5 parallel tasks but does not need epic, ticket, wave-plan, validation,
+into 2-5 compact tasks but does not need epic, ticket, wave-plan, validation,
 and final-PR ceremony.
 
 Path:
@@ -215,6 +215,30 @@ Minimum structure:
     "reviewMode": "risk_based",
     "monitoringMode": "adaptive",
     "maxParallelTasks": 5
+  },
+  "strategy": {
+    "profile": "micro",
+    "executionMode": "bundled",
+    "reviewMode": "risk_based",
+    "monitoringMode": "adaptive",
+    "recommendedBy": "wdd-plan-work",
+    "confirmedBy": null,
+    "requiresUserConfirmation": false,
+    "confidence": "high",
+    "rationale": [
+      "Micro-waves default to bundled execution to minimize coordination overhead."
+    ],
+    "bundleGroups": [
+      {
+        "id": "BUNDLE-001",
+        "tasks": ["TASK-001-api-contract"],
+        "branch": "work/WORK-filter-builder-bundle",
+        "workerThreadId": null,
+        "reviewThreadId": null,
+        "currentGate": "not_started"
+      }
+    ],
+    "overrideHistory": []
   },
   "tasks": [
     {
@@ -441,8 +465,9 @@ The index must include:
 - Recent Durable Memory
 
 Resource files are focused and scannable. Worker agents may propose updates in
-their task branches. The controller reconciles shared-context changes into the
-epic branch, especially when concurrent workers touch the same resource.
+their task or bundle branches. The controller reconciles shared-context changes
+into the epic branch, especially when concurrent workers touch the same
+resource.
 
 Durable memory items use:
 
@@ -485,15 +510,47 @@ Required body sections:
 - Dependency Grid
 - Conflict Grid
 - Waves
+- Recommended Strategy
 - Activation Rules
 - Stop Conditions
 - Known Conflict Risks
 - Manual Adjustments
 
-Waves schedule tasks, not tickets. A wave is activated as a batch of
-concurrently eligible tasks. Eligibility requires no unresolved dependency, no
-active conflict-domain blocker, no stale prerequisite, and no explicit blocked
-status.
+Waves schedule tasks, not tickets. A wave is activated as a strategy-selected
+batch of eligible tasks. Eligibility requires no unresolved dependency, no active
+conflict-domain blocker, no stale prerequisite, and no explicit blocked status.
+
+## Interactive Wave Planning
+
+During planning, WDD recommends a strategy for each wave instead of treating the
+epic profile as the final execution contract. The planner should present the
+recommendation to the user when confirmation is required, then persist the
+confirmed strategy in `orchestration.json`.
+
+Wave strategy fields:
+
+- `profile`: `lite`, `standard`, or `full`, defaulting from the epic.
+- `executionMode`: `bundled`, `hybrid`, or `parallel`.
+- `reviewMode`: `controller_check`, `risk_based`, or `separate_review`.
+- `monitoringMode`: `manual`, `adaptive`, or `tight`.
+- `confidence`: `low`, `medium`, or `high`.
+- `rationale`: short reasons for the recommendation.
+- `requiresUserConfirmation`: whether activation must block until confirmed.
+- `confirmedBy`: `user`, `controller`, or `null`.
+- `bundleGroups`: task groups used by `bundled` or `hybrid` execution.
+- `overrideHistory`: prior strategy changes with reason and actor.
+
+Execution modes:
+
+- `bundled`: one worker, branch, worktree, PR or patch, and review gate for all
+  tasks in the wave.
+- `hybrid`: 2-3 task bundles, each with its own worker and gate.
+- `parallel`: one worker and gate per task.
+
+Recommend `bundled` when tasks are tightly coupled, touch the same files, share
+verification, or are too small to justify per-task overhead. Recommend
+`parallel` when tasks touch independent areas and real wall-clock speedup is
+likely. Recommend `hybrid` when obvious subgroups exist.
 
 ## Orchestration JSON
 
@@ -551,6 +608,22 @@ Minimum structure:
     {
       "id": "WAVE-001",
       "status": "planned",
+      "strategy": {
+        "profile": "standard",
+        "executionMode": "parallel",
+        "reviewMode": "risk_based",
+        "monitoringMode": "adaptive",
+        "recommendedBy": "wdd-plan-epic",
+        "confirmedBy": null,
+        "requiresUserConfirmation": true,
+        "confidence": "medium",
+        "rationale": [
+          "Tasks appear independently executable.",
+          "Parallel execution may reduce wall-clock time."
+        ],
+        "bundleGroups": [],
+        "overrideHistory": []
+      },
       "tasks": [
         {
           "id": "TASK-001-token-types",
@@ -588,17 +661,17 @@ Minimum structure:
 }
 ```
 
-The controller updates this file after task assignment, task movement, epic
-branch creation or verification, task branch creation or verification, worker
-worktree creation or verification, PR or patch creation, review start, P1/P2
-feedback, feedback routing, verification, stale-branch checks, merge, blocker,
-wave completion, and reconciliation.
+The controller updates this file after task or bundle assignment, task movement,
+epic branch creation or verification, task or bundle branch creation or
+verification, worker worktree creation or verification, PR or patch creation,
+review start, P1/P2 feedback, feedback routing, verification, stale-branch
+checks, merge, blocker, wave completion, and reconciliation.
 
 Before any worker starts, the controller must create or verify the epic branch.
-Before dispatching parallel repository-writing workers, it must sync activation
-artifact changes to the epic branch, create or verify one isolated worktree per
-task from that synced state, record the assigned path, and tell each worker to
-start there. Workers must not switch branches in the controller checkout.
+Before dispatching repository-writing workers, it must sync activation artifact
+changes to the epic branch, create or verify isolated worktrees according to the
+selected strategy, record assigned paths, and tell each worker to start there.
+Workers must not switch branches in the controller checkout.
 
 The `monitoring` object records how the controller heartbeat is driven. Allowed
 `mode` values are:
@@ -646,6 +719,7 @@ Required body sections:
 
 - Controller Rule
 - Active Wave
+- Active Wave Strategy
 - Monitoring
 - Active Task Gates
 - Worker Worktrees

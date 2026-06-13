@@ -37,6 +37,20 @@ Tasks:
 
 - TASK-001-example-task
 
+Recommended strategy:
+
+- Profile: standard
+- Execution mode: parallel
+- Review mode: risk_based
+- Monitoring mode: adaptive
+- Confidence: medium
+- Requires user confirmation: yes
+
+Rationale:
+
+- Tasks appear independently executable.
+- Parallel execution may reduce wall-clock time.
+
 Why this grouping is safe:
 
 - Dependencies are satisfied.

@@ -126,21 +126,43 @@ in the epic or shared-context artifacts.
      auth, test fixtures, package manifests, and lockfiles.
    - Record stop conditions requiring reconciliation before the next wave.
 
-10. Write `wave-plan.md`:
+10. Recommend strategy for each wave:
+    - Recommend `profile`, `executionMode`, `reviewMode`, and `monitoringMode`
+      per wave. The epic profile is only the default.
+    - Execution modes are `bundled`, `hybrid`, and `parallel`.
+    - Recommend `bundled` when tasks are tightly coupled, touch the same files,
+      share verification, or are too small to justify per-task overhead.
+    - Recommend `parallel` when tasks touch independent areas, review boundaries
+      are clean, and real wall-clock speedup is likely.
+    - Recommend `hybrid` when the wave has 2-3 obvious subgroups.
+    - Prefer `full` plus `parallel` or `hybrid` for auth, persistence,
+      migrations, public APIs, security, generated code, or broad shared
+      contracts.
+    - Include confidence, concise rationale, `requiresUserConfirmation`, and
+      `confirmedBy`.
+    - Require user confirmation when confidence is `low` or `medium`, when the
+      recommendation differs materially from the epic profile defaults, or when
+      risk is high.
+
+11. Write `wave-plan.md`:
     - Start from `templates/wave-plan.md` in this skill folder.
     - Task inventory.
     - Dependency grid.
     - Conflict grid.
     - One section per wave.
+    - Recommended strategy per wave with rationale and confirmation status.
     - Activation rules.
     - Stop conditions.
     - Known conflict risks.
     - Manual adjustments and rationale.
 
-11. Write `orchestration.json`:
+12. Write `orchestration.json`:
     - Start from `templates/orchestration.json` in this skill folder.
     - Include `"schemaVersion": 1`.
     - Include profile, review mode, and monitoring mode in `configuration`.
+    - Include each wave's `strategy` with execution mode, review mode,
+      monitoring mode, confidence, rationale, confirmation requirement,
+      `confirmedBy`, `bundleGroups`, and `overrideHistory`.
     - Track epic ID, target branch, epic branch, model configuration, storage
       mode, waves, task order, task file paths, dependencies, conflict domains,
       assigned models, review models, worker/review references, branches, PRs,
@@ -154,10 +176,11 @@ in the epic or shared-context artifacts.
     - Use adaptive monitoring by default for `lite` and `standard`; `full` may
       choose tighter cadence when risk justifies the token cost.
 
-12. Write initial `controller-state.md`:
+13. Write initial `controller-state.md`:
     - Start from `templates/controller-state.md` in this skill folder.
     - State controller rule.
     - List pending waves.
+    - Include selected or recommended wave strategy and confirmation state.
     - Include monitoring mode, cadence, status, scheduler reference, fallback
       prompt, and stop condition.
     - Track current gates for planned tasks.
@@ -168,7 +191,7 @@ in the epic or shared-context artifacts.
     - Keep `lite` controller state as a dashboard rather than duplicating every
       field already in `orchestration.json`.
 
-13. Write or update `validation-checklist.md`:
+14. Write or update `validation-checklist.md`:
     - Start from `templates/validation-checklist.md` in this skill folder when
       creating a new checklist.
     - Validate epic readiness.
@@ -176,10 +199,11 @@ in the epic or shared-context artifacts.
     - Validate dependency graph.
     - Validate conflict domains.
     - Validate wave activation readiness.
+    - Validate wave strategy recommendations and confirmations.
     - Validate orchestration schema and coverage.
     - Validate text-only portability.
 
-14. Update `epic.md` frontmatter and planning notes:
+15. Update `epic.md` frontmatter and planning notes:
     - Set ticket and task counts.
     - Update status to `planned` when planning is complete.
     - Update the date.
@@ -192,6 +216,7 @@ in the epic or shared-context artifacts.
 - `wave-plan.md` schedules tasks.
 - `orchestration.json` exists with `schemaVersion: 1`.
 - `orchestration.json` records profile, review mode, and monitoring mode.
+- `orchestration.json` records strategy for every wave.
 - `orchestration.json` records monitoring mode and fallback prompt.
 - `controller-state.md` exists.
 - `controller-state.md` includes a monitoring section.

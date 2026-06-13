@@ -22,12 +22,17 @@ Coordinate active micro-wave tasks without full epic ceremony.
    - `state.json`.
    - Active task files.
    - PR, patch, worker, or verification references when present.
+   - Strategy, including execution mode and bundle groups.
 
 2. Dispatch eligible tasks:
    - Create or verify the work base branch before worker dispatch.
-   - Create or verify one task branch and isolated worktree per
+   - For `bundled`, create or verify one bundle branch and isolated worktree for
+     all micro tasks.
+   - For `hybrid`, create or verify one branch and isolated worktree per bundle
+     group.
+   - For `parallel`, create or verify one task branch and isolated worktree per
      repository-writing task.
-   - Tell each worker the exact worktree path, branch, and one task file.
+   - Tell each worker the exact worktree path, branch, and task files.
    - Require named-file inspection before broad discovery.
    - Require verification evidence and final status token:
      `DONE`, `DONE_WITH_CONCERNS`, `NEEDS_CONTEXT`, or `BLOCKED`.
@@ -54,10 +59,13 @@ Coordinate active micro-wave tasks without full epic ceremony.
    - Review required, started, passed, or blocked.
    - Verification passed, failed, unavailable, or documented as non-blocking.
    - Task merged, merge-ready, blocked, cancelled, or ready to finish.
+   - Bundle gate changed when using `bundled` or `hybrid`.
 
 ## Done When
 
 - Every active task has current state.
+- Every active bundle has current state when execution mode is `bundled` or
+  `hybrid`.
 - Required feedback is routed.
 - Verification evidence is recorded or blockers are explicit.
 - Tasks are merged, merge-ready, blocked, cancelled, or ready for
