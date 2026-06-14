@@ -21,11 +21,13 @@ state and orchestration state.
 
 - `orchestration.json` exists with `schemaVersion: 1`, or a single task file is
   provided.
-- Each worker receives exactly one task file.
+- Each worker receives the task file set assigned by strategy: one task for
+  `parallel` or single-task dispatch, all active wave tasks for `bundled`, or one
+  bundle group's tasks for `hybrid`.
 - The controller does not implement task code.
 - The controller creates or verifies the epic branch before any worker starts.
-- The controller creates or verifies one isolated worktree per
-  repository-writing task before dispatch.
+- The controller creates or verifies one isolated worktree per repository-writing
+  task or bundle before dispatch.
 - Workers start in their assigned worktree and must not switch branches in the
   controller checkout.
 - Workers do not merge their own PRs.
@@ -88,7 +90,7 @@ state and orchestration state.
      orchestration state exist in the worker worktree before starting the
      worker.
    - Record the assigned worktree path before starting the worker.
-   - Require the worker to read the task file first.
+   - Require the worker to read assigned task file paths first.
    - Require the worker to inspect named files/domains before broad discovery.
    - Require the worker to read only relevant shared-context resources.
    - Tell the worker the exact worktree path and assigned branch to use.

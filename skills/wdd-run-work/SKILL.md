@@ -10,9 +10,12 @@ Coordinate active micro-wave tasks without full epic ceremony.
 ## Preconditions
 
 - `.wdd/work/<work-id>/state.json` exists with `schemaVersion: 1`.
-- Each worker receives exactly one micro task file.
+- Each worker receives the micro task file set assigned by strategy: one task
+  for `parallel`, all tasks for `bundled`, or one bundle group's tasks for
+  `hybrid`.
 - The controller does not implement task code.
-- Repository-writing workers use isolated task worktrees when available.
+- Repository-writing workers use isolated task or bundle worktrees when
+  available.
 - Workers do not merge their own PRs or patches.
 
 ## Workflow
