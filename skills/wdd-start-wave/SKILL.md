@@ -1,15 +1,16 @@
 ---
 name: wdd-start-wave
-description: Activate the next pending WDD wave as a concurrent batch of eligible task files, update orchestration and controller state, then hand off to subagent-pr-orchestration.
+description: Activate the next pending WDD wave as a strategy-selected batch of eligible task files, update orchestration and controller state, then hand off to subagent-pr-orchestration.
 ---
 
 # WDD Start Wave
 
 Use this when the user asks to start, continue, resume, or activate
 implementation for a planned WDD epic. This skill activates the next pending wave
-as a concurrent task batch when dependencies and conflict domains allow it.
+as an eligible task batch when dependencies and conflict domains allow it.
 Honor the epic `profile`, review mode, and monitoring mode recorded in
-`epic.md` and `orchestration.json`.
+`epic.md` and `orchestration.json`. Honor the selected wave strategy when it
+exists.
 
 ## User Input
 
@@ -43,6 +44,8 @@ choose the first epic with a planned wave that is not done.
    - Controller state.
    - Task files in the first pending or active wave.
    - Active profile, review mode, and monitoring mode.
+   - Selected wave strategy, including execution mode, confirmation state, and
+     bundle groups.
 
 2. Select wave to activate or resume:
    - If a wave is `in_progress`, resume it.
@@ -50,7 +53,19 @@ choose the first epic with a planned wave that is not done.
    - Do not skip to later waves unless the user explicitly instructs and
      dependencies are satisfied.
 
-3. Determine concurrently eligible tasks:
+3. Verify wave strategy:
+   - Read `strategy.profile`, `strategy.executionMode`, `strategy.reviewMode`,
+     `strategy.monitoringMode`, `strategy.requiresUserConfirmation`, and
+     `strategy.confirmedBy`.
+   - Valid execution modes are `bundled`, `hybrid`, and `parallel`.
+   - If `requiresUserConfirmation` is true and `confirmedBy` is missing, stop
+     before moving task files or creating branches. Present the recommendation,
+     rationale, confidence, and exact options to confirm or override.
+   - If the strategy is stale relative to current task dependencies, conflict
+     domains, or risk, record the mismatch and ask for confirmation before
+     dispatch.
+
+4. Determine eligible tasks:
    - Dependency status is resolved.
    - No active conflict-domain blocker exists.
    - No stale prerequisite blocks work.
@@ -58,52 +73,64 @@ choose the first epic with a planned wave that is not done.
    - Task is in `todo/`, or already `in-progress/` or `review/` and needs
      resumed orchestration.
 
-4. Allocate branch and worktree isolation before dispatch:
-   - Identify the target branch, epic branch, and task branch convention from
-     the constitution, epic, and `orchestration.json`.
+5. Allocate branch and worktree isolation before dispatch:
+   - Identify the target branch, epic branch, and task or bundle branch
+     convention from the constitution, epic, and `orchestration.json`.
    - Create or verify the epic branch before any worker starts. If the epic
      branch cannot be created or verified, block worker dispatch and record the
      exact reason in `orchestration.json` and `controller-state.md`.
-   - For each eligible task that will change repository files, allocate a task
-     branch name and isolated worktree path.
-   - Do not create task branches or task worktrees yet. They must branch from an
-     epic branch commit that already contains the activation artifact updates.
+   - For `parallel`, allocate one task branch and isolated worktree path per
+     eligible repository-writing task.
+   - For `bundled`, allocate one bundle branch and isolated worktree path for
+     the whole wave.
+   - For `hybrid`, allocate one branch and isolated worktree path per bundle
+     group.
+   - Do not create task branches, bundle branches, or worktrees yet. They must
+     branch from an epic branch commit that already contains the activation
+     artifact updates.
 
-5. Activate the wave as a batch and sync controller state:
+6. Activate the wave as a batch and sync controller state:
    - Mark the wave `in_progress` in `wave-plan.md`.
    - Move eligible new task files from `todo/` to `in-progress/`.
    - Keep resumed `in-progress/` and `review/` tasks in their current folders.
    - Do not imply sequential task execution.
-   - Worker agents may run at the same time.
+   - Worker agents may run at the same time only for `parallel` tasks or
+     independent `hybrid` bundles. `bundled` uses one worker for the wave.
    - Record non-eligible tasks and the reason they were not dispatched.
    - Update `orchestration.json` and `controller-state.md` with the moved task
-     paths, task branches, assigned worktree paths, and pending worktree status.
+     paths, task or bundle branches, assigned worktree paths, and pending
+     worktree status.
    - Commit, merge, apply, or otherwise sync these activation artifact changes
-     to the epic branch before creating task branches or worktrees.
+     to the epic branch before creating task or bundle branches and worktrees.
 
-6. Create or verify task branches and worktrees:
-   - For each eligible task that will change repository files, create or verify
-     a dedicated task branch from the synced epic branch.
-   - Create or verify one isolated worktree per eligible task, checked out on
-     that task branch.
-   - Verify each task worktree contains the current `in-progress/...` task file,
+7. Create or verify task branches, bundle branches, and worktrees:
+   - For `parallel`, create or verify a dedicated task branch and isolated
+     worktree per eligible repository-writing task.
+   - For `bundled`, create or verify one bundle branch and isolated worktree for
+     the wave.
+   - For `hybrid`, create or verify one branch and isolated worktree per bundle
+     group.
+   - Verify each task or bundle worktree contains the current task files,
      `orchestration.json`, and `controller-state.md` from the synced epic branch.
-   - If any controller-owned activation state changes after task branch or
-     worktree creation, sync that state into the epic branch and each affected
-     task branch before dispatch.
+   - If any controller-owned activation state changes after task or bundle
+     branch or worktree creation, sync that state into the epic branch and each
+     affected task or bundle branch before dispatch.
    - Do not ask workers to switch branches in the controller checkout. Workers
      start only in their assigned worktree.
 
-7. Finalize `orchestration.json`:
+8. Finalize `orchestration.json`:
    - Set wave status.
    - Set each active task status and current gate.
    - Record task file path after any movement.
    - Record branch, worktree path, worktree status, PR or patch, worker
      reference, reviewer reference, branch freshness, feedback, and
      verification when known.
+   - Record active strategy, bundle group branches, bundle worktrees, worker
+     references, and current bundle gates when using `bundled` or `hybrid`.
 
-8. Finalize `controller-state.md`:
+9. Finalize `controller-state.md`:
    - Active wave.
+   - Active wave strategy and confirmation state.
    - Monitoring mode, cadence, status, scheduler reference, fallback prompt,
      next check, and stop condition.
    - Active task gates.
@@ -116,17 +143,20 @@ choose the first epic with a planned wave that is not done.
    - For `lite`, keep this file as a concise dashboard and avoid duplicating
      detailed state that already lives in `orchestration.json`.
 
-9. Handoff:
+10. Handoff:
    - Invoke `subagent-pr-orchestration`.
-   - Dispatch one worker per eligible active task.
-   - Give each worker exactly one task file, the exact assigned worktree path,
-     the checked-out task branch, and relevant repo instructions.
+   - For `parallel`, dispatch one worker per eligible active task.
+   - For `bundled`, dispatch one worker for the wave and give it all task files
+     in the bundle.
+   - For `hybrid`, dispatch one worker per bundle group.
+   - Give each worker the exact assigned task or bundle files, worktree path,
+     checked-out branch, and relevant repo instructions.
    - Tell each worker to start in the assigned worktree and not switch branches
      in the controller checkout.
    - Task files are the implementation briefs. Do not create a separate
      canonical brief artifact.
 
-10. Establish monitoring before ending the controller turn:
+11. Establish monitoring before ending the controller turn:
    - This is a hard completion gate. Before sending the final response, do not
      mark wave start done or rely on human memory until monitoring is active,
      delegated, or downgraded with a durable manual fallback.
@@ -172,11 +202,15 @@ choose the first epic with a planned wave that is not done.
 ## Done When
 
 - Active wave is marked `in_progress`.
+- Wave strategy is confirmed or explicitly not confirmation-gated.
 - Every eligible active-wave task is dispatched or recorded with a blocker.
 - The epic branch is created or verified before any worker starts.
 - Activation artifact changes are synced to the epic branch before task
   branches and worktrees are created.
-- Each dispatched repository-writing task has a dedicated recorded worktree.
+- Each dispatched repository-writing task or bundle has a dedicated recorded
+  worktree.
+- Each dispatched bundle has a dedicated recorded worktree when execution mode
+  is `bundled` or `hybrid`.
 - `orchestration.json` and `controller-state.md` reflect current gates.
 - Monitoring is active, externally delegated, or recorded as manual fallback
   with a durable resume prompt. If monitoring mode is `codex_thread_heartbeat`,

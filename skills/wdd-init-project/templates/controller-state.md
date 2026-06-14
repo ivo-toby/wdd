@@ -24,13 +24,19 @@ assigned path. Workers must not switch branches in the controller checkout.
 
 Wave: WAVE-001
 
+Activation: batch dispatch of concurrently eligible tasks.
+
+## Active Wave Strategy
+
 Profile: standard
 
 Review mode: risk_based
 
 Monitoring mode: adaptive
 
-Activation: batch dispatch of concurrently eligible tasks.
+Execution mode: parallel
+
+Strategy confirmation: required
 
 ## Monitoring
 

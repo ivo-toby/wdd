@@ -22,6 +22,8 @@ Use this as the read-only front door for WDD.
    - Risk: auth, persistence, data migration, public API, security, generated
      code, CI/deployment, or broad shared architecture.
    - Parallelism: whether 2-5 independent tasks can run safely.
+   - Execution strategy: whether bundled, hybrid, or parallel execution is
+     likely to reduce overhead without hiding risk.
    - User preference for speed, cost, review depth, or ceremony.
 
 2. Inspect local state when useful:
@@ -33,8 +35,8 @@ Use this as the read-only front door for WDD.
 
 3. Recommend one lane:
    - No WDD: one small edit with little coordination value.
-   - `micro`: one bounded ticket or request that can split into 2-5 parallel
-     tasks.
+   - `micro`: one bounded ticket or request that can split into 2-5 compact
+     tasks with optional bundled, hybrid, or parallel execution.
    - `lite`: small or medium epic with limited risk.
    - `standard`: normal multi-ticket feature, migration, or refactor.
    - `full`: auth, persistence, public API, data migration, security, risky
@@ -64,6 +66,14 @@ Use this as the read-only front door for WDD.
 | `standard` | Normal epic | Full epic shape with token-conscious defaults |
 | `full` | High-risk work | Strict review, validation, and monitoring |
 
+Execution modes:
+
+| Mode | Use For | Cost Shape |
+|---|---|---|
+| `bundled` | Tightly coupled or small tasks | One worker and review loop |
+| `hybrid` | 2-3 clear task groups | One worker per bundle |
+| `parallel` | Independent tasks with real speedup | One worker per task |
+
 ## Output
 
 Keep the answer concise. Include:
@@ -72,3 +82,4 @@ Keep the answer concise. Include:
 - Why.
 - Next command or prompt.
 - Existing artifact path when resuming.
+- Existing strategy and confirmation state when available.

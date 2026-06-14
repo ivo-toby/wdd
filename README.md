@@ -64,7 +64,7 @@ profiled epic, or resume existing WDD state.
 | Situation | Use | What You Get |
 |---|---|---|
 | One small code change | No WDD | Normal agent work with repo-native verification |
-| One chunky ticket that can split into 2-5 parallel tasks | `micro` | A compact work brief, task briefs, `state.json`, and one finish handoff |
+| One chunky ticket that can split into 2-5 compact tasks | `micro` | A compact work brief, task briefs, `state.json`, and one finish handoff |
 | Small feature or refactor with limited risk | `lite` | Compact epic artifacts, adaptive monitoring, and risk-based review |
 | Multi-ticket feature, migration, or refactor | `standard` | The normal WDD epic flow with trimmed ceremony where safe |
 | Auth, persistence, public API, data migration, security, or risky parallel work | `full` | Maximum review, validation, and monitoring discipline |
@@ -76,7 +76,7 @@ Should I use WDD for this? Recommend the mode and next step.
 ```
 
 ```text
-Use WDD micro for this ticket. Split it into parallel tasks only if worthwhile.
+Use WDD micro for this ticket. Split it into compact tasks only if worthwhile.
 ```
 
 ```text
@@ -98,7 +98,7 @@ it again.
 - A `wdd-info` front door for mode choice, resume guidance, and ceremony/cost
   tradeoffs.
 - Micro-waves under `.wdd/work/` for bounded ticket-sized work that benefits
-  from limited parallelism without full epic ceremony.
+  from compact task splitting without full epic ceremony.
 - Epic definition from vague product, technical, refactor, migration, or bug
   cluster input.
 - Ticket folders that group related work.
@@ -108,7 +108,7 @@ it again.
 - Progressive-disclosure shared context for architecture, conventions, testing,
   validation, and durable worker discoveries.
 - Dependency-aware and conflict-aware wave planning.
-- Wave activation as a batch of concurrently eligible tasks.
+- Wave activation as a strategy-selected batch of eligible tasks.
 - Persistent `orchestration.json` with `schemaVersion: 1` for resumability.
 - Active-wave monitoring through the best available scheduler, with a durable
   manual fallback prompt when no scheduler is supported.
@@ -218,9 +218,21 @@ orchestration state in one coherent pass.
      grids, `wave-plan.md`, `orchestration.json`, and initial
      `controller-state.md`. The selected profile controls artifact detail,
      monitoring cadence, and review strictness.
+   - Recommends a strategy per wave: profile, execution mode, review mode,
+     monitoring mode, confidence, and rationale. When confirmation is required,
+     the user or controller confirms or adjusts before activation.
+
+   Execution modes:
+   - `bundled`: one worker/branch/review loop for the whole wave.
+   - `hybrid`: 2-3 bundles inside the wave.
+   - `parallel`: one worker/branch/review loop per task.
 
 6. `wdd-start-wave`
-   - Activates the next pending wave as a batch of concurrently eligible tasks.
+   - Activates the next pending wave as a strategy-selected batch of eligible
+     tasks.
+   - Blocks if the selected wave strategy requires confirmation and has not
+     been confirmed.
+   - Dispatches according to strategy: bundled, hybrid, or parallel.
    - Records monitoring mode and fallback prompt. `lite` and `standard` use
      adaptive cadence by default; `full` may keep tighter monitoring.
    - In Codex, creates or verifies the active thread heartbeat before the

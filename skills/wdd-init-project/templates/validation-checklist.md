@@ -36,6 +36,10 @@ created_at: YYYY-MM-DD
 ## Wave Readiness
 
 - [ ] Waves schedule tasks, not tickets.
+- [ ] Each wave records a strategy with profile, execution mode, review mode,
+      monitoring mode, confidence, and rationale.
+- [ ] Execution mode is `bundled`, `hybrid`, or `parallel`.
+- [ ] User or controller confirmation is recorded when the strategy requires it.
 - [ ] Active-wave tasks can run concurrently only when dependencies,
       conflict-domain blockers, prerequisites, and blocked status allow it.
 - [ ] Stop conditions require reconciliation before the next wave starts.
@@ -45,6 +49,7 @@ created_at: YYYY-MM-DD
 - [ ] `orchestration.json` exists.
 - [ ] `orchestration.json` includes `schemaVersion: 1`.
 - [ ] `orchestration.json` records profile, review mode, and monitoring mode.
+- [ ] `orchestration.json` records wave strategy and override history.
 - [ ] Every planned task appears in orchestration state.
 - [ ] Branch, worker worktree, PR or patch, gate, branch freshness, feedback,
       and verification fields are represented.

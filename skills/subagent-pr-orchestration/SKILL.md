@@ -8,7 +8,8 @@ description: Coordinate WDD task worker agents from task files, track each activ
 Use this when `wdd-start-wave` has activated a wave, or when a single task file
 is ready for delegated implementation.
 Honor `profile`, `reviewMode`, and `monitoringMode` from `orchestration.json`
-or micro-wave `state.json` when present.
+or micro-wave `state.json` when present. Honor wave or micro-wave
+`executionMode` when a strategy is recorded.
 
 ## User Input
 
@@ -20,11 +21,13 @@ state and orchestration state.
 
 - `orchestration.json` exists with `schemaVersion: 1`, or a single task file is
   provided.
-- Each worker receives exactly one task file.
+- Each worker receives the task file set assigned by strategy: one task for
+  `parallel` or single-task dispatch, all active wave tasks for `bundled`, or one
+  bundle group's tasks for `hybrid`.
 - The controller does not implement task code.
 - The controller creates or verifies the epic branch before any worker starts.
-- The controller creates or verifies one isolated worktree per
-  repository-writing task before dispatch.
+- The controller creates or verifies one isolated worktree per repository-writing
+  task or bundle before dispatch.
 - Workers start in their assigned worktree and must not switch branches in the
   controller checkout.
 - Workers do not merge their own PRs.
@@ -42,6 +45,8 @@ state and orchestration state.
    - `controller-state.md`.
    - Active task files.
    - Profile, review mode, and monitoring mode.
+   - Wave strategy or micro-wave strategy, including `executionMode` and
+     `bundleGroups`.
 
 2. Ensure each active task has independent state:
    - Task ID and path.
@@ -59,29 +64,36 @@ state and orchestration state.
    - Verification result.
    - Shared-context update status.
    - Cleanup state.
+   - For `bundled` or `hybrid`, also track bundle ID, bundle branch, bundle
+     worktree, bundle worker reference, bundle review reference, and bundle
+     current gate.
 
 3. Dispatch implementation workers:
-   - One task file per worker.
+   - For `parallel`, dispatch one task file per worker.
+   - For `bundled`, dispatch one worker with every task file in the wave.
+   - For `hybrid`, dispatch one worker per bundle group with only that bundle's
+     task files.
    - Before dispatch, verify the epic branch exists or create it from the
      target branch. If this cannot be done, record `blocked` and do not start
      workers.
-   - Before creating task branches or worktrees, verify the epic branch contains
-     the current activation artifact state: moved task paths, active gates,
-     planned task branches, and assigned worktree paths. If not, sync those
-     controller-owned artifact changes to the epic branch first, or record
-     `blocked`.
-   - Before dispatch, create or verify the task branch from the current epic
-     branch for each repository-writing task. Task branches must start from the
-     epic branch commit that contains the current activation artifact state.
-   - Before dispatch, create or verify one isolated worktree per
-     repository-writing task, checked out on its task branch.
-   - Verify the assigned task file path and current orchestration state exist in
-     the worker worktree before starting the worker.
+   - Before creating task or bundle branches and worktrees, verify the epic
+     branch contains the current activation artifact state: moved task paths,
+     active gates, planned task or bundle branches, and assigned worktree paths.
+     If not, sync those controller-owned artifact changes to the epic branch
+     first, or record `blocked`.
+   - Before dispatch, create or verify the task branch or bundle branch from the
+     current epic branch. Branches must start from the epic branch commit that
+     contains the current activation artifact state.
+   - Before dispatch, create or verify one isolated worktree per repository
+     task or bundle, checked out on its assigned branch.
+   - Verify the assigned task file path or bundle task paths and current
+     orchestration state exist in the worker worktree before starting the
+     worker.
    - Record the assigned worktree path before starting the worker.
-   - Require the worker to read the task file first.
+   - Require the worker to read assigned task file paths first.
    - Require the worker to inspect named files/domains before broad discovery.
    - Require the worker to read only relevant shared-context resources.
-   - Tell the worker the exact worktree path and task branch to use.
+   - Tell the worker the exact worktree path and assigned branch to use.
    - Tell the worker to start in that worktree and never switch branches in the
      controller checkout.
    - Require RED/GREEN TDD unless the task explains why it is inapplicable.
@@ -92,16 +104,16 @@ state and orchestration state.
 
 4. Worker prompt contract:
    - Start in the assigned worktree path provided by the controller.
-   - Confirm the worktree is on the assigned task branch before editing.
-   - Confirm the assigned task file path and orchestration state exist in that
-     worktree before editing.
+   - Confirm the worktree is on the assigned branch before editing.
+   - Confirm the assigned task file path or bundle task paths and orchestration
+     state exist in that worktree before editing.
    - Do not switch, create, or reset branches in the controller checkout.
-   - Move or verify the task file status transition from `todo/` to
+   - Move or verify assigned task file status transitions from `todo/` to
      `in-progress/` when starting, inside the assigned worktree.
    - Stay within task scope.
    - Do not start dependent tasks.
    - Do not merge your own PR.
-   - Move the task file to `review/` after PR or patch creation.
+   - Move assigned task files to `review/` after PR or patch creation.
    - Return PR URL or patch reference.
 
 5. Review gate:
@@ -131,16 +143,16 @@ state and orchestration state.
    - Feedback-fix work must not broaden task scope.
 
 7. Branch freshness gate:
-   - Before merge or merge-ready, check whether the task branch is stale
+   - Before merge or merge-ready, check whether the task or bundle branch is stale
      relative to the current epic branch.
    - If stale, require rebase onto the latest epic branch or merge the latest
-     epic branch into the task branch.
+     epic branch into the task or bundle branch.
    - Rerun relevant verification after branch freshness updates.
    - Rerun review if touched areas changed materially.
-   - Do not merge stale task branches blindly.
+   - Do not merge stale task or bundle branches blindly.
 
 8. Shared-context write discipline:
-   - Workers may propose shared-context updates in task branches.
+   - Workers may propose shared-context updates in task or bundle branches.
    - The controller owns reconciliation into the epic branch.
    - If two workers update the same shared-context resource, resolve conflicts
      during review or wave reconciliation.
@@ -157,6 +169,10 @@ state and orchestration state.
    - Shared-context updates are reconciled or queued for reconciliation.
    - Controller merges into the epic branch, or marks `merge_ready` when
      repository policy requires human merge.
+   - For `bundled`, the bundle gate clears only when every task in the bundle
+     has verification evidence and no unresolved blocking feedback.
+   - For `hybrid`, each bundle clears independently; wave reconciliation waits
+     for all bundles.
 
 10. Heartbeat loop:
     - Treat each heartbeat as one bounded, idempotent controller tick.
@@ -176,8 +192,8 @@ state and orchestration state.
     - Do not record or preserve `codex_thread_heartbeat` unless the active
       scheduler reference is verified in the current tick.
     - not_started: create or verify the epic branch, sync activation artifacts,
-      create or verify the task branch and assigned isolated worktree from that
-      synced state, then dispatch if eligible.
+      create or verify task or bundle branches and assigned isolated worktrees
+      from that synced state, then dispatch if eligible.
     - no_pr: inspect worker state and nudge exact missing deliverable.
     - needs_review: start or request review.
     - reviewing: poll review state and comments.
@@ -199,6 +215,7 @@ state and orchestration state.
     - Task branch created or verified.
     - Worker worktree created or verified.
     - Worker started.
+    - Bundle branch, worktree, or worker started.
     - Task moved.
     - PR or patch created.
     - Review started.
@@ -221,6 +238,8 @@ state and orchestration state.
 ## Done When
 
 - Every active task has current independent state.
+- Every active bundle has current independent state when execution mode is
+  `bundled` or `hybrid`.
 - P1/P2 feedback is routed.
 - Branch freshness is enforced before merge.
 - Merge happens only after verification, review, and freshness gates pass.

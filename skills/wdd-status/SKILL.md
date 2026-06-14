@@ -32,7 +32,8 @@ epic, report that epic. If the user asks for all state, scan `.wdd/work/*/` and
    - Count `tasks/*.md`.
    - Read `state.json` if present.
    - Report profile, status, task gates, monitoring, review blockers,
-     verification blockers, and finish readiness.
+     verification blockers, strategy, execution mode, confirmation state, and
+     finish readiness.
 
 3. Scan epics:
    - Read each `epic.md`.
@@ -46,6 +47,7 @@ epic, report that epic. If the user asks for all state, scan `.wdd/work/*/` and
 4. For each relevant epic, report:
    - Epic ID, title, and status.
    - Profile, review mode, and monitoring mode.
+   - Wave strategy, execution mode, confidence, and confirmation state.
    - Target branch and epic branch.
    - Ticket count.
    - Task count by status.
