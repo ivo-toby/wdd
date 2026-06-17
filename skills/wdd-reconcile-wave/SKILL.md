@@ -45,6 +45,7 @@ wave from `controller-state.md` and `orchestration.json`.
    - No unresolved P1/P2 feedback.
    - Branch freshness checked before merge or merge-ready.
    - Branch and PR cleanup state known.
+   - Worktree cleanup state known.
 
 3. Compare planned and actual work:
    - Files actually changed.
@@ -67,41 +68,63 @@ wave from `controller-state.md` and `orchestration.json`.
    - Record PR or patch references.
    - Record verification evidence and review outcome.
 
-6. Update `wave-plan.md`:
+6. Clean up completed worktrees:
+   - Remove each completed task or bundle worktree once its branch or PR has
+     been merged, explicitly closed, cancelled, or safely blocked and all
+     verification, review, and shared-context evidence has been captured.
+   - Before removal, run `git status --short` in the assigned worktree or
+     otherwise verify it has no uncommitted changes. Do not remove dirty
+     worktrees; record `cleanup_blocked` with the exact path and reason.
+   - Use `git worktree remove <assigned-worktree-path>` from the controller
+     checkout for safe worktrees, then run `git worktree prune` if stale
+     administrative entries remain.
+   - Keep branch, PR, patch, commit, and verification references in the WDD
+     artifacts after removing the local worktree.
+   - Set each cleaned task or bundle `worktreeStatus` to `cleaned_up` and
+     record cleanup evidence in `controller-state.md`.
+   - If cleanup is intentionally deferred, record `cleanup_deferred`, the owner,
+     and the concrete follow-up condition before closing reconciliation.
+
+7. Update `wave-plan.md`:
    - Mark wave `done`, `blocked`, or partially closed as appropriate.
    - Add completion date.
    - Add drift notes.
    - Update known conflict risks for future waves.
 
-7. Update future tasks:
+8. Update future tasks:
    - Adjust context, dependencies, conflict domains, verification, branch
      expectations, or scope based on actual merged architecture.
    - Do not start the next wave until these updates are made.
 
-8. Update `orchestration.json`:
+9. Update `orchestration.json`:
    - Task statuses and paths.
    - Wave status.
    - Branch freshness.
    - Verification result.
    - Feedback state.
    - Shared-context reconciliation state.
+   - Worktree cleanup state, including `cleaned_up`, `cleanup_blocked`, or
+     `cleanup_deferred`.
    - Monitoring status set to `inactive`, `stopped`, or `blocked` with the
      reason recorded.
    - Next-wave readiness.
 
-9. Update `controller-state.md`:
-   - Mark wave outcome.
-   - Record that monitoring is stopped, inactive, or blocked before closing the
-     wave.
-   - Add cleanup result.
-   - Record drift and future-task updates.
-   - Add next-wave or epic-validation recommendation.
+10. Update `controller-state.md`:
+    - Mark wave outcome.
+    - Record that monitoring is stopped, inactive, or blocked before closing the
+      wave.
+    - Add cleanup result.
+    - Record drift and future-task updates.
+    - Add next-wave or epic-validation recommendation.
 
 ## Done When
 
 - Wave outcome is recorded.
 - Completed tasks are in `done/`.
 - Shared-context updates are reconciled or explicitly queued.
+- Completed, closed, cancelled, or safely blocked worktrees have been removed
+  with `worktreeStatus` recorded as `cleaned_up`, or cleanup is explicitly
+  blocked/deferred with owner and reason.
 - Active-wave monitoring is stopped, inactive, or explicitly blocked with a
   durable next action.
 - Future tasks reflect drift and new conflict risks.

@@ -62,6 +62,8 @@ Coordinate active micro-wave tasks without full epic ceremony.
    - Review required, started, passed, or blocked.
    - Verification passed, failed, unavailable, or documented as non-blocking.
    - Task merged, merge-ready, blocked, cancelled, or ready to finish.
+   - worktree cleanup state after a task or bundle is no longer actively being
+     edited.
    - Bundle gate changed when using `bundled` or `hybrid`.
 
 ## Done When

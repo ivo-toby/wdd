@@ -30,6 +30,9 @@
         "id": "BUNDLE-001",
         "tasks": ["TASK-001-example-task"],
         "branch": "work/WORK-example-ticket-bundle",
+        "workerWorktree": null,
+        "worktreeStatus": "unassigned",
+        "cleanup": null,
         "workerThreadId": null,
         "reviewThreadId": null,
         "currentGate": "not_started"
@@ -45,6 +48,8 @@
       "branch": "work/TASK-001-example-task",
       "workerThreadId": null,
       "workerWorktree": null,
+      "worktreeStatus": "unassigned",
+      "cleanup": null,
       "currentGate": "not_started",
       "risk": "low",
       "reviewRequired": false,
