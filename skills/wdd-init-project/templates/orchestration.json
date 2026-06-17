@@ -71,6 +71,7 @@
           "branch": "task/TASK-001-example-task",
           "workerWorktree": null,
           "worktreeStatus": "unassigned",
+          "cleanup": null,
           "pr": null,
           "latestCommit": null,
           "branchFreshness": "unknown",
@@ -92,6 +93,6 @@
     "lastCheckedAt": null,
     "nextCheckDueAt": null,
     "schedulerRef": null,
-    "fallbackPrompt": "Run subagent-pr-orchestration for EPIC-example-feature WAVE-001. Read orchestration.json and controller-state.md, verify the epic branch contains current activation artifact state before assigned worker worktrees branch from it, inspect every active worker and reviewer reference, update task gates, and stop when all active tasks are merged, blocked, cancelled, or ready for wdd-reconcile-wave."
+    "fallbackPrompt": "Run subagent-pr-orchestration for EPIC-example-feature WAVE-001. Read orchestration.json and controller-state.md, verify the epic branch contains current activation artifact state before assigned worker worktrees branch from it, inspect every active worker and reviewer reference, update gates, and stop when all active tasks are merged, blocked, cancelled, or ready for wdd-reconcile-wave."
   }
 }

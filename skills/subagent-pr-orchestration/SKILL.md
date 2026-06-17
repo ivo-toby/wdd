@@ -65,8 +65,8 @@ state and orchestration state.
    - Shared-context update status.
    - Cleanup state.
    - For `bundled` or `hybrid`, also track bundle ID, bundle branch, bundle
-     worktree, bundle worker reference, bundle review reference, and bundle
-     current gate.
+     worktree, bundle worker reference, bundle review reference, bundle current
+     gate, and bundle cleanup state.
 
 3. Dispatch implementation workers:
    - For `parallel`, dispatch one task file per worker.
@@ -174,7 +174,23 @@ state and orchestration state.
    - For `hybrid`, each bundle clears independently; wave reconciliation waits
      for all bundles.
 
-10. Heartbeat loop:
+10. Worktree cleanup gate:
+    - After a task or bundle is merged, explicitly closed, cancelled, or blocked
+      with no pending local evidence needed, inspect its assigned worktree before
+      wave reconciliation.
+    - Do not remove a worktree that has uncommitted changes, unpushed commits,
+      unresolved review/fix work, or evidence that still needs to be copied into
+      controller artifacts. Record `cleanup_blocked` with the reason instead.
+    - For safe completed worktrees, remove the Git worktree from the controller
+      checkout with `git worktree remove <assigned-worktree-path>`, then run
+      `git worktree prune` when stale administrative entries remain.
+    - Mark task or bundle cleanup state as `cleaned_up`, keep the branch and PR
+      references in artifacts, and set `worktreeStatus` to `cleaned_up`.
+    - If repository policy requires preserving worktrees for a short audit
+      window, record `cleanup_deferred`, the owner, and the exact follow-up
+      condition.
+
+11. Heartbeat loop:
     - Treat each heartbeat as one bounded, idempotent controller tick.
     - Start every tick by reading current `orchestration.json`,
       `controller-state.md`, task files, and relevant PR or patch state.
@@ -199,8 +215,10 @@ state and orchestration state.
     - reviewing: poll review state and comments.
     - needs_fixes: route current P1/P2 feedback.
     - merge_ready: verify evidence, branch freshness, and merge policy.
-    - merged: update task file, orchestration state, and controller state.
-    - blocked: record blocker, owner, and next required input.
+    - merged: update task file, orchestration state, controller state, and
+      perform the worktree cleanup gate when safe.
+    - blocked: record blocker, owner, next required input, and whether cleanup
+      is blocked or safe.
     - At the end of each tick, update monitoring last check, next check, status,
       scheduler reference, and fallback prompt.
     - If all active-wave tasks are merged, `merge_ready`, closed, blocked,
@@ -210,7 +228,7 @@ state and orchestration state.
       record the exact prompt and due time needed for a human or fresh agent to
       run the next tick.
 
-11. Update state after every meaningful event:
+12. Update state after every meaningful event:
     - Epic branch created or verified.
     - Task branch created or verified.
     - Worker worktree created or verified.
@@ -225,11 +243,12 @@ state and orchestration state.
     - Branch freshness checked.
     - Verification passed or failed.
     - Merge or merge-ready decision completed.
+    - Worktree cleanup completed, blocked, or deferred.
     - Shared-context reconciliation completed or queued.
     - Blocker encountered.
     - Monitoring tick completed, rescheduled, stopped, or downgraded to manual.
 
-12. Completion handoff:
+13. Completion handoff:
     - When all active-wave tasks are merged, `merge_ready`, closed, blocked,
       cancelled, or otherwise ready for wave reconciliation, invoke
       `wdd-reconcile-wave`.
@@ -243,4 +262,6 @@ state and orchestration state.
 - P1/P2 feedback is routed.
 - Branch freshness is enforced before merge.
 - Merge happens only after verification, review, and freshness gates pass.
+- Completed, closed, cancelled, or safely blocked worktrees are removed, or a
+  concrete cleanup blocker/deferment is recorded.
 - Completed wave is ready for `wdd-reconcile-wave`.

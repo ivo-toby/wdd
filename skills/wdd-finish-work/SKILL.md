@@ -30,6 +30,7 @@ Close a micro-wave work packet.
    - No unresolved P1/P2 feedback unless accepted by the user.
    - Branch freshness checked before merge or merge-ready.
    - Verification evidence is present or non-blocking failures are documented.
+   - Worktree cleanup state is known.
 
 3. Update artifacts:
    - Mark completed tasks `done`.
@@ -38,7 +39,23 @@ Close a micro-wave work packet.
    - Set monitoring inactive, stopped, blocked, or manual with a durable reason.
    - Add concise finish notes with PR or patch references and test evidence.
 
-4. Handoff:
+4. Clean up worktrees:
+   - Remove completed micro-wave task or bundle worktrees after their PR, patch,
+     or branch result is merged, accepted, closed, cancelled, or safely blocked.
+   - Before removal, inspect each assigned worktree for uncommitted changes and
+     unrecorded evidence.
+   - Do not remove a worktree that has uncommitted changes, unpushed commits,
+     unresolved feedback, or evidence still needed in `brief.md`, `state.json`,
+     or task files. Record `cleanup_blocked` with the exact path and reason.
+   - For safe completed worktrees, run
+     `git worktree remove <assigned-worktree-path>` from the controller
+     checkout, then `git worktree prune` if stale entries remain.
+   - Keep branch, PR, patch, commit, review, and verification references in
+     `state.json` after the local worktree is removed.
+   - Mark cleaned tasks or bundles with `worktreeStatus: cleaned_up`, or record
+     `cleanup_deferred` with an owner and follow-up condition.
+
+5. Handoff:
    - If work merged into the target branch or accepted branch, summarize result.
    - If repository policy requires a human merge, mark `merge_ready`.
    - If the micro-wave became broader than expected, recommend upgrading the
@@ -48,5 +65,7 @@ Close a micro-wave work packet.
 
 - `brief.md`, `state.json`, and task files reflect final state.
 - Verification and review evidence are summarized.
+- Completed, closed, cancelled, or safely blocked worktrees are removed, or a
+  concrete cleanup blocker/deferment is recorded.
 - Monitoring is no longer active unless explicitly blocked with a next action.
 - The final response names the result and any follow-up.

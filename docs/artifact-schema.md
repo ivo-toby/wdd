@@ -233,9 +233,12 @@ Minimum structure:
         "id": "BUNDLE-001",
         "tasks": ["TASK-001-api-contract"],
         "branch": "work/WORK-filter-builder-bundle",
+        "workerWorktree": null,
+        "worktreeStatus": "unassigned",
         "workerThreadId": null,
         "reviewThreadId": null,
-        "currentGate": "not_started"
+        "currentGate": "not_started",
+        "cleanup": null
       }
     ],
     "overrideHistory": []
@@ -247,10 +250,12 @@ Minimum structure:
       "status": "todo",
       "branch": "work/TASK-001-api-contract",
       "workerWorktree": null,
+      "worktreeStatus": "unassigned",
       "currentGate": "not_started",
       "risk": "low",
       "reviewRequired": false,
-      "verification": null
+      "verification": null,
+      "cleanup": null
     }
   ],
   "monitoring": {
@@ -267,9 +272,9 @@ Minimum structure:
 
 Micro-waves keep the WDD safety core: bounded scope, branch/worktree isolation
 for repository-writing workers, verification evidence, no worker self-merge,
-and a final controller handoff. They intentionally omit ticket containers,
-separate wave plans, epic validation, and final PR artifacts unless the user
-asks to upgrade the work packet into an epic.
+worktree cleanup, and a final controller handoff. They intentionally omit
+ticket containers, separate wave plans, epic validation, and final PR artifacts
+unless the user asks to upgrade the work packet into an epic.
 
 ## GitHub Project Adapter Manifest
 
@@ -392,6 +397,7 @@ review_model_class: review
 branch: task/TASK-001-token-types
 worker_worktree: null
 worktree_status: unassigned
+cleanup: null
 pr: null
 current_gate: not_started
 branch_freshness: unknown
@@ -639,6 +645,7 @@ Minimum structure:
           "branch": "task/TASK-001-token-types",
           "workerWorktree": null,
           "worktreeStatus": "unassigned",
+          "cleanup": null,
           "pr": null,
           "latestCommit": null,
           "branchFreshness": "unknown",
@@ -665,7 +672,14 @@ The controller updates this file after task or bundle assignment, task movement,
 epic branch creation or verification, task or bundle branch creation or
 verification, worker worktree creation or verification, PR or patch creation,
 review start, P1/P2 feedback, feedback routing, verification, stale-branch
-checks, merge, blocker, wave completion, and reconciliation.
+checks, merge, worktree cleanup, blocker, wave completion, and reconciliation.
+
+Worktree cleanup is part of wave and micro-wave closure. After completed,
+closed, cancelled, or safely blocked task or bundle worktrees are no longer
+needed for evidence, controllers remove them with `git worktree remove`, keep
+branch/PR/commit references in artifacts, and record either
+`"worktreeStatus": "cleaned_up"`, `cleanup_blocked`, or `cleanup_deferred`.
+Dirty worktrees or worktrees with unrecorded evidence must not be removed.
 
 Before any worker starts, the controller must create or verify the epic branch.
 Before dispatching repository-writing workers, it must sync activation artifact
