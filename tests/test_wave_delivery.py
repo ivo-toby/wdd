@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,12 +19,37 @@ from wave_delivery.engine import (
     status_summary,
 )
 from wave_delivery.errors import IllegalTransition, RevisionConflict, ValidationError
+from wave_delivery.freshness import check_freshness
+from wave_delivery.leases import ensure_lease, release_lease
 from wave_delivery.migration import apply_migration, build_migration_plan, rollback_migration
 from wave_delivery.schema import new_state, task_state
 from wave_delivery.store import StateStore
 
 
 class WaveDeliveryStateTests(unittest.TestCase):
+    def git(self, repo: Path, *arguments: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(repo), *arguments],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def git_output(self, repo: Path, *arguments: str) -> str:
+        return subprocess.check_output(["git", "-C", str(repo), *arguments], text=True).strip()
+
+    def git_repository(self, root: Path) -> Path:
+        repo = root / "repo"
+        repo.mkdir()
+        self.git(repo, "init", "-b", "main")
+        self.git(repo, "config", "user.email", "wdctl@example.test")
+        self.git(repo, "config", "user.name", "wdctl test")
+        (repo / "README.md").write_text("initial\n", encoding="utf-8")
+        self.git(repo, "add", "README.md")
+        self.git(repo, "commit", "-m", "initial")
+        return repo
+
     def make_store(self) -> tuple[tempfile.TemporaryDirectory[str], StateStore]:
         directory = tempfile.TemporaryDirectory()
         store = StateStore(Path(directory.name) / "orchestration.json")
@@ -312,6 +338,107 @@ class WaveDeliveryStateTests(unittest.TestCase):
         loaded["decisions"]["profileDefault"] = "full"
         loaded["decisionFingerprint"] = "sha256:changed"
         self.assertTrue(ratification_status(state, loaded)["stale"])
+
+    def test_lease_ensure_and_release_manage_an_isolated_worktree(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        repo = self.git_repository(root)
+        store = StateStore(root / "state.json")
+        state = new_state("EPIC-lease")
+        state["constitution"] = {
+            "status": "ratified",
+            "ratification": {"by": "Ivo", "decisionFingerprint": "sha256:test"},
+        }
+        state["tasks"]["TASK-001"] = task_state("TASK-001")
+        store.write(state)
+        worktree = root / "worker"
+
+        ensured, duplicate = ensure_lease(
+            store,
+            repo=repo,
+            task_id="TASK-001",
+            branch="task/TASK-001",
+            worktree=worktree,
+            base_ref="main",
+            idempotency_key="lease-ensure",
+            expected_revision=0,
+        )
+        self.assertFalse(duplicate)
+        self.assertTrue(worktree.is_dir())
+        self.assertEqual(ensured["revision"], 1)
+        self.assertEqual(store.read()["leases"]["TASK-001"]["status"], "active")
+        retried, duplicate = ensure_lease(
+            store,
+            repo=repo,
+            task_id="TASK-001",
+            branch="task/TASK-001",
+            worktree=worktree,
+            base_ref="main",
+            idempotency_key="lease-ensure",
+            expected_revision=0,
+        )
+        self.assertTrue(duplicate)
+        self.assertEqual(retried["revision"], 1)
+
+        released, duplicate = release_lease(
+            store,
+            repo=repo,
+            task_id="TASK-001",
+            idempotency_key="lease-release",
+            expected_revision=1,
+        )
+        self.assertFalse(duplicate)
+        self.assertEqual(released["cleanup"], "cleaned_up")
+        self.assertFalse(worktree.exists())
+        self.assertEqual(store.read()["leases"]["TASK-001"]["status"], "released")
+
+    def test_freshness_is_risk_based_and_enforced_before_merge(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        repo = self.git_repository(root)
+        self.git(repo, "checkout", "-b", "task/TASK-001")
+        (repo / "docs.md").write_text("task change\n", encoding="utf-8")
+        self.git(repo, "add", "docs.md")
+        self.git(repo, "commit", "-m", "task change")
+        self.git(repo, "checkout", "main")
+        (repo / "src.py").write_text("base change\n", encoding="utf-8")
+        self.git(repo, "add", "src.py")
+        self.git(repo, "commit", "-m", "base change")
+
+        nonmaterial = check_freshness(
+            repo, base_ref="main", head_ref="task/TASK-001", conflict_domains=[]
+        )
+        self.assertEqual(nonmaterial["classification"], "nonmaterially_stale")
+        material = check_freshness(
+            repo,
+            base_ref="main",
+            head_ref="task/TASK-001",
+            conflict_domains=["src/**"],
+        )
+        self.assertEqual(material["classification"], "materially_stale")
+
+        store = StateStore(root / "state.json")
+        state = new_state("EPIC-freshness")
+        state["constitution"] = {
+            "status": "ratified",
+            "ratification": {"by": "Ivo", "decisionFingerprint": "sha256:test"},
+        }
+        task = task_state("TASK-001")
+        task["status"] = "merge_ready"
+        task["headSha"] = nonmaterial["headSha"]
+        state["tasks"]["TASK-001"] = task
+        store.write(state)
+        recorded = self.apply(
+            store,
+            "freshness.recorded",
+            0,
+            data=nonmaterial,
+        )
+        self.assertEqual(recorded["tasks"]["TASK-001"]["freshness"]["classification"], "nonmaterially_stale")
+        merged = self.apply(store, "task.merged", 1, data={})
+        self.assertEqual(merged["tasks"]["TASK-001"]["status"], "done")
 
 
 if __name__ == "__main__":

@@ -20,6 +20,9 @@ python3 -m wave_delivery status --state PATH --brief
 python3 -m wave_delivery render --state PATH --output controller-state.md
 python3 -m wave_delivery migrate --state .wdd/epics/EPIC/orchestration.json --to 2 --dry-run
 python3 -m wave_delivery constitution probe --root . --output constitution-proposal.json
+python3 -m wave_delivery lease ensure --state PATH --repo REPO --task TASK-ID \
+  --idempotency-key KEY --expected-revision N
+python3 -m wave_delivery freshness check --repo REPO --base epic/example --head task/TASK-ID
 ```
 
 The in-repository equivalent is `python3 scripts/wdctl.py ...`.
@@ -38,10 +41,14 @@ The in-repository equivalent is `python3 scripts/wdctl.py ...`.
   backup directory before applying stable task paths, and can be rolled back.
 - Constitution probing gathers evidence but never ratifies; proposal fingerprints
   make ratification drift visible through `constitution status`.
+- Lease acquisition creates or reuses one isolated Git worktree per task and
+  records it atomically. Release refuses to remove a dirty worktree.
+- Freshness uses `git merge-tree`, changed-file overlap, and conflict domains to
+  distinguish current, nonmaterially stale, materially stale, and conflicted branches.
 
 ## Deferred work
 
 - Markdown constitution rendering and mandatory stale-proposal enforcement for
   every execution adapter.
-- Git leases, worktree management, monitoring adapters, and review execution.
+- Monitoring adapters and review execution/collection.
 - Installer-generated `wdctl` POSIX and Windows launchers.

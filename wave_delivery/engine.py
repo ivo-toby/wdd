@@ -62,7 +62,14 @@ def task_gate(task: dict[str, Any]) -> str:
     if status == "review":
         return "reviewing"
     if status == "merge_ready":
-        return "merge_ready"
+        freshness = task.get("freshness")
+        if (
+            isinstance(freshness, dict)
+            and freshness.get("headSha") == task.get("headSha")
+            and freshness.get("classification") in {"current", "nonmaterially_stale"}
+        ):
+            return "merge_ready"
+        return "needs_freshness"
     if status in TERMINAL_STATUSES:
         return status
     if has_blocking_findings(task):
@@ -134,6 +141,7 @@ def transition(
         task["headSha"] = _require_head(data, event_type)
         task["review"] = None
         task["verification"] = None
+        task["freshness"] = None
         task["status"] = "review"
     elif event_type == "review.recorded":
         _require_status(task, {"review"}, event_type)
@@ -178,9 +186,32 @@ def transition(
         task["headSha"] = _require_head(data, event_type)
         task["review"] = None
         task["verification"] = None
+        task["freshness"] = None
         task["status"] = "in_progress"
+    elif event_type == "freshness.recorded":
+        _require_status(task, {"merge_ready"}, event_type)
+        head_sha = _require_head(data, event_type)
+        if head_sha != task.get("headSha"):
+            raise IllegalTransition("freshness evidence must match the task head SHA")
+        classification = data.get("classification")
+        if classification not in {
+            "current",
+            "nonmaterially_stale",
+            "materially_stale",
+            "conflicted",
+        }:
+            raise ValidationError("freshness.recorded has an invalid classification")
+        task["freshness"] = {
+            "classification": classification,
+            "baseSha": data.get("baseSha"),
+            "headSha": head_sha,
+            "baseRef": data.get("baseRef"),
+            "headRef": data.get("headRef"),
+        }
     elif event_type == "task.merged":
         _require_status(task, {"merge_ready"}, event_type)
+        if task_gate(task) != "merge_ready":
+            raise IllegalTransition("task.merged requires current or nonmaterially stale freshness evidence")
         task["status"] = "done"
     elif event_type == "task.blocked":
         _require_status(task, TASK_STATUSES - TERMINAL_STATUSES, event_type)
@@ -301,6 +332,7 @@ def next_actions(state: dict[str, Any], *, max_actions: int = 8) -> dict[str, An
                 "needs_fixes": "assign_fix_writer",
                 "needs_review": "run_review",
                 "needs_verification": "run_verification",
+                "needs_freshness": "check_branch_freshness",
                 "ready_to_merge": "mark_merge_ready",
                 "merge_ready": "merge_or_request_human_merge",
             }.get(gate)

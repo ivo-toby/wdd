@@ -40,6 +40,7 @@ def task_state(
         "pr": None,
         "review": None,
         "verification": None,
+        "freshness": None,
         "blocker": None,
     }
 
@@ -138,9 +139,15 @@ def validate_state(state: dict[str, Any]) -> None:
             value = task.get(field)
             if value is not None and not isinstance(value, dict):
                 raise ValidationError(f"tasks.{task_id}.{field} must be an object or null")
+        freshness = task.get("freshness")
+        if freshness is not None and not isinstance(freshness, dict):
+            raise ValidationError(f"tasks.{task_id}.freshness must be an object or null")
 
     for field in ("waves", "monitoring", "telemetry"):
         _require_mapping(state.get(field), field)
+    leases = state.get("leases")
+    if leases is not None and not isinstance(leases, dict):
+        raise ValidationError("leases must be an object when present")
     events = state.get("events")
     if not isinstance(events, list):
         raise ValidationError("events must be a list")

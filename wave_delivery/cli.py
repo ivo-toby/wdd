@@ -11,6 +11,8 @@ from typing import Any
 from .constitution import probe_repository, ratification_status, read_proposal, write_proposal
 from .engine import apply_event, bounded_next_actions, render_to_path, status_summary
 from .errors import WaveDeliveryError
+from .freshness import check_freshness
+from .leases import ensure_lease, release_lease
 from .migration import apply_migration, build_migration_plan, rollback_migration
 from .schema import new_state, task_state
 from .store import StateStore
@@ -48,6 +50,40 @@ def build_parser() -> argparse.ArgumentParser:
     render = subparsers.add_parser("render", help="render a controller-state Markdown projection")
     render.add_argument("--state", required=True, type=Path)
     render.add_argument("--output", required=True, type=Path)
+
+    lease = subparsers.add_parser("lease", help="acquire or release a task branch/worktree lease")
+    lease_subparsers = lease.add_subparsers(dest="lease_command", required=True)
+    ensure = lease_subparsers.add_parser("ensure", help="create or reuse an isolated worker worktree")
+    ensure.add_argument("--state", required=True, type=Path)
+    ensure.add_argument("--repo", required=True, type=Path)
+    ensure.add_argument("--task", required=True)
+    ensure.add_argument("--branch")
+    ensure.add_argument("--worktree", type=Path)
+    ensure.add_argument("--base-ref")
+    ensure.add_argument("--idempotency-key", required=True)
+    ensure.add_argument("--expected-revision", required=True, type=int)
+    ensure.add_argument("--dry-run", action="store_true")
+    release = lease_subparsers.add_parser("release", help="safely remove or retain a worker worktree")
+    release.add_argument("--state", required=True, type=Path)
+    release.add_argument("--repo", required=True, type=Path)
+    release.add_argument("--task", required=True)
+    release.add_argument("--idempotency-key", required=True)
+    release.add_argument("--expected-revision", required=True, type=int)
+    release.add_argument("--keep-worktree", action="store_true")
+
+    freshness = subparsers.add_parser("freshness", help="classify a task branch against its base")
+    freshness_subparsers = freshness.add_subparsers(dest="freshness_command", required=True)
+    for command_name, help_text in (("check", "inspect freshness without mutating state"), ("record", "inspect and record freshness evidence")):
+        command = freshness_subparsers.add_parser(command_name, help=help_text)
+        command.add_argument("--repo", required=True, type=Path)
+        command.add_argument("--base", required=True)
+        command.add_argument("--head", required=True)
+        command.add_argument("--conflict-domain", action="append", default=[])
+        if command_name == "record":
+            command.add_argument("--state", required=True, type=Path)
+            command.add_argument("--task", required=True)
+            command.add_argument("--idempotency-key", required=True)
+            command.add_argument("--expected-revision", required=True, type=int)
 
     migration = subparsers.add_parser("migrate", help="plan or apply a v1-to-v2 migration")
     migration.add_argument("--state", type=Path)
@@ -138,6 +174,54 @@ def main(argv: list[str] | None = None) -> int:
             state = StateStore(args.state).read()
             render_to_path(state, args.output)
             _print_json({"rendered": str(args.output), "revision": state["revision"]})
+            return 0
+
+        if args.command == "lease" and args.lease_command == "ensure":
+            result, duplicate = ensure_lease(
+                StateStore(args.state),
+                repo=args.repo,
+                task_id=args.task,
+                branch=args.branch,
+                worktree=args.worktree,
+                base_ref=args.base_ref,
+                idempotency_key=args.idempotency_key,
+                expected_revision=args.expected_revision,
+                dry_run=args.dry_run,
+            )
+            _print_json({**result, "duplicate": duplicate})
+            return 0
+
+        if args.command == "lease" and args.lease_command == "release":
+            result, duplicate = release_lease(
+                StateStore(args.state),
+                repo=args.repo,
+                task_id=args.task,
+                idempotency_key=args.idempotency_key,
+                expected_revision=args.expected_revision,
+                keep_worktree=args.keep_worktree,
+            )
+            _print_json({**result, "duplicate": duplicate})
+            return 0
+
+        if args.command == "freshness":
+            result = check_freshness(
+                args.repo,
+                base_ref=args.base,
+                head_ref=args.head,
+                conflict_domains=args.conflict_domain,
+            )
+            if args.freshness_command == "check":
+                _print_json(result)
+                return 0
+            state, duplicate = apply_event(
+                StateStore(args.state),
+                event_type="freshness.recorded",
+                task_id=args.task,
+                data=result,
+                idempotency_key=args.idempotency_key,
+                expected_revision=args.expected_revision,
+            )
+            _print_json({"freshness": result, "revision": state["revision"], "duplicate": duplicate})
             return 0
 
         if args.command == "migrate":
