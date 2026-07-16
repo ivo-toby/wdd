@@ -21,7 +21,7 @@ from wave_delivery.engine import (
     status_summary,
 )
 from wave_delivery.errors import IllegalTransition, RevisionConflict, ValidationError
-from wave_delivery.freshness import check_freshness
+from wave_delivery.freshness import check_freshness, record_merge
 from wave_delivery.leases import ensure_lease, release_lease
 from wave_delivery.migration import apply_migration, build_migration_plan, rollback_migration
 from wave_delivery.monitor import monitor_once
@@ -265,7 +265,9 @@ class WaveDeliveryStateTests(unittest.TestCase):
         state_path.write_text(json.dumps(legacy, indent=2) + "\n", encoding="utf-8")
 
         plan = build_migration_plan(state_path)
-        self.assertEqual(plan["scope"], {"id": "EPIC-migrate", "kind": "epic"})
+        self.assertEqual(
+            plan["scope"], {"id": "EPIC-migrate", "kind": "epic", "baseRef": None}
+        )
         self.assertEqual(plan["moves"][0]["target"], "TICKET-001/tasks/TASK-001.md")
         self.assertEqual(plan["targetState"]["constitution"]["status"], "draft")
 
@@ -414,6 +416,7 @@ class WaveDeliveryStateTests(unittest.TestCase):
         self.assertTrue(worktree.is_dir())
         self.assertEqual(ensured["revision"], 1)
         self.assertEqual(store.read()["leases"]["TASK-001"]["status"], "active")
+        self.assertEqual(store.read()["scope"]["baseRef"], "main")
         retried, duplicate = ensure_lease(
             store,
             repo=repo,
@@ -519,6 +522,7 @@ class WaveDeliveryStateTests(unittest.TestCase):
 
         store = StateStore(root / "state.json")
         state = new_state("EPIC-freshness")
+        state["scope"]["baseRef"] = "main"
         state["constitution"] = {
             "status": "ratified",
             "ratification": {"by": "Ivo", "decisionFingerprint": "sha256:test"},
@@ -528,6 +532,14 @@ class WaveDeliveryStateTests(unittest.TestCase):
         task["headSha"] = nonmaterial["headSha"]
         state["tasks"]["TASK-001"] = task
         store.write(state)
+        wrong_base = check_freshness(
+            repo,
+            base_ref="task/TASK-001",
+            head_ref="task/TASK-001",
+            conflict_domains=[],
+        )
+        with self.assertRaisesRegex(IllegalTransition, "does not match scope base main"):
+            self.apply(store, "freshness.recorded", 0, data=wrong_base)
         recorded = self.apply(
             store,
             "freshness.recorded",
@@ -535,8 +547,25 @@ class WaveDeliveryStateTests(unittest.TestCase):
             data=nonmaterial,
         )
         self.assertEqual(recorded["tasks"]["TASK-001"]["freshness"]["classification"], "nonmaterially_stale")
-        merged = self.apply(store, "task.merged", 1, data={})
+        with self.assertRaisesRegex(IllegalTransition, "is not merged into main"):
+            record_merge(
+                store,
+                repo=repo,
+                task_id="TASK-001",
+                idempotency_key="merge-too-early",
+                expected_revision=1,
+            )
+        self.git(repo, "merge", "--no-ff", "--no-edit", "task/TASK-001")
+        merged, duplicate = record_merge(
+            store,
+            repo=repo,
+            task_id="TASK-001",
+            idempotency_key="merge-recorded",
+            expected_revision=1,
+        )
+        self.assertFalse(duplicate)
         self.assertEqual(merged["tasks"]["TASK-001"]["status"], "done")
+        self.assertEqual(merged["tasks"]["TASK-001"]["merge"]["baseRef"], "main")
 
     def test_monitor_writes_only_when_git_observations_change(self):
         directory = tempfile.TemporaryDirectory()

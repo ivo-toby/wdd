@@ -11,8 +11,8 @@ from typing import Any
 from .constitution import probe_repository, ratification_status, read_proposal, write_proposal
 from .doctor import inspect_capabilities
 from .engine import apply_event, bounded_next_actions, render_to_path, status_summary
-from .errors import WaveDeliveryError
-from .freshness import check_freshness
+from .errors import IllegalTransition, WaveDeliveryError
+from .freshness import check_freshness, record_merge
 from .leases import ensure_lease, release_lease
 from .monitor import monitor_once
 from .migration import apply_migration, build_migration_plan, rollback_migration
@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--state", required=True, type=Path)
     init.add_argument("--scope-id", required=True)
     init.add_argument("--scope-kind", choices=("epic", "micro_wave"), default="epic")
+    init.add_argument("--base-ref")
     init.add_argument("--task", action="append", default=[])
 
     doctor = subparsers.add_parser("doctor", help="report optional controller capabilities")
@@ -131,6 +132,17 @@ def build_parser() -> argparse.ArgumentParser:
     verify_collect.add_argument("--idempotency-key", required=True)
     verify_collect.add_argument("--expected-revision", required=True, type=int)
 
+    merge = subparsers.add_parser("merge", help="record a Git-verified task merge")
+    merge_subparsers = merge.add_subparsers(dest="merge_command", required=True)
+    merge_record = merge_subparsers.add_parser(
+        "record", help="mark done only when the task head is contained in the scope base"
+    )
+    merge_record.add_argument("--state", required=True, type=Path)
+    merge_record.add_argument("--repo", required=True, type=Path)
+    merge_record.add_argument("--task", required=True)
+    merge_record.add_argument("--idempotency-key", required=True)
+    merge_record.add_argument("--expected-revision", required=True, type=int)
+
     migration = subparsers.add_parser("migrate", help="plan or apply a v1-to-v2 migration")
     migration.add_argument("--state", type=Path)
     migration.add_argument("--to", type=int, choices=(2,), default=2)
@@ -193,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
             store = StateStore(args.state)
             if store.exists():
                 parser.error(f"state file already exists: {args.state}")
-            state = new_state(args.scope_id, args.scope_kind)
+            state = new_state(args.scope_id, args.scope_kind, base_ref=args.base_ref)
             for task_id in args.task:
                 if task_id in state["tasks"]:
                     parser.error(f"duplicate --task: {task_id}")
@@ -316,6 +328,17 @@ def main(argv: list[str] | None = None) -> int:
             _print_json({"revision": state["revision"], "duplicate": duplicate})
             return 0
 
+        if args.command == "merge" and args.merge_command == "record":
+            state, duplicate = record_merge(
+                StateStore(args.state),
+                repo=args.repo,
+                task_id=args.task,
+                idempotency_key=args.idempotency_key,
+                expected_revision=args.expected_revision,
+            )
+            _print_json({"revision": state["revision"], "duplicate": duplicate})
+            return 0
+
         if args.command == "migrate":
             if args.rollback:
                 if args.state or args.apply or args.dry_run:
@@ -340,6 +363,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "event" and args.event_command == "apply":
+            if args.event == "task.merged":
+                raise IllegalTransition("use 'wdctl merge record' to verify live Git state")
             state, duplicate = apply_event(
                 StateStore(args.state),
                 event_type=args.event,

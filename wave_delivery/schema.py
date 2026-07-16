@@ -41,11 +41,14 @@ def task_state(
         "review": None,
         "verification": None,
         "freshness": None,
+        "merge": None,
         "blocker": None,
     }
 
 
-def new_state(scope_id: str, scope_kind: str = "epic") -> dict[str, Any]:
+def new_state(
+    scope_id: str, scope_kind: str = "epic", *, base_ref: str | None = None
+) -> dict[str, Any]:
     if not scope_id:
         raise ValidationError("scope id must not be empty")
     if scope_kind not in {"epic", "micro_wave"}:
@@ -53,7 +56,7 @@ def new_state(scope_id: str, scope_kind: str = "epic") -> dict[str, Any]:
     return {
         "schemaVersion": SCHEMA_VERSION,
         "revision": 0,
-        "scope": {"id": scope_id, "kind": scope_kind},
+        "scope": {"id": scope_id, "kind": scope_kind, "baseRef": base_ref},
         "constitution": {"status": "draft", "ratification": None},
         "tasks": {},
         "waves": {},
@@ -98,6 +101,7 @@ def validate_state(state: dict[str, Any]) -> None:
     _require_string(scope.get("id"), "scope.id")
     if scope.get("kind") not in {"epic", "micro_wave"}:
         raise ValidationError("scope.kind must be 'epic' or 'micro_wave'")
+    _require_string(scope.get("baseRef"), "scope.baseRef", nullable=True)
 
     constitution = _require_mapping(state.get("constitution"), "constitution")
     constitution_status = constitution.get("status")
@@ -136,7 +140,7 @@ def validate_state(state: dict[str, Any]) -> None:
                 )
         for field in ("branch", "worktree", "headSha", "pr", "blocker"):
             _require_string(task.get(field), f"tasks.{task_id}.{field}", nullable=True)
-        for field in ("review", "verification"):
+        for field in ("review", "verification", "merge"):
             value = task.get(field)
             if value is not None and not isinstance(value, dict):
                 raise ValidationError(f"tasks.{task_id}.{field} must be an object or null")

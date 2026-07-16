@@ -111,7 +111,11 @@ def build_migration_plan(state_path: Path | str) -> dict[str, Any]:
     if source.get("schemaVersion") != 1:
         raise ValidationError("only schemaVersion 1 can be migrated")
     scope_id, scope_kind, micro_wave = _scope_from_v1(source)
-    target = new_state(scope_id, scope_kind)
+    scope_container = source.get("work") if micro_wave else source.get("epic")
+    base_ref = scope_container.get("baseBranch") if isinstance(scope_container, dict) else None
+    if not isinstance(base_ref, str) or not base_ref:
+        base_ref = None
+    target = new_state(scope_id, scope_kind, base_ref=base_ref)
     source_tasks = _legacy_tasks(source, micro_wave=micro_wave)
     moves: list[dict[str, str]] = []
     seen: set[str] = set()

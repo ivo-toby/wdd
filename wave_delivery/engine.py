@@ -149,6 +149,7 @@ def transition(
         task["review"] = None
         task["verification"] = None
         task["freshness"] = None
+        task["merge"] = None
         task["status"] = "review"
     elif event_type == "review.recorded":
         _require_status(task, {"review"}, event_type)
@@ -201,12 +202,22 @@ def transition(
         task["review"] = None
         task["verification"] = None
         task["freshness"] = None
+        task["merge"] = None
         task["status"] = "review" if task.get("pr") else "in_progress"
     elif event_type == "freshness.recorded":
         _require_status(task, {"merge_ready"}, event_type)
         head_sha = _require_head(data, event_type)
         if head_sha != task.get("headSha"):
             raise IllegalTransition("freshness evidence must match the task head SHA")
+        scope_base_ref = state["scope"].get("baseRef")
+        if not scope_base_ref:
+            raise IllegalTransition("freshness evidence requires a configured scope base ref")
+        base_ref = _require_data_string(data, "baseRef", event_type)
+        if base_ref != scope_base_ref:
+            raise IllegalTransition(
+                f"freshness evidence base {base_ref} does not match scope base {scope_base_ref}"
+            )
+        base_sha = _require_data_string(data, "baseSha", event_type)
         classification = data.get("classification")
         if classification not in {
             "current",
@@ -217,15 +228,30 @@ def transition(
             raise ValidationError("freshness.recorded has an invalid classification")
         task["freshness"] = {
             "classification": classification,
-            "baseSha": data.get("baseSha"),
+            "baseSha": base_sha,
             "headSha": head_sha,
-            "baseRef": data.get("baseRef"),
+            "baseRef": base_ref,
             "headRef": data.get("headRef"),
         }
     elif event_type == "task.merged":
         _require_status(task, {"merge_ready"}, event_type)
         if task_gate(task) != "merge_ready":
             raise IllegalTransition("task.merged requires current or nonmaterially stale freshness evidence")
+        if data.get("mergeVerified") is not True:
+            raise IllegalTransition("task.merged requires live Git merge verification")
+        head_sha = _require_head(data, event_type)
+        if head_sha != task.get("headSha"):
+            raise IllegalTransition("merge evidence must match the task head SHA")
+        base_ref = _require_data_string(data, "baseRef", event_type)
+        if base_ref != state["scope"].get("baseRef"):
+            raise IllegalTransition("merge evidence must use the configured scope base ref")
+        base_sha = _require_data_string(data, "baseSha", event_type)
+        task["merge"] = {
+            "baseRef": base_ref,
+            "baseSha": base_sha,
+            "headSha": head_sha,
+            "verifiedAt": utc_now(),
+        }
         task["status"] = "done"
     elif event_type == "task.blocked":
         _require_status(task, TASK_STATUSES - TERMINAL_STATUSES, event_type)

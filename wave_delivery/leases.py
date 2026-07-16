@@ -85,7 +85,16 @@ def ensure_lease(
             or (lease or {}).get("worktree")
             or _default_worktree(repo, state["scope"]["id"], task_id)
         ).resolve()
-        lease_base = base_ref or (lease or {}).get("baseRef") or "HEAD"
+        scope_base = state["scope"].get("baseRef")
+        lease_base = base_ref or (lease or {}).get("baseRef") or scope_base
+        if not lease_base:
+            raise ValidationError(
+                "lease acquisition requires --base-ref when the scope has no configured base"
+            )
+        if scope_base and lease_base != scope_base:
+            raise ValidationError(
+                f"lease base {lease_base} does not match scope base {scope_base}"
+            )
         base_sha = resolve_ref(repo, lease_base)
         existing = worktree_at(repo, lease_worktree)
         if existing:
@@ -135,6 +144,8 @@ def ensure_lease(
             "headSha": head_sha,
             "acquiredAt": utc_now(),
         }
+        if updated["scope"].get("baseRef") is None:
+            updated["scope"]["baseRef"] = lease_base
         updated["tasks"][task_id]["branch"] = lease_branch
         updated["tasks"][task_id]["worktree"] = str(lease_worktree)
         store.write(updated)

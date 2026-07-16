@@ -6,8 +6,10 @@ import fnmatch
 from pathlib import Path
 from typing import Any
 
-from .errors import ValidationError
+from .engine import apply_event
+from .errors import IllegalTransition, ValidationError
 from .git import require_repository, resolve_ref, run_git
+from .store import StateStore
 
 
 FRESHNESS_CLASSIFICATIONS = {
@@ -85,3 +87,50 @@ def check_freshness(
         "conflictDomainPaths": touches_domain,
         "conflictDomains": domains,
     }
+
+
+def record_merge(
+    store: StateStore,
+    *,
+    repo: Path | str,
+    task_id: str,
+    idempotency_key: str,
+    expected_revision: int,
+) -> tuple[dict[str, Any], bool]:
+    """Record completion only after Git proves the task head is in the scope base."""
+    repo = require_repository(repo)
+    state = store.read()
+    try:
+        task = state["tasks"][task_id]
+    except KeyError as error:
+        raise ValidationError(f"unknown task: {task_id}") from error
+    base_ref = state["scope"].get("baseRef")
+    if not isinstance(base_ref, str) or not base_ref:
+        raise IllegalTransition("merge recording requires a configured scope base ref")
+    head_sha = task.get("headSha")
+    if not isinstance(head_sha, str) or not head_sha:
+        raise IllegalTransition("merge recording requires a task head SHA")
+    base_sha = resolve_ref(repo, base_ref)
+    resolved_head = resolve_ref(repo, head_sha)
+    if resolved_head != head_sha:
+        raise IllegalTransition("task head SHA did not resolve to the recorded commit")
+    contained = run_git(
+        repo, "merge-base", "--is-ancestor", head_sha, base_sha, check=False
+    )
+    if contained.returncode != 0:
+        raise IllegalTransition(
+            f"task head {head_sha} is not merged into {base_ref} ({base_sha})"
+        )
+    return apply_event(
+        store,
+        event_type="task.merged",
+        task_id=task_id,
+        data={
+            "mergeVerified": True,
+            "baseRef": base_ref,
+            "baseSha": base_sha,
+            "headSha": head_sha,
+        },
+        idempotency_key=idempotency_key,
+        expected_revision=expected_revision,
+    )
