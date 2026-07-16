@@ -90,9 +90,15 @@ def ensure_lease(
         existing = worktree_at(repo, lease_worktree)
         if existing:
             expected_branch = f"refs/heads/{lease_branch}"
-            if existing.get("branch") not in {expected_branch, None}:
+            if existing.get("branch") != expected_branch:
                 raise ValidationError(
                     f"worktree {lease_worktree} is checked out on {existing.get('branch')}, not {expected_branch}"
+                )
+            worktree_head = resolve_ref(lease_worktree, "HEAD")
+            branch_head = resolve_ref(repo, lease_branch)
+            if worktree_head != branch_head:
+                raise ValidationError(
+                    f"worktree {lease_worktree} HEAD does not match branch {lease_branch}"
                 )
             action = "reuse"
         elif lease_worktree.exists():
@@ -169,6 +175,11 @@ def release_lease(
             entry = worktree_at(repo, worktree)
             if not entry:
                 raise ValidationError(f"leased worktree is not registered with Git: {worktree}")
+            expected_branch = f"refs/heads/{lease['branch']}"
+            if entry.get("branch") != expected_branch:
+                raise ValidationError(
+                    f"refusing to remove worktree on {entry.get('branch')}; expected {expected_branch}"
+                )
             status = run_git(worktree, "status", "--porcelain").stdout.strip()
             if status:
                 raise IllegalTransition(

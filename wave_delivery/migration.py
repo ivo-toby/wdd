@@ -179,6 +179,7 @@ def build_migration_plan(state_path: Path | str) -> dict[str, Any]:
         "kind": "wdctl_migration_plan",
         "id": migration_id,
         "sourceState": str(state_path),
+        "sourceStateFingerprint": _sha256_file(state_path),
         "backupDirectory": str(state_path.parent / ".wdctl-migrations" / migration_id),
         "scope": target["scope"],
         "moves": moves,
@@ -209,6 +210,11 @@ def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
 def apply_migration(plan: dict[str, Any]) -> dict[str, Any]:
     state_path = Path(plan["sourceState"])
     backup_directory = Path(plan["backupDirectory"])
+    expected_state_fingerprint = plan.get("sourceStateFingerprint")
+    if not isinstance(expected_state_fingerprint, str) or not expected_state_fingerprint:
+        raise ValidationError("migration plan is missing its source state fingerprint")
+    if _sha256_file(state_path) != expected_state_fingerprint:
+        raise ValidationError("refusing migration because source state changed after planning")
     if backup_directory.exists():
         raise ValidationError(f"migration backup already exists: {backup_directory}")
     for move in plan["moves"]:
@@ -242,6 +248,8 @@ def apply_migration(plan: dict[str, Any]) -> dict[str, Any]:
             manifest["completedMoves"].append(index)
             manifest["phase"] = "moving_tasks"
             _write_manifest(manifest_path, manifest)
+        if _sha256_file(state_path) != expected_state_fingerprint:
+            raise ValidationError("refusing migration because source state changed while applying")
         atomic_write_text(state_path, json.dumps(plan["targetState"], indent=2, sort_keys=True) + "\n")
         manifest["phase"] = "completed"
         _write_manifest(manifest_path, manifest)

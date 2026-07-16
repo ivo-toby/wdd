@@ -304,6 +304,30 @@ class WaveDeliveryStateTests(unittest.TestCase):
         self.assertEqual(plan["moves"], [])
         self.assertEqual(plan["targetState"]["tasks"]["TASK-001"]["specPath"], "tasks/TASK-001.md")
 
+    def test_migration_refuses_source_state_changed_after_planning(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        state_path = Path(directory.name) / "state.json"
+        legacy = {
+            "schemaVersion": 1,
+            "kind": "micro_wave_state",
+            "work": {"id": "WORK-race"},
+            "tasks": [
+                {
+                    "id": "TASK-001",
+                    "path": "tasks/TASK-001.md",
+                    "status": "todo",
+                }
+            ],
+        }
+        state_path.write_text(json.dumps(legacy), encoding="utf-8")
+        plan = build_migration_plan(state_path)
+        legacy["tasks"][0]["status"] = "done"
+        state_path.write_text(json.dumps(legacy), encoding="utf-8")
+        with self.assertRaisesRegex(ValidationError, "changed after planning"):
+            apply_migration(plan)
+        self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), legacy)
+
     def test_rollback_refuses_to_overwrite_a_migrated_task_change(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -414,6 +438,58 @@ class WaveDeliveryStateTests(unittest.TestCase):
         self.assertEqual(released["cleanup"], "cleaned_up")
         self.assertFalse(worktree.exists())
         self.assertEqual(store.read()["leases"]["TASK-001"]["status"], "released")
+
+    def test_lease_rejects_detached_or_repurposed_worktrees(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        repo = self.git_repository(root)
+        self.git(repo, "branch", "task/TASK-001")
+        self.git(repo, "commit", "--allow-empty", "-m", "main advanced")
+        store = StateStore(root / "state.json")
+        state = new_state("EPIC-lease-identity")
+        state["constitution"] = {
+            "status": "ratified",
+            "ratification": {"by": "Ivo", "decisionFingerprint": "sha256:test"},
+        }
+        state["tasks"]["TASK-001"] = task_state("TASK-001")
+        store.write(state)
+        worktree = root / "worker"
+        self.git(repo, "worktree", "add", "--detach", str(worktree), "main")
+        with self.assertRaisesRegex(ValidationError, "not refs/heads/task/TASK-001"):
+            ensure_lease(
+                store,
+                repo=repo,
+                task_id="TASK-001",
+                branch="task/TASK-001",
+                worktree=worktree,
+                base_ref="main",
+                idempotency_key="detached-lease",
+                expected_revision=0,
+            )
+        self.git(repo, "worktree", "remove", str(worktree))
+
+        ensure_lease(
+            store,
+            repo=repo,
+            task_id="TASK-001",
+            branch="task/TASK-001",
+            worktree=worktree,
+            base_ref="main",
+            idempotency_key="valid-lease",
+            expected_revision=0,
+        )
+        self.git(repo, "worktree", "remove", str(worktree))
+        self.git(repo, "branch", "other-work")
+        self.git(repo, "worktree", "add", str(worktree), "other-work")
+        with self.assertRaisesRegex(ValidationError, "refusing to remove worktree"):
+            release_lease(
+                store,
+                repo=repo,
+                task_id="TASK-001",
+                idempotency_key="release-wrong-worktree",
+                expected_revision=1,
+            )
 
     def test_freshness_is_risk_based_and_enforced_before_merge(self):
         directory = tempfile.TemporaryDirectory()
