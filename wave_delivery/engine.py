@@ -100,6 +100,13 @@ def _require_head(data: dict[str, Any], event_type: str) -> str:
     return head_sha
 
 
+def _require_data_string(data: dict[str, Any], key: str, event_type: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValidationError(f"{event_type} requires data.{key}")
+    return value
+
+
 def transition(
     state: dict[str, Any], event_type: str, task_id: str | None, data: dict[str, Any]
 ) -> dict[str, Any]:
@@ -145,6 +152,7 @@ def transition(
         task["status"] = "review"
     elif event_type == "review.recorded":
         _require_status(task, {"review"}, event_type)
+        base_sha = _require_data_string(data, "baseSha", event_type)
         head_sha = _require_head(data, event_type)
         if head_sha != task.get("headSha"):
             raise IllegalTransition("review evidence must match the task head SHA")
@@ -158,6 +166,7 @@ def transition(
             finding.get("severity") in {"P1", "P2"} for finding in findings
         ) else "passed"
         task["review"] = {
+            "baseSha": base_sha,
             "headSha": head_sha,
             "outcome": outcome,
             "findings": findings,
@@ -166,15 +175,20 @@ def transition(
         task["status"] = "in_progress"
     elif event_type == "verification.recorded":
         _require_status(task, {"in_progress"}, event_type)
+        base_sha = _require_data_string(data, "baseSha", event_type)
         head_sha = _require_head(data, event_type)
         if head_sha != task.get("headSha"):
             raise IllegalTransition("verification evidence must match the task head SHA")
+        review = task.get("review")
+        if isinstance(review, dict) and review.get("baseSha") != base_sha:
+            raise IllegalTransition("verification evidence must use the review base SHA")
         result = data.get("status")
         if result not in {"passed", "failed", "unavailable"}:
             raise ValidationError(
                 "verification.recorded requires data.status: passed, failed, or unavailable"
             )
         task["verification"] = {
+            "baseSha": base_sha,
             "headSha": head_sha,
             "status": result,
             "command": data.get("command"),

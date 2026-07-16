@@ -23,6 +23,9 @@ python3 -m wave_delivery constitution probe --root . --output constitution-propo
 python3 -m wave_delivery lease ensure --state PATH --repo REPO --task TASK-ID \
   --idempotency-key KEY --expected-revision N
 python3 -m wave_delivery freshness check --repo REPO --base epic/example --head task/TASK-ID
+python3 -m wave_delivery monitor --once --state PATH --repo REPO
+python3 -m wave_delivery review collect --state PATH --task TASK-ID --result review-a.json \
+  --idempotency-key KEY --expected-revision N
 ```
 
 The in-repository equivalent is `python3 scripts/wdctl.py ...`.
@@ -45,10 +48,14 @@ The in-repository equivalent is `python3 scripts/wdctl.py ...`.
   records it atomically. Release refuses to remove a dirty worktree.
 - Freshness uses `git merge-tree`, changed-file overlap, and conflict domains to
   distinguish current, nonmaterially stale, materially stale, and conflicted branches.
+- Monitoring observes local Git branches and worktrees without invoking a model,
+  and only writes state when observations change.
+- Review collection validates normalized results, freezes base/head SHA evidence,
+  and aggregates multiple reviewer outputs in one state transition.
 
 ## Deferred work
 
 - Markdown constitution rendering and mandatory stale-proposal enforcement for
   every execution adapter.
-- Monitoring adapters and review execution/collection.
+- External scheduler adapters and verification command execution.
 - Installer-generated `wdctl` POSIX and Windows launchers.

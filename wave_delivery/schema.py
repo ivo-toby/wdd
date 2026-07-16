@@ -62,6 +62,7 @@ def new_state(scope_id: str, scope_kind: str = "epic") -> dict[str, Any]:
             "status": "inactive",
             "lastCheckedAt": None,
             "nextCheckDueAt": None,
+            "observations": {},
         },
         "events": [],
         "appliedIdempotencyKeys": [],

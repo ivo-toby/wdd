@@ -13,6 +13,7 @@ from .engine import apply_event, bounded_next_actions, render_to_path, status_su
 from .errors import WaveDeliveryError
 from .freshness import check_freshness
 from .leases import ensure_lease, release_lease
+from .monitor import monitor_once
 from .migration import apply_migration, build_migration_plan, rollback_migration
 from .schema import new_state, task_state
 from .store import StateStore
@@ -25,6 +26,16 @@ def _json_argument(value: str) -> dict[str, Any]:
         raise argparse.ArgumentTypeError(f"invalid JSON: {error.msg}") from error
     if not isinstance(parsed, dict):
         raise argparse.ArgumentTypeError("JSON data must be an object")
+    return parsed
+
+
+def _json_list_argument(value: str) -> list[str]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {error.msg}") from error
+    if not isinstance(parsed, list) or not all(isinstance(item, str) and item for item in parsed):
+        raise argparse.ArgumentTypeError("JSON command must be a non-empty string array")
     return parsed
 
 
@@ -50,6 +61,12 @@ def build_parser() -> argparse.ArgumentParser:
     render = subparsers.add_parser("render", help="render a controller-state Markdown projection")
     render.add_argument("--state", required=True, type=Path)
     render.add_argument("--output", required=True, type=Path)
+
+    monitor = subparsers.add_parser("monitor", help="perform one cheap Git observation tick")
+    monitor.add_argument("--once", action="store_true", required=True)
+    monitor.add_argument("--state", required=True, type=Path)
+    monitor.add_argument("--repo", required=True, type=Path)
+    monitor.add_argument("--dry-run", action="store_true")
 
     lease = subparsers.add_parser("lease", help="acquire or release a task branch/worktree lease")
     lease_subparsers = lease.add_subparsers(dest="lease_command", required=True)
@@ -84,6 +101,31 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--task", required=True)
             command.add_argument("--idempotency-key", required=True)
             command.add_argument("--expected-revision", required=True, type=int)
+
+    review = subparsers.add_parser("review", help="run or collect normalized review results")
+    review_subparsers = review.add_subparsers(dest="review_command", required=True)
+    review_run = review_subparsers.add_parser("run", help="run one configured reviewer against frozen SHAs")
+    review_run.add_argument("--state", required=True, type=Path)
+    review_run.add_argument("--repo", required=True, type=Path)
+    review_run.add_argument("--task", required=True)
+    review_run.add_argument("--command-json", required=True, type=_json_list_argument)
+    review_run.add_argument("--output", required=True, type=Path)
+    review_run.add_argument("--base-sha")
+    review_collect = review_subparsers.add_parser("collect", help="aggregate one or more review results once")
+    review_collect.add_argument("--state", required=True, type=Path)
+    review_collect.add_argument("--task", required=True)
+    review_collect.add_argument("--result", required=True, type=Path, action="append")
+    review_collect.add_argument("--idempotency-key", required=True)
+    review_collect.add_argument("--expected-revision", required=True, type=int)
+
+    verify = subparsers.add_parser("verify", help="collect normalized verification evidence")
+    verify_subparsers = verify.add_subparsers(dest="verify_command", required=True)
+    verify_collect = verify_subparsers.add_parser("collect", help="record verification evidence")
+    verify_collect.add_argument("--state", required=True, type=Path)
+    verify_collect.add_argument("--task", required=True)
+    verify_collect.add_argument("--result", required=True, type=Path)
+    verify_collect.add_argument("--idempotency-key", required=True)
+    verify_collect.add_argument("--expected-revision", required=True, type=int)
 
     migration = subparsers.add_parser("migrate", help="plan or apply a v1-to-v2 migration")
     migration.add_argument("--state", type=Path)
@@ -176,6 +218,10 @@ def main(argv: list[str] | None = None) -> int:
             _print_json({"rendered": str(args.output), "revision": state["revision"]})
             return 0
 
+        if args.command == "monitor":
+            _print_json(monitor_once(StateStore(args.state), repo=args.repo, dry_run=args.dry_run))
+            return 0
+
         if args.command == "lease" and args.lease_command == "ensure":
             result, duplicate = ensure_lease(
                 StateStore(args.state),
@@ -222,6 +268,44 @@ def main(argv: list[str] | None = None) -> int:
                 expected_revision=args.expected_revision,
             )
             _print_json({"freshness": result, "revision": state["revision"], "duplicate": duplicate})
+            return 0
+
+        if args.command == "review":
+            from .review import collect_review, run_review
+
+            if args.review_command == "run":
+                _print_json(
+                    run_review(
+                        StateStore(args.state),
+                        repo=args.repo,
+                        task_id=args.task,
+                        command=args.command_json,
+                        output=args.output,
+                        base_sha=args.base_sha,
+                    )
+                )
+                return 0
+            state, duplicate = collect_review(
+                StateStore(args.state),
+                task_id=args.task,
+                result_paths=args.result,
+                idempotency_key=args.idempotency_key,
+                expected_revision=args.expected_revision,
+            )
+            _print_json({"revision": state["revision"], "duplicate": duplicate})
+            return 0
+
+        if args.command == "verify" and args.verify_command == "collect":
+            from .review import collect_verification
+
+            state, duplicate = collect_verification(
+                StateStore(args.state),
+                task_id=args.task,
+                result_path=args.result,
+                idempotency_key=args.idempotency_key,
+                expected_revision=args.expected_revision,
+            )
+            _print_json({"revision": state["revision"], "duplicate": duplicate})
             return 0
 
         if args.command == "migrate":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,6 +23,8 @@ from wave_delivery.errors import IllegalTransition, RevisionConflict, Validation
 from wave_delivery.freshness import check_freshness
 from wave_delivery.leases import ensure_lease, release_lease
 from wave_delivery.migration import apply_migration, build_migration_plan, rollback_migration
+from wave_delivery.monitor import monitor_once
+from wave_delivery.review import collect_review, collect_verification, run_review
 from wave_delivery.schema import new_state, task_state
 from wave_delivery.store import StateStore
 
@@ -131,13 +134,13 @@ class WaveDeliveryStateTests(unittest.TestCase):
             store,
             "review.recorded",
             3,
-            data={"headSha": "a", "findings": [], "reviewer": "reviewer-a"},
+            data={"baseSha": "root", "headSha": "a", "findings": [], "reviewer": "reviewer-a"},
         )
         complete = self.apply(
             store,
             "verification.recorded",
             4,
-            data={"headSha": "a", "status": "passed", "command": "python -m unittest"},
+            data={"baseSha": "root", "headSha": "a", "status": "passed", "command": "python -m unittest"},
         )
         self.assertEqual(complete["tasks"]["TASK-001"]["status"], "merge_ready")
         invalidated = self.apply(
@@ -439,6 +442,141 @@ class WaveDeliveryStateTests(unittest.TestCase):
         self.assertEqual(recorded["tasks"]["TASK-001"]["freshness"]["classification"], "nonmaterially_stale")
         merged = self.apply(store, "task.merged", 1, data={})
         self.assertEqual(merged["tasks"]["TASK-001"]["status"], "done")
+
+    def test_monitor_writes_only_when_git_observations_change(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        repo = self.git_repository(root)
+        store = StateStore(root / "state.json")
+        state = new_state("EPIC-monitor")
+        task = task_state("TASK-001")
+        task["branch"] = "main"
+        task["headSha"] = self.git_output(repo, "rev-parse", "main")
+        state["tasks"]["TASK-001"] = task
+        store.write(state)
+
+        initial = monitor_once(store, repo=str(repo))
+        self.assertTrue(initial["changed"])
+        self.assertEqual(initial["revision"], 1)
+        unchanged = monitor_once(store, repo=str(repo))
+        self.assertFalse(unchanged["changed"])
+        self.assertEqual(unchanged["revision"], 1)
+
+        (repo / "README.md").write_text("changed\n", encoding="utf-8")
+        self.git(repo, "add", "README.md")
+        self.git(repo, "commit", "-m", "branch advanced")
+        advanced = monitor_once(store, repo=str(repo))
+        self.assertTrue(advanced["changed"])
+        self.assertEqual(advanced["revision"], 2)
+        self.assertIn(
+            {"task": "TASK-001", "action": "record_head_change"}, advanced["actions"]
+        )
+
+    def test_review_and_verification_collection_are_sha_bound(self):
+        directory, store = self.make_store()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        self.ratify(store)
+        self.apply(store, "task.started", 1)
+        self.apply(
+            store,
+            "task.pr_recorded",
+            2,
+            data={"pr": "https://example.test/pr/1", "headSha": "head-a"},
+        )
+        review_a = root / "review-a.json"
+        review_b = root / "review-b.json"
+        review_a.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "kind": "wdctl_review_result",
+                    "task": "TASK-001",
+                    "baseSha": "base-a",
+                    "headSha": "head-a",
+                    "reviewer": "reviewer-a",
+                    "findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        review_b.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "kind": "wdctl_review_result",
+                    "task": "TASK-001",
+                    "baseSha": "base-a",
+                    "headSha": "head-a",
+                    "reviewer": "reviewer-b",
+                    "findings": [{"severity": "P3", "summary": "Document this later"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        reviewed, duplicate = collect_review(
+            store,
+            task_id="TASK-001",
+            result_paths=[review_a, review_b],
+            idempotency_key="review-aggregate",
+            expected_revision=3,
+        )
+        self.assertFalse(duplicate)
+        self.assertEqual(reviewed["tasks"]["TASK-001"]["review"]["baseSha"], "base-a")
+        verification = root / "verification.json"
+        verification.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "kind": "wdctl_verification_result",
+                    "task": "TASK-001",
+                    "baseSha": "base-a",
+                    "headSha": "head-a",
+                    "status": "passed",
+                    "command": "python3 -m unittest",
+                }
+            ),
+            encoding="utf-8",
+        )
+        verified, duplicate = collect_verification(
+            store,
+            task_id="TASK-001",
+            result_path=verification,
+            idempotency_key="verification-1",
+            expected_revision=4,
+        )
+        self.assertFalse(duplicate)
+        self.assertEqual(verified["tasks"]["TASK-001"]["status"], "merge_ready")
+
+    def test_review_run_validates_its_frozen_sha_output(self):
+        directory, store = self.make_store()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        state = store.read()
+        state["constitution"] = {
+            "status": "ratified",
+            "ratification": {"by": "Ivo", "decisionFingerprint": "sha256:test"},
+        }
+        state["tasks"]["TASK-001"]["status"] = "review"
+        state["tasks"]["TASK-001"]["headSha"] = "head-a"
+        store.write(state)
+        output = root / "review.json"
+        command = [
+            sys.executable,
+            "-c",
+            "import json; print(json.dumps({'schemaVersion': 1, 'kind': 'wdctl_review_result', 'task': 'TASK-001', 'baseSha': 'base-a', 'headSha': 'head-a', 'reviewer': 'test', 'findings': []}))",
+        ]
+        result = run_review(
+            store,
+            repo=root,
+            task_id="TASK-001",
+            command=command,
+            output=output,
+            base_sha="base-a",
+        )
+        self.assertTrue(output.exists())
+        self.assertEqual(result["headSha"], "head-a")
 
 
 if __name__ == "__main__":
