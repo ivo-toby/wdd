@@ -26,9 +26,11 @@ def task_state(
     *,
     depends_on: list[str] | None = None,
     conflict_domains: list[str] | None = None,
+    spec_path: str | None = None,
 ) -> dict[str, Any]:
     return {
         "id": task_id,
+        "specPath": spec_path or f"tasks/{task_id}.md",
         "status": "todo",
         "dependsOn": list(depends_on or []),
         "conflictDomains": list(conflict_domains or []),
@@ -114,6 +116,7 @@ def validate_state(state: dict[str, Any]) -> None:
         task = _require_mapping(task, f"tasks.{task_id}")
         if task.get("id") != task_id:
             raise ValidationError(f"tasks.{task_id}.id must match its object key")
+        _require_string(task.get("specPath"), f"tasks.{task_id}.specPath")
         if task.get("status") not in TASK_STATUSES:
             raise ValidationError(f"tasks.{task_id}.status is invalid")
         for field in ("dependsOn", "conflictDomains"):

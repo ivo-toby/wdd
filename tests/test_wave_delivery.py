@@ -5,13 +5,20 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from wave_delivery.constitution import (
+    probe_repository,
+    ratification_status,
+    read_proposal,
+    write_proposal,
+)
 from wave_delivery.engine import (
     apply_event,
     bounded_next_actions,
     render_controller_state,
     status_summary,
 )
-from wave_delivery.errors import IllegalTransition, RevisionConflict
+from wave_delivery.errors import IllegalTransition, RevisionConflict, ValidationError
+from wave_delivery.migration import apply_migration, build_migration_plan, rollback_migration
 from wave_delivery.schema import new_state, task_state
 from wave_delivery.store import StateStore
 
@@ -173,6 +180,138 @@ class WaveDeliveryStateTests(unittest.TestCase):
         parsed = json.loads(store.path.read_text(encoding="utf-8"))
         self.assertEqual(parsed["revision"], 1)
         self.assertFalse(store.lock_path.exists())
+
+    def test_epic_migration_moves_tasks_to_stable_paths_and_rolls_back(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        state_path = root / "orchestration.json"
+        old_task = root / "TICKET-001" / "todo" / "TASK-001.md"
+        old_task.parent.mkdir(parents=True)
+        old_task.write_text("# Original task\n", encoding="utf-8")
+        legacy = {
+            "schemaVersion": 1,
+            "epic": {"id": "EPIC-migrate"},
+            "waves": [
+                {
+                    "id": "WAVE-001",
+                    "status": "planned",
+                    "tasks": [
+                        {
+                            "id": "TASK-001",
+                            "path": "TICKET-001/todo/TASK-001.md",
+                            "status": "todo",
+                            "dependsOn": [],
+                            "conflictDomains": ["src/example.py"],
+                            "branch": "task/TASK-001",
+                            "workerWorktree": None,
+                            "latestCommit": None,
+                            "pr": None,
+                            "verification": None,
+                        }
+                    ],
+                }
+            ],
+            "monitoring": {"mode": "manual", "status": "inactive"},
+        }
+        state_path.write_text(json.dumps(legacy, indent=2) + "\n", encoding="utf-8")
+
+        plan = build_migration_plan(state_path)
+        self.assertEqual(plan["scope"], {"id": "EPIC-migrate", "kind": "epic"})
+        self.assertEqual(plan["moves"][0]["target"], "TICKET-001/tasks/TASK-001.md")
+        self.assertEqual(plan["targetState"]["constitution"]["status"], "draft")
+
+        result = apply_migration(plan)
+        migrated = StateStore(state_path).read()
+        self.assertEqual(migrated["schemaVersion"], 2)
+        self.assertEqual(migrated["tasks"]["TASK-001"]["specPath"], "TICKET-001/tasks/TASK-001.md")
+        self.assertFalse(old_task.exists())
+        self.assertTrue((root / "TICKET-001" / "tasks" / "TASK-001.md").exists())
+        self.assertTrue(Path(result["backupDirectory"]).is_dir())
+
+        rollback_migration(result["backupDirectory"])
+        restored = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(restored, legacy)
+        self.assertTrue(old_task.exists())
+
+    def test_micro_wave_migration_keeps_existing_task_paths(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        state_path = Path(directory.name) / "state.json"
+        legacy = {
+            "schemaVersion": 1,
+            "kind": "micro_wave_state",
+            "work": {"id": "WORK-migrate"},
+            "tasks": [
+                {
+                    "id": "TASK-001",
+                    "path": "tasks/TASK-001.md",
+                    "status": "todo",
+                }
+            ],
+        }
+        state_path.write_text(json.dumps(legacy), encoding="utf-8")
+        plan = build_migration_plan(state_path)
+        self.assertEqual(plan["scope"]["kind"], "micro_wave")
+        self.assertEqual(plan["moves"], [])
+        self.assertEqual(plan["targetState"]["tasks"]["TASK-001"]["specPath"], "tasks/TASK-001.md")
+
+    def test_rollback_refuses_to_overwrite_a_migrated_task_change(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        state_path = root / "orchestration.json"
+        old_task = root / "TICKET-001" / "todo" / "TASK-001.md"
+        old_task.parent.mkdir(parents=True)
+        old_task.write_text("# Original task\n", encoding="utf-8")
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "epic": {"id": "EPIC-safe-rollback"},
+                    "waves": [
+                        {
+                            "id": "WAVE-001",
+                            "tasks": [
+                                {
+                                    "id": "TASK-001",
+                                    "path": "TICKET-001/todo/TASK-001.md",
+                                    "status": "todo",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = apply_migration(build_migration_plan(state_path))
+        (root / "TICKET-001" / "tasks" / "TASK-001.md").write_text(
+            "# Changed after migration\n", encoding="utf-8"
+        )
+        with self.assertRaises(ValidationError):
+            rollback_migration(result["backupDirectory"])
+
+    def test_constitution_probe_has_stable_fingerprint_and_detects_drift(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "tests").mkdir()
+        (root / "pyproject.toml").write_text("[project]\nname = 'demo'\n", encoding="utf-8")
+        proposal = probe_repository(root)
+        proposal_path = root / "proposal.json"
+        write_proposal(proposal_path, proposal)
+        loaded = read_proposal(proposal_path)
+        self.assertEqual(loaded["decisionFingerprint"], proposal["decisionFingerprint"])
+        state = new_state("EPIC-constitution")
+        state["constitution"] = {
+            "status": "ratified",
+            "ratification": {"by": "Ivo", "decisionFingerprint": proposal["decisionFingerprint"]},
+        }
+        self.assertFalse(ratification_status(state, loaded)["stale"])
+        loaded["decisions"]["profileDefault"] = "full"
+        loaded["decisionFingerprint"] = "sha256:changed"
+        self.assertTrue(ratification_status(state, loaded)["stale"])
 
 
 if __name__ == "__main__":

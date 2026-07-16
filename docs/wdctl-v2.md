@@ -18,6 +18,8 @@ python3 -m wave_delivery event apply --state PATH --event task.started \
 python3 -m wave_delivery next --state PATH
 python3 -m wave_delivery status --state PATH --brief
 python3 -m wave_delivery render --state PATH --output controller-state.md
+python3 -m wave_delivery migrate --state .wdd/epics/EPIC/orchestration.json --to 2 --dry-run
+python3 -m wave_delivery constitution probe --root . --output constitution-proposal.json
 ```
 
 The in-repository equivalent is `python3 scripts/wdctl.py ...`.
@@ -32,10 +34,14 @@ The in-repository equivalent is `python3 scripts/wdctl.py ...`.
 - Review and verification evidence is tied to a task head SHA; a head update
   invalidates both.
 - `next` is read-only and returns concise executable actions and blockers.
+- Migration is dry-run-first, copies original state and task files into a local
+  backup directory before applying stable task paths, and can be rolled back.
+- Constitution probing gathers evidence but never ratifies; proposal fingerprints
+  make ratification drift visible through `constitution status`.
 
 ## Deferred work
 
-- v1-to-v2 migration and stable task-path conversion.
-- Constitution probing and Markdown ratification rendering.
+- Markdown constitution rendering and mandatory stale-proposal enforcement for
+  every execution adapter.
 - Git leases, worktree management, monitoring adapters, and review execution.
 - Installer-generated `wdctl` POSIX and Windows launchers.

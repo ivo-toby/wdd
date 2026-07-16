@@ -138,8 +138,8 @@ The default WDD runtime remains portable and text-only. An experimental,
 standard-library Python controller is available for schema-v2 scopes as
 `python3 -m wave_delivery` or `python3 scripts/wdctl.py`. It currently provides
 atomic revisioned state, explicit constitution ratification, deterministic next
-actions, and generated controller-state projections. It is additive while v1
-artifacts remain the supported portable workflow; see
+actions, generated controller-state projections, and dry-run-first v1-to-v2
+migration. It is additive while v1 artifacts remain the supported portable workflow; see
 [`docs/wdctl-v2.md`](docs/wdctl-v2.md).
 
 ## Skill Pack
