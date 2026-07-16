@@ -132,6 +132,16 @@ available, such as tests, linters, type checks, builds, CI status, or
 `git diff --check`. Those checks prove the target project; they are not required
 to operate the WDD framework itself.
 
+## Experimental Controller
+
+The default WDD runtime remains portable and text-only. An experimental,
+standard-library Python controller is available for schema-v2 scopes as
+`python3 -m wave_delivery` or `python3 scripts/wdctl.py`. It currently provides
+atomic revisioned state, explicit constitution ratification, deterministic next
+actions, and generated controller-state projections. It is additive while v1
+artifacts remain the supported portable workflow; see
+[`docs/wdctl-v2.md`](docs/wdctl-v2.md).
+
 ## Skill Pack
 
 Install or copy the directories in `skills/` into the agent's skill directory.
