@@ -13,6 +13,7 @@ from wave_delivery.constitution import (
     read_proposal,
     write_proposal,
 )
+from wave_delivery.doctor import inspect_capabilities
 from wave_delivery.engine import (
     apply_event,
     bounded_next_actions,
@@ -577,6 +578,30 @@ class WaveDeliveryStateTests(unittest.TestCase):
         )
         self.assertTrue(output.exists())
         self.assertEqual(result["headSha"], "head-a")
+
+    def test_doctor_reports_core_and_optional_capabilities(self):
+        doctor = inspect_capabilities()
+        self.assertTrue(doctor["python"]["supported"])
+        self.assertTrue(doctor["capabilities"]["coreController"])
+        self.assertIn("git", doctor["commands"])
+
+    def test_installer_creates_working_posix_and_windows_launchers(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        prefix = Path(directory.name) / "install"
+        script = Path(__file__).resolve().parents[1] / "scripts" / "install_wave_delivery.py"
+        subprocess.run(
+            [sys.executable, str(script), "--prefix", str(prefix)],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        launcher = prefix / "bin" / "wdctl"
+        self.assertTrue(launcher.exists())
+        self.assertTrue((prefix / "bin" / "wdctl.cmd").exists())
+        help_output = subprocess.check_output([str(launcher), "--help"], text=True)
+        self.assertIn("monitor", help_output)
 
 
 if __name__ == "__main__":

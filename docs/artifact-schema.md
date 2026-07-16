@@ -21,8 +21,8 @@ Required frontmatter:
 id: WDD-CONSTITUTION
 kind: constitution
 version: 1.0.0
-status: active
-ratified: YYYY-MM-DD
+status: draft
+ratified: null
 last_amended: YYYY-MM-DD
 ---
 ```
@@ -43,6 +43,12 @@ Required body sections:
 - Wave Rules
 - Shared Context Rules
 - Governance
+
+The initial constitution is always `draft`. It becomes active only after the
+user explicitly ratifies the compact decision bundle. Schema-v2 controller
+scopes record the actor, time, and decision fingerprint through `wdctl`; a
+schema-v1 portable scope records the equivalent decision in the Markdown
+artifact.
 
 The constitution stores user choices that must not be rediscovered by later
 agents, including model aliases, target branch, branch naming conventions,

@@ -20,7 +20,8 @@ choose the first epic with a planned wave that is not done.
 ## Preconditions
 
 - `wave-plan.md` exists.
-- `orchestration.json` exists with `schemaVersion: 1`.
+- `orchestration.json` exists with `schemaVersion: 1`, or a schema-v2
+  controller state exists for the scope.
 - `controller-state.md` exists or can be created from orchestration state.
 - Task files for the target wave exist in status folders.
 - The controller must not implement task code.
@@ -32,6 +33,9 @@ choose the first epic with a planned wave that is not done.
 - If `controller-state.md` must be created, use this skill folder's
   `templates/controller-state.md` as the starting point. Do not require
   `.wdd/templates/` to exist.
+- For a schema-v2 scope, do not manually move task files or mutate controller
+  JSON. Use `wdctl next`, `wdctl lease ensure`, and `wdctl event apply`; retain
+  this text-only sequence for schema-v1 compatibility.
 
 ## Workflow
 

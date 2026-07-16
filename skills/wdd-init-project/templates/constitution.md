@@ -2,8 +2,8 @@
 id: WDD-CONSTITUTION
 kind: constitution
 version: 1.0.0
-status: active
-ratified: YYYY-MM-DD
+status: draft
+ratified: null
 last_amended: YYYY-MM-DD
 ---
 
@@ -87,8 +87,9 @@ unless the user chose them.
 
 - Tasks follow RED/GREEN TDD unless explicitly test-inapplicable.
 - Repository-native checks may be referenced when available.
-- The WDD framework itself does not require a CLI, scripts, Node.js, npm, or
-  generated validators.
+- The schema-v1 WDD framework itself does not require a CLI, scripts, Node.js,
+  npm, or generated validators. Schema-v2 managed workflows may opt into the
+  `wdctl` controller through an explicit local installation.
 - `git diff --check` is allowed as an optional whitespace sanity check.
 
 ## Agent Roles

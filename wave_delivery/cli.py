@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .constitution import probe_repository, ratification_status, read_proposal, write_proposal
+from .doctor import inspect_capabilities
 from .engine import apply_event, bounded_next_actions, render_to_path, status_summary
 from .errors import WaveDeliveryError
 from .freshness import check_freshness
@@ -48,6 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--scope-id", required=True)
     init.add_argument("--scope-kind", choices=("epic", "micro_wave"), default="epic")
     init.add_argument("--task", action="append", default=[])
+
+    doctor = subparsers.add_parser("doctor", help="report optional controller capabilities")
+    doctor.add_argument("--json", action="store_true")
 
     status = subparsers.add_parser("status", help="show a concise state summary")
     status.add_argument("--state", required=True, type=Path)
@@ -196,6 +200,10 @@ def main(argv: list[str] | None = None) -> int:
                 state["tasks"][task_id] = task_state(task_id)
             store.write(state)
             _print_json({"created": str(args.state), "revision": 0, "scope": state["scope"]})
+            return 0
+
+        if args.command == "doctor":
+            _print_json(inspect_capabilities())
             return 0
 
         if args.command == "status":

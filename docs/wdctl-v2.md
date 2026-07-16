@@ -26,9 +26,16 @@ python3 -m wave_delivery freshness check --repo REPO --base epic/example --head 
 python3 -m wave_delivery monitor --once --state PATH --repo REPO
 python3 -m wave_delivery review collect --state PATH --task TASK-ID --result review-a.json \
   --idempotency-key KEY --expected-revision N
+python3 -m wave_delivery doctor --json
+python3 scripts/install_wave_delivery.py --prefix /chosen/install/path
 ```
 
 The in-repository equivalent is `python3 scripts/wdctl.py ...`.
+
+The installer deliberately requires an explicit prefix. It copies the package to
+`<prefix>/lib`, then writes both `<prefix>/bin/wdctl` and
+`<prefix>/bin/wdctl.cmd`; the former invokes `python3 -m wave_delivery`, and
+the latter invokes `python -m wave_delivery`.
 
 ## Guarantees in this slice
 
