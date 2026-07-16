@@ -35,7 +35,9 @@ choose the first epic with a planned wave that is not done.
   `.wdd/templates/` to exist.
 - For a schema-v2 scope, do not manually move task files or mutate controller
   JSON. Use `wdctl next`, `wdctl lease ensure`, and `wdctl event apply`; retain
-  this text-only sequence for schema-v1 compatibility.
+  this text-only sequence for schema-v1 compatibility. Use `wdctl merge record`
+  rather than a generic event when recording task completion so live Git proves
+  the reviewed task head is present in the configured scope base.
 
 ## Workflow
 
