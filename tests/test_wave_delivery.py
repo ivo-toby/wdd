@@ -151,9 +151,13 @@ class WaveDeliveryStateTests(unittest.TestCase):
             data={"headSha": "b"},
         )
         task = invalidated["tasks"]["TASK-001"]
-        self.assertEqual(task["status"], "in_progress")
+        self.assertEqual(task["status"], "review")
         self.assertIsNone(task["review"])
         self.assertIsNone(task["verification"])
+        self.assertEqual(
+            bounded_next_actions(invalidated)["actions"],
+            [{"task": "TASK-001", "action": "run_review"}],
+        )
 
     def test_next_respects_dependencies_and_conflict_domains(self):
         directory = tempfile.TemporaryDirectory()
@@ -199,8 +203,22 @@ class WaveDeliveryStateTests(unittest.TestCase):
             state["tasks"][task_id] = task
         payload = bounded_next_actions(state)
         self.assertLessEqual(
-            len(json.dumps(payload, separators=(",", ":")).encode("utf-8")), 2048
+            len((json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")),
+            2048,
         )
+        self.assertTrue(payload["truncated"])
+
+    def test_next_marks_an_action_queue_larger_than_its_cap_as_truncated(self):
+        state = new_state("EPIC-many-actions")
+        state["constitution"] = {
+            "status": "ratified",
+            "ratification": {"by": "Ivo", "decisionFingerprint": "sha256:test"},
+        }
+        for number in range(40):
+            task_id = f"TASK-{number:03d}"
+            state["tasks"][task_id] = task_state(task_id)
+        payload = bounded_next_actions(state)
+        self.assertEqual(len(payload["actions"]), 8)
         self.assertTrue(payload["truncated"])
 
     def test_state_file_remains_json_after_event_application(self):

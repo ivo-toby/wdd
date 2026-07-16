@@ -201,7 +201,7 @@ def transition(
         task["review"] = None
         task["verification"] = None
         task["freshness"] = None
-        task["status"] = "in_progress"
+        task["status"] = "review" if task.get("pr") else "in_progress"
     elif event_type == "freshness.recorded":
         _require_status(task, {"merge_ready"}, event_type)
         head_sha = _require_head(data, event_type)
@@ -303,7 +303,9 @@ def _dependency_blockers(state: dict[str, Any], task: dict[str, Any]) -> list[st
     ]
 
 
-def next_actions(state: dict[str, Any], *, max_actions: int = 8) -> dict[str, Any]:
+def next_actions(
+    state: dict[str, Any], *, max_actions: int | None = 8
+) -> dict[str, Any]:
     """Return a bounded, machine-readable action queue without mutating state."""
     blockers: list[dict[str, Any]] = []
     actions: list[dict[str, str]] = []
@@ -320,7 +322,7 @@ def next_actions(state: dict[str, Any], *, max_actions: int = 8) -> dict[str, An
             if task["status"] in ACTIVE_STATUSES:
                 occupied_domains.update(task["conflictDomains"])
         for task_id, task in sorted(state["tasks"].items()):
-            if len(actions) >= max_actions:
+            if max_actions is not None and len(actions) >= max_actions:
                 break
             if task["status"] == "blocked":
                 blockers.append({"task": task_id, "code": "blocked", "message": task["blocker"] or "blocked"})
@@ -342,7 +344,7 @@ def next_actions(state: dict[str, Any], *, max_actions: int = 8) -> dict[str, An
             gate = task_gate(task)
             action = {
                 "no_pr": "await_worker",
-                "reviewing": "collect_review",
+                "reviewing": "run_review",
                 "needs_fixes": "assign_fix_writer",
                 "needs_review": "run_review",
                 "needs_verification": "run_verification",
@@ -365,7 +367,7 @@ def bounded_next_actions(state: dict[str, Any], *, max_bytes: int = 2048) -> dic
     import json
 
     limit = 8
-    full_result = next_actions(state, max_actions=8)
+    full_result = next_actions(state, max_actions=None)
     while limit >= 0:
         result = next_actions(state, max_actions=limit)
         result["blockers"] = full_result["blockers"][:limit]
@@ -373,7 +375,8 @@ def bounded_next_actions(state: dict[str, Any], *, max_bytes: int = 2048) -> dic
             len(result["actions"]) < len(full_result["actions"])
             or len(result["blockers"]) < len(full_result["blockers"])
         )
-        if len(json.dumps(result, separators=(",", ":")).encode("utf-8")) <= max_bytes:
+        rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
+        if len(rendered.encode("utf-8")) <= max_bytes:
             return result
         limit -= 1
     raise ValidationError("next action output cannot fit within the requested byte limit")
