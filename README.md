@@ -1,14 +1,16 @@
 # WDD
 
-Wave-Driven Development is a portable, text-only skill pack for coding agents.
+Wave-Driven Development is a portable workflow kit for coding agents.
 
-The runtime is the Markdown skill pack, not a CLI, script, package, or local
-binary. Agents create and update local artifacts directly under `.wdd/`, using
-Markdown for human and agent context plus hand-editable JSON where resumable
-machine state is useful.
+The runtime is made of two parts: agent skills that describe the workflow, and
+the standard-library Python `wdctl` controller for deterministic state,
+migration, leases, freshness checks, review evidence, and merge recording.
+Agents create and update local artifacts under `.wdd/`, using Markdown for human
+and agent context plus JSON where resumable machine state is useful.
 
-This keeps the workflow usable across local agents, cloud agents, and hosted
-coding environments such as Claude Code Cloud and Codex Cloud.
+This keeps the workflow inspectable across local agents and hosted coding
+environments while still relying on scripts for the mechanical parts that should
+not be left to prompt interpretation.
 
 ## Vision
 
@@ -20,7 +22,7 @@ The core idea is simple: humans define intent, agents do focused work, and the w
 
 Epics provide the strategic boundary. Tickets group related work. Tasks are the executable unit. Waves maximize safe parallelism. Shared context carries durable knowledge across workers. Reviews, validation, and branch gates keep the system honest.
 
-WDD is intentionally text-only. Markdown skills are the runtime. Local artifacts are the source of truth. JSON is used only where machines need resumable state. There is no required CLI, daemon, package, or hosted service.
+WDD is intentionally text-first. Markdown skills describe the process. Local artifacts are the source of truth. JSON is used where machines need resumable state, and `wdctl` handles deterministic controller operations without external runtime dependencies.
 
 That makes the workflow portable across local coding agents, cloud agents, and whatever agent runtime comes next.
 
@@ -35,7 +37,7 @@ The goal is to make parallel agent work controlled enough that a senior engineer
 - Parallelism needs control — waves should maximize concurrency without pretending merge conflicts do not exist.
 - Review is part of execution — worker self-review is useful, but separate review agents and human review remain first-class gates.
 - Agents should preserve discoveries — durable worker memory keeps later tasks from rediscovering the same constraints.
-- Text beats infrastructure — the workflow should work anywhere a coding agent can read and write Markdown.
+- Inspectable artifacts over hidden infrastructure — the workflow should remain understandable from the repository state.
 - Humans own intent and final judgment — WDD helps agents execute, but it does not remove engineering accountability.
 
 ## Who WDD Is For
@@ -116,46 +118,161 @@ it again.
   checks, merges into the epic branch, wave reconciliation, epic validation,
   and final PR preparation.
 
-## Text-Only Runtime
+## Runtime Components
 
-WDD does not require:
+WDD relies on the files in this repository:
 
-- a CLI command
-- scripts
-- Node.js
-- npm
-- generated validators
-- local-only automation
+- `skills/` contains the agent skills that Codex and Claude Code discover.
+- `wave_delivery/` contains the `wdctl` Python package.
+- `scripts/wdctl.py` runs the in-repository controller without installation.
+- `scripts/install_wave_delivery.py` installs the controller into a chosen
+  prefix and writes `wdctl` launchers.
 
-Repository-native checks can still be referenced as optional verification when
-available, such as tests, linters, type checks, builds, CI status, or
-`git diff --check`. Those checks prove the target project; they are not required
-to operate the WDD framework itself.
-
-## Experimental Controller
-
-The default WDD runtime remains portable and text-only. An experimental,
-standard-library Python controller is available for schema-v2 scopes as
-`python3 -m wave_delivery` or `python3 scripts/wdctl.py`. It currently provides
+The controller is a standard-library Python tool for schema-v2 scopes. It is
+available as `python3 -m wave_delivery`, `python3 scripts/wdctl.py`, or an
+installed `wdctl` launcher. It currently provides
 atomic revisioned state, explicit constitution ratification, deterministic next
 actions, generated controller-state projections, and dry-run-first v1-to-v2
 migration. It also offers Git worktree leases and risk-based branch freshness
 checks, live-Git merge completion proof, plus zero-LLM local Git monitoring. It
-is additive while v1 artifacts remain the supported portable workflow; see
+is additive while v1 artifacts remain supported; see
 [`docs/wdctl-v2.md`](docs/wdctl-v2.md).
 
 The experimental controller uses only Python's standard library at runtime.
-Install it into an explicit prefix with
-`python3 scripts/install_wave_delivery.py --prefix /chosen/install/path`; this
-creates POSIX and Windows launchers alongside the portable
-`python -m wave_delivery` entry point.
 
-## Skill Pack
+Repository-native checks can still be referenced as verification when available,
+such as tests, linters, type checks, builds, CI status, or `git diff --check`.
+Those checks prove the target project; `wdctl` proves the WDD controller state.
+
+## Installation
 
 Install or copy the directories in `skills/` into the agent's skill directory.
 Copy the full directories recursively, including their `templates/` and
 `agents/` subdirectories where present. The skill folders are the installable
 runtime; users should not need a separate repository-root `templates/` folder.
+
+Use a clone of this repository as the source:
+
+```sh
+git clone https://github.com/ivo-toby/wdd.git
+cd wdd
+```
+
+Install the controller globally for your user:
+
+```sh
+python3 scripts/install_wave_delivery.py --prefix "$HOME/.local"
+```
+
+Then make sure the prefix is on your `PATH`:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+wdctl doctor
+```
+
+For a project-local controller install, choose a prefix inside the target
+repository:
+
+```sh
+python3 scripts/install_wave_delivery.py --prefix /path/to/project/.wdd/tools
+/path/to/project/.wdd/tools/bin/wdctl doctor
+```
+
+You can also run the controller directly from the WDD clone without installing:
+
+```sh
+python3 scripts/wdctl.py doctor
+```
+
+### Global Skills
+
+Install WDD skills globally when you want them available in every repository.
+
+For Codex:
+
+```sh
+mkdir -p "$HOME/.agents/skills"
+cp -R skills/* "$HOME/.agents/skills/"
+```
+
+For Claude Code:
+
+```sh
+mkdir -p "$HOME/.claude/skills"
+cp -R skills/* "$HOME/.claude/skills/"
+```
+
+Restart Codex if newly installed skills do not appear. Claude Code watches
+existing skill directories live, but restart it after creating a top-level
+skills directory for the first time.
+
+### Project Skills
+
+Install WDD skills at project level when a repository should carry its own WDD
+workflow with the codebase.
+
+For Codex, copy the skills into the repository's `.agents/skills` directory:
+
+```sh
+mkdir -p /path/to/project/.agents/skills
+cp -R skills/* /path/to/project/.agents/skills/
+```
+
+For Claude Code, copy the same skill directories into `.claude/skills`:
+
+```sh
+mkdir -p /path/to/project/.claude/skills
+cp -R skills/* /path/to/project/.claude/skills/
+```
+
+Commit project-level skill installs if the whole team should share the same WDD
+workflow:
+
+```sh
+cd /path/to/project
+git add .agents/skills .claude/skills
+git commit -m "Install WDD skills"
+```
+
+### Updating
+
+Update the source clone first:
+
+```sh
+cd /path/to/wdd
+git pull --ff-only
+```
+
+Then repeat the install step for each copied install:
+
+```sh
+python3 scripts/install_wave_delivery.py --prefix "$HOME/.local"
+cp -R skills/* "$HOME/.agents/skills/"
+cp -R skills/* "$HOME/.claude/skills/"
+```
+
+If a WDD release removes or renames a skill, delete the old WDD skill directory
+before copying again. A plain `cp -R` updates files but does not remove stale
+files that no longer exist in the source clone.
+
+For project-level installs, repeat the copy into the target project and commit
+the resulting changes:
+
+```sh
+cp -R skills/* /path/to/project/.agents/skills/
+cp -R skills/* /path/to/project/.claude/skills/
+cd /path/to/project
+git add .agents/skills .claude/skills
+git commit -m "Update WDD skills"
+```
+
+If you symlink skill directories from a clone instead of copying them, running
+`git pull --ff-only` in that clone updates the skill files in place. Still rerun
+`scripts/install_wave_delivery.py` after pulling, because the `wdctl` installer
+copies `wave_delivery/` into the selected prefix.
+
+## Skill Pack
 
 For Codex-style local skills, that means:
 
