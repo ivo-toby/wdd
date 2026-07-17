@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the in-repository wdctl command without installation."""
+"""Run the in-repository wddctl command without installation."""
 
 from pathlib import Path
 import sys

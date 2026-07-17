@@ -22,7 +22,7 @@ defaults from repository docs and code.
 - If `.wdd/` exists, inspect it and update only missing scaffolding.
 - Keep schema-v1 initialization portable: it must not require a WDD CLI,
   script, package manager, or validator. When initializing a schema-v2 managed
-  workflow, `wdctl` is the optional controller integration and its installer
+  workflow, `wddctl` is the optional controller integration and its installer
   must still be an explicit user choice.
 - Use this skill's local `templates/` directory as the source for starter
   artifacts. Do not rely on a repository-root `templates/` directory.
@@ -76,7 +76,7 @@ defaults from repository docs and code.
      reconciliation, validation when applicable, and final handoff.
    - State that external trackers are adapters.
    - State that schema-v1 is text-only and does not require scripts, while a
-     schema-v2 scope may use the optional `wdctl` controller.
+     schema-v2 scope may use the optional `wddctl` controller.
 
 6. Report:
    - Files created.

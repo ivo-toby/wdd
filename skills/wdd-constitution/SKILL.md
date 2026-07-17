@@ -21,7 +21,7 @@ verification commands, and workflow non-goals.
   `templates/constitution.md`.
 - Read relevant repo docs before asking the user for information.
 - Schema-v1 constitutions remain text-only. For a schema-v2 scope, use
-  `wdctl constitution probe` to gather evidence and `wdctl constitution ratify`
+  `wddctl constitution probe` to gather evidence and `wddctl constitution ratify`
   only after an explicit user decision.
 
 ## Workflow
@@ -38,7 +38,7 @@ verification commands, and workflow non-goals.
 
 3. Present the initial ratification bundle unconditionally:
    - Gather repository evidence first; in schema-v2, prefer
-     `wdctl constitution probe` when available.
+     `wddctl constitution probe` when available.
    - Present the proposed decisions compactly and require the user to ratify or
      change them. Never silently ratify an initial constitution from inference.
    - Use an interactive decision tool when available. Otherwise ask in plain
@@ -95,7 +95,7 @@ verification commands, and workflow non-goals.
    - No unexplained placeholders remain in actual constitution artifacts.
    - Rules are testable and use clear MUST or SHOULD language where needed.
    - Optional repo-native verification commands are concrete when named.
-- Schema-v1 remains text-only; schema-v2 ratification is recorded by `wdctl`.
+- Schema-v1 remains text-only; schema-v2 ratification is recorded by `wddctl`.
 
 ## Done When
 

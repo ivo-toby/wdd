@@ -89,7 +89,7 @@ unless the user chose them.
 - Repository-native checks may be referenced when available.
 - The schema-v1 WDD framework itself does not require a CLI, scripts, Node.js,
   npm, or generated validators. Schema-v2 managed workflows may opt into the
-  `wdctl` controller through an explicit local installation.
+  `wddctl` controller through an explicit local installation.
 - `git diff --check` is allowed as an optional whitespace sanity check.
 
 ## Agent Roles

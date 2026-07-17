@@ -26,7 +26,7 @@ def _task(state: dict[str, Any], task_id: str) -> dict[str, Any]:
 
 
 def _default_worktree(repo: Path, scope_id: str, task_id: str) -> Path:
-    return repo.parent / f"{repo.name}.wdctl-worktrees" / scope_id / task_id
+    return repo.parent / f"{repo.name}.wddctl-worktrees" / scope_id / task_id
 
 
 def _record_event(

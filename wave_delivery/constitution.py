@@ -81,7 +81,7 @@ def probe_repository(root: Path | str) -> dict[str, Any]:
     target_branch = _git_target_branch(root)
     proposal = {
         "schemaVersion": 1,
-        "kind": "wdctl_constitution_proposal",
+        "kind": "wddctl_constitution_proposal",
         "repository": str(root),
         "evidence": {
             "instructionFiles": instruction_files,

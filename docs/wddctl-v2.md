@@ -1,6 +1,6 @@
-# wdctl schema-v2 foundation
+# wddctl schema-v2 foundation
 
-`wdctl` is an experimental, dependency-free controller for the mechanical part
+`wddctl` is an experimental, dependency-free controller for the mechanical part
 of WDD. It does not replace the portable schema-v1 skill workflow yet.
 
 For a schema-v2 scope, Markdown remains the human-authored specification while
@@ -33,11 +33,11 @@ python3 -m wave_delivery doctor --json
 python3 scripts/install_wave_delivery.py --prefix /chosen/install/path
 ```
 
-The in-repository equivalent is `python3 scripts/wdctl.py ...`.
+The in-repository equivalent is `python3 scripts/wddctl.py ...`.
 
 The installer deliberately requires an explicit prefix. It copies the package to
-`<prefix>/lib`, then writes both `<prefix>/bin/wdctl` and
-`<prefix>/bin/wdctl.cmd`; the former invokes `python3 -m wave_delivery`, and
+`<prefix>/lib`, then writes both `<prefix>/bin/wddctl` and
+`<prefix>/bin/wddctl.cmd`; the former invokes `python3 -m wave_delivery`, and
 the latter invokes `python -m wave_delivery`.
 
 ## Guarantees in this slice

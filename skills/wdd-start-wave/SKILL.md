@@ -34,8 +34,8 @@ choose the first epic with a planned wave that is not done.
   `templates/controller-state.md` as the starting point. Do not require
   `.wdd/templates/` to exist.
 - For a schema-v2 scope, do not manually move task files or mutate controller
-  JSON. Use `wdctl next`, `wdctl lease ensure`, and `wdctl event apply`; retain
-  this text-only sequence for schema-v1 compatibility. Use `wdctl merge record`
+  JSON. Use `wddctl next`, `wddctl lease ensure`, and `wddctl event apply`; retain
+  this text-only sequence for schema-v1 compatibility. Use `wddctl merge record`
   rather than a generic event when recording task completion so live Git proves
   the reviewed task head is present in the configured scope base.
 

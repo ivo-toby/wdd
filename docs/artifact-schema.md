@@ -46,7 +46,7 @@ Required body sections:
 
 The initial constitution is always `draft`. It becomes active only after the
 user explicitly ratifies the compact decision bundle. Schema-v2 controller
-scopes record the actor, time, and decision fingerprint through `wdctl`; a
+scopes record the actor, time, and decision fingerprint through `wddctl`; a
 schema-v1 portable scope records the equivalent decision in the Markdown
 artifact.
 

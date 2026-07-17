@@ -33,8 +33,8 @@ state and orchestration state.
 - Workers do not merge their own PRs.
 - GitHub is optional. If no PR system exists, use branches, patches, or local
   status notes while preserving the same gates.
-- In a schema-v2 scope, use `wdctl monitor --once`, `wdctl review collect`,
-  `wdctl verify collect`, and `wdctl freshness record` for mechanical evidence
+- In a schema-v2 scope, use `wddctl monitor --once`, `wddctl review collect`,
+  `wddctl verify collect`, and `wddctl freshness record` for mechanical evidence
   and gate updates. Do not hand-edit their canonical JSON state.
 
 ## Workflow

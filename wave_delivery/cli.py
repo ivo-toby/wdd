@@ -41,7 +41,7 @@ def _json_list_argument(value: str) -> list[str]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="wdctl", description=__doc__)
+    parser = argparse.ArgumentParser(prog="wddctl", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init = subparsers.add_parser("init", help="create a schema-v2 controller state file")
@@ -364,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "event" and args.event_command == "apply":
             if args.event == "task.merged":
-                raise IllegalTransition("use 'wdctl merge record' to verify live Git state")
+                raise IllegalTransition("use 'wddctl merge record' to verify live Git state")
             state, duplicate = apply_event(
                 StateStore(args.state),
                 event_type=args.event,
@@ -405,7 +405,7 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(ratification_status(StateStore(args.state).read(), proposal))
             return 0
     except WaveDeliveryError as error:
-        print(f"wdctl: {error}", file=sys.stderr)
+        print(f"wddctl: {error}", file=sys.stderr)
         return error.exit_code
     parser.error("unknown command")
     return 2

@@ -180,11 +180,11 @@ def build_migration_plan(state_path: Path | str) -> dict[str, Any]:
     target["appliedIdempotencyKeys"] = [migration_key]
     return {
         "schemaVersion": 1,
-        "kind": "wdctl_migration_plan",
+        "kind": "wddctl_migration_plan",
         "id": migration_id,
         "sourceState": str(state_path),
         "sourceStateFingerprint": _sha256_file(state_path),
-        "backupDirectory": str(state_path.parent / ".wdctl-migrations" / migration_id),
+        "backupDirectory": str(state_path.parent / ".wddctl-migrations" / migration_id),
         "scope": target["scope"],
         "moves": moves,
         "targetState": target,
@@ -194,7 +194,7 @@ def build_migration_plan(state_path: Path | str) -> dict[str, Any]:
 def _backup_manifest(plan: dict[str, Any]) -> dict[str, Any]:
     return {
         "schemaVersion": 1,
-        "kind": "wdctl_migration_backup",
+        "kind": "wddctl_migration_backup",
         "id": plan["id"],
         "sourceState": plan["sourceState"],
         "sourceStateFingerprint": _sha256_file(Path(plan["sourceState"])),
@@ -273,8 +273,8 @@ def rollback_migration(backup_directory: Path | str) -> dict[str, Any]:
     backup_directory = Path(backup_directory)
     manifest_path = backup_directory / "manifest.json"
     manifest = _read_json(manifest_path)
-    if manifest.get("kind") != "wdctl_migration_backup":
-        raise ValidationError("backup manifest is not a wdctl migration backup")
+    if manifest.get("kind") != "wddctl_migration_backup":
+        raise ValidationError("backup manifest is not a wddctl migration backup")
     state_path = Path(manifest["sourceState"])
     current_state_fingerprint = _sha256_file(state_path)
     allowed_state_fingerprints = {

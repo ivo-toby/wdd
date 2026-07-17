@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the dependency-free wdctl package with POSIX and Windows launchers."""
+"""Install the dependency-free wddctl package with POSIX and Windows launchers."""
 
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ exec python3 -m wave_delivery "$@"
 """
 
 WINDOWS_LAUNCHER = """@echo off
-set "WDCTL_ROOT=%~dp0.."
-set "PYTHONPATH=%WDCTL_ROOT%\\lib;%PYTHONPATH%"
+set "WDDCTL_ROOT=%~dp0.."
+set "PYTHONPATH=%WDDCTL_ROOT%\\lib;%PYTHONPATH%"
 python -m wave_delivery %*
 """
 
@@ -34,10 +34,13 @@ def install(prefix: Path) -> dict[str, str]:
     library.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(PACKAGE_SOURCE, library, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     bin_directory.mkdir(parents=True, exist_ok=True)
-    posix_launcher = bin_directory / "wdctl"
+    for legacy_launcher in (bin_directory / "wdctl", bin_directory / "wdctl.cmd"):
+        if legacy_launcher.exists():
+            legacy_launcher.unlink()
+    posix_launcher = bin_directory / "wddctl"
     posix_launcher.write_text(POSIX_LAUNCHER, encoding="utf-8")
     posix_launcher.chmod(0o755)
-    windows_launcher = bin_directory / "wdctl.cmd"
+    windows_launcher = bin_directory / "wddctl.cmd"
     windows_launcher.write_text(WINDOWS_LAUNCHER, encoding="utf-8", newline="\r\n")
     return {
         "prefix": str(prefix),

@@ -3,7 +3,7 @@
 Wave-Driven Development is a portable workflow kit for coding agents.
 
 The runtime is made of two parts: agent skills that describe the workflow, and
-the standard-library Python `wdctl` controller for deterministic state,
+the standard-library Python `wddctl` controller for deterministic state,
 migration, leases, freshness checks, review evidence, and merge recording.
 Agents create and update local artifacts under `.wdd/`, using Markdown for human
 and agent context plus JSON where resumable machine state is useful.
@@ -22,7 +22,7 @@ The core idea is simple: humans define intent, agents do focused work, and the w
 
 Epics provide the strategic boundary. Tickets group related work. Tasks are the executable unit. Waves maximize safe parallelism. Shared context carries durable knowledge across workers. Reviews, validation, and branch gates keep the system honest.
 
-WDD is intentionally text-first. Markdown skills describe the process. Local artifacts are the source of truth. JSON is used where machines need resumable state, and `wdctl` handles deterministic controller operations without external runtime dependencies.
+WDD is intentionally text-first. Markdown skills describe the process. Local artifacts are the source of truth. JSON is used where machines need resumable state, and `wddctl` handles deterministic controller operations without external runtime dependencies.
 
 That makes the workflow portable across local coding agents, cloud agents, and whatever agent runtime comes next.
 
@@ -123,26 +123,26 @@ it again.
 WDD relies on the files in this repository:
 
 - `skills/` contains the agent skills that Codex and Claude Code discover.
-- `wave_delivery/` contains the `wdctl` Python package.
-- `scripts/wdctl.py` runs the in-repository controller without installation.
+- `wave_delivery/` contains the controller Python package.
+- `scripts/wddctl.py` runs the in-repository controller without installation.
 - `scripts/install_wave_delivery.py` installs the controller into a chosen
-  prefix and writes `wdctl` launchers.
+  prefix and writes `wddctl` launchers.
 
 The controller is a standard-library Python tool for schema-v2 scopes. It is
-available as `python3 -m wave_delivery`, `python3 scripts/wdctl.py`, or an
-installed `wdctl` launcher. It currently provides
+available as `python3 -m wave_delivery`, `python3 scripts/wddctl.py`, or an
+installed `wddctl` launcher. It currently provides
 atomic revisioned state, explicit constitution ratification, deterministic next
 actions, generated controller-state projections, and dry-run-first v1-to-v2
 migration. It also offers Git worktree leases and risk-based branch freshness
 checks, live-Git merge completion proof, plus zero-LLM local Git monitoring. It
 is additive while v1 artifacts remain supported; see
-[`docs/wdctl-v2.md`](docs/wdctl-v2.md).
+[`docs/wddctl-v2.md`](docs/wddctl-v2.md).
 
 The experimental controller uses only Python's standard library at runtime.
 
 Repository-native checks can still be referenced as verification when available,
 such as tests, linters, type checks, builds, CI status, or `git diff --check`.
-Those checks prove the target project; `wdctl` proves the WDD controller state.
+Those checks prove the target project; `wddctl` proves the WDD controller state.
 
 ## Installation
 
@@ -168,7 +168,7 @@ Then make sure the prefix is on your `PATH`:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
-wdctl doctor
+wddctl doctor
 ```
 
 For a project-local controller install, choose a prefix inside the target
@@ -176,13 +176,13 @@ repository:
 
 ```sh
 python3 scripts/install_wave_delivery.py --prefix /path/to/project/.wdd/tools
-/path/to/project/.wdd/tools/bin/wdctl doctor
+/path/to/project/.wdd/tools/bin/wddctl doctor
 ```
 
 You can also run the controller directly from the WDD clone without installing:
 
 ```sh
-python3 scripts/wdctl.py doctor
+python3 scripts/wddctl.py doctor
 ```
 
 ### Global Skills
@@ -269,7 +269,7 @@ git commit -m "Update WDD skills"
 
 If you symlink skill directories from a clone instead of copying them, running
 `git pull --ff-only` in that clone updates the skill files in place. Still rerun
-`scripts/install_wave_delivery.py` after pulling, because the `wdctl` installer
+`scripts/install_wave_delivery.py` after pulling, because the `wddctl` installer
 copies `wave_delivery/` into the selected prefix.
 
 ## Skill Pack

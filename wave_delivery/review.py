@@ -40,8 +40,8 @@ def normalize_review_results(paths: list[Path | str], *, task_id: str) -> dict[s
     reviewers: list[str] = []
     findings: list[dict[str, Any]] = []
     for result in results:
-        if result.get("schemaVersion") != 1 or result.get("kind") != "wdctl_review_result":
-            raise ValidationError("review result must use schemaVersion 1 and kind wdctl_review_result")
+        if result.get("schemaVersion") != 1 or result.get("kind") != "wddctl_review_result":
+            raise ValidationError("review result must use schemaVersion 1 and kind wddctl_review_result")
         if result.get("task") not in {None, task_id}:
             raise ValidationError(f"review result belongs to {result.get('task')}, not {task_id}")
         result_base = _required_string(result.get("baseSha"), "review result baseSha")
@@ -70,9 +70,9 @@ def normalize_review_results(paths: list[Path | str], *, task_id: str) -> dict[s
 
 def normalize_verification_result(path: Path | str, *, task_id: str) -> dict[str, Any]:
     result = _read_result(path)
-    if result.get("schemaVersion") != 1 or result.get("kind") != "wdctl_verification_result":
+    if result.get("schemaVersion") != 1 or result.get("kind") != "wddctl_verification_result":
         raise ValidationError(
-            "verification result must use schemaVersion 1 and kind wdctl_verification_result"
+            "verification result must use schemaVersion 1 and kind wddctl_verification_result"
         )
     if result.get("task") not in {None, task_id}:
         raise ValidationError(f"verification result belongs to {result.get('task')}, not {task_id}")
