@@ -20,7 +20,9 @@ verification commands, and workflow non-goals.
   `.wdd/constitution.md` is missing, create it from this skill folder's
   `templates/constitution.md`.
 - Read relevant repo docs before asking the user for information.
-- Do not require scripts or CLI commands to create or validate the constitution.
+- Schema-v1 constitutions remain text-only. For a schema-v2 scope, use
+  `wdctl constitution probe` to gather evidence and `wdctl constitution ratify`
+  only after an explicit user decision.
 
 ## Workflow
 
@@ -34,7 +36,15 @@ verification commands, and workflow non-goals.
    - Deployment, data, auth, persistence, security, or CI constraints.
    - Existing agent instructions.
 
-3. Ask for required setup decisions when not inferable:
+3. Present the initial ratification bundle unconditionally:
+   - Gather repository evidence first; in schema-v2, prefer
+     `wdctl constitution probe` when available.
+   - Present the proposed decisions compactly and require the user to ratify or
+     change them. Never silently ratify an initial constitution from inference.
+   - Use an interactive decision tool when available. Otherwise ask in plain
+     text and stop before execution.
+
+4. Ask for required setup decisions when not inferable:
    - Available model aliases.
    - Model usage for epic definition, planning, simple implementation, complex
      implementation, review, feedback-fix, epic validation, and PR description.
@@ -54,7 +64,7 @@ verification commands, and workflow non-goals.
    - Whether review comments go to PRs or local files.
    - Whether feedback fixes prefer the original worker or a fresh worker.
 
-4. Fill or amend required sections:
+5. Fill or amend required sections:
    - Project Scope.
    - Setup Configuration.
    - Model Usage.
@@ -69,23 +79,23 @@ verification commands, and workflow non-goals.
    - Shared Context Rules.
    - Governance.
 
-5. Apply default review policy unless the user overrides it:
+6. Apply default review policy unless the user overrides it:
    - P1 blocks merge.
    - P2 blocks merge.
    - P3 does not block merge.
    - Feedback processing may use the original worker or a fresh worker,
      whichever is safer.
 
-6. Decide version bump:
+7. Decide version bump:
    - MAJOR: role, artifact, or gate changes that break existing epics.
    - MINOR: new required sections, checks, or gates.
    - PATCH: wording or clarification only.
 
-7. Validate by inspection:
+8. Validate by inspection:
    - No unexplained placeholders remain in actual constitution artifacts.
    - Rules are testable and use clear MUST or SHOULD language where needed.
    - Optional repo-native verification commands are concrete when named.
-   - WDD itself remains text-only.
+- Schema-v1 remains text-only; schema-v2 ratification is recorded by `wdctl`.
 
 ## Done When
 

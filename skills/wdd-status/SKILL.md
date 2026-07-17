@@ -26,6 +26,9 @@ epic, report that epic. If the user asks for all state, scan `.wdd/work/*/` and
    - If missing, report that WDD is not initialized and suggest
      `wdd-init-project`.
    - If present, read `.wdd/constitution.md`.
+   - When a schema-v2 state file is present and `wdctl` is available, use
+     `wdctl status --brief` and `wdctl next` as the authoritative mechanical
+     summary; do not repair JSON or task paths manually.
 
 2. Scan micro-wave work packets:
    - Read each `.wdd/work/*/brief.md`.

@@ -19,8 +19,8 @@ state and orchestration state.
 
 ## Preconditions
 
-- `orchestration.json` exists with `schemaVersion: 1`, or a single task file is
-  provided.
+- `orchestration.json` exists with `schemaVersion: 1`, a schema-v2 controller
+  state exists for the scope, or a single task file is provided.
 - Each worker receives the task file set assigned by strategy: one task for
   `parallel` or single-task dispatch, all active wave tasks for `bundled`, or one
   bundle group's tasks for `hybrid`.
@@ -33,6 +33,9 @@ state and orchestration state.
 - Workers do not merge their own PRs.
 - GitHub is optional. If no PR system exists, use branches, patches, or local
   status notes while preserving the same gates.
+- In a schema-v2 scope, use `wdctl monitor --once`, `wdctl review collect`,
+  `wdctl verify collect`, and `wdctl freshness record` for mechanical evidence
+  and gate updates. Do not hand-edit their canonical JSON state.
 
 ## Workflow
 

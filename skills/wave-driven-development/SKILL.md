@@ -25,8 +25,10 @@ compact tasks, prefer the micro-wave path over a full epic.
 - Use `.wdd/` as the durable local source of truth.
 - Honor the constitution default profile and any artifact-level `profile`
   override.
-- Do not rely on a runtime CLI, script, package manager, generated validator, or
-  local binary.
+- Schema-v1 remains portable and does not require a CLI, script, package
+  manager, generated validator, or local binary.
+- For a schema-v2 controller-governed scope, use `wdctl` for mechanical state
+  changes, status, next actions, leases, monitoring, and evidence collection.
 - Keep GitHub, Jira, Linear, Postgram, and similar systems as adapters or
   mirrors, not required storage.
 
@@ -92,7 +94,8 @@ compact tasks, prefer the micro-wave path over a full epic.
    - Ticket container: `<ticket-id>/ticket.md`
    - Task files: `<ticket-id>/<status>/<task-id>.md`
    - Wave plan: `wave-plan.md`
-   - Machine state: `orchestration.json` with `schemaVersion: 1`
+   - Machine state: `orchestration.json` with `schemaVersion: 1` for portable
+     scopes, or controller-governed schema v2 state managed by `wdctl`.
    - Human controller state: `controller-state.md`
    - Epic validation: `epic-validation.md`
    - Final PR draft: `final-pr.md`
@@ -146,5 +149,6 @@ compact tasks, prefer the micro-wave path over a full epic.
 - The current phase has updated concrete text artifacts.
 - The next valid phase is named.
 - Any blocker is recorded in the relevant artifact.
-- No WDD phase required a CLI, script, package manager, generated validator, or
-  local binary.
+- Schema-v1 phases remain runnable without a CLI, script, package manager,
+  generated validator, or local binary. Schema-v2 mechanics ran through
+  `wdctl` rather than direct artifact mutation.

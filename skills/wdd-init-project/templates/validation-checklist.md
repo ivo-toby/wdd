@@ -76,8 +76,8 @@ created_at: YYYY-MM-DD
 
 ## Text-Only Portability
 
-- [ ] Workflow does not require a CLI.
-- [ ] Workflow does not require scripts.
+- [ ] Schema-v1 workflow does not require a CLI or scripts.
+- [ ] Schema-v2 controller use, if selected, has an explicit installation path.
 - [ ] Workflow does not require Node.js or npm.
 - [ ] Repo-native verification commands are optional and project-specific.
 

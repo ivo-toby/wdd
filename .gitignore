@@ -2,3 +2,5 @@ node_modules/
 coverage/
 dist/
 .DS_Store
+__pycache__/
+*.pyc
