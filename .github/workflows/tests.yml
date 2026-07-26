@@ -1,12 +1,18 @@
 name: tests
 
 on:
+  # Only the default branch on push: pull_request already covers PR branches,
+  # and matching both ran every job twice per push.
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
