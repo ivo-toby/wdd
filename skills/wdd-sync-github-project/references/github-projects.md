@@ -51,6 +51,25 @@ prevent that:
    second, unconditional line of defense in case the id-format check above
    is ever bypassed or buggy.
 
+Layer 2 is anchored to a trusted root, not to the immediate container
+directory. Resolving `path` and `container` independently with
+`Path.resolve()` and then comparing the results is not sufficient: if
+`.wdd` or `.wdd/tasks` is itself a symlink pointing outside the repository,
+both sides resolve under that outside target and agree with each other, so
+a naive containment check passes while the write still escapes the
+checkout. To close that, `assert_path_contained()` takes the repository
+root (from the trusted `--root` argument) and:
+
+- walks every path component between that root and the write target --
+  including `.wdd`, `.wdd/tasks`, and any other intermediate directory --
+  refusing the write the moment any of them is a symlink (`Path.is_symlink()`,
+  checked on the unresolved component, before any `.resolve()` happens), and
+- separately requires the fully resolved target still land under the fully
+  resolved root.
+
+Either check failing raises immediately, naming the offending symlinked
+component (or the escaping resolved path) in the error.
+
 ## Risk heuristic
 
 A task is `"risk": "high"` iff its title, labels, or an explicit
@@ -102,6 +121,33 @@ Non-status operations remain safe to emit even with no controller state:
 task, and `update_project_fields` limited to `WDD ID`/`Risk` (no `Status`,
 so the project's own default column applies). Run `wddctl start`/`wddctl
 next` to establish controller state, then re-push to get accurate statuses.
+
+## Push must never duplicate an already-linked task
+
+Push distinguishes three cases per local task, using
+`.wdd/adapters/github-project.json` and the fetched Project snapshot:
+
+1. **No manifest link at all** -- genuinely new. `create_remote_issue` +
+   `add_issue_to_project` + `update_project_fields` are emitted, as above.
+2. **Manifest link exists, and the linked issue/item is present in the
+   snapshot** -- normal update path (`update_project_fields` on status
+   drift, or nothing if it already matches).
+3. **Manifest link exists, but the linked issue/item is absent from the
+   snapshot** -- e.g. it was removed from the Project board, or the fetch
+   was partial/empty. This is *not* the same as "no link at all": treating
+   it as new would silently create a duplicate issue for a task that
+   already has one. Instead:
+   - If the manifest recorded an issue number, push emits
+     `add_issue_to_project` for that same issue number (re-adding it to the
+     project) plus a `linked_item_missing_from_snapshot` warning naming the
+     task and the issue number. `create_remote_issue` is never emitted for
+     this task.
+   - If only a bare Project item id was recorded (no issue number), there
+     is nothing safe to auto-recover with, so push reports a blocking
+     `linked_item_missing_from_snapshot` conflict instead of guessing.
+
+Both the warning and the conflict name the task and the stored link, and
+both are surfaced plainly in the dry-run text output as well as `--json`.
 
 ## Adopting tasks created by push
 

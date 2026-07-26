@@ -18,6 +18,10 @@ it.
 - One GitHub Project maps to one WDD scope (`SCOPE-<project-slug>`).
 - A remote "WDD ID" must be a bare `TASK-<slug>` (no `/`, no `..`); anything
   else blocks the sync as a conflict rather than touching disk.
+- Every local write is re-checked against a trusted `--root`: no component
+  between the root and the write target may be a symlink. A symlinked
+  `.wdd` or `.wdd/tasks` refuses to write rather than silently redirecting
+  outside the checkout.
 
 ## Pull (GitHub -> local)
 
@@ -48,6 +52,14 @@ never mutates GitHub. Without `.wdd/state.json` (e.g. after `pull
 and still emits safe non-status ops. After applying `create_remote_issue` by
 hand, run `record-link --record-link TASK-ID=<issue-or-item-id>` (repeatable)
 to avoid an `id_collision` on the next sync.
+
+A task that is already linked in the manifest but whose issue/item is
+missing from the fetched Project snapshot is **never** recreated: if the
+manifest recorded an issue number, push re-adds that same issue to the
+project instead (`add_issue_to_project` + a loud warning); if only a bare
+item id was recorded, push reports a blocking conflict instead of guessing.
+Either way, `create_remote_issue` is only ever emitted for a task with no
+manifest link at all.
 
 ## Next steps
 

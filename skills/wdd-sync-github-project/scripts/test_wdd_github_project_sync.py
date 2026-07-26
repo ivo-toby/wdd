@@ -552,6 +552,158 @@ class WddGithubProjectSyncTests(unittest.TestCase):
             ]
             self.assertEqual(len(skipped), 1)
 
+    # -- Finding 1 (P2): a symlinked container defeats the containment check --
+
+    def test_symlinked_tasks_dir_cannot_escape_the_repository(self):
+        """Reproduction: point `.wdd/tasks` at a directory outside the repo
+        root. `.resolve()`-both-sides containment would follow the symlink
+        on both `path` and `container` and see them agree -- and write an
+        ordinary task brief outside the checkout. The fix anchors
+        containment to the trusted `--root` and walks every component from
+        there for a symlink, so this must raise instead of writing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            root = tmp_path / "repo"
+            outside = tmp_path / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (root / ".wdd").mkdir()
+            (root / ".wdd" / "tasks").symlink_to(outside, target_is_directory=True)
+
+            result = sync.plan_sync(root, remote_snapshot(), mode="pull")
+            self.assertEqual(result["conflicts"], [])
+
+            with self.assertRaises(RuntimeError) as ctx:
+                sync.apply_local_operations(root, result)
+            self.assertIn("symlink", str(ctx.exception))
+
+            # Nothing was written through the symlink, in particular no task
+            # brief landed in the directory it points at.
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_symlinked_wdd_dir_cannot_escape_the_repository(self):
+        """Same reproduction, one level up: `.wdd` itself is the symlink."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            root = tmp_path / "repo"
+            outside = tmp_path / "outside"
+            root.mkdir()
+            outside.mkdir()
+            root.joinpath(".wdd").symlink_to(outside, target_is_directory=True)
+
+            result = sync.plan_sync(root, remote_snapshot(), mode="pull")
+            self.assertEqual(result["conflicts"], [])
+
+            with self.assertRaises(RuntimeError) as ctx:
+                sync.apply_local_operations(root, result)
+            self.assertIn("symlink", str(ctx.exception))
+
+            self.assertEqual(list(outside.iterdir()), [])
+
+    # -- Finding 2 (P2): a linked task missing from the snapshot must not ---
+    # -- be recreated as a duplicate issue -----------------------------------
+
+    def _write_linked_task(self, root: Path, github_link: dict) -> None:
+        write_text(
+            root / ".wdd" / "plan.json",
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "kind": "wdd_plan",
+                    "scope": {
+                        "id": "SCOPE-auth-refresh",
+                        "baseRef": "wdd/auth-refresh",
+                        "maxConcurrent": None,
+                        "reviewPolicy": "risk_based",
+                        "reconcileEveryNMerges": 3,
+                    },
+                    "tasks": [
+                        {
+                            "id": "TASK-001-api-contract",
+                            "title": "API contract",
+                            "specPath": "tasks/TASK-001-api-contract.md",
+                            "risk": "normal",
+                            "dependsOn": [],
+                            "conflictDomains": ["src/api/**"],
+                        }
+                    ],
+                }
+            ),
+        )
+        write_text(
+            root / ".wdd" / "tasks" / "TASK-001-api-contract.md",
+            "# TASK-001-api-contract: API contract\n\n## Objective\n\nDefine the API contract.\n",
+        )
+        write_text(
+            root / ".wdd" / "adapters" / "github-project.json",
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                    "scope": {"id": "SCOPE-auth-refresh"},
+                    "project": {},
+                    "items": {
+                        "TASK-001-api-contract": {
+                            "localPath": "tasks/TASK-001-api-contract.md",
+                            "github": github_link,
+                            "fingerprints": {"local": "sha256:x", "remote": "sha256:y"},
+                        }
+                    },
+                }
+            ),
+        )
+
+    def test_push_does_not_recreate_an_already_linked_task_missing_from_snapshot(self):
+        """Reproduction: manifest still holds an issue link for a task, but
+        the fetched Project snapshot is empty (the item was removed from the
+        board, or the fetch was partial). This must never fall through to
+        create_remote_issue -- that would duplicate an issue that already
+        exists. The known issue number is re-added to the project instead."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_linked_task(root, {"issueNumber": 42})
+
+            empty_snapshot = {
+                "project": {"owner": "ivo-toby", "number": 4, "repo": "ivo-toby/example", "title": "Auth Refresh"},
+                "items": [],
+            }
+            result = sync.plan_sync(root, empty_snapshot, mode="push", scope_id="SCOPE-auth-refresh")
+
+            actions = [op["action"] for op in result["operations"]]
+            self.assertEqual(actions.count("create_remote_issue"), 0)
+            self.assertIn("add_issue_to_project", actions)
+            re_add = next(op for op in result["operations"] if op["action"] == "add_issue_to_project")
+            self.assertEqual(re_add["issueNumber"], 42)
+            self.assertEqual(result["conflicts"], [])
+
+            missing_warnings = [w for w in result["warnings"] if w["type"] == "linked_item_missing_from_snapshot"]
+            self.assertEqual(len(missing_warnings), 1)
+            self.assertEqual(missing_warnings[0]["task"], "TASK-001-api-contract")
+            self.assertIn("42", missing_warnings[0]["reason"])
+
+    def test_push_reports_conflict_for_linked_item_id_missing_from_snapshot(self):
+        """Same reproduction, but only a bare Project item id (no issue
+        number) was recorded. There is no safe auto-recovery -- this must
+        block as a conflict rather than guess, and still never create."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_linked_task(root, {"itemId": "PVTI_gone"})
+
+            empty_snapshot = {
+                "project": {"owner": "ivo-toby", "number": 4, "repo": "ivo-toby/example", "title": "Auth Refresh"},
+                "items": [],
+            }
+            result = sync.plan_sync(root, empty_snapshot, mode="push", scope_id="SCOPE-auth-refresh")
+
+            actions = [op["action"] for op in result["operations"]]
+            self.assertEqual(actions.count("create_remote_issue"), 0)
+            self.assertEqual(result["operations"], [])
+
+            conflicts = [c for c in result["conflicts"] if c["type"] == "linked_item_missing_from_snapshot"]
+            self.assertEqual(len(conflicts), 1)
+            self.assertEqual(conflicts[0]["task"], "TASK-001-api-contract")
+            self.assertIn("PVTI_gone", conflicts[0]["reason"])
+
     def test_push_with_controller_state_still_updates_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

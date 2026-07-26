@@ -56,20 +56,64 @@ def local_status_to_remote(status: str | None) -> str:
 TASK_ID_PATTERN = re.compile(r"^TASK-[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
-def assert_path_contained(path: Path, container: Path, what: str) -> Path:
+def assert_no_symlink_between(root: Path, target: Path, what: str) -> None:
+    """Walk every path component from `root` (exclusive) down to `target`
+    (inclusive), refusing the write if any of them is a symlink.
+
+    `root` must come from a source the caller trusts (the `--root` CLI
+    argument) -- everything below it, including `.wdd` and `.wdd/tasks`
+    themselves, is treated as untrusted until proven otherwise. A symlinked
+    intermediate directory is exactly how a plain "resolve both sides and
+    compare" containment check gets defeated: `.resolve()` silently follows
+    the symlink, so both `target` and a symlinked container end up agreeing
+    on some directory outside the repository. Walking the unresolved
+    components and checking each with `Path.is_symlink()` catches that
+    before any resolution happens.
+    """
+    root_resolved = root.resolve()
+    try:
+        relative_parts = target.relative_to(root).parts
+    except ValueError:
+        relative_parts = target.absolute().relative_to(root.absolute()).parts
+    current = root_resolved
+    for part in relative_parts:
+        current = current / part
+        if current.is_symlink():
+            raise RuntimeError(
+                f"Refusing to write {what}: {current} is a symlink. A symlinked "
+                f".wdd, .wdd/tasks, or other intermediate directory cannot be used "
+                f"to redirect a write outside {root_resolved}."
+            )
+
+
+def assert_path_contained(path: Path, container: Path, what: str, *, root: Path) -> Path:
     """Refuse to resolve `path` outside `container`.
 
     This is intentionally independent of TASK_ID_PATTERN validation upstream:
     every path this adapter writes is ultimately keyed by a "WDD ID" that can
     originate from remote, attacker-controlled data, so the write path itself
     is re-checked here even if ID-format validation was bypassed or buggy.
+
+    Containment is anchored to `root` -- the repository root, which the
+    caller must obtain from a trusted source (the `--root` argument) -- not
+    to `container` itself. See `assert_no_symlink_between()`: if `container`
+    (e.g. `.wdd` or `.wdd/tasks`) is itself a symlink pointing outside the
+    repository, resolving `container` and `path` independently and comparing
+    the results is not a safe check, because both then resolve under that
+    same outside target and agree with each other. So this checks two
+    independent things, both anchored to `root`: (1) no path component
+    between `root` and either `container` or `path` is a symlink, and (2)
+    the fully resolved `path` still lands under the fully resolved `root`.
     """
+    root_resolved = root.resolve()
+    assert_no_symlink_between(root, container, what)
+    assert_no_symlink_between(root, path, what)
+
     resolved = path.resolve()
-    container_resolved = container.resolve()
-    if resolved != container_resolved and container_resolved not in resolved.parents:
+    if resolved != root_resolved and root_resolved not in resolved.parents:
         raise RuntimeError(
             f"Refusing to write {what}: resolved path {resolved} is outside the "
-            f"required directory {container_resolved}"
+            f"repository root {root_resolved}"
         )
     return resolved
 
@@ -472,7 +516,7 @@ def record_remote_links(root: Path | str, links: dict[str, dict[str, Any]]) -> l
         if entry is None:
             raise RuntimeError(f"--record-link references {task_id!r}, which is not a task in .wdd/plan.json")
         brief_path = root / ".wdd" / entry["specPath"]
-        assert_path_contained(brief_path, tasks_dir, "task brief")
+        assert_path_contained(brief_path, tasks_dir, "task brief", root=root)
         brief_text = brief_path.read_text(encoding="utf-8") if brief_path.exists() else ""
         existing_entry = items.get(task_id) or {}
         github = dict(existing_entry.get("github") or {})
@@ -495,7 +539,7 @@ def record_remote_links(root: Path | str, links: dict[str, dict[str, Any]]) -> l
         "items": items,
     }
     manifest_file = manifest_path(root)
-    assert_path_contained(manifest_file, root / ".wdd", "adapter manifest")
+    assert_path_contained(manifest_file, root / ".wdd", "adapter manifest", root=root)
     manifest_file.parent.mkdir(parents=True, exist_ok=True)
     manifest_file.write_text(json.dumps(manifest_out, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return recorded
@@ -767,18 +811,75 @@ def plan_sync(
             desired_status = local_status_to_remote(task_state["status"]) if task_state else None
             manifest_entry = manifest_items.get(task_id) or {}
             github_link = manifest_entry.get("github") or {}
+            has_link = github_link.get("issueNumber") is not None or bool(github_link.get("itemId"))
             linked_item = None
             if github_link.get("issueNumber") is not None:
                 linked_item = remote_by_link.get(("issue", github_link["issueNumber"]))
             if linked_item is None and github_link.get("itemId"):
                 linked_item = remote_by_link.get(("item", str(github_link["itemId"])))
 
+            if has_link and linked_item is None:
+                # The manifest already records a remote link for this task,
+                # but the fetched Project snapshot does not contain that
+                # issue/item -- e.g. it was removed from the Project board,
+                # or the snapshot fetch was partial/empty. This is NOT the
+                # same as "no link at all": falling through to the
+                # create_remote_issue branch below would create a duplicate
+                # issue for a task that already has one. Never do that.
+                if github_link.get("issueNumber") is not None:
+                    # We at least know the issue number, so the safe,
+                    # non-destructive recovery is to re-add that existing
+                    # issue to the Project rather than manufacture a new one.
+                    operations.append(
+                        {
+                            "action": "add_issue_to_project",
+                            "task": task_id,
+                            "projectOwner": project.get("owner"),
+                            "projectNumber": project.get("number"),
+                            "issueNumber": github_link["issueNumber"],
+                        }
+                    )
+                    warnings.append(
+                        {
+                            "type": "linked_item_missing_from_snapshot",
+                            "task": task_id,
+                            "reason": (
+                                f"task {task_id} is linked to issue #{github_link['issueNumber']} in "
+                                ".wdd/adapters/github-project.json, but that issue was not present "
+                                "in the fetched GitHub Project snapshot -- re-adding the existing "
+                                "issue to the project instead of creating a duplicate. If it was "
+                                "intentionally removed from the project, update or clear the link "
+                                "in the manifest and re-push."
+                            ),
+                        }
+                    )
+                else:
+                    # Only a bare Project item id was recorded (no issue
+                    # number), and that item is gone from the snapshot.
+                    # There is nothing safe to auto-recover here -- block and
+                    # ask a human to look, rather than guess.
+                    conflicts.append(
+                        {
+                            "type": "linked_item_missing_from_snapshot",
+                            "task": task_id,
+                            "reason": (
+                                f"task {task_id} is linked to project item {github_link.get('itemId')!r} "
+                                "in .wdd/adapters/github-project.json, but that item was not found in "
+                                "the fetched GitHub Project snapshot. Refusing to create a duplicate "
+                                "issue -- verify the item still exists on the GitHub Project, or "
+                                "update/clear the manifest link, then re-push."
+                            ),
+                        }
+                    )
+                continue
+
             if linked_item is None:
-                # Creating the remote issue/item and setting its non-status
-                # fields is safe even with no controller state: there is no
-                # existing remote status to regress. Only omit "Status" so
-                # the project's own default column applies instead of an
-                # invented "todo".
+                # Genuinely new: no manifest link exists for this task at
+                # all. Creating the remote issue/item and setting its
+                # non-status fields is safe even with no controller state:
+                # there is no existing remote status to regress. Only omit
+                # "Status" so the project's own default column applies
+                # instead of an invented "todo".
                 fields = {"WDD ID": task_id, "Risk": entry.get("risk", "normal")}
                 if desired_status is not None:
                     fields["Status"] = desired_status
@@ -845,6 +946,13 @@ def plan_sync(
                         "fields": {"WDD ID": task_id, "Status": desired_status, "Risk": entry.get("risk", "normal")},
                     }
                 )
+
+    if conflicts:
+        # Re-assert the invariant "conflicts present => no operations" --
+        # the push loop above can itself append a conflict (e.g.
+        # linked_item_missing_from_snapshot) after other operations were
+        # already appended for earlier tasks in the same loop.
+        operations = []
 
     return {
         "schemaVersion": 1,
@@ -935,7 +1043,7 @@ def apply_local_operations(root: Path | str, result: dict[str, Any]) -> None:
     tasks_dir = wdd_dir / "tasks"
 
     plan_path = wdd_dir / "plan.json"
-    assert_path_contained(plan_path, wdd_dir, "plan.json")
+    assert_path_contained(plan_path, wdd_dir, "plan.json", root=root)
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
 
@@ -943,13 +1051,13 @@ def apply_local_operations(root: Path | str, result: dict[str, Any]) -> None:
         brief_path = wdd_dir / plan_tasks[task_id]["specPath"]
         # Belt and braces (see assert_path_contained docstring): specPath is
         # derived from a remote "WDD ID" field, which is attacker-controlled.
-        assert_path_contained(brief_path, tasks_dir, "task brief")
+        assert_path_contained(brief_path, tasks_dir, "task brief", root=root)
         brief_path.parent.mkdir(parents=True, exist_ok=True)
         brief_path.write_text(brief_text, encoding="utf-8")
 
     manifest = build_manifest(root, result, plan)
     manifest_file = manifest_path(root)
-    assert_path_contained(manifest_file, wdd_dir, "adapter manifest")
+    assert_path_contained(manifest_file, wdd_dir, "adapter manifest", root=root)
     manifest_file.parent.mkdir(parents=True, exist_ok=True)
     manifest_file.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -1041,6 +1149,16 @@ def print_text_plan(result: dict[str, Any]) -> None:
             "following tasks (their current remote Status is preserved as-is):"
         )
         for warning in status_skipped:
+            print(f"  - {warning['task']}: {warning['reason']}")
+
+    missing_linked_items = [w for w in result["warnings"] if w.get("type") == "linked_item_missing_from_snapshot"]
+    if missing_linked_items:
+        print(
+            "\nWARNING: the following tasks are already linked to a remote issue that is "
+            "missing from the fetched Project snapshot. NOT creating a duplicate issue -- "
+            "re-adding the existing one to the project instead:"
+        )
+        for warning in missing_linked_items:
             print(f"  - {warning['task']}: {warning['reason']}")
 
     applied = result.get("appliedOperations")
