@@ -933,10 +933,30 @@ class PortabilityTests(BaseTest):
             clone, "SCOPE-demo", "TASK-A", store.read()["tasks"]["TASK-A"]["worktree"]
         )
         # Follows the checkout; never points back at the original directory.
+        # Build the expectation from the canonical clone path: worktree_for
+        # canonicalizes, and on macOS the temp root is /var -> /private/var.
+        canonical = clone.resolve()
         self.assertEqual(
-            resolved, clone.parent / "renamed-checkout.wdd" / "worktrees" / "SCOPE-demo" / "TASK-A"
+            resolved,
+            canonical.parent / f"{canonical.name}.wdd" / "worktrees" / "SCOPE-demo" / "TASK-A",
         )
         self.assertNotIn("proj.wdd", str(resolved))
+
+    def test_an_aliased_repository_path_derives_the_same_worktree(self) -> None:
+        """A symlinked path must not fork the derived location.
+
+        This is the macOS /var -> /private/var case, reproduced with an
+        explicit symlink so every platform covers it rather than only macOS.
+        """
+        real = self.root / "real"
+        (real / "checkout").mkdir(parents=True)
+        alias = self.root / "aliased"
+        alias.symlink_to(real, target_is_directory=True)
+
+        via_alias = worktree_for(alias / "checkout", "SCOPE-demo", "TASK-A")
+        via_real = worktree_for(real / "checkout", "SCOPE-demo", "TASK-A")
+        self.assertEqual(via_alias, via_real)
+        self.assertNotIn("aliased", str(via_alias))
 
     def test_an_explicit_worktree_override_is_stored_relative(self) -> None:
         repo = self.repository()
