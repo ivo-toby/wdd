@@ -1,4 +1,9 @@
-"""Normalized SHA-bound review and verification result handling."""
+"""SHA-bound review and verification evidence.
+
+Evidence is pinned to the exact commit it was produced against. The controller
+already knows the base and head SHAs, so callers never supply them: recording
+evidence takes findings or a status, nothing more.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +15,13 @@ from typing import Any
 
 from .engine import apply_event
 from .errors import IllegalTransition, ValidationError
+from .git import is_ancestor, require_repository, resolve_ref, run_git
 from .store import StateStore, atomic_write_text
+
+
+REVIEW_RESULT_KIND = "wddctl_review_result"
+VERIFICATION_RESULT_KIND = "wddctl_verification_result"
+SEVERITIES = {"P1", "P2", "P3"}
 
 
 def _read_result(path: Path | str) -> dict[str, Any]:
@@ -31,7 +42,134 @@ def _required_string(value: Any, name: str) -> str:
     return value
 
 
+def validate_findings(findings: Any) -> list[dict[str, Any]]:
+    if not isinstance(findings, list):
+        raise ValidationError("findings must be a list")
+    validated: list[dict[str, Any]] = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            raise ValidationError("each finding must be an object")
+        severity = finding.get("severity")
+        if severity not in SEVERITIES:
+            raise ValidationError(
+                f"each finding requires severity P1, P2, or P3 (got {severity!r})"
+            )
+        _required_string(finding.get("summary"), "finding summary")
+        validated.append(finding)
+    return validated
+
+
+def evidence_shas(
+    state: dict[str, Any], task_id: str, *, repo: Path | str | None = None
+) -> tuple[str, str]:
+    """Return the (baseSha, headSha) any evidence for this task must be pinned to."""
+    try:
+        task = state["tasks"][task_id]
+    except KeyError as error:
+        raise ValidationError(f"unknown task: {task_id}") from error
+    head_sha = _required_string(task.get("headSha"), f"task {task_id} headSha")
+    review = task.get("review")
+    if isinstance(review, dict) and review.get("headSha") == head_sha:
+        # Keep verification pinned to the same base the review used.
+        return review["baseSha"], head_sha
+    base_ref = state["scope"].get("baseRef")
+    if repo is not None and base_ref:
+        repository = require_repository(repo)
+        merge_base = run_git(
+            repository, "merge-base", base_ref, head_sha, check=False
+        ).stdout.strip()
+        if merge_base:
+            if merge_base == head_sha:
+                # The head is already contained in the base — typically it was
+                # merged outside wddctl. The derived range is empty, so review
+                # and verification would describe no changes at all, which is
+                # how a mandatory review got bypassed.
+                raise IllegalTransition(
+                    f"{task_id} describes an empty range against {base_ref}: its head "
+                    f"{head_sha} is already contained in the base, so there is nothing "
+                    "to review or verify"
+                )
+            return merge_base, head_sha
+    lease = (state.get("leases") or {}).get(task_id) or {}
+    base_sha = lease.get("baseSha")
+    if not base_sha:
+        raise IllegalTransition(
+            f"cannot determine the base SHA for {task_id}; pass --repo so it can be computed"
+        )
+    return base_sha, head_sha
+
+
+def record_review(
+    store: StateStore,
+    *,
+    task_id: str,
+    findings: list[dict[str, Any]],
+    reviewer: str,
+    repo: Path | str | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    state = store.read()
+    base_sha, head_sha = evidence_shas(state, task_id, repo=repo)
+    return apply_event(
+        store,
+        event_type="review.recorded",
+        task_id=task_id,
+        data={
+            "baseSha": base_sha,
+            "headSha": head_sha,
+            "findings": validate_findings(findings),
+            "reviewer": _required_string(reviewer, "reviewer"),
+        },
+        idempotency_key=idempotency_key,
+        expected_revision=expected_revision,
+    )
+
+
+def record_verification(
+    store: StateStore,
+    *,
+    task_id: str,
+    status: str,
+    command: str | None = None,
+    repo: Path | str | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    if status not in {"passed", "failed", "unavailable"}:
+        raise ValidationError("verification status must be passed, failed, or unavailable")
+    state = store.read()
+    base_sha, head_sha = evidence_shas(state, task_id, repo=repo)
+    return apply_event(
+        store,
+        event_type="verification.recorded",
+        task_id=task_id,
+        data={
+            "baseSha": base_sha,
+            "headSha": head_sha,
+            "status": status,
+            "command": command,
+        },
+        idempotency_key=idempotency_key,
+        expected_revision=expected_revision,
+    )
+
+
 def normalize_review_results(paths: list[Path | str], *, task_id: str) -> dict[str, Any]:
+    """Merge one or more external reviewer result files into a single record.
+
+    Each file must be a JSON object shaped like::
+
+        {
+          "schemaVersion": 1,
+          "kind": "wddctl_review_result",
+          "task": "TASK-001",
+          "baseSha": "<sha>",
+          "headSha": "<sha>",
+          "reviewer": "name",
+          "findings": [{"severity": "P1", "summary": "...", "file": "...", "line": 1}]
+        }
+    """
     if not paths:
         raise ValidationError("at least one review result is required")
     results = [_read_result(path) for path in paths]
@@ -40,8 +178,10 @@ def normalize_review_results(paths: list[Path | str], *, task_id: str) -> dict[s
     reviewers: list[str] = []
     findings: list[dict[str, Any]] = []
     for result in results:
-        if result.get("schemaVersion") != 1 or result.get("kind") != "wddctl_review_result":
-            raise ValidationError("review result must use schemaVersion 1 and kind wddctl_review_result")
+        if result.get("schemaVersion") != 1 or result.get("kind") != REVIEW_RESULT_KIND:
+            raise ValidationError(
+                f'review result must set "schemaVersion": 1 and "kind": "{REVIEW_RESULT_KIND}"'
+            )
         if result.get("task") not in {None, task_id}:
             raise ValidationError(f"review result belongs to {result.get('task')}, not {task_id}")
         result_base = _required_string(result.get("baseSha"), "review result baseSha")
@@ -52,14 +192,7 @@ def normalize_review_results(paths: list[Path | str], *, task_id: str) -> dict[s
             raise ValidationError("all review results must use the same headSha")
         base_sha, head_sha = result_base, result_head
         reviewers.append(_required_string(result.get("reviewer"), "review result reviewer"))
-        result_findings = result.get("findings", [])
-        if not isinstance(result_findings, list):
-            raise ValidationError("review result findings must be a list")
-        for finding in result_findings:
-            if not isinstance(finding, dict) or finding.get("severity") not in {"P1", "P2", "P3"}:
-                raise ValidationError("each review finding requires severity P1, P2, or P3")
-            _required_string(finding.get("summary"), "review finding summary")
-            findings.append(finding)
+        findings.extend(validate_findings(result.get("findings", [])))
     return {
         "baseSha": base_sha,
         "headSha": head_sha,
@@ -69,10 +202,24 @@ def normalize_review_results(paths: list[Path | str], *, task_id: str) -> dict[s
 
 
 def normalize_verification_result(path: Path | str, *, task_id: str) -> dict[str, Any]:
+    """Read one external verification result file.
+
+    The file must be a JSON object shaped like::
+
+        {
+          "schemaVersion": 1,
+          "kind": "wddctl_verification_result",
+          "task": "TASK-001",
+          "baseSha": "<sha>",
+          "headSha": "<sha>",
+          "status": "passed",
+          "command": "pytest -q"
+        }
+    """
     result = _read_result(path)
-    if result.get("schemaVersion") != 1 or result.get("kind") != "wddctl_verification_result":
+    if result.get("schemaVersion") != 1 or result.get("kind") != VERIFICATION_RESULT_KIND:
         raise ValidationError(
-            "verification result must use schemaVersion 1 and kind wddctl_verification_result"
+            f'verification result must set "schemaVersion": 1 and "kind": "{VERIFICATION_RESULT_KIND}"'
         )
     if result.get("task") not in {None, task_id}:
         raise ValidationError(f"verification result belongs to {result.get('task')}, not {task_id}")
@@ -96,6 +243,7 @@ def run_review(
     output: Path | str,
     base_sha: str | None = None,
 ) -> dict[str, Any]:
+    """Run one configured reviewer command against frozen base/head SHAs."""
     if not command or not all(isinstance(item, str) and item for item in command):
         raise ValidationError("review command must be a non-empty JSON string array")
     state = store.read()
@@ -107,16 +255,14 @@ def run_review(
         raise ValidationError(f"unknown task: {task_id}") from error
     if task["status"] != "review":
         raise IllegalTransition("review execution requires a task in the review gate")
-    head_sha = _required_string(task.get("headSha"), "task headSha")
-    lease = (state.get("leases") or {}).get(task_id) or {}
-    base_sha = base_sha or lease.get("baseSha")
-    base_sha = _required_string(base_sha, "review baseSha")
+    derived_base, head_sha = evidence_shas(state, task_id, repo=repo)
+    base_sha = base_sha or derived_base
     environment = os.environ.copy()
     environment.update(
         {
-            "WDCTL_REVIEW_TASK": task_id,
-            "WDCTL_REVIEW_BASE_SHA": base_sha,
-            "WDCTL_REVIEW_HEAD_SHA": head_sha,
+            "WDDCTL_REVIEW_TASK": task_id,
+            "WDDCTL_REVIEW_BASE_SHA": base_sha,
+            "WDDCTL_REVIEW_HEAD_SHA": head_sha,
         }
     )
     result = subprocess.run(
@@ -142,15 +288,56 @@ def run_review(
     return {"output": str(temporary), **normalized}
 
 
+def verify_external_shas(
+    state: dict[str, Any], task_id: str, result: dict[str, Any], repo: Path | str | None
+) -> None:
+    """Bind externally supplied evidence to real commits.
+
+    The transition already rejects a headSha that is not the task's current
+    head. The base was trusted, so a result naming a nonexistent base SHA was
+    accepted and the task still reached merge. Check the base is a real commit
+    and actually an ancestor of the head it claims to describe.
+    """
+    task = state["tasks"][task_id]
+    base_sha, head_sha = result["baseSha"], result["headSha"]
+    if head_sha != task.get("headSha"):
+        raise IllegalTransition(
+            f"evidence head {head_sha} does not match the current head of {task_id}"
+        )
+    if repo is None:
+        raise IllegalTransition(
+            "collecting external evidence requires --repo so its SHAs can be verified"
+        )
+    repository = require_repository(repo)
+    for label, sha in (("baseSha", base_sha), ("headSha", head_sha)):
+        try:
+            resolve_ref(repository, sha)
+        except ValidationError as error:
+            raise IllegalTransition(
+                f"evidence {label} {sha} is not a commit in this repository"
+            ) from error
+    # "Any ancestor" is too weak: baseSha == headSha describes an empty range,
+    # so a review of nothing was accepted. The base must be the exact one the
+    # controller derives for this task.
+    expected_base, expected_head = evidence_shas(state, task_id, repo=repository)
+    if base_sha != expected_base or head_sha != expected_head:
+        raise IllegalTransition(
+            f"evidence for {task_id} must describe {expected_base}..{expected_head}; "
+            f"got {base_sha}..{head_sha}"
+        )
+
+
 def collect_review(
     store: StateStore,
     *,
     task_id: str,
     result_paths: list[Path | str],
-    idempotency_key: str,
-    expected_revision: int,
+    repo: Path | str | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     result = normalize_review_results(result_paths, task_id=task_id)
+    verify_external_shas(store.read(), task_id, result, repo)
     return apply_event(
         store,
         event_type="review.recorded",
@@ -166,10 +353,12 @@ def collect_verification(
     *,
     task_id: str,
     result_path: Path | str,
-    idempotency_key: str,
-    expected_revision: int,
+    repo: Path | str | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     result = normalize_verification_result(result_path, task_id=task_id)
+    verify_external_shas(store.read(), task_id, result, repo)
     return apply_event(
         store,
         event_type="verification.recorded",

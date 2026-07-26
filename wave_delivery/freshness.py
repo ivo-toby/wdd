@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import fnmatch
 from pathlib import Path
 from typing import Any
 
+from .domains import matches_domain
 from .engine import apply_event
 from .errors import IllegalTransition, ValidationError
 from .git import require_repository, resolve_ref, run_git
@@ -25,10 +25,7 @@ def _changed_paths(repo: Path, start: str, end: str) -> list[str]:
     return sorted(path for path in output.splitlines() if path)
 
 
-def _matches_domain(path: str, domain: str) -> bool:
-    if domain.endswith("/**"):
-        return path.startswith(domain[:-3])
-    return fnmatch.fnmatch(path, domain) or path == domain
+_matches_domain = matches_domain
 
 
 def check_freshness(
@@ -89,15 +86,15 @@ def check_freshness(
     }
 
 
-def record_merge(
+def record_freshness(
     store: StateStore,
     *,
     repo: Path | str,
     task_id: str,
-    idempotency_key: str,
-    expected_revision: int,
-) -> tuple[dict[str, Any], bool]:
-    """Record completion only after Git proves the task head is in the scope base."""
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> tuple[dict[str, Any], bool, dict[str, Any]]:
+    """Classify a task branch against the scope base and record the result."""
     repo = require_repository(repo)
     state = store.read()
     try:
@@ -106,31 +103,22 @@ def record_merge(
         raise ValidationError(f"unknown task: {task_id}") from error
     base_ref = state["scope"].get("baseRef")
     if not isinstance(base_ref, str) or not base_ref:
-        raise IllegalTransition("merge recording requires a configured scope base ref")
+        raise IllegalTransition("freshness recording requires a configured scope base ref")
     head_sha = task.get("headSha")
     if not isinstance(head_sha, str) or not head_sha:
-        raise IllegalTransition("merge recording requires a task head SHA")
-    base_sha = resolve_ref(repo, base_ref)
-    resolved_head = resolve_ref(repo, head_sha)
-    if resolved_head != head_sha:
-        raise IllegalTransition("task head SHA did not resolve to the recorded commit")
-    contained = run_git(
-        repo, "merge-base", "--is-ancestor", head_sha, base_sha, check=False
+        raise IllegalTransition("freshness recording requires a task head SHA")
+    result = check_freshness(
+        repo,
+        base_ref=base_ref,
+        head_ref=head_sha,
+        conflict_domains=task["conflictDomains"],
     )
-    if contained.returncode != 0:
-        raise IllegalTransition(
-            f"task head {head_sha} is not merged into {base_ref} ({base_sha})"
-        )
-    return apply_event(
+    state, duplicate = apply_event(
         store,
-        event_type="task.merged",
+        event_type="freshness.recorded",
         task_id=task_id,
-        data={
-            "mergeVerified": True,
-            "baseRef": base_ref,
-            "baseSha": base_sha,
-            "headSha": head_sha,
-        },
+        data=result,
         idempotency_key=idempotency_key,
         expected_revision=expected_revision,
     )
+    return state, duplicate, result

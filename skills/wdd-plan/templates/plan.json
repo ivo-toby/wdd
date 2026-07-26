@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "kind": "wdd_plan",
+  "scope": {
+    "id": "SCOPE-auth-refresh",
+    "baseRef": "wdd/auth-refresh",
+    "maxConcurrent": 3,
+    "reviewPolicy": "risk_based",
+    "reconcileEveryNMerges": 3
+  },
+  "tasks": [
+    {
+      "id": "TASK-001-token-types",
+      "title": "Token type contract",
+      "specPath": "tasks/TASK-001-token-types.md",
+      "risk": "high",
+      "dependsOn": [],
+      "conflictDomains": ["src/auth/**", "src/schema.ts"]
+    },
+    {
+      "id": "TASK-002-refresh-endpoint",
+      "title": "Refresh token endpoint",
+      "specPath": "tasks/TASK-002-refresh-endpoint.md",
+      "risk": "high",
+      "dependsOn": ["TASK-001-token-types"],
+      "conflictDomains": ["src/auth/routes/**"]
+    },
+    {
+      "id": "TASK-003-refresh-docs",
+      "title": "Document the refresh flow",
+      "specPath": "tasks/TASK-003-refresh-docs.md",
+      "risk": "normal",
+      "dependsOn": ["TASK-001-token-types"],
+      "conflictDomains": ["docs/auth.md"]
+    }
+  ]
+}

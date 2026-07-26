@@ -1,94 +1,33 @@
 ---
 name: wdd-status
-description: Show current Wave-Driven Development state from local .wdd text artifacts, including constitution status, micro-wave work packets, epics, tickets, tasks, waves, orchestration gates, monitoring, shared-context reconciliation, validation, and next action.
+description: Report current Wave-Driven Development state read-only via wddctl status, next, and render. Use when the user asks for progress, current state, active tasks, blockers, or what happens next in a WDD scope.
 ---
 
 # WDD Status
 
-Use this when the user asks for progress, current state, next step, active wave,
-blockers, task gates, or a dashboard view.
-
-## User Input
-
-If the user names a work packet, report that micro-wave. If the user names an
-epic, report that epic. If the user asks for all state, scan `.wdd/work/*/` and
-`.wdd/epics/*/` folders.
-
-## Preconditions
-
-- Read-only unless the user explicitly asks to fix stale state.
-- Do not infer completion without artifact evidence.
-- Do not implement task code.
+Read-only reporting. Never modify `.wdd/` artifacts or task code here.
 
 ## Workflow
 
-1. Check `.wdd/`:
-   - If missing, report that WDD is not initialized and suggest
-     `wdd-init-project`.
-   - If present, read `.wdd/constitution.md`.
-   - When a schema-v2 state file is present and `wddctl` is available, use
-     `wddctl status --brief` and `wddctl next` as the authoritative mechanical
-     summary; do not repair JSON or task paths manually.
+1. If `.wdd/` is missing, say WDD isn't initialized and point at
+   `wave-driven-development` to get started.
+2. If `.wdd/constitution.md` exists but isn't ratified, report that and
+   point at `wdd-constitution` — execution is blocked until then.
+3. Otherwise, run:
+   - `wddctl status --json` for a concise summary of the scope and its
+     tasks.
+   - `wddctl next` for the current action queue — what's blocking, what
+     needs dispatching, what's ready to merge.
+   - `wddctl render --output .wdd/state.md` if a durable markdown snapshot
+     is useful to the user.
+4. Report each task's gate — `not_started`, `no_pr`, `reviewing`,
+   `needs_review`, `needs_verification`, `needs_fixes`, `needs_freshness`,
+   `ready_to_merge`, `merge_ready`, or a terminal `done`/`blocked`/
+   `cancelled` — plus open P1/P2 findings and any reconciliation due.
+   `wddctl next` reports the matching *action* for each gate; don't confuse
+   the two vocabularies when summarizing.
+5. Name the next concrete action and which skill handles it: `wdd-run` for
+   controller work, `wdd-plan` if the plan needs reshaping.
 
-2. Scan micro-wave work packets:
-   - Read each `.wdd/work/*/brief.md`.
-   - Count `tasks/*.md`.
-   - Read `state.json` if present.
-   - Report profile, status, task gates, monitoring, review blockers,
-     verification blockers, strategy, execution mode, confirmation state, and
-     finish readiness.
-
-3. Scan epics:
-   - Read each `epic.md`.
-   - Detect ticket folders.
-   - Count task files by status folder.
-   - Read `wave-plan.md` if present.
-   - Read `orchestration.json` if present.
-   - Read `controller-state.md` if present.
-   - Check for `epic-validation.md` and `final-pr.md`.
-
-4. For each relevant epic, report:
-   - Epic ID, title, and status.
-   - Profile, review mode, and monitoring mode.
-   - Wave strategy, execution mode, confidence, and confirmation state.
-   - Target branch and epic branch.
-   - Ticket count.
-   - Task count by status.
-   - Wave plan status.
-   - Active wave if any.
-   - Active task gates.
-   - Monitoring mode, cadence, status, scheduler reference, last check, next
-     check, and whether manual fallback is required.
-   - Branch freshness issues.
-   - Open P1/P2 feedback.
-   - Shared-context reconciliation status.
-   - Epic validation state.
-   - Final PR state.
-   - Blockers.
-
-5. Determine next action:
-   - Missing constitution: `wdd-constitution`.
-   - Micro-wave draft without task state: `wdd-plan-work`.
-   - Micro-wave active with open gates: `wdd-run-work`.
-   - Micro-wave tasks ready to close: `wdd-finish-work`.
-   - Epic draft without planning artifacts: `wdd-plan-epic`.
-   - Planning artifacts incomplete: `wdd-plan-epic`.
-   - Pending wave: `wdd-start-wave`.
-   - Active wave with open gates: `subagent-pr-orchestration`.
-   - Active wave with stale or missing monitoring: resume
-     `subagent-pr-orchestration` using the fallback prompt in
-     `controller-state.md`.
-   - Completed active wave: `wdd-reconcile-wave`.
-   - All waves complete without validation: `wdd-epic-validation`.
-   - Validation passed without final PR draft: `wdd-final-pr`.
-
-6. Output:
-   - Keep concise by default.
-   - Use tables only when multiple epics, tasks, or gates are present.
-   - Include exact artifact paths.
-
-## Done When
-
-- Status reflects actual `.wdd/` artifacts.
-- The next recommended skill is named.
-- No files are modified unless the user explicitly requested repair.
+Never hand-repair `state.json` or task file paths — if something looks
+wrong, that's a bug to report, not to patch.

@@ -21,7 +21,7 @@ def inspect_capabilities() -> dict[str, Any]:
         },
         "capabilities": {
             "coreController": True,
-            "gitLeasesAndFreshness": available["git"],
+            "gitIntegration": available["git"],
             "githubAdapter": available["gh"],
             "atlassianAdapter": available["acli"],
             "codexAutomation": available["codex"],

@@ -1,0 +1,58 @@
+name: tests
+
+on:
+  # Only the default branch on push: pull_request already covers PR branches,
+  # and matching both ran every job twice per push.
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Oldest supported interpreter (pyproject: requires-python >= 3.10).
+          - os: ubuntu-latest
+            python: '3.10'
+          - os: ubuntu-latest
+            python: '3.13'
+          # macOS canonicalizes /var to /private/var. A worktree-path bug of
+          # exactly that shape reached review because it cannot reproduce on
+          # Linux, so it is worth one job.
+          - os: macos-latest
+            python: '3.13'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Git identity for the repositories the tests create
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "wdd CI"
+          git config --global init.defaultBranch main
+
+      - name: Core controller suite
+        run: python -m unittest discover -s tests
+
+      - name: GitHub Project adapter suite
+        run: python skills/wdd-sync-github-project/scripts/test_wdd_github_project_sync.py
+
+      - name: Controller runs from a clean install
+        run: |
+          python scripts/install_wave_delivery.py --prefix "${{ runner.temp }}/wdd"
+          "${{ runner.temp }}/wdd/bin/wddctl" doctor

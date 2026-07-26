@@ -1,106 +1,44 @@
 ---
 name: wdd-constitution
-description: Create or amend a text-only WDD constitution with model aliases, storage mode, branching, review policy, verification policy, agent roles, task rules, wave rules, shared-context rules, and governance.
+description: Create, amend, or ratify a WDD project constitution — target/base branch naming, verification commands, review policy, model aliases, and merge policy — using wddctl constitution probe/ratify/status. Use before any WDD execution can begin, or when governance decisions need to change.
 ---
 
 # WDD Constitution
 
-Use this when creating, reviewing, or amending `.wdd/constitution.md`.
-
-## User Input
-
-Consider user-provided principles, boundaries, model availability, branch
-preferences, WDD profile defaults, review gates, storage preferences,
-verification commands, and workflow non-goals.
-
-## Preconditions
-
-- `.wdd/` must exist. If missing, use `wdd-init-project`.
-- Read existing `.wdd/constitution.md`. If `.wdd/` exists but
-  `.wdd/constitution.md` is missing, create it from this skill folder's
-  `templates/constitution.md`.
-- Read relevant repo docs before asking the user for information.
-- Schema-v1 constitutions remain text-only. For a schema-v2 scope, use
-  `wddctl constitution probe` to gather evidence and `wddctl constitution ratify`
-  only after an explicit user decision.
+`.wdd/constitution.md` records the handful of decisions that change how
+`wddctl` behaves for this repo. Execution is blocked until it's ratified —
+this is deliberate: a controller should never infer branch naming, review
+policy, or verification commands on its own.
 
 ## Workflow
 
-1. Load current constitution:
-   - Identify missing setup decisions, stale values, and contradictions.
-   - Capture current version, ratified date, and last amended date.
+1. If `.wdd/constitution.md` doesn't exist, create it from
+   `templates/constitution.md`.
+2. Gather repo evidence before asking the user anything: run
+   `wddctl constitution probe --root .` to collect what's inferable
+   (existing branch conventions, verification commands, project type).
+3. Present the probed and proposed decisions to the user compactly and get
+   an explicit decision on each — target branch, base branch naming
+   convention, verification command(s), review policy default
+   (`always` / `risk_based` / `none`), model aliases if the user has
+   preferences, and merge policy (controller merges automatically vs.
+   requires human approval). Never silently ratify from inference alone.
+4. Fill the constitution's sections with the ratified decisions and check
+   `wddctl constitution status` reflects them.
+5. Ratify with `wddctl constitution ratify --by NAME --decision-fingerprint SHA`
+   once the user has explicitly signed off on the current content — the
+   fingerprint ties ratification to the exact text that was approved, so
+   don't ratify text the user hasn't actually seen.
+6. To amend later, edit the file, get explicit re-approval of what changed,
+   then run `wddctl constitution amend --by NAME --decision-fingerprint SHA`.
+   `ratify` is the initial act only and is refused once ratified; `amend`
+   records the fingerprint it superseded, so governance history stays
+   auditable. Treat an amendment as changing behavior immediately for any
+   scope not yet started.
 
-2. Gather repo evidence:
-   - Project type and primary languages.
-   - Existing optional verification commands.
-   - Deployment, data, auth, persistence, security, or CI constraints.
-   - Existing agent instructions.
+## Done when
 
-3. Present the initial ratification bundle unconditionally:
-   - Gather repository evidence first; in schema-v2, prefer
-     `wddctl constitution probe` when available.
-   - Present the proposed decisions compactly and require the user to ratify or
-     change them. Never silently ratify an initial constitution from inference.
-   - Use an interactive decision tool when available. Otherwise ask in plain
-     text and stop before execution.
-
-4. Ask for required setup decisions when not inferable:
-   - Available model aliases.
-   - Model usage for epic definition, planning, simple implementation, complex
-     implementation, review, feedback-fix, epic validation, and PR description.
-   - Storage mode: local Markdown, GitHub Projects, or both when supported.
-   - WDD profile default, usually `standard`.
-   - Allowed profiles, usually `micro`, `lite`, `standard`, and `full`.
-   - Review mode default, usually `risk_based`.
-   - Monitoring mode default, usually `adaptive`.
-   - Target branch, defaulting to `main` only if repo evidence does not name
-     another branch.
-   - Epic branch convention, defaulting to `epic/[epic-slug]`.
-   - Task branch convention, defaulting to `task/[task-id]-[task-slug]`.
-   - Whether PRs are required for every task.
-   - Whether local patches are allowed when PRs are unavailable.
-   - Whether P2 findings block merge.
-   - Whether P3 findings become follow-up tasks.
-   - Whether review comments go to PRs or local files.
-   - Whether feedback fixes prefer the original worker or a fresh worker.
-
-5. Fill or amend required sections:
-   - Project Scope.
-   - Setup Configuration.
-   - Model Usage.
-   - WDD Profile Defaults.
-   - Branching Policy.
-   - Review Policy.
-   - Verification Policy.
-   - Agent Roles.
-   - Planning Rules.
-   - Task Rules.
-   - Wave Rules.
-   - Shared Context Rules.
-   - Governance.
-
-6. Apply default review policy unless the user overrides it:
-   - P1 blocks merge.
-   - P2 blocks merge.
-   - P3 does not block merge.
-   - Feedback processing may use the original worker or a fresh worker,
-     whichever is safer.
-
-7. Decide version bump:
-   - MAJOR: role, artifact, or gate changes that break existing epics.
-   - MINOR: new required sections, checks, or gates.
-   - PATCH: wording or clarification only.
-
-8. Validate by inspection:
-   - No unexplained placeholders remain in actual constitution artifacts.
-   - Rules are testable and use clear MUST or SHOULD language where needed.
-   - Optional repo-native verification commands are concrete when named.
-- Schema-v1 remains text-only; schema-v2 ratification is recorded by `wddctl`.
-
-## Done When
-
-- `.wdd/constitution.md` records setup, branch, profile, review, verification,
-  role, task, wave, shared-context, and governance rules.
-- Version and dates are updated correctly.
-- Open user-needed questions are explicit.
-- The next phase is `wdd-start-epic`.
+- Every decision in `templates/constitution.md`'s sections is filled with a
+  real value, not a placeholder.
+- `wddctl constitution status` reports ratified.
+- Any open question the user still needs to answer is stated explicitly.

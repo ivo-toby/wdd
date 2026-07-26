@@ -4,3 +4,6 @@ dist/
 .DS_Store
 __pycache__/
 *.pyc
+
+# wddctl transient state lock (durable .wdd/ state IS committed)
+.wdd/.*.lock
