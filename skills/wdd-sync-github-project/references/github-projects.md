@@ -47,28 +47,51 @@ prevent that:
    written) until the field is fixed on GitHub and the sync is rerun.
 2. Independently of that check, every path this adapter is about to write
    (task brief, `plan.json`, the manifest) is re-resolved and verified to
-   stay inside the expected directory before the write happens. This is a
-   second, unconditional line of defense in case the id-format check above
-   is ever bypassed or buggy.
+   stay inside the *narrowest correct container for that artifact kind*
+   before the write happens. This is a second, unconditional line of
+   defense in case the id-format check above is ever bypassed or buggy.
 
-Layer 2 is anchored to a trusted root, not to the immediate container
-directory. Resolving `path` and `container` independently with
-`Path.resolve()` and then comparing the results is not sufficient: if
-`.wdd` or `.wdd/tasks` is itself a symlink pointing outside the repository,
-both sides resolve under that outside target and agree with each other, so
-a naive containment check passes while the write still escapes the
-checkout. To close that, `assert_path_contained()` takes the repository
-root (from the trusted `--root` argument) and:
+Containment is anchored to the specific artifact kind, not merely "inside
+the repository root" -- checking only the latter is too loose. A forged
+`specPath` of `../victim.md` resolves to `<root>/victim.md`, which is still
+"inside the repository root" and would pass a root-only check, even though
+it has escaped `.wdd/tasks/` entirely and overwrites an arbitrary
+repository file. `assert_path_contained()` therefore takes a `container`
+argument specific to what is being written:
+
+- task briefs must resolve to somewhere under `<root>/.wdd/tasks/`.
+- `plan.json` must resolve to exactly `<root>/.wdd/plan.json`.
+- the manifest must resolve to exactly `<root>/.wdd/adapters/github-project.json`.
+
+The symlink-component walk underneath that check is still anchored to a
+trusted root, not to the immediate container directory. Resolving `path`
+and `container` independently with `Path.resolve()` and then comparing the
+results is not sufficient: if `.wdd` or `.wdd/tasks` is itself a symlink
+pointing outside the repository, both sides resolve under that outside
+target and agree with each other, so a naive containment check passes while
+the write still escapes the checkout. To close that,
+`assert_path_contained()` takes the repository root (from the trusted
+`--root` argument) and:
 
 - walks every path component between that root and the write target --
   including `.wdd`, `.wdd/tasks`, and any other intermediate directory --
   refusing the write the moment any of them is a symlink (`Path.is_symlink()`,
   checked on the unresolved component, before any `.resolve()` happens), and
-- separately requires the fully resolved target still land under the fully
-  resolved root.
+- separately requires the fully resolved target still land inside (or,
+  for `plan.json`/the manifest, exactly match) the fully resolved
+  container.
 
 Either check failing raises immediately, naming the offending symlinked
 component (or the escaping resolved path) in the error.
+
+### Apply is all-or-nothing
+
+`apply_local_operations()` validates every path for every operation in the
+batch -- `plan.json`, every task brief, the manifest -- *before* writing
+any of them. If any path is rejected, nothing has been written yet, so
+`.wdd/` is left exactly as it was: there is no torn state where a freshly
+written `plan.json` references a brief that was never created because a
+later brief in the same batch failed its containment check.
 
 ## Risk heuristic
 

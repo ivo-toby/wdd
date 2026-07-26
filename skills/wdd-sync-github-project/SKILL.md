@@ -18,10 +18,15 @@ it.
 - One GitHub Project maps to one WDD scope (`SCOPE-<project-slug>`).
 - A remote "WDD ID" must be a bare `TASK-<slug>` (no `/`, no `..`); anything
   else blocks the sync as a conflict rather than touching disk.
-- Every local write is re-checked against a trusted `--root`: no component
-  between the root and the write target may be a symlink. A symlinked
-  `.wdd` or `.wdd/tasks` refuses to write rather than silently redirecting
-  outside the checkout.
+- Every local write is re-checked against a trusted `--root` and confined to
+  the narrowest correct container for that artifact: task briefs under
+  `.wdd/tasks/`, `plan.json` and the manifest at their exact fixed paths.
+  No path component between the root and the write target may be a
+  symlink. A symlinked `.wdd` or `.wdd/tasks`, or a brief `specPath` that
+  resolves outside `.wdd/tasks/` (e.g. `../victim.md`), refuses to write
+  rather than silently redirecting elsewhere in the repo.
+- `--apply-local` validates every path in the batch before writing anything:
+  a rejected sync writes nothing at all, leaving `.wdd/` exactly as it was.
 
 ## Pull (GitHub -> local)
 

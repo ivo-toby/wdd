@@ -86,7 +86,9 @@ def assert_no_symlink_between(root: Path, target: Path, what: str) -> None:
             )
 
 
-def assert_path_contained(path: Path, container: Path, what: str, *, root: Path) -> Path:
+def assert_path_contained(
+    path: Path, container: Path, what: str, *, root: Path, exact: bool = False
+) -> Path:
     """Refuse to resolve `path` outside `container`.
 
     This is intentionally independent of TASK_ID_PATTERN validation upstream:
@@ -94,26 +96,48 @@ def assert_path_contained(path: Path, container: Path, what: str, *, root: Path)
     originate from remote, attacker-controlled data, so the write path itself
     is re-checked here even if ID-format validation was bypassed or buggy.
 
-    Containment is anchored to `root` -- the repository root, which the
-    caller must obtain from a trusted source (the `--root` argument) -- not
-    to `container` itself. See `assert_no_symlink_between()`: if `container`
-    (e.g. `.wdd` or `.wdd/tasks`) is itself a symlink pointing outside the
-    repository, resolving `container` and `path` independently and comparing
-    the results is not a safe check, because both then resolve under that
-    same outside target and agree with each other. So this checks two
-    independent things, both anchored to `root`: (1) no path component
-    between `root` and either `container` or `path` is a symlink, and (2)
-    the fully resolved `path` still lands under the fully resolved `root`.
+    `container` must be the *narrowest* correct container for this artifact
+    kind, not merely "somewhere inside the repository root":
+
+    - task briefs: `container` is `<root>/.wdd/tasks` (any file under it).
+    - `plan.json` / the manifest: `container` is the exact file path itself,
+      with `exact=True` -- these are single fixed files, not a directory a
+      remote-controlled id can pick a name inside of.
+
+    A containment check anchored only to `root` is too loose: a forged
+    `specPath` of `../victim.md` resolves to `<root>/victim.md`, which is
+    still "inside the repository root" and would pass such a check, even
+    though it has escaped `.wdd/tasks/` entirely and overwrites an arbitrary
+    repository file. Anchoring to the specific `container` for this artifact
+    kind closes that gap.
+
+    The symlink-component walk below is still anchored to `root` -- the
+    repository root, which the caller must obtain from a trusted source (the
+    `--root` argument) -- not to `container` itself. See
+    `assert_no_symlink_between()`: if `container` (e.g. `.wdd` or
+    `.wdd/tasks`) is itself a symlink pointing outside the repository,
+    resolving `container` and `path` independently and comparing the results
+    is not a safe check, because both then resolve under that same outside
+    target and agree with each other. So this checks two independent things:
+    (1) no path component between `root` and either `container` or `path` is
+    a symlink, and (2) the fully resolved `path` still lands inside (or, for
+    `exact=True`, exactly matches) the fully resolved `container`.
     """
-    root_resolved = root.resolve()
     assert_no_symlink_between(root, container, what)
     assert_no_symlink_between(root, path, what)
 
+    container_resolved = container.resolve()
     resolved = path.resolve()
-    if resolved != root_resolved and root_resolved not in resolved.parents:
+    if exact:
+        if resolved != container_resolved:
+            raise RuntimeError(
+                f"Refusing to write {what}: resolved path {resolved} must be "
+                f"exactly {container_resolved}"
+            )
+    elif resolved != container_resolved and container_resolved not in resolved.parents:
         raise RuntimeError(
             f"Refusing to write {what}: resolved path {resolved} is outside the "
-            f"repository root {root_resolved}"
+            f"expected directory {container_resolved}"
         )
     return resolved
 
@@ -539,7 +563,7 @@ def record_remote_links(root: Path | str, links: dict[str, dict[str, Any]]) -> l
         "items": items,
     }
     manifest_file = manifest_path(root)
-    assert_path_contained(manifest_file, root / ".wdd", "adapter manifest", root=root)
+    assert_path_contained(manifest_file, manifest_path(root), "adapter manifest", root=root, exact=True)
     manifest_file.parent.mkdir(parents=True, exist_ok=True)
     manifest_file.write_text(json.dumps(manifest_out, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return recorded
@@ -1043,21 +1067,36 @@ def apply_local_operations(root: Path | str, result: dict[str, Any]) -> None:
     tasks_dir = wdd_dir / "tasks"
 
     plan_path = wdd_dir / "plan.json"
-    assert_path_contained(plan_path, wdd_dir, "plan.json", root=root)
-    plan_path.parent.mkdir(parents=True, exist_ok=True)
-    plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    manifest_file = manifest_path(root)
 
+    # Validate every write path for every operation up front, before a
+    # single byte is written. If any path is rejected (symlink, wrong
+    # container), nothing has been written yet and .wdd/ is left exactly as
+    # it was -- no torn state where a freshly-written plan.json references
+    # briefs that were never created because a later brief's path failed.
+    assert_path_contained(plan_path, wdd_dir / "plan.json", "plan.json", root=root, exact=True)
+    brief_paths: dict[str, Path] = {}
     for task_id, brief_text in briefs.items():
         brief_path = wdd_dir / plan_tasks[task_id]["specPath"]
         # Belt and braces (see assert_path_contained docstring): specPath is
         # derived from a remote "WDD ID" field, which is attacker-controlled.
+        # Containment is against .wdd/tasks specifically, not merely "inside
+        # the repo root" -- a specPath of "../victim.md" would otherwise
+        # still resolve inside the repo and pass a looser check.
         assert_path_contained(brief_path, tasks_dir, "task brief", root=root)
+        brief_paths[task_id] = brief_path
+    assert_path_contained(manifest_file, manifest_path(root), "adapter manifest", root=root, exact=True)
+
+    # Every path validated -- now perform the actual writes.
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+
+    for task_id, brief_text in briefs.items():
+        brief_path = brief_paths[task_id]
         brief_path.parent.mkdir(parents=True, exist_ok=True)
         brief_path.write_text(brief_text, encoding="utf-8")
 
     manifest = build_manifest(root, result, plan)
-    manifest_file = manifest_path(root)
-    assert_path_contained(manifest_file, wdd_dir, "adapter manifest", root=root)
     manifest_file.parent.mkdir(parents=True, exist_ok=True)
     manifest_file.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 

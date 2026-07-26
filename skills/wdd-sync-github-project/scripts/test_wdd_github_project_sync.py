@@ -411,11 +411,147 @@ class WddGithubProjectSyncTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 sync.apply_local_operations(root, forged_result)
 
-            # plan.json itself is a legitimate, non-attacker-controlled path
-            # and may already have been written before the brief write is
-            # reached; what must never happen is the brief escaping .wdd/.
+            # All paths are validated before any write happens (Finding 2:
+            # all-or-nothing pre-validation), so plan.json is never written
+            # either -- and, in particular, the brief never escapes .wdd/.
+            self.assertFalse((root / ".wdd" / "plan.json").exists())
             self.assertFalse((root / ".wdd" / "tasks").exists())
             self.assertFalse((root.parent / "escaped-via-bypass.md").exists())
+
+    # -- Finding 1 (P2): containment anchored to the repo root, not the -----
+    # -- artifact-specific container, lets "../victim.md" escape .wdd/tasks --
+
+    def test_containment_confines_brief_to_tasks_dir_not_just_repo_root(self):
+        """Reproduction: a forged specPath of '../victim.md' resolves to
+        <root>/victim.md, which is still "inside the repository root" -- a
+        containment check anchored only to root would accept it. Task
+        briefs must be confined to .wdd/tasks/ specifically, so this must
+        raise and the pre-existing file must be left untouched."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            victim = root / "victim.md"
+            original_content = "original content, not to be touched\n"
+            write_text(victim, original_content)
+
+            forged_entry = {
+                "id": "TASK-forged",
+                "title": "Forged",
+                "specPath": "../victim.md",
+                "risk": "normal",
+                "dependsOn": [],
+                "conflictDomains": [],
+            }
+            forged_result = {
+                "schemaVersion": 1,
+                "mode": "pull",
+                "scopeId": "SCOPE-forged",
+                "project": {"base_ref": "wdd/forged"},
+                "operations": [],
+                "conflicts": [],  # simulates a bypass upstream of this check
+                "warnings": [],
+                "remoteItems": [],
+                "planTasks": {"TASK-forged": forged_entry},
+                "briefs": {"TASK-forged": "malicious content"},
+                "existingPlan": None,
+            }
+
+            with self.assertRaises(RuntimeError) as ctx:
+                sync.apply_local_operations(root, forged_result)
+            self.assertIn("task brief", str(ctx.exception))
+
+            # The pre-existing file outside .wdd/tasks/ must be byte-for-byte
+            # unchanged -- not overwritten, not appended to.
+            self.assertEqual(victim.read_text(encoding="utf-8"), original_content)
+            # Nothing was written at all (Finding 2: validate before write).
+            self.assertFalse((root / ".wdd" / "plan.json").exists())
+            self.assertFalse((root / ".wdd" / "tasks").exists())
+
+    def test_plan_json_containment_rejects_a_path_outside_wdd_dir(self):
+        """plan.json must resolve to exactly <root>/.wdd/plan.json, not just
+        somewhere under the repo root."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            forged_result = {
+                "schemaVersion": 1,
+                "mode": "pull",
+                "scopeId": "SCOPE-forged",
+                "project": {"base_ref": "wdd/forged"},
+                "operations": [],
+                "conflicts": [],
+                "warnings": [],
+                "remoteItems": [],
+                "planTasks": {
+                    "TASK-001-x": {
+                        "id": "TASK-001-x",
+                        "title": "x",
+                        "specPath": "tasks/TASK-001-x.md",
+                        "risk": "normal",
+                        "dependsOn": [],
+                        "conflictDomains": [],
+                    }
+                },
+                "briefs": {"TASK-001-x": "brief text"},
+                "existingPlan": None,
+            }
+            # A well-formed request writes fine, exercising the exact-match
+            # path so this test also proves the happy path is not broken.
+            sync.apply_local_operations(root, forged_result)
+            self.assertTrue((root / ".wdd" / "plan.json").exists())
+
+    # -- Finding 2 (P2): a rejected sync must leave .wdd/ exactly as it was -
+
+    def test_apply_local_operations_is_all_or_nothing_on_a_later_rejection(self):
+        """Reproduction: two operations are queued; the first task's brief
+        path is fine, the second task's specPath is a forged traversal. If
+        paths were validated interleaved with writes, plan.json and the
+        first brief would already be on disk by the time the second path is
+        rejected -- a torn .wdd/ referencing a brief for a task whose write
+        never actually happened for the rest of the batch, and inconsistent
+        with the raised error. Every path must be validated up front so a
+        rejection leaves .wdd/ completely untouched."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            victim = root / "victim2.md"
+            write_text(victim, "untouched\n")
+
+            good_entry = {
+                "id": "TASK-001-good",
+                "title": "Good",
+                "specPath": "tasks/TASK-001-good.md",
+                "risk": "normal",
+                "dependsOn": [],
+                "conflictDomains": [],
+            }
+            bad_entry = {
+                "id": "TASK-002-bad",
+                "title": "Bad",
+                "specPath": "../victim2.md",
+                "risk": "normal",
+                "dependsOn": [],
+                "conflictDomains": [],
+            }
+            result = {
+                "schemaVersion": 1,
+                "mode": "pull",
+                "scopeId": "SCOPE-forged",
+                "project": {"base_ref": "wdd/forged"},
+                "operations": [],
+                "conflicts": [],
+                "warnings": [],
+                "remoteItems": [],
+                "planTasks": {"TASK-001-good": good_entry, "TASK-002-bad": bad_entry},
+                "briefs": {"TASK-001-good": "good brief", "TASK-002-bad": "bad brief"},
+                "existingPlan": None,
+            }
+
+            with self.assertRaises(RuntimeError):
+                sync.apply_local_operations(root, result)
+
+            # Nothing was written -- not plan.json, not the first (valid)
+            # brief, and the victim file outside .wdd/ is untouched.
+            self.assertFalse((root / ".wdd" / "plan.json").exists())
+            self.assertFalse((root / ".wdd" / "tasks" / "TASK-001-good.md").exists())
+            self.assertEqual(victim.read_text(encoding="utf-8"), "untouched\n")
 
     # -- Finding 2 (P2): convergence path for tasks created by push ---------
 
