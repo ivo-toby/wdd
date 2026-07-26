@@ -16,8 +16,8 @@ it.
 - Never auto-resolve conflicts. If a task changed both locally and on
   GitHub since the last sync, report it and write nothing for that task.
 - One GitHub Project maps to one WDD scope (`SCOPE-<project-slug>`).
-- A remote "WDD ID" must be a bare `TASK-<slug>` (no `/`, no `..`);
-  anything else blocks the sync as a conflict instead of touching disk.
+- A remote "WDD ID" must be a bare `TASK-<slug>` (no `/`, no `..`); anything
+  else blocks the sync as a conflict rather than touching disk.
 
 ## Pull (GitHub -> local)
 
@@ -42,22 +42,12 @@ python3 scripts/wdd_github_project_sync.py push --root . \
   --project-owner OWNER --project-number 4 --repo OWNER/REPO
 ```
 
-Emits a dry-run operation plan from `.wdd/state.json` and `.wdd/plan.json`.
-Never mutates GitHub itself. **Without `.wdd/state.json`** (e.g. right after
-`pull --apply-local`, which never writes it), push does not guess a status
-and will not push a task back down to "Todo" -- it skips status changes,
-reports why, and still emits safe non-status operations (issue creation,
-WDD ID/Risk fields).
-
-After applying `create_remote_issue`/`add_issue_to_project` by hand, record
-the created id so the next sync matches instead of an `id_collision`:
-
-```bash
-python3 scripts/wdd_github_project_sync.py record-link --root . \
-  --record-link TASK-001-example=123
-```
-
-Repeatable; the value is an issue number or a project item id (`PVTI_...`).
+Emits a dry-run operation plan from `.wdd/state.json` and `.wdd/plan.json`;
+never mutates GitHub. Without `.wdd/state.json` (e.g. after `pull
+--apply-local`), it skips status changes instead of defaulting to "Todo",
+and still emits safe non-status ops. After applying `create_remote_issue` by
+hand, run `record-link --record-link TASK-ID=<issue-or-item-id>` (repeatable)
+to avoid an `id_collision` on the next sync.
 
 ## Next steps
 
