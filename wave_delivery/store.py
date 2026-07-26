@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -65,30 +67,89 @@ class StateStore:
         validate_state(state)
         atomic_write_text(self.path, json.dumps(state, indent=2, sort_keys=True) + "\n")
 
+    def _lock_holder(self) -> dict[str, str]:
+        try:
+            raw = self.lock_path.read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError):
+            return {}
+        fields = {}
+        for line in raw.splitlines():
+            name, _, value = line.partition("=")
+            if value:
+                fields[name.strip()] = value.strip()
+        return fields
+
+    def _holder_is_gone(self, holder: dict[str, str]) -> bool:
+        """True when the recorded holder cannot possibly still be running.
+
+        A crash inside the lock never runs the release, so without this the
+        whole scope stays frozen until a human deletes the file — and manual
+        deletion is itself unsafe, because it can remove a live holder's lock.
+        The check is deliberately conservative: an unparseable file, a
+        different host, or a live pid all mean "leave it alone".
+        """
+        if holder.get("host") != socket.gethostname():
+            return False
+        try:
+            pid = int(holder.get("pid", ""))
+        except ValueError:
+            return False
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        except OSError:
+            return False
+        return False
+
     @contextmanager
     def locked(self) -> Iterator[None]:
         deadline = time.monotonic() + self.lock_timeout_seconds
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # A token, not just a pid: releasing must never unlink a lock this
+        # process does not hold. Reclaiming a stale lock (or a human deleting
+        # one) otherwise lets the previous holder's release remove the new
+        # holder's lock, admitting a second writer under an "exclusive" lock.
+        token = f"{os.getpid()}:{uuid.uuid4().hex}"
         while True:
             try:
                 descriptor = os.open(
                     self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
                 )
             except FileExistsError:
+                holder = self._lock_holder()
+                if self._holder_is_gone(holder):
+                    try:
+                        # Only remove the exact file we just inspected.
+                        if self._lock_holder().get("token") == holder.get("token"):
+                            self.lock_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
                 if time.monotonic() >= deadline:
                     raise LockUnavailable(
-                        f"state lock is held: {self.lock_path}; inspect it before retrying"
+                        f"state lock is held: {self.lock_path} ({holder.get('pid', 'unknown pid')} "
+                        f"on {holder.get('host', 'unknown host')}); inspect it before retrying"
                     )
                 time.sleep(0.05)
                 continue
             else:
                 with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                    handle.write(f"pid={os.getpid()}\n")
+                    handle.write(
+                        f"pid={os.getpid()}\nhost={socket.gethostname()}\ntoken={token}\n"
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 break
         try:
             yield
         finally:
-            try:
-                self.lock_path.unlink()
-            except FileNotFoundError:
-                pass
+            if self._lock_holder().get("token") == token:
+                try:
+                    self.lock_path.unlink()
+                except FileNotFoundError:
+                    pass

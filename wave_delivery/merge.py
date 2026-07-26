@@ -5,7 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .engine import apply_event, apply_mutation, task_gate, transition
+from .engine import (
+    NoChange,
+    apply_mutation,
+    require_ratified,
+    task_gate,
+    transition,
+)
 from .errors import IllegalTransition, RevisionConflict, ValidationError
 from .freshness import check_freshness
 from .git import (
@@ -26,14 +32,6 @@ BLOCKING_FRESHNESS = {"materially_stale", "conflicted"}
 REFRESHABLE_STATUSES = {"in_progress", "review", "merge_ready"}
 
 
-class _NoChange(Exception):
-    """Nothing to do; carries the result to return unchanged."""
-
-    def __init__(self, result: dict[str, Any]) -> None:
-        super().__init__("no change")
-        self.result = result
-
-
 def _task(state: dict[str, Any], task_id: str) -> dict[str, Any]:
     try:
         return state["tasks"][task_id]
@@ -41,18 +39,29 @@ def _task(state: dict[str, Any], task_id: str) -> dict[str, Any]:
         raise ValidationError(f"unknown task: {task_id}") from error
 
 
-def _preflight_revision(state: dict[str, Any], expected_revision: int | None) -> None:
-    """Fail before touching Git, not after.
+def _preflight(
+    state: dict[str, Any], expected_revision: int | None, idempotency_key: str | None
+) -> bool:
+    """Fail before touching Git, not after; return True for a known duplicate.
 
     Both merge and refresh mutate Git and only then apply an event. Validating
     the revision inside that later apply left the branch already moved while
     controller state was unchanged.
+
+    The idempotency key is honoured first, matching ``apply_mutation``. A retry
+    that carries both an explicit key and the now-stale revision it was first
+    issued with is the case explicit keys exist for; rejecting it as a revision
+    conflict told the caller "no Git state was changed" when the first attempt
+    had in fact already merged.
     """
+    if idempotency_key and idempotency_key in state["appliedIdempotencyKeys"]:
+        return True
     if expected_revision is not None and state["revision"] != expected_revision:
         raise RevisionConflict(
             f"expected revision {expected_revision}, found {state['revision']}; "
             "no Git state was changed"
         )
+    return False
 
 
 def _base_ref(state: dict[str, Any]) -> str:
@@ -87,7 +96,8 @@ def refresh_task(
     """Merge the scope base into a task branch and record the new head."""
     repo = require_repository(repo)
     state = store.read()
-    _preflight_revision(state, expected_revision)
+    if _preflight(state, expected_revision, idempotency_key):
+        return {"task": task_id, "action": "duplicate", "revision": state["revision"], "duplicate": True}
     task = _task(state, task_id)
     base_ref = _base_ref(state)
     branch = task.get("branch")
@@ -131,6 +141,7 @@ def refresh_task(
         # transition validates status, and refreshing e.g. a blocked task moved
         # its branch and only then raised, leaving state pointing at the old
         # commit.
+        require_ratified(current)
         status = current["tasks"][task_id]["status"]
         if status not in REFRESHABLE_STATUSES:
             raise IllegalTransition(
@@ -142,7 +153,7 @@ def refresh_task(
         recorded = current["tasks"][task_id].get("headSha")
         if is_ancestor(repo, base_sha, before):
             if not recorded or before == recorded:
-                raise _NoChange({"task": task_id, "action": "already_current", "headSha": before})
+                raise NoChange({"task": task_id, "action": "already_current", "headSha": before})
             after = before
             action = "adopted_external_merge"
             note = "branch was already current; recorded its head and invalidated evidence"
@@ -191,7 +202,7 @@ def refresh_task(
             expected_revision=expected_revision,
             mutator=mutator,
         )
-    except _NoChange as unchanged:
+    except NoChange as unchanged:
         return unchanged.result
     return {**outcome, "revision": state["revision"], "duplicate": duplicate}
 
@@ -207,7 +218,8 @@ def merge_task(
     """Perform the merge into the scope base, then record it as Git-verified."""
     repo = require_repository(repo)
     state = store.read()
-    _preflight_revision(state, expected_revision)
+    if _preflight(state, expected_revision, idempotency_key):
+        return {"task": task_id, "action": "duplicate", "revision": state["revision"], "duplicate": True}
     task = _task(state, task_id)
     base_ref = _base_ref(state)
 
@@ -216,6 +228,7 @@ def merge_task(
     def mutator(current: dict[str, Any]) -> dict[str, Any]:
         # Serialized with the state commit: the base branch must never move
         # while another controller advances the revision underneath us.
+        require_ratified(current)
         task = _task(current, task_id)
         gate = task_gate(current, task)
         if gate != "merge_ready":

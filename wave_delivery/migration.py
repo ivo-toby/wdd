@@ -17,7 +17,7 @@ from typing import Any
 
 from .errors import ValidationError
 from .schema import SCHEMA_VERSION, validate_state
-from .store import atomic_write_text
+from .store import StateStore, atomic_write_text
 
 
 SUPPORTED_SOURCE_VERSIONS = {2}
@@ -118,9 +118,14 @@ def plan_migration(path: Path | str, *, review_policy: str = "always") -> dict[s
 
 def apply_migration(path: Path | str, *, review_policy: str = "always") -> dict[str, Any]:
     path = Path(path)
-    plan = plan_migration(path, review_policy=review_policy)
-    migrated = convert(read_source(path), review_policy=review_policy)
-    backup = Path(plan["backup"])
-    shutil.copy2(path, backup)
-    atomic_write_text(path, json.dumps(migrated, indent=2, sort_keys=True) + "\n")
+    # Serialized against another migrate: read, backup and write must be one
+    # step, or a second migration can copy the already-converted v3 file over
+    # the v2 backup and leave no copy of the original anywhere. Normal v3
+    # commands cannot race this, since they reject v2 state on read.
+    with StateStore(path).locked():
+        plan = plan_migration(path, review_policy=review_policy)
+        migrated = convert(read_source(path), review_policy=review_policy)
+        backup = Path(plan["backup"])
+        shutil.copy2(path, backup)
+        atomic_write_text(path, json.dumps(migrated, indent=2, sort_keys=True) + "\n")
     return {**plan, "applied": True}

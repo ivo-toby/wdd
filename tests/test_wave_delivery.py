@@ -3,12 +3,15 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import socket
 import shlex
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+from wave_delivery import leases
 from wave_delivery.cli import main
 from wave_delivery.constitution import (
     probe_repository,
@@ -30,11 +33,17 @@ from wave_delivery.engine import (
     task_gate,
     transition,
 )
-from wave_delivery.errors import IllegalTransition, RevisionConflict, ValidationError
+from wave_delivery.errors import (
+    IllegalTransition,
+    LockUnavailable,
+    RevisionConflict,
+    ValidationError,
+)
 from wave_delivery.freshness import check_freshness, record_freshness
 from wave_delivery.git import worktree_for
 from wave_delivery.leases import release_task, start_task, submit_task
 from wave_delivery.merge import merge_task, refresh_task
+from wave_delivery import migration
 from wave_delivery.migration import apply_migration, plan_migration
 from wave_delivery.monitor import monitor_once
 from wave_delivery.plan import (
@@ -501,6 +510,212 @@ class ThirdRoundRegressionTests(BaseTest):
         self.assertIsNotNone(task["pr"], "submit after refresh never recorded a deliverable")
         state = store.read()
         self.assertNotEqual(task_gate(state, task), "no_pr")
+
+
+class FourthRoundRegressionTests(BaseTest):
+    """Findings reproduced against 615fa11."""
+
+    def test_unblock_re_checks_admission_before_returning_to_progress(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        started = start_task(store, repo=repo, task_id="TASK-A")[0]
+        self.commit_in(started["worktree"], "src/schema.ts", "a\n")
+        submit_task(store, repo=repo, task_id="TASK-A")
+        # Blocking releases the domain on purpose, so a rival can be admitted.
+        apply_event(store, event_type="task.blocked", task_id="TASK-A", data={"reason": "waiting"})
+        start_task(store, repo=repo, task_id="TASK-B")
+
+        with self.assertRaises(IllegalTransition) as raised:
+            apply_event(store, event_type="task.unblocked", task_id="TASK-A", data={})
+        self.assertIn("conflict_domains", str(raised.exception))
+        self.assertIn("TASK-B", str(raised.exception))
+        self.assertEqual(store.read()["tasks"]["TASK-A"]["status"], "blocked")
+
+        # ...and it resumes as soon as the domain is free again.
+        apply_event(store, event_type="task.cancelled", task_id="TASK-B", data={})
+        apply_event(store, event_type="task.unblocked", task_id="TASK-A", data={})
+        self.assertEqual(store.read()["tasks"]["TASK-A"]["status"], "in_progress")
+
+    def test_unratified_start_leaves_git_untouched(self) -> None:
+        repo = self.repository()
+        store = StateStore(repo / ".wdd" / "state.json")
+        apply_plan(store, validate_plan(self.plan_document()), repo=repo)
+        with self.assertRaises(IllegalTransition):
+            start_task(store, repo=repo, task_id="TASK-A")
+        self.assertEqual(self.git(repo, "branch", "--list", "task/TASK-A"), "")
+        self.assertNotIn("TASK-A", self.git(repo, "worktree", "list"))
+        self.assertEqual(store.read()["tasks"]["TASK-A"]["status"], "todo")
+
+    def test_a_refused_plan_apply_never_creates_the_base_branch(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        start_task(store, repo=repo, task_id="TASK-A")
+
+        moved = validate_plan(self.plan_document(scope={"baseRef": "wdd/other"}))
+        with self.assertRaises(IllegalTransition):
+            apply_plan(store, moved, repo=repo)
+        self.assertEqual(self.git(repo, "branch", "--list", "wdd/other"), "")
+        self.assertEqual(store.read()["scope"]["baseRef"], "wdd/demo")
+
+        # A stale revision must also be rejected before Git moves.
+        third = validate_plan(self.plan_document(scope={"baseRef": "wdd/third"}))
+        with self.assertRaises(RevisionConflict):
+            apply_plan(store, third, repo=repo, expected_revision=0)
+        self.assertEqual(self.git(repo, "branch", "--list", "wdd/third"), "")
+
+
+class ConcurrencyRegressionTests(BaseTest):
+    """Second-lens findings reproduced against 615fa11."""
+
+    def merge_ready(self, repo: Path, store: StateStore, task: str = "TASK-A") -> dict:
+        started = start_task(store, repo=repo, task_id=task)[0]
+        self.commit_in(started["worktree"], "src/schema.ts", "changed\n")
+        submit_task(store, repo=repo, task_id=task)
+        record_review(store, repo=repo, task_id=task, findings=[], reviewer="tester")
+        record_verification(store, repo=repo, task_id=task, status="passed", command="pytest")
+        record_freshness(store, repo=repo, task_id=task)
+        return started
+
+    def test_resubmitting_an_unchanged_head_keeps_the_evidence(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        self.merge_ready(repo, store)
+        before = store.read()["tasks"]["TASK-A"]
+        revision = store.read()["revision"]
+        self.assertEqual(before["status"], "merge_ready")
+
+        result, duplicate = submit_task(store, repo=repo, task_id="TASK-A")
+        after = store.read()["tasks"]["TASK-A"]
+        self.assertEqual(result["action"], "already_recorded")
+        self.assertFalse(duplicate)
+        self.assertEqual(after["headSha"], before["headSha"])
+        self.assertEqual(after["status"], "merge_ready")
+        self.assertIsNotNone(after["verification"], "an innocent retry discarded verification")
+        self.assertIsNotNone(after["freshness"], "an innocent retry discarded freshness")
+        self.assertEqual(store.read()["revision"], revision, "a no-op submit burned a revision")
+
+    def test_submit_resolves_the_head_under_the_store_lock(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        started = start_task(store, repo=repo, task_id="TASK-A")[0]
+        self.commit_in(started["worktree"], "src/schema.ts", "a\n")
+        observed: list[bool] = []
+        original = leases.resolve_ref
+
+        def watching_resolve_ref(repository, ref):
+            observed.append(store.lock_path.exists())
+            return original(repository, ref)
+
+        leases.resolve_ref = watching_resolve_ref
+        try:
+            submit_task(store, repo=repo, task_id="TASK-A")
+        finally:
+            leases.resolve_ref = original
+        self.assertTrue(observed, "submit resolved no ref at all")
+        self.assertTrue(
+            all(observed),
+            "submit read Git outside the lock; a concurrent refresh can be reverted",
+        )
+
+    def test_release_completes_when_the_worktree_is_already_gone(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        self.merge_ready(repo, store)
+        merge_task(store, repo=repo, task_id="TASK-A")
+        path = worktree_for(repo, "SCOPE-demo", "TASK-A")
+        # Exactly what a crash between 'git worktree remove' and the state
+        # write leaves behind: worktree gone, lease still active.
+        self.git(repo, "worktree", "remove", str(path))
+        self.git(repo, "worktree", "prune")
+        self.assertEqual(store.read()["leases"]["TASK-A"]["status"], "active")
+
+        result, _ = release_task(store, repo=repo, task_id="TASK-A")
+        self.assertEqual(result["cleanup"], "already_removed")
+        self.assertEqual(store.read()["leases"]["TASK-A"]["status"], "released")
+
+    def test_merge_retry_with_a_used_key_is_a_duplicate_not_a_conflict(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        self.merge_ready(repo, store)
+        revision = store.read()["revision"]
+        merge_task(
+            store, repo=repo, task_id="TASK-A", expected_revision=revision, idempotency_key="K1"
+        )
+        # The caller died before seeing the result and retried the identical
+        # command; the revision it was issued with is now stale by definition.
+        retry = merge_task(
+            store, repo=repo, task_id="TASK-A", expected_revision=revision, idempotency_key="K1"
+        )
+        self.assertTrue(retry["duplicate"])
+        self.assertEqual(retry["task"], "TASK-A")
+
+    def test_a_lock_left_by_a_dead_process_is_reclaimed(self) -> None:
+        store = StateStore(self.root / "s.json", lock_timeout_seconds=0.2)
+        store.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        host = socket.gethostname()
+        store.lock_path.write_text(f"pid=999999\nhost={host}\ntoken=dead\n", encoding="utf-8")
+        with store.locked():
+            pass
+
+        # A live holder is never stolen from, and an unparseable or foreign
+        # lock is left alone rather than guessed about.
+        for content in (f"pid={os.getpid()}\nhost={host}\ntoken=live\n", "garbage\n"):
+            store.lock_path.write_text(content, encoding="utf-8")
+            with self.assertRaises(LockUnavailable):
+                with store.locked():
+                    pass
+        store.lock_path.unlink()
+
+    def test_releasing_a_lock_never_removes_someone_elses(self) -> None:
+        store = StateStore(self.root / "s.json", lock_timeout_seconds=0.2)
+        with store.locked():
+            # Whatever the reason -- a reclaim, or a human deleting a lock they
+            # believed stale -- another holder now owns the file. Unlinking it
+            # here would admit a second writer under an "exclusive" lock.
+            store.lock_path.write_text("pid=1\nhost=other\ntoken=someone-else\n", encoding="utf-8")
+        self.assertTrue(store.lock_path.exists())
+        store.lock_path.unlink()
+
+    def test_creating_a_scope_twice_concurrently_refuses_the_loser(self) -> None:
+        repo = self.repository()
+        rival = StateStore(repo / ".wdd" / "state.json")
+        apply_plan(rival, validate_plan(self.plan_document()), repo=repo)
+
+        loser = StateStore(repo / ".wdd" / "state.json")
+        real_exists = loser.exists
+        calls: list[bool] = []
+
+        def stale_first_check() -> bool:
+            # The pre-lock check ran before the rival's write landed; every
+            # later call, including the one inside the lock, sees the truth.
+            calls.append(True)
+            return False if len(calls) == 1 else real_exists()
+
+        loser.exists = stale_first_check
+        with self.assertRaises(IllegalTransition) as raised:
+            apply_plan(loser, validate_plan(self.plan_document()), repo=repo)
+        self.assertIn("created concurrently", str(raised.exception))
+        self.assertEqual(rival.read()["scope"]["id"], "SCOPE-demo")
+
+    def test_migration_is_serialized_against_a_second_migration(self) -> None:
+        path = self.root / "v2.json"
+        path.write_text(json.dumps(MigrationTests.v2_state(self)), encoding="utf-8")
+        original = migration.StateStore
+
+        def impatient(target):
+            return original(target, lock_timeout_seconds=0.2)
+
+        migration.StateStore = impatient
+        try:
+            # A second migrate must not read, back up and write while the first
+            # is mid-flight: it would copy the already-converted v3 file over
+            # the v2 backup, leaving no copy of the original anywhere.
+            with StateStore(path, lock_timeout_seconds=0.2).locked():
+                with self.assertRaises(LockUnavailable):
+                    apply_migration(path)
+        finally:
+            migration.StateStore = original
+        self.assertEqual(json.loads(path.read_text())["schemaVersion"], 2)
 
 
 class MigrationTests(BaseTest):

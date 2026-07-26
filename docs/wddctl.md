@@ -53,6 +53,16 @@ Every mutating command accepts `--expected-revision N` and
 - Pass them when several controllers or processes share one scope and you
   need a hard conflict instead of a silent merge of intent — `wddctl` raises
   `RevisionConflict` if the state moved since you last read it.
+- When both are passed, the key wins: a retry carrying the key *and* the
+  now-stale revision it was first issued with returns `"duplicate": true`
+  rather than a `RevisionConflict`. That is the whole point of the key, and
+  it matters most on `merge` and `refresh`, where the first attempt may
+  already have moved Git.
+
+The state lock records the holding pid and host. A lock whose pid is no
+longer running on this host is reclaimed automatically, so a crash inside
+the lock does not freeze the scope; a live holder is never stolen from, and
+releasing only ever removes the lock this process actually took.
 
 ## Commands
 
@@ -266,6 +276,9 @@ commits of its own past the base. Without `--pr`, the recorded reference is
 `branch:<name>@<short-sha>`. Re-submitting after new commits records
 `task.head_updated` instead of `task.pr_recorded`, and invalidates any
 existing review and verification evidence — see Guarantees below.
+Re-submitting with *no* new commits is a no-op (`"action":
+"already_recorded"`): it burns no revision and keeps the evidence, so an
+innocent retry cannot demote a `merge_ready` task.
 
 ### `review record`
 
@@ -458,7 +471,10 @@ wddctl release --task TASK-001-token-types --repo . [--keep-worktree]
 Only valid once a task is `done`, `cancelled`, or `blocked`. Refuses to
 remove a worktree that's dirty, detached, or checked out to an unexpected
 branch. `--keep-worktree` releases the lease bookkeeping without deleting
-the directory.
+the directory. A worktree that Git no longer knows about *and* is absent
+from disk — what a crash between `git worktree remove` and the state write
+leaves behind — is recorded as `"cleanup": "already_removed"` rather than
+refused, so release always converges.
 
 ### `block` / `unblock` / `cancel`
 
@@ -469,7 +485,10 @@ wddctl cancel --task TASK-001-token-types
 ```
 
 `unblock` returns the task to `todo` (if it never got a PR) or `in_progress`
-(if it did). `cancel` is terminal.
+(if it did). Because a blocked task releases its conflict domains, the
+`in_progress` path re-runs admission and refuses if a rival took the domain
+while this task waited — cancel or finish the rival first. `cancel` is
+terminal.
 
 ### `note`
 

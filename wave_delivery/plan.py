@@ -276,9 +276,18 @@ def apply_plan(
         if dry_run:
             return result
         base = None
-        if repo is not None and plan["scope"]["baseRef"]:
-            base = ensure_base_branch(repo, plan["scope"]["baseRef"], from_ref=from_ref)
-        store.write(state)
+        # Creation is a check-then-act: without the lock two controllers both
+        # saw no state and the loser's plan was silently discarded. The
+        # existence check is repeated inside so the second one loses cleanly.
+        with store.locked():
+            if store.exists():
+                raise IllegalTransition(
+                    f"scope state already exists at {store.path}; it was created concurrently — "
+                    "re-run to apply this plan as a diff"
+                )
+            if repo is not None and plan["scope"]["baseRef"]:
+                base = ensure_base_branch(repo, plan["scope"]["baseRef"], from_ref=from_ref)
+            store.write(state)
         return {**result, "revision": 0, "base": base}
 
     current = store.read()
@@ -294,9 +303,21 @@ def apply_plan(
     if dry_run or unchanged:
         return {**result, "unchanged": unchanged}
 
-    base = None
-    if repo is not None and plan["scope"]["baseRef"]:
-        base = ensure_base_branch(repo, plan["scope"]["baseRef"], from_ref=from_ref)
+    base: dict[str, Any] | None = None
+
+    def mutator(state: dict[str, Any]) -> dict[str, Any]:
+        # Validate before creating the branch, and do both inside the store
+        # lock. Every refusal below -- scope-id mismatch, editing a task that
+        # has started, changing baseRef while tasks are active, a stale
+        # --expected-revision -- used to fire only after the base branch had
+        # already been created, leaving a ref the operator never asked for
+        # that a later corrected apply would silently adopt as its base.
+        nonlocal base
+        updated = _apply_plan_to_state(state, plan)
+        if repo is not None and plan["scope"]["baseRef"]:
+            base = ensure_base_branch(repo, plan["scope"]["baseRef"], from_ref=from_ref)
+        return updated
+
     state, duplicate = apply_mutation(
         store,
         event_type="plan.applied",
@@ -304,6 +325,6 @@ def apply_plan(
         data={"diff": diff},
         idempotency_key=idempotency_key,
         expected_revision=expected_revision,
-        mutator=lambda state: _apply_plan_to_state(state, plan),
+        mutator=mutator,
     )
     return {**result, "revision": state["revision"], "duplicate": duplicate, "base": base}

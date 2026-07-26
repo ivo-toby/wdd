@@ -25,6 +25,18 @@ def utc_now() -> str:
     )
 
 
+class NoChange(Exception):
+    """Raised by a mutator when there is nothing to do.
+
+    ``apply_mutation`` treats this as a clean exit: no revision is burned and
+    nothing is written. It carries the result the caller should return.
+    """
+
+    def __init__(self, result: dict[str, Any]) -> None:
+        super().__init__("no change")
+        self.result = result
+
+
 def event_id(
     revision: int, event_type: str, task_id: str | None, data: dict[str, Any]
 ) -> str:
@@ -60,7 +72,7 @@ def _task(state: dict[str, Any], task_id: str | None) -> dict[str, Any]:
         raise ValidationError(f"unknown task: {task_id}") from error
 
 
-def _require_ratified(state: dict[str, Any]) -> None:
+def require_ratified(state: dict[str, Any]) -> None:
     if state["constitution"]["status"] != "ratified":
         raise IllegalTransition(
             "execution is blocked until the constitution is explicitly ratified"
@@ -130,6 +142,16 @@ def admission_blocker(state: dict[str, Any], task_id: str) -> dict[str, Any] | N
     if isinstance(limit, int) and active_count >= limit:
         return {"code": "max_concurrent", "limit": limit, "active": active_count}
     return None
+
+
+def describe_blocker(blocker: dict[str, Any]) -> str:
+    """Render an admission blocker for an error message."""
+    detail = blocker.get("domains") or blocker.get("dependsOn") or [str(blocker.get("limit"))]
+    text = f"{blocker['code']} ({', '.join(detail)})"
+    holders = blocker.get("heldBy")
+    if holders:
+        text += f" held by {', '.join(holders)}"
+    return text
 
 
 def task_gate(state: dict[str, Any], task: dict[str, Any]) -> str:
@@ -250,7 +272,7 @@ def transition(
         }
         return state
 
-    _require_ratified(state)
+    require_ratified(state)
 
     if event_type == "reconcile.completed":
         state["reconcile"]["mergesSinceCheckpoint"] = 0
@@ -405,7 +427,20 @@ def transition(
         task["blocker"] = reason
     elif event_type == "task.unblocked":
         _require_status(task, {"blocked"}, event_type)
-        task["status"] = "todo" if not task.get("pr") else "in_progress"
+        if task.get("pr"):
+            # Blocked tasks release their conflict domains on purpose, so a
+            # rival can be admitted while this one waits. Returning it straight
+            # to in_progress without consulting admission put both on the same
+            # domain at once -- the exact thing task.started refuses to do.
+            blocker = admission_blocker(state, task_id)
+            if blocker is not None:
+                raise IllegalTransition(
+                    f"cannot unblock {task_id} back into progress: "
+                    f"{describe_blocker(blocker)}"
+                )
+            task["status"] = "in_progress"
+        else:
+            task["status"] = "todo"
         task["blocker"] = None
     elif event_type == "task.cancelled":
         _require_status(task, TASK_STATUSES - TERMINAL_STATUSES, event_type)
@@ -418,7 +453,7 @@ def transition(
 def apply_mutation(
     store: StateStore,
     *,
-    event_type: str,
+    event_type: str | Callable[[dict[str, Any]], str],
     task_id: str | None,
     data: dict[str, Any],
     idempotency_key: str | None,
@@ -431,9 +466,14 @@ def apply_mutation(
     current revision is read under the same exclusive lock that guards the
     write, and the event gets a unique id rather than a payload-derived one —
     see :func:`event_id` for why deduping on payload is wrong.
+
+    ``event_type`` may be a callable taking the locked state, for commands
+    whose event depends on state they must not read outside the lock.
     """
     with store.locked():
         state = store.read()
+        if callable(event_type):
+            event_type = event_type(state)
         key = idempotency_key or event_id(
             state["revision"] + 1, event_type, task_id, data
         )
