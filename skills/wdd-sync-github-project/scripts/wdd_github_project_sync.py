@@ -46,6 +46,35 @@ def local_status_to_remote(status: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# WDD task-id validation -- a "WDD ID" field is attacker-controlled data from
+# a remote GitHub Project board, and it feeds directly into filesystem paths
+# (task specPath, brief files). It must be a single path segment: no `/`,
+# no `..`, no other separators. See assert_path_contained() below for the
+# second, independent line of defense (containment-check the resolved path).
+# ---------------------------------------------------------------------------
+
+TASK_ID_PATTERN = re.compile(r"^TASK-[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def assert_path_contained(path: Path, container: Path, what: str) -> Path:
+    """Refuse to resolve `path` outside `container`.
+
+    This is intentionally independent of TASK_ID_PATTERN validation upstream:
+    every path this adapter writes is ultimately keyed by a "WDD ID" that can
+    originate from remote, attacker-controlled data, so the write path itself
+    is re-checked here even if ID-format validation was bypassed or buggy.
+    """
+    resolved = path.resolve()
+    container_resolved = container.resolve()
+    if resolved != container_resolved and container_resolved not in resolved.parents:
+        raise RuntimeError(
+            f"Refusing to write {what}: resolved path {resolved} is outside the "
+            f"required directory {container_resolved}"
+        )
+    return resolved
+
+
+# ---------------------------------------------------------------------------
 # Risk heuristic -- deliberately small and documented (see CONTRACT: "risk").
 # ---------------------------------------------------------------------------
 
@@ -186,8 +215,19 @@ def normalize_remote_items(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         title = str(raw.get("title") or content.get("title") or "Untitled").strip()
         explicit_raw = field_value(raw, "wdd_id", "WDD ID", "WDDID")
         explicit_id = None
-        if explicit_raw and str(explicit_raw).strip().upper().startswith("TASK-"):
-            explicit_id = str(explicit_raw).strip()
+        invalid_wdd_id = None
+        if explicit_raw:
+            candidate = str(explicit_raw).strip()
+            if candidate.upper().startswith("TASK-"):
+                if TASK_ID_PATTERN.match(candidate):
+                    explicit_id = candidate
+                else:
+                    # Looks like it was meant to be a WDD ID but fails the
+                    # strict single-segment format (e.g. contains `/` or
+                    # `..`). Never use it to build a path -- see
+                    # process_remote_items(), which turns this into a
+                    # blocking conflict instead of a generated task id.
+                    invalid_wdd_id = candidate
         normalized.append(
             {
                 "item_id": raw.get("item_id") or raw.get("id"),
@@ -201,6 +241,7 @@ def normalize_remote_items(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
                 "labels": get_labels(raw),
                 "risk_hint": str(field_value(raw, "Risk", "WDD Risk") or ""),
                 "explicit_id": explicit_id,
+                "invalid_wdd_id": invalid_wdd_id,
                 "depends_raw": field_value(
                     raw, "depends_on", "Depends On", "DependsOn", "Blocked By", "blocked_by"
                 ),
@@ -300,6 +341,15 @@ def process_remote_items(
     items = normalize_remote_items(snapshot)
     assign_task_ids(items, known_task_ids, reverse_lookup)
     warnings = resolve_depends_on(items)
+    for item in items:
+        if item.get("invalid_wdd_id"):
+            warnings.append(
+                {
+                    "type": "invalid_wdd_id",
+                    "task": item["task_id"],
+                    "reference": item["invalid_wdd_id"],
+                }
+            )
     entries: dict[str, dict[str, Any]] = {}
     for item in items:
         conflict_domains = split_field_list(item.get("conflict_raw"))
@@ -360,6 +410,95 @@ def load_state(root: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Adoption links -- the convergence path for tasks created by `push`.
+#
+# `push` only ever emits a dry-run plan (create_remote_issue /
+# add_issue_to_project / update_project_fields); this script never mutates
+# GitHub. Once a human (or the GitHub CLI/connector) has actually applied
+# that plan, the resulting issue number / project item id has to be written
+# back into the manifest, or the *next* sync will not recognize the local
+# task as already-linked and will report an id_collision. `--record-link`
+# closes that loop without this adapter ever touching GitHub itself.
+# ---------------------------------------------------------------------------
+
+
+def parse_record_link(spec: str) -> tuple[str, dict[str, Any]]:
+    """Parse one `--record-link TASK-ID=VALUE` argument. VALUE is an issue
+    number (digits) or a GitHub Projects item id (anything else, e.g.
+    `PVTI_...`)."""
+    if "=" not in spec:
+        raise RuntimeError(f"--record-link must look like TASK-ID=VALUE, got {spec!r}")
+    task_id, _, value = spec.partition("=")
+    task_id = task_id.strip()
+    value = value.strip()
+    if not TASK_ID_PATTERN.match(task_id):
+        raise RuntimeError(
+            f"--record-link task id {task_id!r} is not a valid task id "
+            f"(must match {TASK_ID_PATTERN.pattern!r})"
+        )
+    if not value:
+        raise RuntimeError(f"--record-link value for {task_id} is empty")
+    if value.isdigit():
+        return task_id, {"issueNumber": int(value)}
+    return task_id, {"itemId": value}
+
+
+def record_remote_links(root: Path | str, links: dict[str, dict[str, Any]]) -> list[str]:
+    """Write previously-created remote issue/item identifiers for local-only
+    tasks into `.wdd/adapters/github-project.json`, so the next pull/push
+    matches the existing remote item instead of creating an id_collision.
+
+    The local fingerprint is recomputed from the task's current plan.json
+    entry and brief so an immediate follow-up sync does not misreport this
+    as a "local changed" conflict; the remote fingerprint is left unset and
+    is filled in naturally by the next real pull/push against a snapshot.
+    """
+    root = Path(root)
+    plan = load_local_plan(root)
+    if plan is None:
+        raise RuntimeError("No .wdd/plan.json found; cannot record a link before a plan exists")
+    tasks_by_id = {entry["id"]: normalize_task_entry(entry) for entry in plan.get("tasks", [])}
+
+    manifest = load_manifest(root)
+    items = dict(manifest.get("items") or {})
+    tasks_dir = root / ".wdd" / "tasks"
+    recorded: list[str] = []
+
+    for task_id, link in links.items():
+        entry = tasks_by_id.get(task_id)
+        if entry is None:
+            raise RuntimeError(f"--record-link references {task_id!r}, which is not a task in .wdd/plan.json")
+        brief_path = root / ".wdd" / entry["specPath"]
+        assert_path_contained(brief_path, tasks_dir, "task brief")
+        brief_text = brief_path.read_text(encoding="utf-8") if brief_path.exists() else ""
+        existing_entry = items.get(task_id) or {}
+        github = dict(existing_entry.get("github") or {})
+        github.update(link)
+        items[task_id] = {
+            "localPath": entry["specPath"],
+            "github": github,
+            "fingerprints": {
+                "local": fingerprint_local_task(entry, brief_text),
+                "remote": (existing_entry.get("fingerprints") or {}).get("remote"),
+            },
+        }
+        recorded.append(task_id)
+
+    manifest_out = {
+        "schemaVersion": 1,
+        "updatedAt": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "scope": manifest.get("scope") or {"id": (plan.get("scope") or {}).get("id")},
+        "project": manifest.get("project") or {},
+        "items": items,
+    }
+    manifest_file = manifest_path(root)
+    assert_path_contained(manifest_file, root / ".wdd", "adapter manifest")
+    manifest_file.parent.mkdir(parents=True, exist_ok=True)
+    manifest_file.write_text(json.dumps(manifest_out, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return recorded
 
 
 def fingerprint_local_task(entry: dict[str, Any], brief_text: str) -> str:
@@ -505,7 +644,27 @@ def plan_sync(
         remote_snapshot, known_task_ids=known_ids, reverse_lookup=reverse_lookup
     )
 
-    conflicts: list[dict[str, Any]] = []
+    # A malformed "WDD ID" field is remote, attacker-controlled data that this
+    # adapter would otherwise turn directly into a filesystem path (task
+    # specPath / brief path). Block the whole sync -- same fail-closed
+    # treatment as scope_mismatch/id_collision -- rather than silently
+    # falling back to a generated id. assert_path_contained() below is the
+    # independent second check on the actual write path.
+    invalid_id_warnings = [w for w in warnings if w["type"] == "invalid_wdd_id"]
+    warnings = [w for w in warnings if w["type"] != "invalid_wdd_id"]
+    conflicts: list[dict[str, Any]] = [
+        {
+            "type": "invalid_wdd_id",
+            "task": w["task"],
+            "reason": (
+                f"remote WDD ID {w['reference']!r} is not a valid task id -- it must match "
+                f"{TASK_ID_PATTERN.pattern!r} (no `/`, no `..`, no other path separators). "
+                "Fix the WDD ID field on the GitHub Project item/issue and re-sync; nothing "
+                "will be written until this is resolved."
+            ),
+        }
+        for w in invalid_id_warnings
+    ]
     operations: list[dict[str, Any]] = []
     plan_tasks: dict[str, dict[str, Any]] = {}
     brief_ops: list[dict[str, Any]] = []
@@ -588,6 +747,7 @@ def plan_sync(
 
     if mode in {"push", "sync"} and not conflicts:
         state = load_state(root)
+        has_controller_state = state is not None
         state_tasks = (state or {}).get("tasks") or {}
         remote_by_link: dict[tuple[str, Any], dict[str, Any]] = {}
         for item in items:
@@ -597,8 +757,14 @@ def plan_sync(
                 remote_by_link[("item", str(item["item_id"]))] = item
 
         for task_id, entry in sorted(existing_tasks_by_id.items()):
-            status = (state_tasks.get(task_id) or {}).get("status", "todo")
-            desired_status = local_status_to_remote(status)
+            # No controller state at all means we do not actually know this
+            # task's status -- e.g. a task just imported by `pull
+            # --apply-local`, which writes no state.json. Defaulting to
+            # "todo" here would silently regress an already-in-progress
+            # remote item the moment someone runs `push`. Only compute a
+            # desired_status when wddctl has actually recorded one.
+            task_state = state_tasks.get(task_id) if has_controller_state else None
+            desired_status = local_status_to_remote(task_state["status"]) if task_state else None
             manifest_entry = manifest_items.get(task_id) or {}
             github_link = manifest_entry.get("github") or {}
             linked_item = None
@@ -608,6 +774,26 @@ def plan_sync(
                 linked_item = remote_by_link.get(("item", str(github_link["itemId"])))
 
             if linked_item is None:
+                # Creating the remote issue/item and setting its non-status
+                # fields is safe even with no controller state: there is no
+                # existing remote status to regress. Only omit "Status" so
+                # the project's own default column applies instead of an
+                # invented "todo".
+                fields = {"WDD ID": task_id, "Risk": entry.get("risk", "normal")}
+                if desired_status is not None:
+                    fields["Status"] = desired_status
+                else:
+                    warnings.append(
+                        {
+                            "type": "status_skipped_no_controller_state",
+                            "task": task_id,
+                            "reason": (
+                                "no .wdd/state.json found; creating the remote issue without "
+                                "a Status field so the project's default column applies -- "
+                                "run wddctl to establish controller state, then re-push"
+                            ),
+                        }
+                    )
                 operations.append(
                     {
                         "action": "create_remote_issue",
@@ -627,11 +813,24 @@ def plan_sync(
                         "requiresIssueUrlFrom": task_id,
                     }
                 )
-                operations.append(
+                operations.append({"action": "update_project_fields", "task": task_id, "fields": fields})
+                continue
+
+            if desired_status is None:
+                # Task is already linked to a remote item with its own
+                # status; refuse to emit a status-changing operation rather
+                # than overwrite it with an invented "todo". Preserve
+                # whatever the remote currently has.
+                warnings.append(
                     {
-                        "action": "update_project_fields",
+                        "type": "status_skipped_no_controller_state",
                         "task": task_id,
-                        "fields": {"WDD ID": task_id, "Status": desired_status, "Risk": entry.get("risk", "normal")},
+                        "reason": (
+                            "no .wdd/state.json found; refusing to push a Status change -- "
+                            f"the remote Status ({linked_item.get('status_text') or 'unknown'!r}) "
+                            "is preserved as-is. Run wddctl to establish controller state, "
+                            "then re-push"
+                        ),
                     }
                 )
                 continue
@@ -732,17 +931,25 @@ def apply_local_operations(root: Path | str, result: dict[str, Any]) -> None:
         plan = dict(existing_plan)
         plan["tasks"] = [tasks_by_id[task_id] for task_id in ordered_ids]
 
-    plan_path = root / ".wdd" / "plan.json"
+    wdd_dir = root / ".wdd"
+    tasks_dir = wdd_dir / "tasks"
+
+    plan_path = wdd_dir / "plan.json"
+    assert_path_contained(plan_path, wdd_dir, "plan.json")
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
 
     for task_id, brief_text in briefs.items():
-        brief_path = root / ".wdd" / plan_tasks[task_id]["specPath"]
+        brief_path = wdd_dir / plan_tasks[task_id]["specPath"]
+        # Belt and braces (see assert_path_contained docstring): specPath is
+        # derived from a remote "WDD ID" field, which is attacker-controlled.
+        assert_path_contained(brief_path, tasks_dir, "task brief")
         brief_path.parent.mkdir(parents=True, exist_ok=True)
         brief_path.write_text(brief_text, encoding="utf-8")
 
     manifest = build_manifest(root, result, plan)
     manifest_file = manifest_path(root)
+    assert_path_contained(manifest_file, wdd_dir, "adapter manifest")
     manifest_file.parent.mkdir(parents=True, exist_ok=True)
     manifest_file.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -827,6 +1034,15 @@ def print_text_plan(result: dict[str, Any]) -> None:
         for warning in unresolved:
             print(f"  - {warning['task']}: {warning['reference']!r} did not match any known item")
 
+    status_skipped = [w for w in result["warnings"] if w.get("type") == "status_skipped_no_controller_state"]
+    if status_skipped:
+        print(
+            "\nWARNING: no .wdd/state.json found, so no Status changes were pushed for the "
+            "following tasks (their current remote Status is preserved as-is):"
+        )
+        for warning in status_skipped:
+            print(f"  - {warning['task']}: {warning['reason']}")
+
     applied = result.get("appliedOperations")
     if applied is not None:
         if applied:
@@ -851,10 +1067,18 @@ def print_text_plan(result: dict[str, Any]) -> None:
         label = operation.get("task") or operation.get("scopeId") or ""
         print(f"- {operation['action']} {label}".rstrip())
 
+    if any(op["action"] == "create_remote_issue" for op in result["operations"]):
+        print(
+            "\nAfter applying create_remote_issue/add_issue_to_project by hand, record the "
+            "resulting id so the next sync matches instead of colliding:\n"
+            "  python3 wdd_github_project_sync.py record-link --root . "
+            "--record-link TASK-ID=<issue-number-or-item-id>"
+        )
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["inspect", "pull", "push", "sync"])
+    parser.add_argument("mode", choices=["inspect", "pull", "push", "sync", "record-link"])
     parser.add_argument("--root", default=".", help="Repository root (contains .wdd/)")
     parser.add_argument("--scope-id", help="Override the derived WDD scope id")
     parser.add_argument("--remote-json", type=Path, help="GitHub Project snapshot JSON")
@@ -863,9 +1087,37 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", help="GitHub repository owner/name for issue writes")
     parser.add_argument("--apply-local", action="store_true")
     parser.add_argument("--json", action="store_true", help="Print JSON output")
+    parser.add_argument(
+        "--record-link",
+        action="append",
+        default=[],
+        metavar="TASK-ID=ISSUE_NUMBER_OR_ITEM_ID",
+        help=(
+            "Only valid with the 'record-link' mode. Record a remote issue "
+            "number or GitHub Projects item id for a local-only task that a "
+            "previously-applied `push` plan created, so the next sync "
+            "matches it instead of reporting an id_collision. Repeatable."
+        ),
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.root)
+
+    if args.mode == "record-link":
+        if not args.record_link:
+            parser.error("record-link mode requires at least one --record-link TASK-ID=VALUE")
+        links: dict[str, dict[str, Any]] = {}
+        for spec in args.record_link:
+            task_id, link = parse_record_link(spec)
+            links[task_id] = link
+        recorded = record_remote_links(root, links)
+        if args.json:
+            print(json.dumps({"recorded": recorded}, indent=2, sort_keys=True))
+        else:
+            for task_id in recorded:
+                print(f"Recorded remote link for {task_id}")
+        return 0
+
     if args.remote_json:
         snapshot = load_remote_json(args.remote_json)
     else:
@@ -893,5 +1145,18 @@ def main(argv: list[str] | None = None) -> int:
     return 1 if result["conflicts"] else 0
 
 
+def cli() -> int:
+    """Report refusals as errors, not as an uncaught traceback.
+
+    The refusals this script raises are safety decisions — a traversal-shaped
+    task id, an unresolved conflict — and a stack trace buries the reason.
+    """
+    try:
+        return main()
+    except RuntimeError as error:
+        print(f"wdd-sync-github-project: {error}", file=sys.stderr)
+        return 2
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())

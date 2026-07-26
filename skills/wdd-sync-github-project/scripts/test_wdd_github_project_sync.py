@@ -350,6 +350,223 @@ class WddGithubProjectSyncTests(unittest.TestCase):
             actions = {operation["action"] for operation in residual["appliedOperations"]}
             self.assertIn("create_plan", actions)
 
+    # -- Finding 1 (P1): path traversal via a malicious remote "WDD ID" -----
+
+    def test_malicious_wdd_id_cannot_escape_wdd_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot = remote_snapshot()
+            malicious_id = "TASK-/../../../escaped"
+            snapshot["items"][0]["wdd_id"] = malicious_id
+
+            result = sync.plan_sync(root, snapshot, mode="pull")
+
+            # The malicious id must be reported as a blocking conflict, not
+            # silently used to build a path.
+            invalid_id_conflicts = [c for c in result["conflicts"] if c["type"] == "invalid_wdd_id"]
+            self.assertEqual(len(invalid_id_conflicts), 1)
+            self.assertIn(malicious_id, invalid_id_conflicts[0]["reason"])
+            self.assertEqual(result["operations"], [])
+
+            # apply_local_operations must refuse outright (same fail-closed
+            # path as scope_mismatch/id_collision) -- a clear error is raised.
+            with self.assertRaises(RuntimeError):
+                sync.apply_local_operations(root, result)
+
+            # Nothing was written anywhere, in particular not outside .wdd/.
+            self.assertFalse((root / ".wdd").exists())
+            self.assertFalse((root.parent / "escaped").exists())
+            self.assertFalse((root.parent / "escaped.md").exists())
+
+    def test_containment_check_is_independent_second_layer(self):
+        """Even if a malicious specPath somehow bypassed WDD-ID validation
+        upstream (a bug, a future code path, a hand-built result dict), the
+        resolved-path containment check in apply_local_operations must still
+        refuse to write outside .wdd/tasks/. Belt and braces."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            escaping_spec_path = "../../../escaped-via-bypass.md"
+            forged_entry = {
+                "id": "TASK-forged",
+                "title": "Forged",
+                "specPath": escaping_spec_path,
+                "risk": "normal",
+                "dependsOn": [],
+                "conflictDomains": [],
+            }
+            forged_result = {
+                "schemaVersion": 1,
+                "mode": "pull",
+                "scopeId": "SCOPE-forged",
+                "project": {"base_ref": "wdd/forged"},
+                "operations": [],
+                "conflicts": [],  # simulates a bypass: no conflict was raised
+                "warnings": [],
+                "remoteItems": [],
+                "planTasks": {"TASK-forged": forged_entry},
+                "briefs": {"TASK-forged": "malicious content"},
+                "existingPlan": None,
+            }
+
+            with self.assertRaises(RuntimeError):
+                sync.apply_local_operations(root, forged_result)
+
+            # plan.json itself is a legitimate, non-attacker-controlled path
+            # and may already have been written before the brief write is
+            # reached; what must never happen is the brief escaping .wdd/.
+            self.assertFalse((root / ".wdd" / "tasks").exists())
+            self.assertFalse((root.parent / "escaped-via-bypass.md").exists())
+
+    # -- Finding 2 (P2): convergence path for tasks created by push ---------
+
+    def test_record_link_lets_next_sync_match_instead_of_collide(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_text(
+                root / ".wdd" / "plan.json",
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "kind": "wdd_plan",
+                        "scope": {
+                            "id": "SCOPE-auth-refresh",
+                            "baseRef": "wdd/auth-refresh",
+                            "maxConcurrent": None,
+                            "reviewPolicy": "risk_based",
+                            "reconcileEveryNMerges": 3,
+                        },
+                        "tasks": [
+                            {
+                                "id": "TASK-001-api-contract",
+                                "title": "API contract",
+                                "specPath": "tasks/TASK-001-api-contract.md",
+                                "risk": "normal",
+                                "dependsOn": [],
+                                "conflictDomains": ["src/api/**"],
+                            }
+                        ],
+                    }
+                ),
+            )
+            write_text(
+                root / ".wdd" / "tasks" / "TASK-001-api-contract.md",
+                "# TASK-001-api-contract: API contract\n\n## Objective\n\nDefine the API contract.\n",
+            )
+
+            push_snapshot = {
+                "project": {"owner": "ivo-toby", "number": 4, "repo": "ivo-toby/example", "title": "Auth Refresh"},
+                "items": [],
+            }
+            first_push = sync.plan_sync(root, push_snapshot, mode="push", scope_id="SCOPE-auth-refresh")
+            self.assertIn("create_remote_issue", [op["action"] for op in first_push["operations"]])
+
+            # Simulate a human applying that plan by hand: the issue now
+            # exists on GitHub as #42. Record that link locally.
+            recorded = sync.record_remote_links(root, {"TASK-001-api-contract": {"issueNumber": 42}})
+            self.assertEqual(recorded, ["TASK-001-api-contract"])
+
+            manifest = json.loads(
+                (root / ".wdd" / "adapters" / "github-project.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["items"]["TASK-001-api-contract"]["github"]["issueNumber"], 42)
+
+            # The next push/sync must now see the task as linked (matching
+            # issue #42 in the remote snapshot) instead of creating another
+            # remote issue / colliding.
+            snapshot_with_issue = {
+                "project": {"owner": "ivo-toby", "number": 4, "repo": "ivo-toby/example", "title": "Auth Refresh"},
+                "items": [
+                    {
+                        "item_id": "PVTI_new",
+                        "issue_number": 42,
+                        "url": "https://github.com/ivo-toby/example/issues/42",
+                        "title": "API contract",
+                        "body": "Define the API contract.",
+                        "status": "Todo",
+                    }
+                ],
+            }
+            second_push = sync.plan_sync(root, snapshot_with_issue, mode="push", scope_id="SCOPE-auth-refresh")
+            self.assertEqual(second_push["conflicts"], [])
+            self.assertNotIn("create_remote_issue", [op["action"] for op in second_push["operations"]])
+
+    def test_record_link_rejects_unknown_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_text(
+                root / ".wdd" / "plan.json",
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "kind": "wdd_plan",
+                        "scope": {"id": "SCOPE-x", "baseRef": "wdd/x", "maxConcurrent": None,
+                                  "reviewPolicy": "risk_based", "reconcileEveryNMerges": 3},
+                        "tasks": [],
+                    }
+                ),
+            )
+            with self.assertRaises(RuntimeError):
+                sync.record_remote_links(root, {"TASK-does-not-exist": {"issueNumber": 1}})
+
+    def test_parse_record_link_cli_argument(self):
+        task_id, link = sync.parse_record_link("TASK-001-api-contract=42")
+        self.assertEqual(task_id, "TASK-001-api-contract")
+        self.assertEqual(link, {"issueNumber": 42})
+
+        task_id, link = sync.parse_record_link("TASK-001-api-contract=PVTI_abc123")
+        self.assertEqual(link, {"itemId": "PVTI_abc123"})
+
+        with self.assertRaises(RuntimeError):
+            sync.parse_record_link("not-a-valid-spec")
+        with self.assertRaises(RuntimeError):
+            sync.parse_record_link("TASK-/../escape=42")
+
+    # -- Finding 3 (P2): push must not invent "todo" with no controller state --
+
+    def test_push_without_controller_state_does_not_regress_remote_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_pull = sync.plan_sync(root, remote_snapshot(), mode="pull")
+            sync.apply_local_operations(root, first_pull)
+
+            # `pull --apply-local` writes no state.json (by design -- wddctl
+            # owns it exclusively). Push immediately afterwards must not map
+            # the imported "In Progress" task back down to "Todo".
+            self.assertFalse((root / ".wdd" / "state.json").exists())
+
+            result = sync.plan_sync(root, remote_snapshot(), mode="push")
+
+            status_ops = {
+                op["task"]: op["fields"]["Status"]
+                for op in result["operations"]
+                if op["action"] == "update_project_fields" and "Status" in op.get("fields", {})
+            }
+            # No status-changing operation at all for the in-progress task --
+            # in particular, it must never be pushed back to "Todo".
+            self.assertNotIn("TASK-002-refresh-token-endpoint", status_ops)
+
+            skipped = [
+                w
+                for w in result["warnings"]
+                if w["type"] == "status_skipped_no_controller_state" and w["task"] == "TASK-002-refresh-token-endpoint"
+            ]
+            self.assertEqual(len(skipped), 1)
+
+    def test_push_with_controller_state_still_updates_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_pull = sync.plan_sync(root, remote_snapshot(), mode="pull")
+            sync.apply_local_operations(root, first_pull)
+
+            write_text(
+                root / ".wdd" / "state.json",
+                json.dumps({"schemaVersion": 3, "tasks": {"TASK-001-token-type-contract": {"status": "review"}}}),
+            )
+
+            result = sync.plan_sync(root, remote_snapshot(), mode="push")
+            field_ops = {op["task"]: op for op in result["operations"] if op["action"] == "update_project_fields"}
+            self.assertEqual(field_ops["TASK-001-token-type-contract"]["fields"]["Status"], "Review")
+
 
 if __name__ == "__main__":
     unittest.main()
