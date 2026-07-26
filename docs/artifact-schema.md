@@ -1,807 +1,176 @@
-# WDD Artifact Schema
+# WDD artifact schema
 
-WDD artifacts are local text files. Markdown carries human and agent context.
-Hand-editable JSON carries resumable orchestration state where structured state
-is useful.
-
-The canonical root is `.wdd/`.
-
-## Constitution
-
-Path:
+WDD's durable state lives under `.wdd/` in the target repository:
 
 ```text
-.wdd/constitution.md
+.wdd/
+  constitution.md          # human-authored governance; ratified via wddctl
+  plan.json                # the only planning input
+  state.json               # wddctl-owned; never hand-edit
+  state.md                 # generated projection (wddctl render)
+  tasks/<TASK-ID>.md       # worker briefs, referenced by each task's specPath
+  shared-context/          # durable discoveries
 ```
 
-Required frontmatter:
+Everything here is either human-authored Markdown/JSON that `wddctl` reads,
+or a `wddctl`-generated file that must not be hand-edited.
 
-```yaml
----
-id: WDD-CONSTITUTION
-kind: constitution
-version: 1.0.0
-status: draft
-ratified: null
-last_amended: YYYY-MM-DD
----
-```
+## `constitution.md`
 
-Required body sections:
+Free-form governance Markdown. `wddctl` does not parse its content — it
+tracks ratification as a separate event in `state.json`, keyed to a decision
+fingerprint the human (or the constitution skill) ties to the text that was
+actually approved. Execution stays blocked (`wddctl next` returns only a
+`constitution_unratified` blocker) until `wddctl constitution ratify` is
+called.
 
-- Project Scope
-- Setup Configuration
-- Model Usage
-- WDD Profile Defaults
-- Storage Mode
-- Branching Policy
-- Review Policy
-- Verification Policy
-- Agent Roles
-- Planning Rules
-- Task Rules
-- Wave Rules
-- Shared Context Rules
-- Governance
+Conventional body sections:
 
-The initial constitution is always `draft`. It becomes active only after the
-user explicitly ratifies the compact decision bundle. Schema-v2 controller
-scopes record the actor, time, and decision fingerprint through `wddctl`; a
-schema-v1 portable scope records the equivalent decision in the Markdown
-artifact.
+- **Branching** — target branch, base branch naming convention (a scope's
+  `baseRef`), task branch naming (`task/<TASK-ID>`, assigned by `wddctl
+  start`).
+- **Verification** — the project's real verification command(s) (tests,
+  linters, type checks); what to record when no automated check applies.
+- **Review policy** — which `reviewPolicy` this repo defaults to
+  (`always` / `risk_based` / `none`), and which task categories should be
+  marked `"risk": "high"` under `risk_based`.
+- **Model aliases** — any model choices the user wants remembered, so later
+  agents don't have to re-infer them.
+- **Merge policy** — whether the controller merges automatically or a human
+  approves each merge; the scope's default `reconcileEveryNMerges` and
+  `maxConcurrent`.
+- **Governance** — how to amend: edit, get explicit re-approval, re-ratify.
+  A re-ratification changes behavior immediately for any scope not yet
+  started.
 
-The constitution stores user choices that must not be rediscovered by later
-agents, including model aliases, target branch, branch naming conventions,
-default WDD profile, review blocking policy, feedback-fix preference, and patch
-fallback policy.
+`wddctl constitution probe --root .` gathers evidence from the repository
+(instruction files, detectable verification commands, current branch) into a
+proposal JSON file to speed up filling these sections in — it never ratifies
+anything itself. See [`docs/wddctl.md`](wddctl.md) for the probe/ratify/status
+commands.
 
-Recommended profile fields in the body:
+## `plan.json`
 
-```yaml
-wdd_profile_default: standard
-allowed_profiles:
-  - micro
-  - lite
-  - standard
-  - full
-review_mode_default: risk_based
-monitoring_default: adaptive
-```
-
-Profiles mean:
-
-- `micro`: bounded ticket-sized work under `.wdd/work/`.
-- `lite`: compact epic artifacts, adaptive monitoring, risk-based review.
-- `standard`: normal epic workflow with token-conscious defaults.
-- `full`: maximum ceremony for high-risk work.
-
-## Epic
-
-Path:
-
-```text
-.wdd/epics/EPIC-auth-refresh/epic.md
-```
-
-Required frontmatter:
-
-```yaml
----
-id: EPIC-auth-refresh
-kind: epic
-type: feature
-slug: auth-refresh
-title: Auth Refresh
-status: draft
-created_at: YYYY-MM-DD
-updated_at: YYYY-MM-DD
-target_branch: main
-epic_branch: epic/auth-refresh
-profile: standard
-review_mode: risk_based
-monitoring_mode: adaptive
-schema_version: 1
-ticket_count: 0
-task_count: 0
-adapter_links:
-  github_issue: null
-  jira_epic: null
----
-```
-
-Required body sections:
-
-- Summary
-- Goal
-- Background
-- Product Context
-- Technical Context
-- Deliverables
-- Non-Goals
-- Assumptions
-- Constraints
-- Risks
-- Dependencies
-- Affected Areas
-- Validation Strategy
-- Definition of Done
-- Open Questions
-- Planning Notes
-
-The epic is ready for planning only when deliverables are concrete, scope
-boundaries are explicit, and the definition of done is testable. The `profile`
-field records the chosen ceremony level. User input overrides the constitution
-default when creating the epic; later agents honor the recorded epic value.
-
-## Micro-Wave Work Packet
-
-Use micro-waves for a single chunky ticket or bounded request that can split
-into 2-5 compact tasks but does not need epic, ticket, wave-plan, validation,
-and final-PR ceremony.
-
-Path:
-
-```text
-.wdd/work/WORK-filter-builder/brief.md
-```
-
-Required frontmatter:
-
-```yaml
----
-id: WORK-filter-builder
-kind: work_packet
-profile: micro
-slug: filter-builder
-title: Filter Builder
-status: draft
-created_at: YYYY-MM-DD
-updated_at: YYYY-MM-DD
-target_branch: main
-base_branch: work/filter-builder
-schema_version: 1
-task_count: 0
-adapter_links:
-  github_issue: null
-  jira_issue: null
----
-```
-
-Required body sections:
-
-- Summary
-- Goal
-- Scope
-- Non-Scope
-- Relevant Context
-- Parallelization Notes
-- Validation Strategy
-- Definition of Done
-- Open Questions
-- Finish Notes
-
-Micro-wave task path:
-
-```text
-.wdd/work/WORK-filter-builder/tasks/TASK-001-api-contract.md
-```
-
-Micro-wave task files are compact implementation briefs. Required body sections:
-
-- Objective
-- Scope
-- Context To Read
-- Likely Files
-- Dependencies
-- Conflict Domains
-- Validation
-- Done
-- Evidence
-
-Micro-wave state path:
-
-```text
-.wdd/work/WORK-filter-builder/state.json
-```
-
-Minimum structure:
+The single planning input. `wddctl plan apply` reads it and creates or
+updates a scope in `state.json`; re-applying is safe and diffs the new plan
+against the current state.
 
 ```json
 {
   "schemaVersion": 1,
-  "kind": "micro_wave_state",
-  "profile": "micro",
-  "work": {
-    "id": "WORK-filter-builder",
-    "title": "Filter Builder",
-    "targetBranch": "main",
-    "baseBranch": "work/filter-builder"
-  },
-  "configuration": {
-    "reviewMode": "risk_based",
-    "monitoringMode": "adaptive",
-    "maxParallelTasks": 5
-  },
-  "strategy": {
-    "profile": "micro",
-    "executionMode": "bundled",
-    "reviewMode": "risk_based",
-    "monitoringMode": "adaptive",
-    "recommendedBy": "wdd-plan-work",
-    "confirmedBy": null,
-    "requiresUserConfirmation": false,
-    "confidence": "high",
-    "rationale": [
-      "Micro-waves default to bundled execution to minimize coordination overhead."
-    ],
-    "bundleGroups": [
-      {
-        "id": "BUNDLE-001",
-        "tasks": ["TASK-001-api-contract"],
-        "branch": "work/WORK-filter-builder-bundle",
-        "workerWorktree": null,
-        "worktreeStatus": "unassigned",
-        "workerThreadId": null,
-        "reviewThreadId": null,
-        "currentGate": "not_started",
-        "cleanup": null
-      }
-    ],
-    "overrideHistory": []
+  "kind": "wdd_plan",
+  "scope": {
+    "id": "SCOPE-auth-refresh",
+    "baseRef": "wdd/auth-refresh",
+    "maxConcurrent": 3,
+    "reviewPolicy": "risk_based",
+    "reconcileEveryNMerges": 3
   },
   "tasks": [
     {
-      "id": "TASK-001-api-contract",
-      "path": "tasks/TASK-001-api-contract.md",
-      "status": "todo",
-      "branch": "work/TASK-001-api-contract",
-      "workerWorktree": null,
-      "worktreeStatus": "unassigned",
-      "currentGate": "not_started",
-      "risk": "low",
-      "reviewRequired": false,
-      "verification": null,
-      "cleanup": null
+      "id": "TASK-001-token-types",
+      "title": "Token type contract",
+      "specPath": "tasks/TASK-001-token-types.md",
+      "risk": "high",
+      "dependsOn": [],
+      "conflictDomains": ["src/auth/**", "src/schema.ts"]
     }
-  ],
-  "monitoring": {
-    "mode": "manual",
-    "cadence": "adaptive",
-    "status": "inactive",
-    "lastCheckedAt": null,
-    "nextCheckDueAt": null,
-    "schedulerRef": null,
-    "fallbackPrompt": "Run wdd-run-work for WORK-filter-builder. Read state.json and task files, inspect active worker or PR references, update gates, and stop when tasks are ready for wdd-finish-work."
-  }
+  ]
 }
 ```
 
-Micro-waves keep the WDD safety core: bounded scope, branch/worktree isolation
-for repository-writing workers, verification evidence, no worker self-merge,
-worktree cleanup, and a final controller handoff. They intentionally omit
-ticket containers, separate wave plans, epic validation, and final PR artifacts
-unless the user asks to upgrade the work packet into an epic.
+`schemaVersion` and `kind` are required and must be exactly `1` and
+`"wdd_plan"`.
 
-## GitHub Project Adapter Manifest
+### `scope`
 
-Optional path:
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `id` | string, required | — | Scope identifier; stable across re-applies of the same plan. |
+| `baseRef` | string or null | `null` | The scope's base branch. `plan apply` creates it (from `--from-ref`, default `HEAD`) if it doesn't exist. Cannot change once any task has left `todo`. |
+| `maxConcurrent` | positive integer or null | `null` (unlimited) | Caps how many tasks may be active (`in_progress`/`review`/`merge_ready`) at once — the real limit on rebase churn. |
+| `reviewPolicy` | `always` \| `risk_based` \| `none` | `risk_based` | `always`: every task needs a separate reviewer. `risk_based`: only `"risk": "high"` tasks do. `none`: no task does. |
+| `reconcileEveryNMerges` | positive integer or null | `3` | A reconciliation checkpoint becomes due after this many merges, or immediately when a `wddctl note` is filed. |
 
-```text
-.wdd/epics/EPIC-auth-refresh/adapters/github-project.json
-```
+### `tasks[]`
 
-Required shape when present:
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `id` | string, required | — | Task identifier, unique within the plan. |
+| `title` | string | task `id` | Human-readable label. |
+| `specPath` | string | `tasks/<id>.md` | Path (relative to `.wdd/`) to the task's worker brief. |
+| `risk` | `normal` \| `high` | `normal` | Drives review requirement under `risk_based`. |
+| `dependsOn` | string list | `[]` | Task IDs that must reach `done` before this task is admissible. Cycles are rejected at plan time. |
+| `conflictDomains` | string list | `[]` | Paths/globs this task writes to. Two tasks sharing a domain are never concurrently active. A domain ending in `/**` is a path-prefix match; anything else uses `fnmatch`. |
+
+Editing or removing a task that has already started (left `todo`) is
+refused — decompose further work into new task IDs instead.
+
+## `state.json`
+
+Owned entirely by `wddctl`. Never hand-edit it — every field here is the
+output of applying validated events, and hand-editing breaks the guarantees
+in [`docs/wddctl.md`](wddctl.md) (atomic writes, revisioned history, evidence
+pinned to head SHA). Use `wddctl render --output state.md` for a read-only
+Markdown projection instead.
+
+Top-level shape:
 
 ```json
 {
-  "schemaVersion": 1,
-  "updatedAt": "YYYY-MM-DDTHH:MM:SSZ",
-  "epic": {
-    "id": "EPIC-auth-refresh"
-  },
-  "project": {
-    "owner": "OWNER",
-    "number": 4,
-    "id": "PVT_...",
-    "title": "Auth Refresh",
-    "url": "https://github.com/orgs/OWNER/projects/4",
-    "repo": "OWNER/REPO",
-    "wdd_id": "EPIC-auth-refresh"
-  },
-  "items": {
-    "TICKET-001-token-contract": {
-      "kind": "ticket",
-      "localPath": "TICKET-001-token-contract/ticket.md",
-      "github": {
-        "itemId": "PVTI_...",
-        "issueNumber": 123,
-        "url": "https://github.com/OWNER/REPO/issues/123"
-      },
-      "fingerprints": {
-        "local": "sha256:...",
-        "remote": "sha256:..."
-      }
-    }
-  }
+  "schemaVersion": 3,
+  "revision": 7,
+  "scope": { "...": "as in plan.json, plus maxConcurrent/reviewPolicy resolved" },
+  "constitution": { "status": "ratified", "ratification": { "by": "...", "decisionFingerprint": "...", "at": "..." } },
+  "tasks": { "TASK-001-token-types": { "...": "..." } },
+  "leases": { "TASK-001-token-types": { "...": "worktree bookkeeping" } },
+  "reconcile": { "everyNMerges": 3, "mergesSinceCheckpoint": 1, "lastCheckpointAt": null, "pendingNotes": [] },
+  "monitoring": { "mode": "manual", "status": "inactive", "observations": {} },
+  "events": [ { "revision": 7, "type": "task.merged", "task": "TASK-001-token-types", "idempotencyKey": "...", "at": "..." } ],
+  "appliedIdempotencyKeys": ["..."],
+  "telemetry": { "eventApplications": 12, "renderCount": 3 }
 }
 ```
 
-The manifest belongs to optional adapter state. It records GitHub Project links
-and sync fingerprints so `wdd-sync-github-project` can detect local-only,
-remote-only, and conflicting changes without making GitHub Projects the WDD
-source of truth.
-
-## Ticket Folder
-
-Path:
-
-```text
-.wdd/epics/EPIC-auth-refresh/TICKET-001-token-contract/ticket.md
-```
-
-Required frontmatter:
-
-```yaml
----
-id: TICKET-001-token-contract
-kind: ticket
-epic: EPIC-auth-refresh
-slug: token-contract
-title: Token Contract
-status: planned
-task_count: 2
-depends_on: []
-conflict_domains:
-  - src/auth/**
-adapter_links:
-  github_issue: null
----
-```
-
-Required body sections:
-
-- Summary
-- Objective
-- Scope
-- Non-Scope
-- Shared Context References
-- Task Inventory
-- Dependencies
-- Conflict Domains
-- Validation Expectations
-- Review Focus
-- Completion Criteria
-
-Tickets are containers. They group related tasks but are not assigned directly
-to worker agents.
-
-## Task
-
-Path:
-
-```text
-.wdd/epics/EPIC-auth-refresh/TICKET-001-token-contract/todo/TASK-001-token-types.md
-```
-
-Required frontmatter:
-
-```yaml
----
-id: TASK-001-token-types
-kind: task
-epic: EPIC-auth-refresh
-ticket: TICKET-001-token-contract
-wave: WAVE-001
-slug: token-types
-title: Token Types
-status: todo
-depends_on: []
-conflict_domains:
-  - src/auth/token-types.ts
-assigned_model_class: simple-implementation
-review_model_class: review
-branch: task/TASK-001-token-types
-worker_worktree: null
-worktree_status: unassigned
-cleanup: null
-pr: null
-current_gate: not_started
-branch_freshness: unknown
-verification:
-  - project-specific verification command
----
-```
-
-Required body sections for `standard` and `full` task files:
-
-- Status
-- Parent Ticket
-- Wave
-- Objective
-- Scope
-- Non-Scope
-- Relevant Context
-- Likely Files / Areas
-- Dependencies
-- Conflict Domains
-- Assigned Model Class
-- Branch
-- Worker Worktree
-- PR / Patch Reference
-- RED-GREEN TDD Plan
-- Implementation Notes
-- Durable Memory Notes To Consider
-- Task-Level Definition of Done
-- Validation Steps
-- Verification Evidence
-- Review Feedback
-- Completion Notes
-
-Allowed compact body sections for `lite` task files:
-
-- Objective
-- Scope
-- Context To Read
-- Likely Files
-- Dependencies And Conflicts
-- TDD And Validation
-- Done
-- Evidence
-
-Task files are the worker implementation briefs. A task file moves through
-`todo/`, `in-progress/`, `review/`, `done/`, `blocked/`, and `cancelled/` as
-the durable visible state.
-
-## Shared Context
-
-Index path:
-
-```text
-.wdd/epics/EPIC-auth-refresh/shared-context/index.md
-```
-
-Resource path:
-
-```text
-.wdd/epics/EPIC-auth-refresh/shared-context/resources/architecture.md
-```
-
-The index must include:
-
-- Overview
-- Resource Index
-- When To Read Each Resource
-- Key Decisions
-- Key Warnings
-- Known Constraints
-- Recent Durable Memory
-
-Resource files are focused and scannable. Worker agents may propose updates in
-their task or bundle branches. The controller reconciles shared-context changes
-into the epic branch, especially when concurrent workers touch the same
-resource.
-
-Durable memory items use:
-
-```markdown
-### Short Title
-
-- Source task: TASK-001-token-types
-- Source PR/branch: task/TASK-001-token-types
-- Status: confirmed | inferred | needs verification
-- Summary:
-- Why it matters:
-- Affected files or areas:
-- Follow-up implications:
-```
-
-## Wave Plan
-
-Path:
-
-```text
-.wdd/epics/EPIC-auth-refresh/wave-plan.md
-```
-
-Required frontmatter:
-
-```yaml
----
-id: EPIC-auth-refresh-WAVES
-kind: wave_plan
-epic: EPIC-auth-refresh
-status: planned
-created_at: YYYY-MM-DD
-updated_at: YYYY-MM-DD
----
-```
-
-Required body sections:
-
-- Task Inventory
-- Dependency Grid
-- Conflict Grid
-- Waves
-- Recommended Strategy
-- Activation Rules
-- Stop Conditions
-- Known Conflict Risks
-- Manual Adjustments
-
-Waves schedule tasks, not tickets. A wave is activated as a strategy-selected
-batch of eligible tasks. Eligibility requires no unresolved dependency, no active
-conflict-domain blocker, no stale prerequisite, and no explicit blocked status.
-
-## Interactive Wave Planning
-
-During planning, WDD recommends a strategy for each wave instead of treating the
-epic profile as the final execution contract. The planner should present the
-recommendation to the user when confirmation is required, then persist the
-confirmed strategy in `orchestration.json`.
-
-Wave strategy fields:
-
-- `profile`: `lite`, `standard`, or `full`, defaulting from the epic.
-- `executionMode`: `bundled`, `hybrid`, or `parallel`.
-- `reviewMode`: `controller_check`, `risk_based`, or `separate_review`.
-- `monitoringMode`: `manual`, `adaptive`, or `tight`.
-- `confidence`: `low`, `medium`, or `high`.
-- `rationale`: short reasons for the recommendation.
-- `requiresUserConfirmation`: whether activation must block until confirmed.
-- `confirmedBy`: `user`, `controller`, or `null`.
-- `bundleGroups`: task groups used by `bundled` or `hybrid` execution.
-- `overrideHistory`: prior strategy changes with reason and actor.
-
-Execution modes:
-
-- `bundled`: one worker, branch, worktree, PR or patch, and review gate for all
-  tasks in the wave.
-- `hybrid`: 2-3 task bundles, each with its own worker and gate.
-- `parallel`: one worker and gate per task.
-
-Recommend `bundled` when tasks are tightly coupled, touch the same files, share
-verification, or are too small to justify per-task overhead. Recommend
-`parallel` when tasks touch independent areas and real wall-clock speedup is
-likely. Recommend `hybrid` when obvious subgroups exist.
-
-## Orchestration JSON
-
-Path:
-
-```text
-.wdd/epics/EPIC-auth-refresh/orchestration.json
-```
-
-Required top-level field:
-
-```json
-{
-  "schemaVersion": 1
-}
-```
-
-Minimum structure:
-
-```json
-{
-  "schemaVersion": 1,
-  "epic": {
-    "id": "EPIC-auth-refresh",
-    "name": "Auth Refresh",
-    "targetBranch": "main",
-    "baseBranch": "epic/auth-refresh"
-  },
-  "configuration": {
-    "storageMode": "local-markdown",
-    "profile": "standard",
-    "reviewMode": "risk_based",
-    "monitoringMode": "adaptive",
-    "models": {
-      "planning": "configured-model-key",
-      "implementationSimple": "configured-model-key",
-      "implementationComplex": "configured-model-key",
-      "review": "configured-model-key",
-      "feedbackFix": "configured-model-key",
-      "epicValidation": "configured-model-key",
-      "prDescription": "configured-model-key"
-    },
-    "branching": {
-      "epicBranchConvention": "epic/[epic-slug]",
-      "taskBranchConvention": "task/[task-id]-[task-slug]",
-      "taskPrTarget": "epic branch",
-      "finalPrTarget": "target branch",
-      "epicBranchRequiredBeforeWorkerDispatch": true,
-      "activationArtifactsSyncedBeforeTaskWorktrees": true,
-      "isolatedWorktreePerRepositoryTask": true,
-      "workersMaySwitchControllerCheckout": false
-    }
-  },
-  "waves": [
-    {
-      "id": "WAVE-001",
-      "status": "planned",
-      "strategy": {
-        "profile": "standard",
-        "executionMode": "parallel",
-        "reviewMode": "risk_based",
-        "monitoringMode": "adaptive",
-        "recommendedBy": "wdd-plan-epic",
-        "confirmedBy": null,
-        "requiresUserConfirmation": true,
-        "confidence": "medium",
-        "rationale": [
-          "Tasks appear independently executable.",
-          "Parallel execution may reduce wall-clock time."
-        ],
-        "bundleGroups": [],
-        "overrideHistory": []
-      },
-      "tasks": [
-        {
-          "id": "TASK-001-token-types",
-          "ticket": "TICKET-001-token-contract",
-          "path": "TICKET-001-token-contract/todo/TASK-001-token-types.md",
-          "status": "todo",
-          "dependsOn": [],
-          "conflictDomains": ["src/auth/token-types.ts"],
-          "assignedModel": "configured-model-key",
-          "reviewModel": "configured-model-key",
-          "workerThreadId": null,
-          "reviewThreadId": null,
-          "branch": "task/TASK-001-token-types",
-          "workerWorktree": null,
-          "worktreeStatus": "unassigned",
-          "cleanup": null,
-          "pr": null,
-          "latestCommit": null,
-          "branchFreshness": "unknown",
-          "blockingFeedback": [],
-          "verification": null,
-          "currentGate": "not_started"
-        }
-      ]
-    }
-  ],
-  "monitoring": {
-    "mode": "manual",
-    "cadence": "adaptive",
-    "status": "inactive",
-    "lastCheckedAt": null,
-    "nextCheckDueAt": null,
-    "schedulerRef": null,
-    "fallbackPrompt": "Run subagent-pr-orchestration for EPIC-auth-refresh WAVE-001. Read orchestration.json and controller-state.md, verify the epic branch contains current activation artifact state before assigned worker worktrees branch from it, inspect every active worker and reviewer reference, update task gates, and stop when all active tasks are merged, blocked, cancelled, or ready for wdd-reconcile-wave."
-  }
-}
-```
-
-The controller updates this file after task or bundle assignment, task movement,
-epic branch creation or verification, task or bundle branch creation or
-verification, worker worktree creation or verification, PR or patch creation,
-review start, P1/P2 feedback, feedback routing, verification, stale-branch
-checks, merge, worktree cleanup, blocker, wave completion, and reconciliation.
-
-Worktree cleanup is part of wave and micro-wave closure. After completed,
-closed, cancelled, or safely blocked task or bundle worktrees are no longer
-needed for evidence, controllers remove them with `git worktree remove`, keep
-branch/PR/commit references in artifacts, and record either
-`"worktreeStatus": "cleaned_up"`, `cleanup_blocked`, or `cleanup_deferred`.
-Dirty worktrees or worktrees with unrecorded evidence must not be removed.
-
-Before any worker starts, the controller must create or verify the epic branch.
-Before dispatching repository-writing workers, it must sync activation artifact
-changes to the epic branch, create or verify isolated worktrees according to the
-selected strategy, record assigned paths, and tell each worker to start there.
-Workers must not switch branches in the controller checkout.
-
-The `monitoring` object records how the controller heartbeat is driven. Allowed
-`mode` values are:
-
-- `codex_thread_heartbeat`: Codex thread automation attached to the active
-  controller conversation.
-- `claude_loop`: Claude Code `/loop` or scheduled task in the active local
-  session.
-- `external_scheduler`: durable external runner such as a desktop scheduled
-  task, cloud routine, GitHub Actions schedule, or equivalent project adapter.
-- `manual`: no scheduler is available; the controller records an exact fallback
-  prompt and due time for a human or fresh agent to resume.
-
-When `mode` is `codex_thread_heartbeat`, `schedulerRef` must identify a
-verified active Codex heartbeat automation. If the controller cannot create,
-update, or verify that heartbeat before ending its turn, it must select the next
-scheduler option or downgrade to `manual` and record the failed scheduler
-attempt in controller state.
-
-Every heartbeat tick must be bounded and idempotent: load current artifacts,
-poll worker and reviewer references, advance gates, update artifacts, and stop
-or deactivate monitoring when all active-wave tasks are merged, blocked,
-cancelled, or ready for wave reconciliation. Monitoring must not depend on
-hidden conversation state.
-
-When monitoring mode is `adaptive`, default cadence is based on gate activity:
-
-- `no_pr`: slower polling, usually 15-30 minutes.
-- `needs_review`, `reviewing`, `needs_fixes`, or `merge_ready`: faster polling,
-  usually around 5 minutes.
-- repeated no-change ticks: downgrade to manual fallback when safe.
-
-The cadence changes do not relax heartbeat verification. A recorded
-`codex_thread_heartbeat` still requires a verified scheduler reference.
-
-## Controller State
-
-Path:
-
-```text
-.wdd/epics/EPIC-auth-refresh/controller-state.md
-```
-
-Required body sections:
-
-- Controller Rule
-- Active Wave
-- Active Wave Strategy
-- Monitoring
-- Active Task Gates
-- Worker Worktrees
-- Branch Freshness
-- Open P1/P2 Feedback
-- Verification Status
-- Shared Context Reconciliation
-- Event Log
-- Next Action
-
-The controller state is human-readable. It must show the assigned worktree path
-for every active repository-writing task before that worker starts.
-`orchestration.json` is the machine-readable resume surface.
-
-## Epic Validation
-
-Path:
-
-```text
-.wdd/epics/EPIC-auth-refresh/epic-validation.md
-```
-
-Required body sections:
-
-- Validation Summary
-- Epic Definition Of Done
-- Deliverable Checklist
-- Task State Audit
-- Review Audit
-- Verification Evidence
-- Shared Context Audit
-- Monitoring Audit
-- Integration Risks
-- Branch State
-- Result
-
-Epic validation happens only after all waves are complete.
-
-## Final PR
-
-Path:
-
-```text
-.wdd/epics/EPIC-auth-refresh/final-pr.md
-```
-
-Required body sections:
-
-- PR Title
-- Epic Summary
-- Completed Deliverables
-- Definition Of Done Checklist
-- Validation Evidence
-- Test Results
-- Wave Summary
-- Task Summary
-- Review Summary
-- Known Limitations
-- Risks
-- Follow-Up Tasks
-- Documentation Updates
-- References
-
-The final PR targets the original target branch and is prepared only after
-epic validation passes.
+Each entry under `tasks` carries: `id`, `title`, `specPath`, `status`
+(`todo` / `in_progress` / `review` / `merge_ready` / `done` / `blocked` /
+`cancelled`), `risk`, `dependsOn`, `conflictDomains`, `branch`, `worktree`,
+`headSha`, `pr`, `review`, `verification`, `freshness`, `merge`, and
+`blocker`. The `review`/`verification`/`freshness`/`merge` objects each carry
+the `baseSha`/`headSha` (or `baseRef`) the evidence was pinned to, so a stale
+or mismatched entry is directly visible.
+
+`events` is a full append-only history of every applied transition —
+useful for auditing what happened and when, without needing to reconstruct
+it from Git history.
+
+`gates`, in the sense of "what to do next for this task," are not stored —
+they're computed live by `wddctl next` and `wddctl status` from the fields
+above. See the gates table in [`docs/wddctl.md`](wddctl.md).
+
+## Task briefs (`.wdd/tasks/<TASK-ID>.md`)
+
+The worker implementation brief for one task, referenced by that task's
+`specPath` in `plan.json`. There is no required frontmatter schema — `wddctl`
+never reads these files, only the plan's `specPath` string that points at
+them. A useful brief still tends to cover:
+
+- **Objective** — what this task delivers.
+- **Scope / Non-scope** — what's in and explicitly out.
+- **Relevant context** — pointers into `shared-context/`, prior task
+  findings, or repo docs the worker shouldn't have to rediscover.
+- **Dependencies and conflict domains** — restated from `plan.json` so the
+  worker sees why it can or can't run yet.
+- **Verification** — the command(s) that should pass before `submit`.
+- **Definition of done.**
+
+## `shared-context/`
+
+Durable knowledge that should survive past any one task or agent context
+window: architecture notes, discovered conventions, testing strategy,
+constraints found mid-implementation. Free-form Markdown, organized however
+the project prefers (an `index.md` plus focused resource files is a common
+pattern). `wddctl note --note "..." [--task ID]` queues a discovery into
+`state.json`'s `reconcile.pendingNotes` and makes a reconciliation checkpoint
+due; folding a queued note into `shared-context/` durably (or deciding it
+doesn't need to be) is part of what a reconciliation checkpoint is for.

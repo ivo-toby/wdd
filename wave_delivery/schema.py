@@ -1,4 +1,4 @@
-"""Schema-v2 model validation with no runtime dependencies."""
+"""Controller state model with no runtime dependencies."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any
 from .errors import ValidationError
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 TASK_STATUSES = {
     "todo",
     "in_progress",
@@ -19,19 +19,27 @@ TASK_STATUSES = {
     "cancelled",
 }
 CONSTITUTION_STATUSES = {"draft", "ratified"}
+REVIEW_POLICIES = {"always", "risk_based", "none"}
+RISK_LEVELS = {"normal", "high"}
 
 
 def task_state(
     task_id: str,
     *,
+    title: str | None = None,
     depends_on: list[str] | None = None,
     conflict_domains: list[str] | None = None,
     spec_path: str | None = None,
+    risk: str = "normal",
 ) -> dict[str, Any]:
+    if risk not in RISK_LEVELS:
+        raise ValidationError(f"task risk must be one of {sorted(RISK_LEVELS)}")
     return {
         "id": task_id,
+        "title": title or task_id,
         "specPath": spec_path or f"tasks/{task_id}.md",
         "status": "todo",
+        "risk": risk,
         "dependsOn": list(depends_on or []),
         "conflictDomains": list(conflict_domains or []),
         "branch": None,
@@ -47,19 +55,36 @@ def task_state(
 
 
 def new_state(
-    scope_id: str, scope_kind: str = "epic", *, base_ref: str | None = None
+    scope_id: str,
+    *,
+    base_ref: str | None = None,
+    max_concurrent: int | None = None,
+    review_policy: str = "risk_based",
+    reconcile_every_n_merges: int | None = 3,
 ) -> dict[str, Any]:
     if not scope_id:
         raise ValidationError("scope id must not be empty")
-    if scope_kind not in {"epic", "micro_wave"}:
-        raise ValidationError("scope kind must be 'epic' or 'micro_wave'")
+    if review_policy not in REVIEW_POLICIES:
+        raise ValidationError(f"review policy must be one of {sorted(REVIEW_POLICIES)}")
+    if max_concurrent is not None and (not isinstance(max_concurrent, int) or max_concurrent < 1):
+        raise ValidationError("maxConcurrent must be a positive integer or null")
     return {
         "schemaVersion": SCHEMA_VERSION,
         "revision": 0,
-        "scope": {"id": scope_id, "kind": scope_kind, "baseRef": base_ref},
+        "scope": {
+            "id": scope_id,
+            "baseRef": base_ref,
+            "maxConcurrent": max_concurrent,
+            "reviewPolicy": review_policy,
+        },
         "constitution": {"status": "draft", "ratification": None},
         "tasks": {},
-        "waves": {},
+        "reconcile": {
+            "everyNMerges": reconcile_every_n_merges,
+            "mergesSinceCheckpoint": 0,
+            "lastCheckpointAt": None,
+            "pendingNotes": [],
+        },
         "monitoring": {
             "mode": "manual",
             "status": "inactive",
@@ -99,9 +124,12 @@ def validate_state(state: dict[str, Any]) -> None:
 
     scope = _require_mapping(state.get("scope"), "scope")
     _require_string(scope.get("id"), "scope.id")
-    if scope.get("kind") not in {"epic", "micro_wave"}:
-        raise ValidationError("scope.kind must be 'epic' or 'micro_wave'")
     _require_string(scope.get("baseRef"), "scope.baseRef", nullable=True)
+    if scope.get("reviewPolicy") not in REVIEW_POLICIES:
+        raise ValidationError(f"scope.reviewPolicy must be one of {sorted(REVIEW_POLICIES)}")
+    max_concurrent = scope.get("maxConcurrent")
+    if max_concurrent is not None and (not isinstance(max_concurrent, int) or max_concurrent < 1):
+        raise ValidationError("scope.maxConcurrent must be a positive integer or null")
 
     constitution = _require_mapping(state.get("constitution"), "constitution")
     constitution_status = constitution.get("status")
@@ -123,8 +151,11 @@ def validate_state(state: dict[str, Any]) -> None:
         if task.get("id") != task_id:
             raise ValidationError(f"tasks.{task_id}.id must match its object key")
         _require_string(task.get("specPath"), f"tasks.{task_id}.specPath")
+        _require_string(task.get("title"), f"tasks.{task_id}.title")
         if task.get("status") not in TASK_STATUSES:
             raise ValidationError(f"tasks.{task_id}.status is invalid")
+        if task.get("risk") not in RISK_LEVELS:
+            raise ValidationError(f"tasks.{task_id}.risk must be 'normal' or 'high'")
         for field in ("dependsOn", "conflictDomains"):
             value = task.get(field)
             if not isinstance(value, list) or not all(
@@ -148,7 +179,18 @@ def validate_state(state: dict[str, Any]) -> None:
         if freshness is not None and not isinstance(freshness, dict):
             raise ValidationError(f"tasks.{task_id}.freshness must be an object or null")
 
-    for field in ("waves", "monitoring", "telemetry"):
+    detect_dependency_cycle(tasks)
+
+    reconcile = _require_mapping(state.get("reconcile"), "reconcile")
+    every = reconcile.get("everyNMerges")
+    if every is not None and (not isinstance(every, int) or every < 1):
+        raise ValidationError("reconcile.everyNMerges must be a positive integer or null")
+    if not isinstance(reconcile.get("mergesSinceCheckpoint"), int):
+        raise ValidationError("reconcile.mergesSinceCheckpoint must be an integer")
+    if not isinstance(reconcile.get("pendingNotes"), list):
+        raise ValidationError("reconcile.pendingNotes must be a list")
+
+    for field in ("monitoring", "telemetry"):
         _require_mapping(state.get(field), field)
     leases = state.get("leases")
     if leases is not None and not isinstance(leases, dict):
@@ -159,6 +201,27 @@ def validate_state(state: dict[str, Any]) -> None:
     keys = state.get("appliedIdempotencyKeys")
     if not isinstance(keys, list) or not all(isinstance(key, str) and key for key in keys):
         raise ValidationError("appliedIdempotencyKeys must be a non-empty-string list")
+
+
+def detect_dependency_cycle(tasks: dict[str, Any]) -> None:
+    """Raise if the dependency graph is not acyclic."""
+    unvisited, visiting, done = 0, 1, 2
+    marks: dict[str, int] = {task_id: unvisited for task_id in tasks}
+
+    def walk(task_id: str, trail: list[str]) -> None:
+        if marks[task_id] == done:
+            return
+        if marks[task_id] == visiting:
+            cycle = " -> ".join([*trail[trail.index(task_id):], task_id])
+            raise ValidationError(f"dependency cycle: {cycle}")
+        marks[task_id] = visiting
+        for dependency in tasks[task_id].get("dependsOn", []):
+            if dependency in tasks:
+                walk(dependency, [*trail, task_id])
+        marks[task_id] = done
+
+    for task_id in sorted(tasks):
+        walk(task_id, [])
 
 
 def copied_state(state: dict[str, Any]) -> dict[str, Any]:

@@ -1,4 +1,9 @@
-"""Command-line interface for the initial deterministic WDD controller."""
+"""wddctl: the deterministic half of Wave-Driven Development.
+
+The agent loop is: `wddctl next` -> do the one thing that needs judgment ->
+`wddctl <verb>` -> repeat. Every mechanical action is a verb here, so no
+mechanical step depends on prompt interpretation.
+"""
 
 from __future__ import annotations
 
@@ -10,384 +15,509 @@ from typing import Any
 
 from .constitution import probe_repository, ratification_status, read_proposal, write_proposal
 from .doctor import inspect_capabilities
-from .engine import apply_event, bounded_next_actions, render_to_path, status_summary
+from .engine import (
+    admission_schedule,
+    apply_event,
+    bounded_next_actions,
+    render_to_path,
+    status_summary,
+)
 from .errors import IllegalTransition, WaveDeliveryError
-from .freshness import check_freshness, record_merge
-from .leases import ensure_lease, release_lease
+from .freshness import check_freshness, record_freshness
+from .leases import release_task, start_task, submit_task
+from .merge import merge_task, refresh_task
 from .monitor import monitor_once
-from .migration import apply_migration, build_migration_plan, rollback_migration
-from .schema import new_state, task_state
+from .plan import apply_plan, read_plan, state_from_plan
+from .review import record_review, record_verification, validate_findings
 from .store import StateStore
 
 
-def _json_argument(value: str) -> dict[str, Any]:
+def _json_argument(value: str) -> Any:
     try:
-        parsed = json.loads(value)
+        return json.loads(value)
     except json.JSONDecodeError as error:
         raise argparse.ArgumentTypeError(f"invalid JSON: {error.msg}") from error
+
+
+def _json_object(value: str) -> dict[str, Any]:
+    parsed = _json_argument(value)
     if not isinstance(parsed, dict):
         raise argparse.ArgumentTypeError("JSON data must be an object")
     return parsed
 
 
-def _json_list_argument(value: str) -> list[str]:
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as error:
-        raise argparse.ArgumentTypeError(f"invalid JSON: {error.msg}") from error
+def _json_list(value: str) -> list[str]:
+    parsed = _json_argument(value)
     if not isinstance(parsed, list) or not all(isinstance(item, str) and item for item in parsed):
         raise argparse.ArgumentTypeError("JSON command must be a non-empty string array")
     return parsed
 
 
+def _add_concurrency_flags(parser: argparse.ArgumentParser) -> None:
+    """Optional optimistic-concurrency controls.
+
+    Omit them and the current revision is used under the same lock that guards
+    the write, with an idempotency key derived from the event payload. Pass them
+    when several controllers share one scope and you want a hard conflict.
+    """
+    parser.add_argument("--expected-revision", type=int, default=None)
+    parser.add_argument("--idempotency-key", default=None)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wddctl", description=__doc__)
+    parser.add_argument("--state", type=Path, default=Path(".wdd/state.json"))
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    init = subparsers.add_parser("init", help="create a schema-v2 controller state file")
-    init.add_argument("--state", required=True, type=Path)
-    init.add_argument("--scope-id", required=True)
-    init.add_argument("--scope-kind", choices=("epic", "micro_wave"), default="epic")
-    init.add_argument("--base-ref")
-    init.add_argument("--task", action="append", default=[])
+    plan = subparsers.add_parser("plan", help="create or update a scope from a plan file")
+    plan_subparsers = plan.add_subparsers(dest="plan_command", required=True)
+    plan_apply = plan_subparsers.add_parser("apply", help="apply plan.json to the scope")
+    plan_apply.add_argument("--plan", required=True, type=Path)
+    plan_apply.add_argument("--repo", type=Path, default=Path("."))
+    plan_apply.add_argument("--from-ref", default=None, help="start point for a new base branch")
+    plan_apply.add_argument("--dry-run", action="store_true")
+    _add_concurrency_flags(plan_apply)
+    plan_preview = plan_subparsers.add_parser(
+        "preview", help="project the admission order (a view, not a gate)"
+    )
+    plan_preview.add_argument("--plan", type=Path)
 
-    doctor = subparsers.add_parser("doctor", help="report optional controller capabilities")
-    doctor.add_argument("--json", action="store_true")
+    subparsers.add_parser("doctor", help="report optional controller capabilities").add_argument(
+        "--json", action="store_true"
+    )
 
     status = subparsers.add_parser("status", help="show a concise state summary")
-    status.add_argument("--state", required=True, type=Path)
-    status.add_argument("--brief", action="store_true")
     status.add_argument("--json", action="store_true")
 
     next_command = subparsers.add_parser("next", help="show executable next actions and blockers")
-    next_command.add_argument("--state", required=True, type=Path)
     next_command.add_argument("--max-bytes", type=int, default=2048)
 
-    render = subparsers.add_parser("render", help="render a controller-state Markdown projection")
-    render.add_argument("--state", required=True, type=Path)
+    render = subparsers.add_parser("render", help="render a Markdown state projection")
     render.add_argument("--output", required=True, type=Path)
+
+    start = subparsers.add_parser(
+        "start", help="admit a task, create its isolated worktree, and mark it in progress"
+    )
+    start.add_argument("--task", required=True)
+    start.add_argument("--repo", type=Path, default=Path("."))
+    start.add_argument("--branch")
+    start.add_argument("--worktree", type=Path)
+    _add_concurrency_flags(start)
+
+    submit = subparsers.add_parser("submit", help="record a task deliverable and its head SHA")
+    submit.add_argument("--task", required=True)
+    submit.add_argument("--repo", type=Path, default=Path("."))
+    submit.add_argument("--pr", help="PR URL; defaults to a branch reference")
+    _add_concurrency_flags(submit)
+
+    review = subparsers.add_parser("review", help="record review findings")
+    review_subparsers = review.add_subparsers(dest="review_command", required=True)
+    review_record = review_subparsers.add_parser(
+        "record", help="record findings inline; base and head SHAs are supplied by the controller"
+    )
+    review_record.add_argument("--task", required=True)
+    review_record.add_argument("--reviewer", required=True)
+    review_record.add_argument(
+        "--findings",
+        type=_json_argument,
+        default=[],
+        help='JSON array, e.g. \'[{"severity":"P1","summary":"...","file":"a.py","line":3}]\'; '
+        "omit or pass [] for a clean review",
+    )
+    review_record.add_argument("--repo", type=Path, default=Path("."))
+    _add_concurrency_flags(review_record)
+    review_run = review_subparsers.add_parser("run", help="run a configured reviewer command")
+    review_run.add_argument("--task", required=True)
+    review_run.add_argument("--repo", type=Path, default=Path("."))
+    review_run.add_argument("--command-json", required=True, type=_json_list)
+    review_run.add_argument("--output", required=True, type=Path)
+    review_collect = review_subparsers.add_parser(
+        "collect", help="aggregate external reviewer result files"
+    )
+    review_collect.add_argument("--task", required=True)
+    review_collect.add_argument("--result", required=True, type=Path, action="append")
+    _add_concurrency_flags(review_collect)
+
+    verify = subparsers.add_parser("verify", help="record verification evidence")
+    verify_subparsers = verify.add_subparsers(dest="verify_command", required=True)
+    verify_record = verify_subparsers.add_parser("record", help="record a verification outcome")
+    verify_record.add_argument("--task", required=True)
+    verify_record.add_argument("--status", required=True, choices=("passed", "failed", "unavailable"))
+    # dest must not be "command": that is the top-level subparser destination.
+    verify_record.add_argument(
+        "--command", dest="verify_command_text", help="the command that produced this result"
+    )
+    verify_record.add_argument("--repo", type=Path, default=Path("."))
+    _add_concurrency_flags(verify_record)
+    verify_collect = verify_subparsers.add_parser("collect", help="read an external result file")
+    verify_collect.add_argument("--task", required=True)
+    verify_collect.add_argument("--result", required=True, type=Path)
+    _add_concurrency_flags(verify_collect)
+
+    freshness = subparsers.add_parser("freshness", help="classify a task branch against the base")
+    freshness_subparsers = freshness.add_subparsers(dest="freshness_command", required=True)
+    freshness_check = freshness_subparsers.add_parser("check", help="inspect without mutating state")
+    freshness_check.add_argument("--repo", type=Path, default=Path("."))
+    freshness_check.add_argument("--base", required=True)
+    freshness_check.add_argument("--head", required=True)
+    freshness_check.add_argument("--conflict-domain", action="append", default=[])
+    freshness_record = freshness_subparsers.add_parser("record", help="inspect and record evidence")
+    freshness_record.add_argument("--task", required=True)
+    freshness_record.add_argument("--repo", type=Path, default=Path("."))
+    _add_concurrency_flags(freshness_record)
+
+    refresh = subparsers.add_parser(
+        "refresh", help="merge the scope base into a task branch and re-record its head"
+    )
+    refresh.add_argument("--task", required=True)
+    refresh.add_argument("--repo", type=Path, default=Path("."))
+    _add_concurrency_flags(refresh)
+
+    merge = subparsers.add_parser("merge", help="merge a task into the scope base and record it")
+    merge.add_argument("--task", required=True)
+    merge.add_argument("--repo", type=Path, default=Path("."))
+    _add_concurrency_flags(merge)
+
+    release = subparsers.add_parser("release", help="remove a finished task's worktree")
+    release.add_argument("--task", required=True)
+    release.add_argument("--repo", type=Path, default=Path("."))
+    release.add_argument("--keep-worktree", action="store_true")
+    _add_concurrency_flags(release)
+
+    block = subparsers.add_parser("block", help="mark a task blocked with a reason")
+    block.add_argument("--task", required=True)
+    block.add_argument("--reason", required=True)
+    _add_concurrency_flags(block)
+
+    unblock = subparsers.add_parser("unblock", help="return a blocked task to the queue")
+    unblock.add_argument("--task", required=True)
+    _add_concurrency_flags(unblock)
+
+    cancel = subparsers.add_parser("cancel", help="cancel a task")
+    cancel.add_argument("--task", required=True)
+    _add_concurrency_flags(cancel)
+
+    note = subparsers.add_parser("note", help="queue a durable discovery for reconciliation")
+    note.add_argument("--task")
+    note.add_argument("--note", required=True)
+    _add_concurrency_flags(note)
+
+    reconcile = subparsers.add_parser("reconcile", help="reconciliation checkpoint")
+    reconcile_subparsers = reconcile.add_subparsers(dest="reconcile_command", required=True)
+    reconcile_subparsers.add_parser("status", help="show whether a checkpoint is due")
+    reconcile_done = reconcile_subparsers.add_parser("done", help="clear the checkpoint")
+    _add_concurrency_flags(reconcile_done)
 
     monitor = subparsers.add_parser("monitor", help="perform one cheap Git observation tick")
     monitor.add_argument("--once", action="store_true", required=True)
-    monitor.add_argument("--state", required=True, type=Path)
-    monitor.add_argument("--repo", required=True, type=Path)
+    monitor.add_argument("--repo", type=Path, default=Path("."))
     monitor.add_argument("--dry-run", action="store_true")
 
-    lease = subparsers.add_parser("lease", help="acquire or release a task branch/worktree lease")
-    lease_subparsers = lease.add_subparsers(dest="lease_command", required=True)
-    ensure = lease_subparsers.add_parser("ensure", help="create or reuse an isolated worker worktree")
-    ensure.add_argument("--state", required=True, type=Path)
-    ensure.add_argument("--repo", required=True, type=Path)
-    ensure.add_argument("--task", required=True)
-    ensure.add_argument("--branch")
-    ensure.add_argument("--worktree", type=Path)
-    ensure.add_argument("--base-ref")
-    ensure.add_argument("--idempotency-key", required=True)
-    ensure.add_argument("--expected-revision", required=True, type=int)
-    ensure.add_argument("--dry-run", action="store_true")
-    release = lease_subparsers.add_parser("release", help="safely remove or retain a worker worktree")
-    release.add_argument("--state", required=True, type=Path)
-    release.add_argument("--repo", required=True, type=Path)
-    release.add_argument("--task", required=True)
-    release.add_argument("--idempotency-key", required=True)
-    release.add_argument("--expected-revision", required=True, type=int)
-    release.add_argument("--keep-worktree", action="store_true")
-
-    freshness = subparsers.add_parser("freshness", help="classify a task branch against its base")
-    freshness_subparsers = freshness.add_subparsers(dest="freshness_command", required=True)
-    for command_name, help_text in (("check", "inspect freshness without mutating state"), ("record", "inspect and record freshness evidence")):
-        command = freshness_subparsers.add_parser(command_name, help=help_text)
-        command.add_argument("--repo", required=True, type=Path)
-        command.add_argument("--base", required=True)
-        command.add_argument("--head", required=True)
-        command.add_argument("--conflict-domain", action="append", default=[])
-        if command_name == "record":
-            command.add_argument("--state", required=True, type=Path)
-            command.add_argument("--task", required=True)
-            command.add_argument("--idempotency-key", required=True)
-            command.add_argument("--expected-revision", required=True, type=int)
-
-    review = subparsers.add_parser("review", help="run or collect normalized review results")
-    review_subparsers = review.add_subparsers(dest="review_command", required=True)
-    review_run = review_subparsers.add_parser("run", help="run one configured reviewer against frozen SHAs")
-    review_run.add_argument("--state", required=True, type=Path)
-    review_run.add_argument("--repo", required=True, type=Path)
-    review_run.add_argument("--task", required=True)
-    review_run.add_argument("--command-json", required=True, type=_json_list_argument)
-    review_run.add_argument("--output", required=True, type=Path)
-    review_run.add_argument("--base-sha")
-    review_collect = review_subparsers.add_parser("collect", help="aggregate one or more review results once")
-    review_collect.add_argument("--state", required=True, type=Path)
-    review_collect.add_argument("--task", required=True)
-    review_collect.add_argument("--result", required=True, type=Path, action="append")
-    review_collect.add_argument("--idempotency-key", required=True)
-    review_collect.add_argument("--expected-revision", required=True, type=int)
-
-    verify = subparsers.add_parser("verify", help="collect normalized verification evidence")
-    verify_subparsers = verify.add_subparsers(dest="verify_command", required=True)
-    verify_collect = verify_subparsers.add_parser("collect", help="record verification evidence")
-    verify_collect.add_argument("--state", required=True, type=Path)
-    verify_collect.add_argument("--task", required=True)
-    verify_collect.add_argument("--result", required=True, type=Path)
-    verify_collect.add_argument("--idempotency-key", required=True)
-    verify_collect.add_argument("--expected-revision", required=True, type=int)
-
-    merge = subparsers.add_parser("merge", help="record a Git-verified task merge")
-    merge_subparsers = merge.add_subparsers(dest="merge_command", required=True)
-    merge_record = merge_subparsers.add_parser(
-        "record", help="mark done only when the task head is contained in the scope base"
-    )
-    merge_record.add_argument("--state", required=True, type=Path)
-    merge_record.add_argument("--repo", required=True, type=Path)
-    merge_record.add_argument("--task", required=True)
-    merge_record.add_argument("--idempotency-key", required=True)
-    merge_record.add_argument("--expected-revision", required=True, type=int)
-
-    migration = subparsers.add_parser("migrate", help="plan or apply a v1-to-v2 migration")
-    migration.add_argument("--state", type=Path)
-    migration.add_argument("--to", type=int, choices=(2,), default=2)
-    migration.add_argument("--dry-run", action="store_true")
-    migration.add_argument("--apply", action="store_true")
-    migration.add_argument("--rollback", type=Path)
-
-    event = subparsers.add_parser("event", help="apply a legal state transition")
+    event = subparsers.add_parser("event", help="escape hatch: apply one raw transition")
     event_subparsers = event.add_subparsers(dest="event_command", required=True)
-    apply = event_subparsers.add_parser("apply", help="apply one event atomically")
-    apply.add_argument("--state", required=True, type=Path)
-    apply.add_argument("--event", required=True)
-    apply.add_argument("--task")
-    apply.add_argument("--data", type=_json_argument, default={})
-    apply.add_argument("--idempotency-key", required=True)
-    apply.add_argument("--expected-revision", required=True, type=int)
+    event_apply = event_subparsers.add_parser("apply", help="apply one event atomically")
+    event_apply.add_argument("--event", required=True)
+    event_apply.add_argument("--task")
+    event_apply.add_argument("--data", type=_json_object, default={})
+    _add_concurrency_flags(event_apply)
 
     constitution = subparsers.add_parser("constitution", help="manage constitution ratification")
     constitution_subparsers = constitution.add_subparsers(
         dest="constitution_command", required=True
     )
-    ratify = constitution_subparsers.add_parser("ratify", help="record explicit ratification")
-    ratify.add_argument("--state", required=True, type=Path)
-    ratify.add_argument("--by", required=True)
-    fingerprint_source = ratify.add_mutually_exclusive_group(required=True)
-    fingerprint_source.add_argument("--decision-fingerprint")
-    fingerprint_source.add_argument("--proposal", type=Path)
-    ratify.add_argument("--idempotency-key", required=True)
-    ratify.add_argument("--expected-revision", required=True, type=int)
-    probe = constitution_subparsers.add_parser("probe", help="gather repository evidence and propose decisions")
-    probe.add_argument("--root", required=True, type=Path)
+    for name, help_text in (
+        ("ratify", "record the initial explicit ratification"),
+        ("amend", "re-ratify after the constitution changed"),
+    ):
+        command = constitution_subparsers.add_parser(name, help=help_text)
+        command.add_argument("--by", required=True)
+        fingerprint_source = command.add_mutually_exclusive_group(required=True)
+        fingerprint_source.add_argument("--decision-fingerprint")
+        fingerprint_source.add_argument("--proposal", type=Path)
+        _add_concurrency_flags(command)
+    probe = constitution_subparsers.add_parser("probe", help="gather repository evidence")
+    probe.add_argument("--root", type=Path, default=Path("."))
     probe.add_argument("--output", type=Path)
-    constitution_status = constitution_subparsers.add_parser("status", help="check ratification and proposal drift")
-    constitution_status.add_argument("--state", required=True, type=Path)
+    constitution_status = constitution_subparsers.add_parser(
+        "status", help="check ratification and proposal drift"
+    )
     constitution_status.add_argument("--proposal", type=Path)
     return parser
 
 
-def _print_json(value: dict[str, Any]) -> None:
+def _print_json(value: Any) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
 
 
 def _brief(summary: dict[str, Any]) -> str:
     counts = ", ".join(f"{status}={count}" for status, count in summary["taskCounts"].items())
-    return "\n".join(
-        [
-            f"{summary['scope']['id']} revision {summary['revision']}",
-            f"constitution: {summary['constitution']}",
-            f"tasks: {counts}",
-            f"active: {len(summary['activeTasks'])}",
-        ]
+    lines = [
+        f"{summary['scope']['id']} revision {summary['revision']}",
+        f"constitution: {summary['constitution']}",
+        f"tasks: {counts}",
+        f"active: {len(summary['activeTasks'])}",
+    ]
+    if summary["reconcile"]["due"]:
+        lines.append(f"reconciliation due: {summary['reconcile']['due']['code']}")
+    return "\n".join(lines)
+
+
+def _concurrency(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "expected_revision": getattr(args, "expected_revision", None),
+        "idempotency_key": getattr(args, "idempotency_key", None),
+    }
+
+
+def _simple_event(store: StateStore, args: argparse.Namespace, event: str, data: dict[str, Any]) -> int:
+    state, duplicate = apply_event(
+        store, event_type=event, task_id=getattr(args, "task", None), data=data, **_concurrency(args)
     )
+    _print_json({"revision": state["revision"], "duplicate": duplicate})
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    store = StateStore(args.state)
     try:
-        if args.command == "init":
-            store = StateStore(args.state)
-            if store.exists():
-                parser.error(f"state file already exists: {args.state}")
-            state = new_state(args.scope_id, args.scope_kind, base_ref=args.base_ref)
-            for task_id in args.task:
-                if task_id in state["tasks"]:
-                    parser.error(f"duplicate --task: {task_id}")
-                state["tasks"][task_id] = task_state(task_id)
-            store.write(state)
-            _print_json({"created": str(args.state), "revision": 0, "scope": state["scope"]})
-            return 0
-
         if args.command == "doctor":
             _print_json(inspect_capabilities())
             return 0
 
-        if args.command == "status":
-            summary = status_summary(StateStore(args.state).read())
-            if args.json:
-                _print_json(summary)
-            else:
-                print(_brief(summary))
-            return 0
-
-        if args.command == "next":
+        if args.command == "plan" and args.plan_command == "apply":
             _print_json(
-                bounded_next_actions(StateStore(args.state).read(), max_bytes=args.max_bytes)
+                apply_plan(
+                    store,
+                    read_plan(args.plan),
+                    repo=args.repo,
+                    from_ref=args.from_ref,
+                    dry_run=args.dry_run,
+                    **_concurrency(args),
+                )
             )
             return 0
 
+        if args.command == "plan" and args.plan_command == "preview":
+            state = state_from_plan(read_plan(args.plan)) if args.plan else store.read()
+            _print_json(
+                {
+                    "scope": state["scope"]["id"],
+                    "maxConcurrent": state["scope"]["maxConcurrent"],
+                    "note": "projected admission order; rounds are a view, not a gate",
+                    "rounds": admission_schedule(state),
+                }
+            )
+            return 0
+
+        if args.command == "status":
+            summary = status_summary(store.read())
+            _print_json(summary) if args.json else print(_brief(summary))
+            return 0
+
+        if args.command == "next":
+            _print_json(bounded_next_actions(store.read(), max_bytes=args.max_bytes))
+            return 0
+
         if args.command == "render":
-            state = StateStore(args.state).read()
+            state = store.read()
             render_to_path(state, args.output)
             _print_json({"rendered": str(args.output), "revision": state["revision"]})
             return 0
 
-        if args.command == "monitor":
-            _print_json(monitor_once(StateStore(args.state), repo=args.repo, dry_run=args.dry_run))
-            return 0
-
-        if args.command == "lease" and args.lease_command == "ensure":
-            result, duplicate = ensure_lease(
-                StateStore(args.state),
+        if args.command == "start":
+            result, duplicate = start_task(
+                store,
                 repo=args.repo,
                 task_id=args.task,
                 branch=args.branch,
                 worktree=args.worktree,
-                base_ref=args.base_ref,
-                idempotency_key=args.idempotency_key,
-                expected_revision=args.expected_revision,
-                dry_run=args.dry_run,
+                **_concurrency(args),
             )
             _print_json({**result, "duplicate": duplicate})
             return 0
 
-        if args.command == "lease" and args.lease_command == "release":
-            result, duplicate = release_lease(
-                StateStore(args.state),
+        if args.command == "submit":
+            result, duplicate = submit_task(
+                store, repo=args.repo, task_id=args.task, pr=args.pr, **_concurrency(args)
+            )
+            _print_json({**result, "duplicate": duplicate})
+            return 0
+
+        if args.command == "review" and args.review_command == "record":
+            state, duplicate = record_review(
+                store,
+                task_id=args.task,
+                findings=validate_findings(args.findings),
+                reviewer=args.reviewer,
                 repo=args.repo,
-                task_id=args.task,
-                idempotency_key=args.idempotency_key,
-                expected_revision=args.expected_revision,
-                keep_worktree=args.keep_worktree,
+                **_concurrency(args),
             )
-            _print_json({**result, "duplicate": duplicate})
+            task = state["tasks"][args.task]
+            _print_json(
+                {
+                    "revision": state["revision"],
+                    "duplicate": duplicate,
+                    "outcome": (task.get("review") or {}).get("outcome"),
+                    "status": task["status"],
+                }
+            )
             return 0
 
-        if args.command == "freshness":
-            result = check_freshness(
-                args.repo,
-                base_ref=args.base,
-                head_ref=args.head,
-                conflict_domains=args.conflict_domain,
-            )
-            if args.freshness_command == "check":
-                _print_json(result)
-                return 0
-            state, duplicate = apply_event(
-                StateStore(args.state),
-                event_type="freshness.recorded",
-                task_id=args.task,
-                data=result,
-                idempotency_key=args.idempotency_key,
-                expected_revision=args.expected_revision,
-            )
-            _print_json({"freshness": result, "revision": state["revision"], "duplicate": duplicate})
-            return 0
+        if args.command == "review" and args.review_command == "run":
+            from .review import run_review
 
-        if args.command == "review":
-            from .review import collect_review, run_review
-
-            if args.review_command == "run":
-                _print_json(
-                    run_review(
-                        StateStore(args.state),
-                        repo=args.repo,
-                        task_id=args.task,
-                        command=args.command_json,
-                        output=args.output,
-                        base_sha=args.base_sha,
-                    )
+            _print_json(
+                run_review(
+                    store,
+                    repo=args.repo,
+                    task_id=args.task,
+                    command=args.command_json,
+                    output=args.output,
                 )
-                return 0
+            )
+            return 0
+
+        if args.command == "review" and args.review_command == "collect":
+            from .review import collect_review
+
             state, duplicate = collect_review(
-                StateStore(args.state),
-                task_id=args.task,
-                result_paths=args.result,
-                idempotency_key=args.idempotency_key,
-                expected_revision=args.expected_revision,
+                store, task_id=args.task, result_paths=args.result, **_concurrency(args)
             )
             _print_json({"revision": state["revision"], "duplicate": duplicate})
+            return 0
+
+        if args.command == "verify" and args.verify_command == "record":
+            state, duplicate = record_verification(
+                store,
+                task_id=args.task,
+                status=args.status,
+                command=args.verify_command_text,
+                repo=args.repo,
+                **_concurrency(args),
+            )
+            _print_json(
+                {
+                    "revision": state["revision"],
+                    "duplicate": duplicate,
+                    "status": state["tasks"][args.task]["status"],
+                }
+            )
             return 0
 
         if args.command == "verify" and args.verify_command == "collect":
             from .review import collect_verification
 
             state, duplicate = collect_verification(
-                StateStore(args.state),
-                task_id=args.task,
-                result_path=args.result,
-                idempotency_key=args.idempotency_key,
-                expected_revision=args.expected_revision,
+                store, task_id=args.task, result_path=args.result, **_concurrency(args)
             )
             _print_json({"revision": state["revision"], "duplicate": duplicate})
             return 0
 
-        if args.command == "merge" and args.merge_command == "record":
-            state, duplicate = record_merge(
-                StateStore(args.state),
+        if args.command == "freshness" and args.freshness_command == "check":
+            _print_json(
+                check_freshness(
+                    args.repo,
+                    base_ref=args.base,
+                    head_ref=args.head,
+                    conflict_domains=args.conflict_domain,
+                )
+            )
+            return 0
+
+        if args.command == "freshness" and args.freshness_command == "record":
+            state, duplicate, result = record_freshness(
+                store, repo=args.repo, task_id=args.task, **_concurrency(args)
+            )
+            _print_json(
+                {
+                    "classification": result["classification"],
+                    "revision": state["revision"],
+                    "duplicate": duplicate,
+                }
+            )
+            return 0
+
+        if args.command == "refresh":
+            _print_json(refresh_task(store, repo=args.repo, task_id=args.task, **_concurrency(args)))
+            return 0
+
+        if args.command == "merge":
+            _print_json(merge_task(store, repo=args.repo, task_id=args.task, **_concurrency(args)))
+            return 0
+
+        if args.command == "release":
+            result, duplicate = release_task(
+                store,
                 repo=args.repo,
                 task_id=args.task,
-                idempotency_key=args.idempotency_key,
-                expected_revision=args.expected_revision,
+                keep_worktree=args.keep_worktree,
+                **_concurrency(args),
+            )
+            _print_json({**result, "duplicate": duplicate})
+            return 0
+
+        if args.command == "block":
+            return _simple_event(store, args, "task.blocked", {"reason": args.reason})
+
+        if args.command == "unblock":
+            return _simple_event(store, args, "task.unblocked", {})
+
+        if args.command == "cancel":
+            return _simple_event(store, args, "task.cancelled", {})
+
+        if args.command == "note":
+            return _simple_event(store, args, "note.added", {"note": args.note})
+
+        if args.command == "reconcile" and args.reconcile_command == "status":
+            state = store.read()
+            _print_json(
+                {
+                    "due": status_summary(state)["reconcile"]["due"],
+                    "mergesSinceCheckpoint": state["reconcile"]["mergesSinceCheckpoint"],
+                    "everyNMerges": state["reconcile"]["everyNMerges"],
+                    "pendingNotes": state["reconcile"]["pendingNotes"],
+                }
+            )
+            return 0
+
+        if args.command == "reconcile" and args.reconcile_command == "done":
+            state, duplicate = apply_event(
+                store,
+                event_type="reconcile.completed",
+                task_id=None,
+                data={},
+                **_concurrency(args),
             )
             _print_json({"revision": state["revision"], "duplicate": duplicate})
             return 0
 
-        if args.command == "migrate":
-            if args.rollback:
-                if args.state or args.apply or args.dry_run:
-                    parser.error("--rollback cannot be combined with --state, --apply, or --dry-run")
-                _print_json(rollback_migration(args.rollback))
-                return 0
-            if not args.state:
-                parser.error("--state is required unless --rollback is used")
-            if args.apply == args.dry_run:
-                parser.error("choose exactly one of --dry-run or --apply")
-            plan = build_migration_plan(args.state)
-            if args.dry_run:
-                _print_json({
-                    "id": plan["id"],
-                    "scope": plan["scope"],
-                    "moves": plan["moves"],
-                    "backupDirectory": plan["backupDirectory"],
-                    "targetSchemaVersion": 2,
-                })
-            else:
-                _print_json(apply_migration(plan))
+        if args.command == "monitor":
+            _print_json(monitor_once(store, repo=args.repo, dry_run=args.dry_run))
             return 0
 
         if args.command == "event" and args.event_command == "apply":
             if args.event == "task.merged":
-                raise IllegalTransition("use 'wddctl merge record' to verify live Git state")
-            state, duplicate = apply_event(
-                StateStore(args.state),
-                event_type=args.event,
-                task_id=args.task,
-                data=args.data,
-                idempotency_key=args.idempotency_key,
-                expected_revision=args.expected_revision,
-            )
-            _print_json({"revision": state["revision"], "duplicate": duplicate})
-            return 0
+                # Keeps the Git-verified-merge guarantee true for the CLI surface:
+                # completion cannot be asserted, only proved by 'wddctl merge'.
+                raise IllegalTransition(
+                    "use 'wddctl merge --task ID --repo .' so live Git proves the merge"
+                )
+            return _simple_event(store, args, args.event, args.data)
 
-        if args.command == "constitution" and args.constitution_command == "ratify":
-            if args.proposal:
-                fingerprint = read_proposal(args.proposal)["decisionFingerprint"]
-            else:
-                fingerprint = args.decision_fingerprint
+        if args.command == "constitution" and args.constitution_command in {"ratify", "amend"}:
+            fingerprint = (
+                read_proposal(args.proposal)["decisionFingerprint"]
+                if args.proposal
+                else args.decision_fingerprint
+            )
             state, duplicate = apply_event(
-                StateStore(args.state),
-                event_type="constitution.ratified",
+                store,
+                event_type=f"constitution.{'ratified' if args.constitution_command == 'ratify' else 'amended'}",
                 task_id=None,
                 data={"by": args.by, "decisionFingerprint": fingerprint},
-                idempotency_key=args.idempotency_key,
-                expected_revision=args.expected_revision,
+                **_concurrency(args),
             )
             _print_json({"revision": state["revision"], "duplicate": duplicate})
             return 0
@@ -402,7 +532,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "constitution" and args.constitution_command == "status":
             proposal = read_proposal(args.proposal) if args.proposal else None
-            _print_json(ratification_status(StateStore(args.state).read(), proposal))
+            _print_json(ratification_status(store.read(), proposal))
             return 0
     except WaveDeliveryError as error:
         print(f"wddctl: {error}", file=sys.stderr)
