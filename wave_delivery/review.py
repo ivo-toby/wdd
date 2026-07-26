@@ -306,9 +306,14 @@ def verify_external_shas(
             raise IllegalTransition(
                 f"evidence {label} {sha} is not a commit in this repository"
             ) from error
-    if not is_ancestor(repository, base_sha, head_sha):
+    # "Any ancestor" is too weak: baseSha == headSha describes an empty range,
+    # so a review of nothing was accepted. The base must be the exact one the
+    # controller derives for this task.
+    expected_base, expected_head = evidence_shas(state, task_id, repo=repository)
+    if base_sha != expected_base or head_sha != expected_head:
         raise IllegalTransition(
-            f"evidence baseSha {base_sha} is not an ancestor of headSha {head_sha}"
+            f"evidence for {task_id} must describe {expected_base}..{expected_head}; "
+            f"got {base_sha}..{head_sha}"
         )
 
 

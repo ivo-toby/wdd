@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .engine import apply_event, task_gate
+from .engine import apply_event, apply_mutation, task_gate, transition
 from .errors import IllegalTransition, RevisionConflict, ValidationError
 from .freshness import check_freshness
 from .git import (
@@ -16,11 +16,20 @@ from .git import (
     require_repository,
     resolve_ref,
     run_git,
+    worktree_branch,
 )
 from .store import StateStore
 
 
 BLOCKING_FRESHNESS = {"materially_stale", "conflicted"}
+
+
+class _NoChange(Exception):
+    """Nothing to do; carries the result to return unchanged."""
+
+    def __init__(self, result: dict[str, Any]) -> None:
+        super().__init__("no change")
+        self.result = result
 
 
 def _task(state: dict[str, Any], task_id: str) -> dict[str, Any]:
@@ -90,78 +99,88 @@ def refresh_task(
             f"task worktree is missing: {worktree_path}; "
             f"run 'wddctl start --task {task_id} --repo .' to re-attach it"
         )
+    # Existence and cleanliness do not prove identity: a worktree switched to
+    # another branch would have the base merged into that branch instead, while
+    # the task branch stayed put and the command still reported success.
+    checked_out = worktree_branch(worktree_path)
+    if checked_out is None:
+        raise IllegalTransition(
+            f"refusing to refresh {task_id}: worktree {worktree_path} has a detached HEAD; "
+            f"check out {branch} first"
+        )
+    if checked_out != branch:
+        raise IllegalTransition(
+            f"refusing to refresh {task_id}: worktree {worktree_path} is on {checked_out}, "
+            f"not {branch}"
+        )
     if run_git(worktree_path, "status", "--porcelain").stdout.strip():
         raise IllegalTransition(
             f"refusing to refresh {task_id}: worktree has uncommitted changes ({worktree_path})"
         )
 
-    before = resolve_ref(repo, branch)
-    base_sha = resolve_ref(repo, base_ref)
-    if is_ancestor(repo, base_sha, before):
-        recorded = task.get("headSha")
-        if not recorded or before == recorded:
-            # Nothing submitted yet, or state already matches the branch.
-            return {"task": task_id, "action": "already_current", "headSha": before}
-        # The branch moved without wddctl seeing it — typically a conflict
-        # resolved by hand in the worktree. Record the head so the task is not
-        # left reporting stale freshness against a commit that no longer exists.
-        state, duplicate = apply_event(
+    outcome: dict[str, Any] = {}
+
+    def mutator(current: dict[str, Any]) -> dict[str, Any]:
+        # Everything from here runs inside the store lock, so no other
+        # controller can advance the revision between the Git mutation and the
+        # state commit. Previously the branch moved and the commit then failed.
+        before = resolve_ref(repo, branch)
+        base_sha = resolve_ref(repo, base_ref)
+        recorded = current["tasks"][task_id].get("headSha")
+        if is_ancestor(repo, base_sha, before):
+            if not recorded or before == recorded:
+                raise _NoChange({"task": task_id, "action": "already_current", "headSha": before})
+            after = before
+            action = "adopted_external_merge"
+            note = "branch was already current; recorded its head and invalidated evidence"
+        else:
+            merge = run_git(
+                worktree_path,
+                "merge",
+                "--no-edit",
+                "-m",
+                f"wdd: refresh {task_id} from {base_ref}",
+                base_sha,
+                check=False,
+            )
+            if merge.returncode != 0:
+                conflicts = run_git(
+                    worktree_path, "diff", "--name-only", "--diff-filter=U", check=False
+                ).stdout.split()
+                run_git(worktree_path, "merge", "--abort", check=False)
+                raise IllegalTransition(
+                    f"refreshing {task_id} from {base_ref} conflicts in: "
+                    f"{', '.join(conflicts) or 'unknown files'}; "
+                    "resolve it in the task worktree, then re-run"
+                )
+            after = resolve_ref(repo, branch)
+            action = "refreshed"
+            note = "review and verification evidence was invalidated by the new head"
+        outcome.update(
+            {
+                "task": task_id,
+                "action": action,
+                "previousHeadSha": recorded if action == "adopted_external_merge" else before,
+                "headSha": after,
+                "baseSha": base_sha,
+                "note": note,
+            }
+        )
+        return transition(current, "task.head_updated", task_id, {"headSha": after})
+
+    try:
+        state, duplicate = apply_mutation(
             store,
             event_type="task.head_updated",
             task_id=task_id,
-            data={"headSha": before},
+            data={},
             idempotency_key=idempotency_key,
             expected_revision=expected_revision,
+            mutator=mutator,
         )
-        return {
-            "task": task_id,
-            "action": "adopted_external_merge",
-            "previousHeadSha": task.get("headSha"),
-            "headSha": before,
-            "baseSha": base_sha,
-            "revision": state["revision"],
-            "duplicate": duplicate,
-            "note": "branch was already current; recorded its head and invalidated evidence",
-        }
-
-    merge = run_git(
-        worktree_path,
-        "merge",
-        "--no-edit",
-        "-m",
-        f"wdd: refresh {task_id} from {base_ref}",
-        base_sha,
-        check=False,
-    )
-    if merge.returncode != 0:
-        conflicts = run_git(
-            worktree_path, "diff", "--name-only", "--diff-filter=U", check=False
-        ).stdout.split()
-        run_git(worktree_path, "merge", "--abort", check=False)
-        raise IllegalTransition(
-            f"refreshing {task_id} from {base_ref} conflicts in: {', '.join(conflicts) or 'unknown files'}; "
-            "resolve it in the task worktree, then re-run"
-        )
-
-    after = resolve_ref(repo, branch)
-    state, duplicate = apply_event(
-        store,
-        event_type="task.head_updated",
-        task_id=task_id,
-        data={"headSha": after},
-        idempotency_key=idempotency_key,
-        expected_revision=expected_revision,
-    )
-    return {
-        "task": task_id,
-        "action": "refreshed",
-        "previousHeadSha": before,
-        "headSha": after,
-        "baseSha": base_sha,
-        "revision": state["revision"],
-        "duplicate": duplicate,
-        "note": "review and verification evidence was invalidated by the new head",
-    }
+    except _NoChange as unchanged:
+        return unchanged.result
+    return {**outcome, "revision": state["revision"], "duplicate": duplicate}
 
 
 def merge_task(
@@ -179,79 +198,90 @@ def merge_task(
     task = _task(state, task_id)
     base_ref = _base_ref(state)
 
-    gate = task_gate(state, task)
-    if gate != "merge_ready":
-        raise IllegalTransition(
-            f"task {task_id} is at gate '{gate}', not 'merge_ready'; run 'wddctl next' for the required step"
-        )
-    head_sha = task.get("headSha")
-    if not isinstance(head_sha, str) or not head_sha:
-        raise IllegalTransition(f"task {task_id} has no recorded head SHA")
+    outcome: dict[str, Any] = {}
 
-    branch = task.get("branch") or head_sha
-    live = check_freshness(
-        repo,
-        base_ref=base_ref,
-        head_ref=head_sha,
-        conflict_domains=task["conflictDomains"],
-    )
-    if live["classification"] in BLOCKING_FRESHNESS:
-        raise IllegalTransition(
-            f"task {task_id} is {live['classification']} against {base_ref}; "
-            f"run 'wddctl refresh --task {task_id}' first"
-        )
-
-    base_sha_before = resolve_ref(repo, base_ref)
-    if is_ancestor(repo, head_sha, base_sha_before):
-        action = "already_merged"
-    else:
-        directory = _integration_dir(repo, state, base_ref)
-        merge = run_git(
-            directory,
-            "merge",
-            "--no-ff",
-            "-m",
-            f"wdd: merge {task_id} into {base_ref}",
-            head_sha,
-            check=False,
-        )
-        if merge.returncode != 0:
-            conflicts = run_git(
-                directory, "diff", "--name-only", "--diff-filter=U", check=False
-            ).stdout.split()
-            run_git(directory, "merge", "--abort", check=False)
+    def mutator(current: dict[str, Any]) -> dict[str, Any]:
+        # Serialized with the state commit: the base branch must never move
+        # while another controller advances the revision underneath us.
+        task = _task(current, task_id)
+        gate = task_gate(current, task)
+        if gate != "merge_ready":
             raise IllegalTransition(
-                f"merging {task_id} into {base_ref} conflicts in: {', '.join(conflicts) or 'unknown files'}; "
-                f"run 'wddctl refresh --task {task_id}' and resolve it on the task branch"
+                f"task {task_id} is at gate '{gate}', not 'merge_ready'; "
+                "run 'wddctl next' for the required step"
             )
-        action = "merged"
+        head_sha = task.get("headSha")
+        if not isinstance(head_sha, str) or not head_sha:
+            raise IllegalTransition(f"task {task_id} has no recorded head SHA")
 
-    base_sha = resolve_ref(repo, base_ref)
-    if not is_ancestor(repo, head_sha, base_sha):
-        raise IllegalTransition(
-            f"task head {head_sha} is still not contained in {base_ref} ({base_sha}) after merging"
+        live = check_freshness(
+            repo, base_ref=base_ref, head_ref=head_sha, conflict_domains=task["conflictDomains"]
+        )
+        if live["classification"] in BLOCKING_FRESHNESS:
+            raise IllegalTransition(
+                f"task {task_id} is {live['classification']} against {base_ref}; "
+                f"run 'wddctl refresh --task {task_id}' first"
+            )
+
+        if is_ancestor(repo, head_sha, resolve_ref(repo, base_ref)):
+            action = "already_merged"
+        else:
+            directory = _integration_dir(repo, current, base_ref)
+            merge = run_git(
+                directory,
+                "merge",
+                "--no-ff",
+                "-m",
+                f"wdd: merge {task_id} into {base_ref}",
+                head_sha,
+                check=False,
+            )
+            if merge.returncode != 0:
+                conflicts = run_git(
+                    directory, "diff", "--name-only", "--diff-filter=U", check=False
+                ).stdout.split()
+                run_git(directory, "merge", "--abort", check=False)
+                raise IllegalTransition(
+                    f"merging {task_id} into {base_ref} conflicts in: "
+                    f"{', '.join(conflicts) or 'unknown files'}; "
+                    f"run 'wddctl refresh --task {task_id}' and resolve it on the task branch"
+                )
+            action = "merged"
+
+        base_sha = resolve_ref(repo, base_ref)
+        if not is_ancestor(repo, head_sha, base_sha):
+            raise IllegalTransition(
+                f"task head {head_sha} is still not contained in {base_ref} ({base_sha}) after merging"
+            )
+        outcome.update(
+            {
+                "task": task_id,
+                "action": action,
+                "branch": task.get("branch") or head_sha,
+                "baseRef": base_ref,
+                "baseSha": base_sha,
+                "headSha": head_sha,
+            }
+        )
+        return transition(
+            current,
+            "task.merged",
+            task_id,
+            {
+                "mergeVerified": True,
+                "baseRef": base_ref,
+                "baseSha": base_sha,
+                "headSha": head_sha,
+            },
         )
 
-    state, duplicate = apply_event(
+    state, duplicate = apply_mutation(
         store,
         event_type="task.merged",
         task_id=task_id,
-        data={
-            "mergeVerified": True,
-            "baseRef": base_ref,
-            "baseSha": base_sha,
-            "headSha": head_sha,
-        },
+        data={},
         idempotency_key=idempotency_key,
         expected_revision=expected_revision,
+        mutator=mutator,
     )
-    return {
-        "task": task_id,
-        "action": action,
-        "branch": branch,
-        "baseRef": base_ref,
-        "baseSha": base_sha,
-        "headSha": head_sha,
-        "revision": state["revision"],
-        "duplicate": duplicate,
-    }
+    return {**outcome, "revision": state["revision"], "duplicate": duplicate}

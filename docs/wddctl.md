@@ -499,13 +499,18 @@ revisions) to the current schema. Dry-run first; `--apply` writes a
 `.v2.bak` backup beside the state file before converting.
 
 ```sh
-wddctl migrate --state .wdd/state.json --dry-run
-wddctl migrate --state .wdd/state.json --apply [--review-policy risk_based]
+wddctl --state .wdd/state.json migrate --dry-run
+wddctl --state .wdd/state.json migrate --apply
 ```
+
+`--state` is a global option, so it goes before the subcommand.
 
 Waves are dropped (scheduling is derived from dependencies and conflict
 domains), every task defaults to `risk: normal`, and recorded worktree paths
-are cleared because the location is derived per checkout. Reading v2 state
+are cleared because the location is derived per checkout. `reviewPolicy`
+becomes `always`, because schema v2 required review for every task —
+migrating must not silently drop that obligation. Pass
+`--review-policy risk_based` to loosen it deliberately. Reading v2 state
 without migrating fails with a message pointing here.
 
 ### `monitor`

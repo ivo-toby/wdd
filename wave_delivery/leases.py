@@ -25,6 +25,7 @@ from .git import (
     run_git,
     task_worktree_path,
     worktree_at,
+    worktree_branch,
 )
 from .schema import copied_state
 from .store import StateStore
@@ -202,6 +203,20 @@ def submit_task(
         repo, state["scope"]["id"], task_id, task.get("worktree")
     )
     if resolved_worktree.exists():
+        # Clean is not enough: a worktree switched to another branch would let
+        # submit record the stale task-branch SHA and silently drop the work
+        # that was actually committed.
+        checked_out = worktree_branch(resolved_worktree)
+        if checked_out is None:
+            raise IllegalTransition(
+                f"task {task_id} worktree {resolved_worktree} has a detached HEAD; "
+                f"check out {branch} before submitting"
+            )
+        if checked_out != branch:
+            raise IllegalTransition(
+                f"task {task_id} worktree {resolved_worktree} is on {checked_out}, not {branch}; "
+                "submit would record the wrong commit"
+            )
         dirty = run_git(resolved_worktree, "status", "--porcelain").stdout.strip()
         if dirty:
             raise IllegalTransition(

@@ -265,6 +265,35 @@ class ReviewFindingRegressionTests(BaseTest):
             refresh_task(store, repo=repo, task_id="TASK-A", expected_revision=0)
         self.assertEqual(self.git(repo, "rev-parse", "task/TASK-A"), head_before)
 
+    def test_the_revision_check_precedes_the_git_mutation(self) -> None:
+        """The Git work and the state commit share one lock.
+
+        Checking the revision only in a later apply left the branch already
+        moved while state was unchanged. The check now runs inside the same
+        lock, before the mutator that touches Git.
+        """
+        from wave_delivery.engine import apply_mutation
+
+        repo = self.repository()
+        store = self.scope(repo)
+        ran: list[str] = []
+
+        def mutator(state: dict) -> dict:
+            ran.append("mutator")
+            return state
+
+        with self.assertRaises(RevisionConflict):
+            apply_mutation(
+                store,
+                event_type="note.added",
+                task_id=None,
+                data={"note": "x"},
+                idempotency_key=None,
+                expected_revision=0,
+                mutator=mutator,
+            )
+        self.assertEqual(ran, [], "the mutator ran despite a stale revision")
+
     def test_tightening_the_policy_re_gates_a_merge_ready_task(self) -> None:
         repo = self.repository()
         store = self.scope(repo)  # risk_based, TASK-A is normal risk -> no review
@@ -313,6 +342,76 @@ class ReviewFindingRegressionTests(BaseTest):
         with self.assertRaises(IllegalTransition) as raised:
             collect_review(store, task_id="TASK-A", result_paths=[bogus], repo=repo)
         self.assertIn("not a commit", str(raised.exception))
+
+    def test_submit_refuses_a_worktree_on_a_different_branch(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        started, _ = start_task(store, repo=repo, task_id="TASK-A")
+        worktree = Path(started["worktree"])
+        self.commit_in(worktree, "src/schema.ts", "real work\n")
+        task_sha = self.git(repo, "rev-parse", "task/TASK-A")
+
+        # Clean, but pointed somewhere else entirely.
+        self.git(worktree, "checkout", "-q", "-b", "unrelated-submit")
+        self.commit_in(worktree, "src/schema.ts", "work on the wrong branch\n")
+
+        with self.assertRaises(IllegalTransition) as raised:
+            submit_task(store, repo=repo, task_id="TASK-A")
+        self.assertIn("unrelated-submit", str(raised.exception))
+        self.assertIsNone(store.read()["tasks"]["TASK-A"]["headSha"])
+
+        self.git(worktree, "checkout", "-q", "task/TASK-A")
+        submit_task(store, repo=repo, task_id="TASK-A")
+        self.assertEqual(store.read()["tasks"]["TASK-A"]["headSha"], task_sha)
+
+    def test_refresh_refuses_a_worktree_on_a_different_branch(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        started, _ = start_task(store, repo=repo, task_id="TASK-A")
+        worktree = Path(started["worktree"])
+        self.commit_in(worktree, "src/schema.ts", "work\n")
+        submit_task(store, repo=repo, task_id="TASK-A")
+        task_before = self.git(repo, "rev-parse", "task/TASK-A")
+
+        self.git(worktree, "checkout", "-q", "-b", "unrelated-refresh")
+        self.git(repo, "checkout", "-q", "wdd/demo")
+        (repo / "docs.md").write_text("base moved\n", encoding="utf-8")
+        self.git(repo, "add", "-A")
+        self.git(repo, "commit", "-qm", "advance base")
+
+        with self.assertRaises(IllegalTransition) as raised:
+            refresh_task(store, repo=repo, task_id="TASK-A")
+        self.assertIn("unrelated-refresh", str(raised.exception))
+        # Neither branch moved.
+        self.assertEqual(self.git(repo, "rev-parse", "task/TASK-A"), task_before)
+
+    def test_collected_evidence_must_describe_the_exact_expected_range(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo, self.plan_document(scope={"reviewPolicy": "always"}))
+        result, _ = start_task(store, repo=repo, task_id="TASK-A")
+        head = self.commit_in(result["worktree"], "src/schema.ts", "x\n")
+        submit_task(store, repo=repo, task_id="TASK-A")
+
+        # An empty range: a real commit, a real ancestor of itself, reviewing nothing.
+        empty_range = self.root / "empty.json"
+        empty_range.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "kind": "wddctl_review_result",
+                    "task": "TASK-A",
+                    "baseSha": head,
+                    "headSha": head,
+                    "reviewer": "external",
+                    "findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaises(IllegalTransition) as raised:
+            collect_review(store, task_id="TASK-A", result_paths=[empty_range], repo=repo)
+        self.assertIn("must describe", str(raised.exception))
+        self.assertIsNone(store.read()["tasks"]["TASK-A"]["review"])
 
     def test_submit_measures_against_the_base_the_task_started_from(self) -> None:
         repo = self.repository()
@@ -398,11 +497,30 @@ class MigrationTests(BaseTest):
         self.assertEqual(migrated["schemaVersion"], 3)
         self.assertEqual(migrated["tasks"]["T1"]["risk"], "normal")
         self.assertEqual(migrated["tasks"]["T1"]["title"], "T1")
-        self.assertEqual(migrated["scope"]["reviewPolicy"], "risk_based")
+        # v2 required review for every task; migrating must not drop that.
+        self.assertEqual(migrated["scope"]["reviewPolicy"], "always")
         self.assertNotIn("waves", migrated)
         # The stale absolute worktree from the old machine is cleared.
         self.assertIsNone(migrated["tasks"]["T1"]["worktree"])
         self.assertEqual(migrated["revision"], 4)
+
+    def test_the_migration_hint_is_a_runnable_command(self) -> None:
+        path = self.root / "state.json"
+        path.write_text(json.dumps(self.v2_state()), encoding="utf-8")
+        with self.assertRaises(ValidationError) as raised:
+            StateStore(path).read()
+        hint = str(raised.exception)
+        # --state is a global option, so it must precede the subcommand.
+        self.assertIn("wddctl --state <path> migrate --dry-run", hint)
+        parser = __import__("wave_delivery.cli", fromlist=["build_parser"]).build_parser()
+        parsed = parser.parse_args(["--state", str(path), "migrate", "--dry-run"])
+        self.assertEqual(parsed.command, "migrate")
+
+    def test_loosening_the_migrated_policy_must_be_explicit(self) -> None:
+        path = self.root / "state.json"
+        path.write_text(json.dumps(self.v2_state()), encoding="utf-8")
+        apply_migration(path, review_policy="risk_based")
+        self.assertEqual(StateStore(path).read()["scope"]["reviewPolicy"], "risk_based")
 
     def test_migrating_current_state_is_refused(self) -> None:
         repo = self.repository()

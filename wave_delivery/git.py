@@ -98,6 +98,12 @@ def worktree_at(repo: Path | str, path: Path | str) -> dict[str, str] | None:
     return None
 
 
+def worktree_branch(path: Path | str) -> str | None:
+    """The branch a worktree has checked out, or None when detached."""
+    result = run_git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    return result.stdout.strip() or None
+
+
 def wdd_root(repo: Path) -> Path:
     """Managed worktrees live beside the repository, never inside its working tree."""
     return repo.parent / f"{repo.name}.wdd"

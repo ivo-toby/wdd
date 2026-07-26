@@ -220,7 +220,10 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--dry-run", action="store_true")
     migrate.add_argument("--apply", action="store_true")
     migrate.add_argument(
-        "--review-policy", choices=("always", "risk_based", "none"), default="risk_based"
+        "--review-policy",
+        choices=("always", "risk_based", "none"),
+        default="always",
+        help="schema v2 required review for every task; the default preserves that",
     )
 
     monitor = subparsers.add_parser("monitor", help="perform one cheap Git observation tick")

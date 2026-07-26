@@ -44,7 +44,7 @@ def read_source(path: Path | str) -> dict[str, Any]:
     return state
 
 
-def convert(state: dict[str, Any], *, review_policy: str = "risk_based") -> dict[str, Any]:
+def convert(state: dict[str, Any], *, review_policy: str = "always") -> dict[str, Any]:
     """Return the v3 equivalent of a v2 state."""
     scope = dict(state.get("scope") or {})
     migrated: dict[str, Any] = {
@@ -91,7 +91,7 @@ def convert(state: dict[str, Any], *, review_policy: str = "risk_based") -> dict
     return migrated
 
 
-def plan_migration(path: Path | str, *, review_policy: str = "risk_based") -> dict[str, Any]:
+def plan_migration(path: Path | str, *, review_policy: str = "always") -> dict[str, Any]:
     path = Path(path)
     source = read_source(path)
     migrated = convert(source, review_policy=review_policy)
@@ -104,13 +104,19 @@ def plan_migration(path: Path | str, *, review_policy: str = "risk_based") -> di
         "notes": [
             "waves are dropped; scheduling is derived from dependencies and conflict domains",
             "every task defaults to risk 'normal' — mark high-risk tasks in plan.json",
-            f"reviewPolicy defaults to {review_policy!r}",
+            f"reviewPolicy is {review_policy!r}"
+            + (
+                " — schema v2 required review for every task, so this preserves that"
+                " obligation; pass --review-policy risk_based to loosen it deliberately"
+                if review_policy == "always"
+                else " — chosen explicitly; schema v2 required review for every task"
+            ),
             "recorded worktree paths are cleared; the location is derived per checkout",
         ],
     }
 
 
-def apply_migration(path: Path | str, *, review_policy: str = "risk_based") -> dict[str, Any]:
+def apply_migration(path: Path | str, *, review_policy: str = "always") -> dict[str, Any]:
     path = Path(path)
     plan = plan_migration(path, review_policy=review_policy)
     migrated = convert(read_source(path), review_policy=review_policy)

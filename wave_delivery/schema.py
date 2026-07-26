@@ -117,7 +117,7 @@ def validate_state(state: dict[str, Any]) -> None:
     if state.get("schemaVersion") != SCHEMA_VERSION:
         found = state.get("schemaVersion")
         hint = (
-            " run 'wddctl migrate --state <path> --dry-run' to convert it"
+            " run 'wddctl --state <path> migrate --dry-run' to convert it"
             if found == 2
             else ""
         )
