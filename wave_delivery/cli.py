@@ -26,6 +26,7 @@ from .errors import IllegalTransition, WaveDeliveryError
 from .freshness import check_freshness, record_freshness
 from .leases import release_task, start_task, submit_task
 from .merge import merge_task, refresh_task
+from .migration import apply_migration, plan_migration
 from .monitor import monitor_once
 from .plan import apply_plan, read_plan, state_from_plan
 from .review import record_review, record_verification, validate_findings
@@ -141,6 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review_collect.add_argument("--task", required=True)
     review_collect.add_argument("--result", required=True, type=Path, action="append")
+    review_collect.add_argument("--repo", type=Path, default=Path("."))
     _add_concurrency_flags(review_collect)
 
     verify = subparsers.add_parser("verify", help="record verification evidence")
@@ -157,6 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_collect = verify_subparsers.add_parser("collect", help="read an external result file")
     verify_collect.add_argument("--task", required=True)
     verify_collect.add_argument("--result", required=True, type=Path)
+    verify_collect.add_argument("--repo", type=Path, default=Path("."))
     _add_concurrency_flags(verify_collect)
 
     freshness = subparsers.add_parser("freshness", help="classify a task branch against the base")
@@ -212,6 +215,13 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_subparsers.add_parser("status", help="show whether a checkpoint is due")
     reconcile_done = reconcile_subparsers.add_parser("done", help="clear the checkpoint")
     _add_concurrency_flags(reconcile_done)
+
+    migrate = subparsers.add_parser("migrate", help="convert schema-v2 state to the current schema")
+    migrate.add_argument("--dry-run", action="store_true")
+    migrate.add_argument("--apply", action="store_true")
+    migrate.add_argument(
+        "--review-policy", choices=("always", "risk_based", "none"), default="risk_based"
+    )
 
     monitor = subparsers.add_parser("monitor", help="perform one cheap Git observation tick")
     monitor.add_argument("--once", action="store_true", required=True)
@@ -403,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
             from .review import collect_review
 
             state, duplicate = collect_review(
-                store, task_id=args.task, result_paths=args.result, **_concurrency(args)
+                store, task_id=args.task, result_paths=args.result, repo=args.repo, **_concurrency(args)
             )
             _print_json({"revision": state["revision"], "duplicate": duplicate})
             return 0
@@ -430,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
             from .review import collect_verification
 
             state, duplicate = collect_verification(
-                store, task_id=args.task, result_path=args.result, **_concurrency(args)
+                store, task_id=args.task, result_path=args.result, repo=args.repo, **_concurrency(args)
             )
             _print_json({"revision": state["revision"], "duplicate": duplicate})
             return 0
@@ -511,6 +521,13 @@ def main(argv: list[str] | None = None) -> int:
                 **_concurrency(args),
             )
             _print_json({"revision": state["revision"], "duplicate": duplicate})
+            return 0
+
+        if args.command == "migrate":
+            if args.apply == args.dry_run:
+                parser.error("choose exactly one of --dry-run or --apply")
+            runner = apply_migration if args.apply else plan_migration
+            _print_json(runner(args.state, review_policy=args.review_policy))
             return 0
 
         if args.command == "monitor":

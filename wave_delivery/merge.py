@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .engine import apply_event, task_gate
-from .errors import IllegalTransition, ValidationError
+from .errors import IllegalTransition, RevisionConflict, ValidationError
 from .freshness import check_freshness
 from .git import (
     ensure_worktree,
@@ -28,6 +28,20 @@ def _task(state: dict[str, Any], task_id: str) -> dict[str, Any]:
         return state["tasks"][task_id]
     except KeyError as error:
         raise ValidationError(f"unknown task: {task_id}") from error
+
+
+def _preflight_revision(state: dict[str, Any], expected_revision: int | None) -> None:
+    """Fail before touching Git, not after.
+
+    Both merge and refresh mutate Git and only then apply an event. Validating
+    the revision inside that later apply left the branch already moved while
+    controller state was unchanged.
+    """
+    if expected_revision is not None and state["revision"] != expected_revision:
+        raise RevisionConflict(
+            f"expected revision {expected_revision}, found {state['revision']}; "
+            "no Git state was changed"
+        )
 
 
 def _base_ref(state: dict[str, Any]) -> str:
@@ -62,6 +76,7 @@ def refresh_task(
     """Merge the scope base into a task branch and record the new head."""
     repo = require_repository(repo)
     state = store.read()
+    _preflight_revision(state, expected_revision)
     task = _task(state, task_id)
     base_ref = _base_ref(state)
     branch = task.get("branch")
@@ -160,6 +175,7 @@ def merge_task(
     """Perform the merge into the scope base, then record it as Git-verified."""
     repo = require_repository(repo)
     state = store.read()
+    _preflight_revision(state, expected_revision)
     task = _task(state, task_id)
     base_ref = _base_ref(state)
 

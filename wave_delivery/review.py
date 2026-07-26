@@ -15,7 +15,7 @@ from typing import Any
 
 from .engine import apply_event
 from .errors import IllegalTransition, ValidationError
-from .git import require_repository, run_git
+from .git import is_ancestor, require_repository, resolve_ref, run_git
 from .store import StateStore, atomic_write_text
 
 
@@ -278,19 +278,56 @@ def run_review(
     return {"output": str(temporary), **normalized}
 
 
+def verify_external_shas(
+    state: dict[str, Any], task_id: str, result: dict[str, Any], repo: Path | str | None
+) -> None:
+    """Bind externally supplied evidence to real commits.
+
+    The transition already rejects a headSha that is not the task's current
+    head. The base was trusted, so a result naming a nonexistent base SHA was
+    accepted and the task still reached merge. Check the base is a real commit
+    and actually an ancestor of the head it claims to describe.
+    """
+    task = state["tasks"][task_id]
+    base_sha, head_sha = result["baseSha"], result["headSha"]
+    if head_sha != task.get("headSha"):
+        raise IllegalTransition(
+            f"evidence head {head_sha} does not match the current head of {task_id}"
+        )
+    if repo is None:
+        raise IllegalTransition(
+            "collecting external evidence requires --repo so its SHAs can be verified"
+        )
+    repository = require_repository(repo)
+    for label, sha in (("baseSha", base_sha), ("headSha", head_sha)):
+        try:
+            resolve_ref(repository, sha)
+        except ValidationError as error:
+            raise IllegalTransition(
+                f"evidence {label} {sha} is not a commit in this repository"
+            ) from error
+    if not is_ancestor(repository, base_sha, head_sha):
+        raise IllegalTransition(
+            f"evidence baseSha {base_sha} is not an ancestor of headSha {head_sha}"
+        )
+
+
 def collect_review(
     store: StateStore,
     *,
     task_id: str,
     result_paths: list[Path | str],
+    repo: Path | str | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
+    result = normalize_review_results(result_paths, task_id=task_id)
+    verify_external_shas(store.read(), task_id, result, repo)
     return apply_event(
         store,
         event_type="review.recorded",
         task_id=task_id,
-        data=normalize_review_results(result_paths, task_id=task_id),
+        data=result,
         idempotency_key=idempotency_key,
         expected_revision=expected_revision,
     )
@@ -301,14 +338,17 @@ def collect_verification(
     *,
     task_id: str,
     result_path: Path | str,
+    repo: Path | str | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
+    result = normalize_verification_result(result_path, task_id=task_id)
+    verify_external_shas(store.read(), task_id, result, repo)
     return apply_event(
         store,
         event_type="verification.recorded",
         task_id=task_id,
-        data=normalize_verification_result(result_path, task_id=task_id),
+        data=result,
         idempotency_key=idempotency_key,
         expected_revision=expected_revision,
     )

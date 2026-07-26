@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import fnmatch
 from pathlib import Path
 from typing import Any
 
+from .domains import matches_domain
 from .engine import apply_event
 from .errors import IllegalTransition, ValidationError
 from .git import require_repository, resolve_ref, run_git
@@ -25,10 +25,7 @@ def _changed_paths(repo: Path, start: str, end: str) -> list[str]:
     return sorted(path for path in output.splitlines() if path)
 
 
-def _matches_domain(path: str, domain: str) -> bool:
-    if domain.endswith("/**"):
-        return path.startswith(domain[:-3])
-    return fnmatch.fnmatch(path, domain) or path == domain
+_matches_domain = matches_domain
 
 
 def check_freshness(

@@ -115,8 +115,14 @@ def validate_state(state: dict[str, Any]) -> None:
     if not isinstance(state, dict):
         raise ValidationError("controller state must be an object")
     if state.get("schemaVersion") != SCHEMA_VERSION:
+        found = state.get("schemaVersion")
+        hint = (
+            " run 'wddctl migrate --state <path> --dry-run' to convert it"
+            if found == 2
+            else ""
+        )
         raise ValidationError(
-            f"unsupported schemaVersion {state.get('schemaVersion')!r}; expected {SCHEMA_VERSION}"
+            f"unsupported schemaVersion {found!r}; expected {SCHEMA_VERSION}.{hint}"
         )
     revision = state.get("revision")
     if not isinstance(revision, int) or revision < 0:

@@ -5,9 +5,11 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import shlex
 from copy import deepcopy
 from typing import Any, Callable
 
+from .domains import overlapping_domains
 from .errors import IllegalTransition, RevisionConflict, ValidationError
 from .schema import TASK_STATUSES, copied_state
 from .store import StateStore, atomic_write_text
@@ -116,12 +118,12 @@ def admission_blocker(state: dict[str, Any], task_id: str) -> dict[str, Any] | N
         for domain in other["conflictDomains"]:
             holder_by_domain.setdefault(domain, other_id)
 
-    overlap = sorted(set(task["conflictDomains"]) & set(holder_by_domain))
-    if overlap:
+    collisions = overlapping_domains(task["conflictDomains"], holder_by_domain)
+    if collisions:
         return {
             "code": "conflict_domains",
-            "domains": overlap,
-            "heldBy": sorted({holder_by_domain[domain] for domain in overlap}),
+            "domains": sorted(collisions),
+            "heldBy": sorted(set(collisions.values())),
         }
 
     limit = state["scope"].get("maxConcurrent")
@@ -137,6 +139,21 @@ def task_gate(state: dict[str, Any], task: dict[str, Any]) -> str:
     if status == "review":
         return "reviewing"
     if status == "merge_ready":
+        # Re-check evidence, not just freshness: tightening reviewPolicy after a
+        # task reached merge_ready must re-gate it rather than let it merge with
+        # review: null.
+        if has_blocking_findings(task):
+            return "needs_fixes"
+        if review_required(state, task):
+            review = task.get("review")
+            if not _head_matches(review, task.get("headSha")) or review.get("outcome") != "passed":
+                return "needs_review"
+        verification = task.get("verification")
+        if (
+            not _head_matches(verification, task.get("headSha"))
+            or verification.get("status") != "passed"
+        ):
+            return "needs_verification"
         freshness = task.get("freshness")
         if (
             isinstance(freshness, dict)
@@ -273,7 +290,7 @@ def transition(
     elif event_type == "review.recorded":
         # in_progress is accepted so that raising reviewPolicy mid-flight, or
         # reviewing a task the policy did not require, cannot wedge the gate.
-        _require_status(task, {"review", "in_progress"}, event_type)
+        _require_status(task, {"review", "in_progress", "merge_ready"}, event_type)
         if not task.get("pr"):
             raise IllegalTransition("review.recorded requires a submitted task")
         base_sha = _require_data_string(data, "baseSha", event_type)
@@ -297,6 +314,8 @@ def transition(
             "reviewer": data.get("reviewer"),
         }
         task["status"] = "in_progress"
+        if task_gate(state, task) == "ready_to_merge":
+            task["status"] = "merge_ready"
     elif event_type == "verification.recorded":
         _require_status(task, {"in_progress"}, event_type)
         base_sha = _require_data_string(data, "baseSha", event_type)
@@ -522,10 +541,13 @@ def decorate_actions(
     ``command`` runs now. ``recordWith`` records the outcome once the judgment
     work (implementing, reviewing, verifying) is done.
     """
-    prefix = "wddctl" + (f" --state {state_path}" if state_path else "")
+    # Every dynamic value is shell-quoted: these strings are documented as
+    # copy-pasteable, and a task id containing shell metacharacters would
+    # otherwise produce an executable injected command.
+    prefix = "wddctl" + (f" --state {shlex.quote(state_path)}" if state_path else "")
     for action in result["actions"]:
         run_now, record_with = ACTION_COMMANDS.get(action["action"], (None, None))
-        fields = {"task": action["task"], "repo": repo}
+        fields = {"task": shlex.quote(action["task"]), "repo": shlex.quote(repo)}
         if run_now:
             action["command"] = f"{prefix} {run_now.format(**fields)}"
         if record_with:

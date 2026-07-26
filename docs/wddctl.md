@@ -42,9 +42,14 @@ Every mutating command accepts `--expected-revision N` and
 `--idempotency-key KEY`. Both are optional everywhere:
 
 - Omit them and `wddctl` reads the current revision under the same exclusive
-  lock that guards the write, and derives an idempotency key from the event
-  payload. A retried identical call collapses to a no-op instead of
-  double-applying.
+  lock that guards the write, and gives the event a unique id. It does *not*
+  dedupe by payload: a payload-derived key cannot tell a retry from a
+  legitimately repeated event, and doing so silently wedged scopes (an
+  argument-free `reconcile done` became a one-shot per scope). Retries are
+  safe by construction instead — every transition is either guarded by the
+  status it requires or writes evidence by overwriting it.
+- Pass `--idempotency-key` when you genuinely need at-most-once semantics;
+  it is honoured exactly, and a second call with the same key is a no-op.
 - Pass them when several controllers or processes share one scope and you
   need a hard conflict instead of a silent merge of intent — `wddctl` raises
   `RevisionConflict` if the state moved since you last read it.
@@ -487,6 +492,22 @@ one, or when any note is pending. `next` surfaces this as a
 `run_reconciliation` action. `reconcile done` clears the merge counter and
 pending notes and stamps the checkpoint time.
 
+### `migrate`
+
+Convert schema-v2 controller state (produced by `wddctl init` on older
+revisions) to the current schema. Dry-run first; `--apply` writes a
+`.v2.bak` backup beside the state file before converting.
+
+```sh
+wddctl migrate --state .wdd/state.json --dry-run
+wddctl migrate --state .wdd/state.json --apply [--review-policy risk_based]
+```
+
+Waves are dropped (scheduling is derived from dependencies and conflict
+domains), every task defaults to `risk: normal`, and recorded worktree paths
+are cleared because the location is derived per checkout. Reading v2 state
+without migrating fails with a message pointing here.
+
 ### `monitor`
 
 One cheap, zero-LLM Git observation tick — branch/worktree state, nothing
@@ -551,6 +572,14 @@ about the commit that replaced it.
   local file lock, reads the current revision under that lock, and records
   an idempotency key (explicit or derived) before writing — see "Optional
   concurrency flags" above.
+- **External evidence is verified, not trusted.** `review collect` and
+  `verify collect` require `--repo` and check that the envelope's `baseSha`
+  is a real commit and an actual ancestor of the `headSha` it claims to
+  describe. A result naming a nonexistent base is refused.
+- **Conflict domains overlap semantically.** `src/auth/**` blocks
+  `src/auth/token.py`; the comparison is not string equality. Where overlap
+  is undecidable the answer is "they overlap", because over-blocking costs
+  parallelism and under-blocking costs a silently lost diff.
 - **Evidence pinned to head SHA.** Review and verification results carry the
   exact `baseSha`/`headSha` they were produced against; the transition layer
   rejects evidence that doesn't match the task's current head.

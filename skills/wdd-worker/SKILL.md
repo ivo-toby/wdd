@@ -14,9 +14,12 @@ controller already created for you.
   it) and confirm it's on the assigned branch before editing anything.
 - Never switch, create, or reset branches in the controller checkout — that
   checkout isn't yours to move.
-- Read the task's `specPath` brief first: objective, scope, non-scope,
-  conflict domains, verification command. Read named files before doing
-  broad discovery.
+- Read your brief first: objective, scope, non-scope, conflict domains,
+  verification command. Read named files before doing broad discovery. The
+  controller gives you the brief's **absolute path in its own checkout** —
+  do not look for it inside your worktree. Your branch was cut from a
+  committed base, so briefs that were written but not committed are not
+  there.
 
 ## Stay in scope
 
@@ -31,15 +34,17 @@ controller already created for you.
 
 ## Finish
 
-- Commit your work, then run `wddctl submit --task ID --repo . [--pr URL]`
-  to record the deliverable — the head SHA is read from the branch, you
-  don't supply it.
-- If you made a discovery that matters beyond this task (a shared
-  assumption that turned out false, a gotcha the next worker needs), queue
-  it with `wddctl note --note "..." --task ID` rather than burying it in a
-  commit message. This is what makes reconciliation due.
-- Do not merge your own work — that's the controller's job via
-  `wddctl merge`.
+- Commit your work in your worktree. That is your whole deliverable.
+- **Do not run `wddctl` at all.** State belongs to the controller, and
+  `wddctl` resolves `--state` and `--repo` relative to the working
+  directory — run from your worktree it would read a state file that isn't
+  there, or worse, the wrong one. The controller records your submission
+  once you report back.
+- Report any discovery that matters beyond this task (a shared assumption
+  that turned out false, a gotcha the next worker needs) in your final
+  message. The controller queues it with `wddctl note`; that is what makes
+  reconciliation due.
+- Do not merge your own work — that's the controller's job.
 
 ## Final status
 

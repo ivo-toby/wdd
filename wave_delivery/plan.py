@@ -8,7 +8,7 @@ from typing import Any
 
 from .engine import apply_mutation
 from .errors import IllegalTransition, ValidationError
-from .git import branch_exists, require_repository, resolve_ref, run_git
+from .git import branch_exists, require_repository, resolve_ref, run_git, validate_ref_name
 from .schema import (
     REVIEW_POLICIES,
     RISK_LEVELS,
@@ -50,8 +50,8 @@ def validate_plan(plan: Any) -> dict[str, Any]:
     if not isinstance(scope_id, str) or not scope_id:
         raise ValidationError("plan.scope.id must be a non-empty string")
     base_ref = scope.get("baseRef")
-    if base_ref is not None and (not isinstance(base_ref, str) or not base_ref):
-        raise ValidationError("plan.scope.baseRef must be a non-empty string or null")
+    if base_ref is not None:
+        validate_ref_name(base_ref, what="plan.scope.baseRef")
     policy = scope.get("reviewPolicy", "risk_based")
     if policy not in REVIEW_POLICIES:
         raise ValidationError(f"plan.scope.reviewPolicy must be one of {sorted(REVIEW_POLICIES)}")
@@ -234,6 +234,9 @@ def _apply_plan_to_state(state: dict[str, Any], plan: dict[str, Any]) -> dict[st
 def ensure_base_branch(repo: Path | str, base_ref: str, *, from_ref: str | None) -> dict[str, Any]:
     """Create the scope base branch if it does not exist yet."""
     repo = require_repository(repo)
+    validate_ref_name(base_ref, what="base ref")
+    if from_ref is not None:
+        validate_ref_name(from_ref, what="--from-ref")
     if branch_exists(repo, base_ref):
         return {"baseRef": base_ref, "action": "verified", "baseSha": resolve_ref(repo, base_ref)}
     start = from_ref or "HEAD"

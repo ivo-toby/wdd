@@ -19,6 +19,7 @@ from wave_delivery.constitution import (
 from wave_delivery.doctor import inspect_capabilities
 from wave_delivery.engine import (
     admission_blocker,
+    decorate_actions,
     admission_schedule,
     apply_event,
     bounded_next_actions,
@@ -34,8 +35,15 @@ from wave_delivery.freshness import check_freshness, record_freshness
 from wave_delivery.git import worktree_for
 from wave_delivery.leases import release_task, start_task, submit_task
 from wave_delivery.merge import merge_task, refresh_task
+from wave_delivery.migration import apply_migration, plan_migration
 from wave_delivery.monitor import monitor_once
-from wave_delivery.plan import apply_plan, read_plan, state_from_plan, validate_plan
+from wave_delivery.plan import (
+    apply_plan,
+    ensure_base_branch,
+    read_plan,
+    state_from_plan,
+    validate_plan,
+)
 from wave_delivery.review import (
     collect_review,
     collect_verification,
@@ -193,6 +201,215 @@ class AdmissionTests(BaseTest):
             start_task(store, repo=repo, task_id="TASK-B")
         self.assertIn("conflict_domains", str(raised.exception))
         self.assertFalse((repo.parent / "proj.wdd" / "worktrees" / "SCOPE-demo" / "TASK-B").exists())
+
+
+class ReviewFindingRegressionTests(BaseTest):
+    """One test per reviewer finding, so none of them can silently return."""
+
+    def test_conflict_domains_overlap_semantically_not_by_string_equality(self) -> None:
+        for held, wanted, expect_blocked in [
+            ("src/auth/**", "src/auth/token.py", True),
+            ("src/auth/**", "src/auth/deep/nested.ts", True),
+            ("src/**", "src/auth/**", True),
+            ("*.py", "src/x.py", True),
+            ("src/*.ts", "src/a.ts", True),
+            ("src/auth/**", "src/schema.ts", False),
+            ("docs/**", "src/**", False),
+            ("src/a.ts", "src/b.ts", False),
+        ]:
+            state = ratified(new_state("SCOPE-x", base_ref="wdd/x"))
+            state["tasks"]["HOLDER"] = task_state("HOLDER", conflict_domains=[held])
+            state["tasks"]["HOLDER"]["status"] = "in_progress"
+            state["tasks"]["WANTER"] = task_state("WANTER", conflict_domains=[wanted])
+            blocked = admission_blocker(state, "WANTER") is not None
+            self.assertEqual(
+                blocked, expect_blocked, f"{held!r} vs {wanted!r} should block={expect_blocked}"
+            )
+
+    def test_an_option_like_base_ref_never_reaches_git(self) -> None:
+        repo = self.repository()
+        self.git(repo, "branch", "victim")
+        with self.assertRaises(ValidationError):
+            validate_plan(self.plan_document(scope={"baseRef": "-D"}))
+        with self.assertRaises(ValidationError):
+            ensure_base_branch(repo, "-D", from_ref="victim")
+        # The branch it would have deleted is still there.
+        self.assertIn("victim", self.git(repo, "branch", "--format=%(refname:short)").split())
+
+    def test_emitted_commands_quote_shell_metacharacters(self) -> None:
+        result = decorate_actions(
+            {"actions": [{"task": "TASK-A; touch /tmp/pwned", "action": "start_task"}]},
+            repo=".",
+        )
+        command = result["actions"][0]["command"]
+        self.assertNotIn("; touch", shlex.split(command)[0])
+        # Splitting the way a shell would yields the task id as ONE argument.
+        self.assertIn("TASK-A; touch /tmp/pwned", shlex.split(command))
+
+    def test_merge_and_refresh_check_the_revision_before_touching_git(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        result, _ = start_task(store, repo=repo, task_id="TASK-A")
+        self.commit_in(result["worktree"], "src/schema.ts", "x\n")
+        submit_task(store, repo=repo, task_id="TASK-A")
+        record_verification(store, task_id="TASK-A", status="passed", repo=repo)
+        record_freshness(store, repo=repo, task_id="TASK-A")
+        base_before = self.git(repo, "rev-parse", "wdd/demo")
+
+        with self.assertRaises(RevisionConflict):
+            merge_task(store, repo=repo, task_id="TASK-A", expected_revision=0)
+        self.assertEqual(self.git(repo, "rev-parse", "wdd/demo"), base_before)
+
+        head_before = self.git(repo, "rev-parse", "task/TASK-A")
+        with self.assertRaises(RevisionConflict):
+            refresh_task(store, repo=repo, task_id="TASK-A", expected_revision=0)
+        self.assertEqual(self.git(repo, "rev-parse", "task/TASK-A"), head_before)
+
+    def test_tightening_the_policy_re_gates_a_merge_ready_task(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)  # risk_based, TASK-A is normal risk -> no review
+        result, _ = start_task(store, repo=repo, task_id="TASK-A")
+        self.commit_in(result["worktree"], "src/schema.ts", "x\n")
+        submit_task(store, repo=repo, task_id="TASK-A")
+        record_verification(store, task_id="TASK-A", status="passed", repo=repo)
+        record_freshness(store, repo=repo, task_id="TASK-A")
+        self.assertEqual(store.read()["tasks"]["TASK-A"]["status"], "merge_ready")
+        self.assertIsNone(store.read()["tasks"]["TASK-A"]["review"])
+
+        apply_plan(store, validate_plan(self.plan_document(scope={"reviewPolicy": "always"})), repo=repo)
+        state = store.read()
+        self.assertEqual(task_gate(state, state["tasks"]["TASK-A"]), "needs_review")
+        with self.assertRaises(IllegalTransition):
+            merge_task(store, repo=repo, task_id="TASK-A")
+
+        # And the re-gated task is not wedged: a review unblocks it again.
+        record_review(store, task_id="TASK-A", findings=[], reviewer="rev", repo=repo)
+        record_freshness(store, repo=repo, task_id="TASK-A")
+        merge_task(store, repo=repo, task_id="TASK-A")
+        self.assertEqual(store.read()["tasks"]["TASK-A"]["status"], "done")
+
+    def test_external_evidence_must_name_real_commits(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo, self.plan_document(scope={"reviewPolicy": "always"}))
+        result, _ = start_task(store, repo=repo, task_id="TASK-A")
+        head = self.commit_in(result["worktree"], "src/schema.ts", "x\n")
+        submit_task(store, repo=repo, task_id="TASK-A")
+
+        bogus = self.root / "bogus.json"
+        bogus.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "kind": "wddctl_review_result",
+                    "task": "TASK-A",
+                    "baseSha": "0" * 40,
+                    "headSha": head,
+                    "reviewer": "external",
+                    "findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaises(IllegalTransition) as raised:
+            collect_review(store, task_id="TASK-A", result_paths=[bogus], repo=repo)
+        self.assertIn("not a commit", str(raised.exception))
+
+    def test_submit_measures_against_the_base_the_task_started_from(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        # TASK-C starts, does nothing. TASK-A lands work, advancing the base.
+        start_task(store, repo=repo, task_id="TASK-C")
+        worked, _ = start_task(store, repo=repo, task_id="TASK-A")
+        self.commit_in(worked["worktree"], "src/schema.ts", "real work\n")
+        submit_task(store, repo=repo, task_id="TASK-A")
+        record_verification(store, task_id="TASK-A", status="passed", repo=repo)
+        record_freshness(store, repo=repo, task_id="TASK-A")
+        merge_task(store, repo=repo, task_id="TASK-A")
+
+        # TASK-C still has zero commits of its own; the moving base must not
+        # make an untouched branch look like work.
+        with self.assertRaises(IllegalTransition) as raised:
+            submit_task(store, repo=repo, task_id="TASK-C")
+        self.assertIn("nothing to submit", str(raised.exception))
+
+
+class MigrationTests(BaseTest):
+    def v2_state(self) -> dict:
+        return {
+            "schemaVersion": 2,
+            "revision": 4,
+            "scope": {"id": "SCOPE-old", "kind": "epic", "baseRef": "epic/x"},
+            "constitution": {
+                "status": "ratified",
+                "ratification": {"by": "i", "decisionFingerprint": "f", "at": "t"},
+            },
+            "tasks": {
+                "T1": {
+                    "id": "T1",
+                    "specPath": "tasks/T1.md",
+                    "status": "in_progress",
+                    "dependsOn": [],
+                    "conflictDomains": ["src/**"],
+                    "branch": "task/T1",
+                    "worktree": "/machine/that/no/longer/exists",
+                    "headSha": None,
+                    "pr": None,
+                    "review": None,
+                    "verification": None,
+                    "freshness": None,
+                    "merge": None,
+                    "blocker": None,
+                }
+            },
+            "waves": {},
+            "monitoring": {
+                "mode": "manual",
+                "status": "inactive",
+                "lastCheckedAt": None,
+                "nextCheckDueAt": None,
+                "observations": {},
+            },
+            "events": [],
+            "appliedIdempotencyKeys": [],
+            "telemetry": {"eventApplications": 4, "renderCount": 0},
+        }
+
+    def test_v2_state_is_not_a_dead_end(self) -> None:
+        path = self.root / "state.json"
+        path.write_text(json.dumps(self.v2_state()), encoding="utf-8")
+        with self.assertRaises(ValidationError) as raised:
+            StateStore(path).read()
+        self.assertIn("migrate", str(raised.exception))
+
+    def test_dry_run_does_not_write(self) -> None:
+        path = self.root / "state.json"
+        original = json.dumps(self.v2_state())
+        path.write_text(original, encoding="utf-8")
+        plan_migration(path)
+        self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_apply_converts_and_backs_up(self) -> None:
+        path = self.root / "state.json"
+        path.write_text(json.dumps(self.v2_state()), encoding="utf-8")
+        result = apply_migration(path)
+        self.assertTrue(Path(result["backup"]).exists())
+
+        migrated = StateStore(path).read()
+        self.assertEqual(migrated["schemaVersion"], 3)
+        self.assertEqual(migrated["tasks"]["T1"]["risk"], "normal")
+        self.assertEqual(migrated["tasks"]["T1"]["title"], "T1")
+        self.assertEqual(migrated["scope"]["reviewPolicy"], "risk_based")
+        self.assertNotIn("waves", migrated)
+        # The stale absolute worktree from the old machine is cleared.
+        self.assertIsNone(migrated["tasks"]["T1"]["worktree"])
+        self.assertEqual(migrated["revision"], 4)
+
+    def test_migrating_current_state_is_refused(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        with self.assertRaises(ValidationError) as raised:
+            plan_migration(store.path)
+        self.assertIn("already schema", str(raised.exception))
 
 
 class PlanTests(BaseTest):
@@ -539,7 +756,7 @@ class EvidenceTests(BaseTest):
             ),
             encoding="utf-8",
         )
-        collect_review(store, task_id="TASK-A", result_paths=[review_file])
+        collect_review(store, task_id="TASK-A", result_paths=[review_file], repo=repo)
 
         verification_file = self.root / "verify.json"
         verification_file.write_text(
@@ -556,7 +773,7 @@ class EvidenceTests(BaseTest):
             ),
             encoding="utf-8",
         )
-        collect_verification(store, task_id="TASK-A", result_path=verification_file)
+        collect_verification(store, task_id="TASK-A", result_path=verification_file, repo=repo)
         self.assertEqual(store.read()["tasks"]["TASK-A"]["status"], "merge_ready")
 
     def test_a_wrong_envelope_is_rejected_with_a_useful_message(self) -> None:
@@ -565,7 +782,7 @@ class EvidenceTests(BaseTest):
         bad = self.root / "bad.json"
         bad.write_text(json.dumps({"baseSha": "a", "headSha": "b", "findings": []}), encoding="utf-8")
         with self.assertRaises(ValidationError) as raised:
-            collect_review(store, task_id="TASK-A", result_paths=[bad])
+            collect_review(store, task_id="TASK-A", result_paths=[bad], repo=repo)
         self.assertIn("wddctl_review_result", str(raised.exception))
 
 
@@ -1103,7 +1320,18 @@ class CliTests(BaseTest):
         self.commit_in(worktree, "src/schema.ts", "cli change\n")
         self.assertEqual(run("submit", "--task", "TASK-A", "--repo", str(repo)), 0)
         self.assertEqual(
-            run("verify", "record", "--task", "TASK-A", "--status", "passed", "--command", "pytest"),
+            run(
+                "verify",
+                "record",
+                "--task",
+                "TASK-A",
+                "--status",
+                "passed",
+                "--command",
+                "pytest",
+                "--repo",
+                str(repo),
+            ),
             0,
         )
         self.assertEqual(run("freshness", "record", "--task", "TASK-A", "--repo", str(repo)), 0)
@@ -1129,6 +1357,8 @@ class CliTests(BaseTest):
                 "passed",
                 "--command",
                 "npm test",
+                "--repo",
+                str(repo),
             ]
         )
         self.assertEqual(code, 0)

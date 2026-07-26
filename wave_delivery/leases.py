@@ -208,11 +208,22 @@ def submit_task(
                 f"task {task_id} has uncommitted changes in {resolved_worktree}; commit them before submitting"
             )
     head_sha = resolve_ref(repo, branch)
-    base_ref = state["scope"].get("baseRef")
-    if base_ref and head_sha == resolve_ref(repo, base_ref):
-        raise IllegalTransition(
-            f"task {task_id} has no commits of its own on {branch}; there is nothing to submit"
-        )
+    # Compare against the base this task actually started from. Comparing with
+    # the *current* base let an untouched branch look like work as soon as
+    # another task advanced the base.
+    lease = (state.get("leases") or {}).get(task_id) or {}
+    origin = lease.get("baseSha") or (
+        resolve_ref(repo, state["scope"]["baseRef"]) if state["scope"].get("baseRef") else None
+    )
+    if origin:
+        own_commits = run_git(
+            repo, "rev-list", "--count", f"{origin}..{head_sha}", check=False
+        ).stdout.strip()
+        if own_commits in {"", "0"}:
+            raise IllegalTransition(
+                f"task {task_id} has no commits of its own on {branch} since it started; "
+                "there is nothing to submit"
+            )
     reference = pr or f"branch:{branch}@{head_sha[:12]}"
     event = "task.pr_recorded" if task.get("headSha") is None else "task.head_updated"
     data = {"pr": reference, "headSha": head_sha} if event == "task.pr_recorded" else {"headSha": head_sha}
