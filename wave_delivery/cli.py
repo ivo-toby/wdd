@@ -32,6 +32,9 @@ from .review import record_review, record_verification, validate_findings
 from .store import StateStore
 
 
+DEFAULT_STATE = Path(".wdd/state.json")
+
+
 def _json_argument(value: str) -> Any:
     try:
         return json.loads(value)
@@ -66,7 +69,7 @@ def _add_concurrency_flags(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wddctl", description=__doc__)
-    parser.add_argument("--state", type=Path, default=Path(".wdd/state.json"))
+    parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     plan = subparsers.add_parser("plan", help="create or update a scope from a plan file")
@@ -90,10 +93,12 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true")
 
     next_command = subparsers.add_parser("next", help="show executable next actions and blockers")
-    next_command.add_argument("--max-bytes", type=int, default=2048)
+    next_command.add_argument("--max-bytes", type=int, default=4096)
+    next_command.add_argument("--repo", type=Path, default=Path("."))
 
     render = subparsers.add_parser("render", help="render a Markdown state projection")
     render.add_argument("--output", required=True, type=Path)
+    render.add_argument("--repo", type=Path, default=Path("."))
 
     start = subparsers.add_parser(
         "start", help="admit a task, create its isolated worktree, and mark it in progress"
@@ -262,6 +267,12 @@ def _brief(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _state_option(args: argparse.Namespace) -> str | None:
+    """Echo --state back into emitted commands only when it is not the default."""
+    state = str(args.state)
+    return None if state == str(DEFAULT_STATE) else state
+
+
 def _concurrency(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "expected_revision": getattr(args, "expected_revision", None),
@@ -317,12 +328,21 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "next":
-            _print_json(bounded_next_actions(store.read(), max_bytes=args.max_bytes))
+            _print_json(
+                bounded_next_actions(
+                    store.read(),
+                    max_bytes=args.max_bytes,
+                    state_path=_state_option(args),
+                    repo=str(args.repo),
+                )
+            )
             return 0
 
         if args.command == "render":
             state = store.read()
-            render_to_path(state, args.output)
+            render_to_path(
+                state, args.output, state_path=_state_option(args), repo=str(args.repo)
+            )
             _print_json({"rendered": str(args.output), "revision": state["revision"]})
             return 0
 

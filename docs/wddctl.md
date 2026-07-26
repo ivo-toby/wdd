@@ -26,9 +26,9 @@ wddctl --state /path/to/.wdd/state.json status
 ## The loop
 
 ```sh
-wddctl next                     # what needs doing
-<do the one thing needing judgment>
-wddctl <verb> --task ID         # record it
+wddctl next                     # what needs doing, and the command for it
+<run the action's `command`, or do the judgment work>
+<run the action's `recordWith` to record the outcome>
 ```
 
 Repeat until `next` reports no actions. A typical task with no separate
@@ -136,22 +136,49 @@ The action queue — read-only, and the thing to run every iteration of the
 loop.
 
 ```sh
-wddctl next [--max-bytes N]
+wddctl next [--max-bytes N] [--repo PATH]
 ```
 
-`--max-bytes` (default 2048) bounds the output size for prompt budgets;
+`--max-bytes` (default 4096) bounds the output size for prompt budgets;
 `wddctl` shrinks the action list until the rendered JSON fits and reports
-`"truncated": true` if anything was cut. Output shape:
+`"truncated": true` if anything was cut. Commands are attached before the
+budget is measured, so the limit stays honest. Output shape:
 
 ```json
 {
   "scope": "SCOPE-auth-refresh",
   "revision": 7,
-  "actions": [{"task": "TASK-002-refresh-route", "action": "start_task"}],
+  "actions": [
+    {
+      "task": "TASK-002-refresh-route",
+      "action": "start_task",
+      "command": "wddctl start --task TASK-002-refresh-route --repo ."
+    },
+    {
+      "task": "TASK-001-token-types",
+      "action": "await_worker",
+      "recordWith": "wddctl submit --task TASK-001-token-types --repo ."
+    }
+  ],
   "blockers": [{"task": "TASK-003-session-ui", "code": "dependencies", "dependsOn": ["TASK-001-token-types"]}],
   "truncated": false
 }
 ```
+
+Each action carries the literal command to use, so no caller has to translate
+an action name into an invocation:
+
+- **`command`** — run it as-is, right now. Emitted for `start_task`,
+  `check_branch_freshness`, and `merge_task`.
+- **`recordWith`** — the step needs judgment first (implement, review, run
+  the tests). Do that, then run this to record the outcome. Emitted for
+  `await_worker`, `run_review`, `run_verification`, `assign_fix_writer`, and
+  `run_reconciliation`.
+
+An action never carries both: either it is mechanical enough to run now, or
+it is a piece of work whose result gets recorded afterwards. `--repo` (default
+`.`) and a non-default `--state` are echoed into the emitted commands so they
+stay copy-pasteable; the default `--state` is omitted for brevity.
 
 A single pass never proposes two conflicting starts: admission is simulated
 task by task within the same call.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -677,6 +678,58 @@ class LifecycleTests(BaseTest):
         rendered = render_controller_state(store.read())
         self.assertIn("TASK-A", rendered)
         self.assertIn("Do not edit", rendered)
+
+    def test_next_emits_the_literal_command_for_each_action(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        actions = {a["task"]: a for a in bounded_next_actions(store.read())["actions"]}
+        self.assertEqual(actions["TASK-A"]["action"], "start_task")
+        self.assertEqual(
+            actions["TASK-A"]["command"], "wddctl start --task TASK-A --repo ."
+        )
+        # start_task is a command to run now, so it carries no follow-up recording.
+        self.assertNotIn("recordWith", actions["TASK-A"])
+
+        start_task(store, repo=repo, task_id="TASK-A")
+        awaiting = {a["task"]: a for a in bounded_next_actions(store.read())["actions"]}
+        self.assertEqual(awaiting["TASK-A"]["action"], "await_worker")
+        self.assertEqual(
+            awaiting["TASK-A"]["recordWith"], "wddctl submit --task TASK-A --repo ."
+        )
+        # await_worker is a wait, so there is nothing to run right now.
+        self.assertNotIn("command", awaiting["TASK-A"])
+
+    def test_emitted_commands_echo_a_non_default_state_path(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        actions = bounded_next_actions(store.read(), state_path="custom/state.json")["actions"]
+        self.assertTrue(
+            actions[0]["command"].startswith("wddctl --state custom/state.json start")
+        )
+
+    def test_every_emitted_command_is_a_real_cli_invocation(self) -> None:
+        """A command that does not parse would send the agent down a dead end."""
+        from wave_delivery.engine import ACTION_COMMANDS
+        from wave_delivery.cli import build_parser
+
+        parser = build_parser()
+        for action, (run_now, record_with) in ACTION_COMMANDS.items():
+            for template in (run_now, record_with):
+                if not template:
+                    continue
+                rendered = template.format(task="TASK-A", repo=".")
+                # Split the way a shell would: quoted placeholders are one token.
+                argv = shlex.split(rendered)
+                try:
+                    parser.parse_args(argv)
+                except SystemExit:  # pragma: no cover - failure path
+                    self.fail(f"{action} emits an unparseable command: {rendered}")
+
+    def test_render_includes_the_commands(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        rendered = render_controller_state(store.read())
+        self.assertIn("wddctl start --task TASK-A --repo .", rendered)
 
     def test_next_output_stays_within_its_byte_budget(self) -> None:
         state = ratified(new_state("SCOPE-big", base_ref="wdd/big"))
