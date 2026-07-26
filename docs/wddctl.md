@@ -226,7 +226,26 @@ wddctl start --task TASK-001-token-types --repo .
 }
 ```
 
-Implement the task in the printed `worktree` path.
+Implement the task in the printed `worktree` path. Worktrees live beside the
+repository at `<repo>.wdd/worktrees/<scope>/<task>`, never inside its working
+tree, and the location is derived rather than stored (see
+[`artifact-schema.md`](artifact-schema.md)).
+
+Running `start` against a task that is already `in_progress`, `review`, or
+`merge_ready` **re-attaches** it instead of restarting it: the worktree is
+recreated from the task's existing branch and the task keeps its status,
+evidence, and history. `action` comes back as `reattach:<what git did>`. This
+is the handoff path — clone a repository whose committed `state.json` shows
+work in flight, and one `start` puts you back in it:
+
+```sh
+git fetch origin 'refs/heads/task/*:refs/heads/task/*'
+wddctl start --task TASK-001-token-types --repo .   # -> reattach:attach_existing_branch
+```
+
+Re-attaching fails if the task's branch is not present in this repository,
+telling you to fetch it first — the worktree can be recreated, the commits
+cannot.
 
 ### `submit`
 

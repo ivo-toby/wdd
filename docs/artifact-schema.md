@@ -140,6 +140,21 @@ Each entry under `tasks` carries: `id`, `title`, `specPath`, `status`
 the `baseSha`/`headSha` (or `baseRef`) the evidence was pinned to, so a stale
 or mismatched entry is directly visible.
 
+`worktree` is normally `null`, and that is deliberate. A task's worktree lives
+at `<repo>.wdd/worktrees/<scope>/<task>` — a pure function of the checkout it
+belongs to. Recording it would bake this machine's directory name into
+committed state, so a clone into a differently named directory would resolve
+back to the original machine's worktree. The location is derived instead, and
+the field only holds a value when a caller passed an explicit `--worktree`,
+in which case it is stored relative to the repository root.
+
+This is what makes a scope portable. A cloud agent can clone a repository
+whose `state.json` says a task is `in_progress`, find no worktree (they are
+never committed — they sit beside the repository), and run
+`wddctl start --task ID --repo .` to re-attach: the branch is fetched, the
+worktree is recreated in the new checkout's own tree, and the task continues
+from where it was without restarting.
+
 `events` is a full append-only history of every applied transition —
 useful for auditing what happened and when, without needing to reconstruct
 it from Git history.

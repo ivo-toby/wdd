@@ -6,12 +6,22 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from .engine import admission_blocker, apply_event, apply_mutation, transition, utc_now
+from .engine import (
+    ACTIVE_STATUSES,
+    admission_blocker,
+    apply_event,
+    apply_mutation,
+    transition,
+    utc_now,
+)
 from .errors import IllegalTransition, ValidationError
 from .git import (
+    branch_exists,
     ensure_worktree,
+    worktree_override,
     require_repository,
     resolve_ref,
+    worktree_for,
     run_git,
     task_worktree_path,
     worktree_at,
@@ -25,6 +35,56 @@ def _task(state: dict[str, Any], task_id: str) -> dict[str, Any]:
         return state["tasks"][task_id]
     except KeyError as error:
         raise ValidationError(f"unknown task: {task_id}") from error
+
+
+def _reattach(
+    state: dict[str, Any], repo: Path, task_id: str, outcome: dict[str, Any]
+) -> dict[str, Any]:
+    """Recreate the worktree for an already-started task.
+
+    This is the local-agent-to-cloud-agent handoff: the committed state says a
+    task is in progress, its branch exists, but the worktree that lived beside
+    the old checkout was never part of the clone.
+    """
+    task = state["tasks"][task_id]
+    branch = task.get("branch")
+    if not branch:
+        raise IllegalTransition(f"task {task_id} is {task['status']} but has no branch recorded")
+    if not branch_exists(repo, branch):
+        raise IllegalTransition(
+            f"task {task_id} is {task['status']} but branch {branch} is missing from this "
+            "repository; fetch it before re-attaching"
+        )
+    target = worktree_for(repo, state["scope"]["id"], task_id, task.get("worktree"))
+    action = ensure_worktree(repo, target, branch, base_ref=state["scope"].get("baseRef"))
+
+    updated = copied_state(state)
+    updated["tasks"][task_id]["worktree"] = worktree_override(
+        repo, target, state["scope"]["id"], task_id
+    )
+    lease = dict((updated.get("leases") or {}).get(task_id) or {})
+    lease.update(
+        {
+            "status": "active",
+            "branch": branch,
+            "worktree": str(target),
+            "baseRef": state["scope"].get("baseRef"),
+            "headSha": resolve_ref(repo, branch),
+            "reattachedAt": utc_now(),
+        }
+    )
+    updated.setdefault("leases", {})[task_id] = lease
+    outcome.update(
+        {
+            "task": task_id,
+            "action": f"reattach:{action}",
+            "branch": branch,
+            "worktree": str(target),
+            "status": task["status"],
+            "specPath": task["specPath"],
+        }
+    )
+    return updated
 
 
 def start_task(
@@ -45,9 +105,15 @@ def start_task(
     """
     repo = require_repository(repo)
     outcome: dict[str, Any] = {}
+    # A re-attach must not derive the same idempotency key as the original
+    # start, or it would be swallowed as a duplicate and never run.
+    reattaching = _task(store.read(), task_id)["status"] in ACTIVE_STATUSES
+    event_type = "lease.reattached" if reattaching else "task.started"
 
     def mutator(state: dict[str, Any]) -> dict[str, Any]:
         task = _task(state, task_id)
+        if task["status"] in ACTIVE_STATUSES:
+            return _reattach(state, repo, task_id, outcome)
         if task["status"] != "todo":
             raise IllegalTransition(
                 f"task {task_id} is {task['status']}, not todo; nothing to start"
@@ -63,14 +129,16 @@ def start_task(
             raise IllegalTransition("this scope has no configured base ref")
         task_branch = branch or task.get("branch") or f"task/{task_id}"
         task_worktree = Path(
-            worktree or task.get("worktree") or task_worktree_path(repo, state["scope"]["id"], task_id)
+            worktree
+            or worktree_for(repo, state["scope"]["id"], task_id, task.get("worktree"))
         ).resolve()
         action = ensure_worktree(repo, task_worktree, task_branch, base_ref=base_ref)
         head_sha = resolve_ref(repo, task_branch)
 
         updated = transition(state, "task.started", task_id, {})
         updated["tasks"][task_id]["branch"] = task_branch
-        updated["tasks"][task_id]["worktree"] = str(task_worktree)
+        override = worktree_override(repo, task_worktree, state["scope"]["id"], task_id)
+        updated["tasks"][task_id]["worktree"] = override
         updated.setdefault("leases", {})[task_id] = {
             "status": "active",
             "branch": task_branch,
@@ -95,7 +163,7 @@ def start_task(
 
     state, duplicate = apply_mutation(
         store,
-        event_type="task.started",
+        event_type=event_type,
         task_id=task_id,
         data={},
         idempotency_key=idempotency_key,
@@ -130,12 +198,14 @@ def submit_task(
     branch = task.get("branch")
     if not branch:
         raise IllegalTransition(f"task {task_id} has no branch; run 'wddctl start' first")
-    worktree = task.get("worktree")
-    if worktree and Path(worktree).exists():
-        dirty = run_git(worktree, "status", "--porcelain").stdout.strip()
+    resolved_worktree = worktree_for(
+        repo, state["scope"]["id"], task_id, task.get("worktree")
+    )
+    if resolved_worktree.exists():
+        dirty = run_git(resolved_worktree, "status", "--porcelain").stdout.strip()
         if dirty:
             raise IllegalTransition(
-                f"task {task_id} has uncommitted changes in {worktree}; commit them before submitting"
+                f"task {task_id} has uncommitted changes in {resolved_worktree}; commit them before submitting"
             )
     head_sha = resolve_ref(repo, branch)
     base_ref = state["scope"].get("baseRef")
@@ -188,7 +258,7 @@ def release_task(
         lease = (state.get("leases") or {}).get(task_id)
         if not isinstance(lease, dict) or lease.get("status") != "active":
             raise IllegalTransition(f"task {task_id} has no active worktree")
-        path = Path(lease["worktree"])
+        path = worktree_for(repo, state["scope"]["id"], task_id, task.get("worktree"))
         if not keep_worktree:
             entry = worktree_at(repo, path)
             if not entry:

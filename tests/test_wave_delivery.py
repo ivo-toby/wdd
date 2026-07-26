@@ -31,6 +31,7 @@ from wave_delivery.engine import (
 )
 from wave_delivery.errors import IllegalTransition, RevisionConflict, ValidationError
 from wave_delivery.freshness import check_freshness, record_freshness
+from wave_delivery.git import worktree_for
 from wave_delivery.leases import release_task, start_task, submit_task
 from wave_delivery.merge import merge_task, refresh_task
 from wave_delivery.monitor import monitor_once
@@ -594,7 +595,7 @@ class MergeTests(BaseTest):
         store = self.scope(repo)
         self.drive_to_merge_ready(store, repo, "TASK-A", "src/schema.ts")
         merge_task(store, repo=repo, task_id="TASK-A")
-        worktree = Path(store.read()["tasks"]["TASK-A"]["worktree"])
+        worktree = worktree_for(repo, "SCOPE-demo", "TASK-A")
         (worktree / "stray.txt").write_text("unsaved\n", encoding="utf-8")
         with self.assertRaises(IllegalTransition):
             release_task(store, repo=repo, task_id="TASK-A")
@@ -604,7 +605,7 @@ class MergeTests(BaseTest):
         store = self.scope(repo)
         self.drive_to_merge_ready(store, repo, "TASK-A", "src/schema.ts")
         merge_task(store, repo=repo, task_id="TASK-A")
-        worktree = Path(store.read()["tasks"]["TASK-A"]["worktree"])
+        worktree = worktree_for(repo, "SCOPE-demo", "TASK-A")
         release_task(store, repo=repo, task_id="TASK-A")
         self.assertFalse(worktree.exists())
 
@@ -614,6 +615,95 @@ class MergeTests(BaseTest):
         start_task(store, repo=repo, task_id="TASK-A")
         with self.assertRaises(IllegalTransition):
             release_task(store, repo=repo, task_id="TASK-A")
+
+
+class PortabilityTests(BaseTest):
+    """Committed state must survive being cloned to a different directory."""
+
+    def test_the_default_worktree_location_is_not_stored_at_all(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        started, _ = start_task(store, repo=repo, task_id="TASK-A")
+        # Storing it would bake in this checkout's directory name.
+        self.assertIsNone(store.read()["tasks"]["TASK-A"]["worktree"])
+        self.assertEqual(
+            Path(started["worktree"]), worktree_for(repo, "SCOPE-demo", "TASK-A")
+        )
+        self.assertNotIn(str(self.root), json.dumps(store.read()["tasks"]["TASK-A"]))
+
+    def test_a_differently_named_clone_resolves_into_its_own_tree(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        start_task(store, repo=repo, task_id="TASK-A")
+
+        clone = self.root / "elsewhere" / "renamed-checkout"
+        clone.parent.mkdir(parents=True)
+        resolved = worktree_for(
+            clone, "SCOPE-demo", "TASK-A", store.read()["tasks"]["TASK-A"]["worktree"]
+        )
+        # Follows the checkout; never points back at the original directory.
+        self.assertEqual(
+            resolved, clone.parent / "renamed-checkout.wdd" / "worktrees" / "SCOPE-demo" / "TASK-A"
+        )
+        self.assertNotIn("proj.wdd", str(resolved))
+
+    def test_an_explicit_worktree_override_is_stored_relative(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        custom = self.root / "custom-trees" / "TASK-A"
+        started, _ = start_task(store, repo=repo, task_id="TASK-A", worktree=custom)
+        stored = store.read()["tasks"]["TASK-A"]["worktree"]
+        self.assertIsNotNone(stored)
+        self.assertFalse(Path(stored).is_absolute(), f"{stored} must be relative")
+        self.assertEqual(Path(started["worktree"]), custom.resolve())
+        self.assertEqual(worktree_for(repo, "SCOPE-demo", "TASK-A", stored), custom.resolve())
+
+    def test_start_reattaches_a_started_task_whose_worktree_is_gone(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        first, _ = start_task(store, repo=repo, task_id="TASK-A")
+        self.commit_in(first["worktree"], "src/schema.ts", "work\n")
+
+        # Simulate the handoff: the branch is in the repository, the worktree
+        # that lived beside the previous checkout is not.
+        self.git(repo, "worktree", "remove", "--force", first["worktree"])
+        self.assertFalse(Path(first["worktree"]).exists())
+        self.assertEqual(store.read()["tasks"]["TASK-A"]["status"], "in_progress")
+
+        again, duplicate = start_task(store, repo=repo, task_id="TASK-A")
+        self.assertFalse(duplicate)
+        self.assertTrue(again["action"].startswith("reattach:"))
+        self.assertEqual(again["status"], "in_progress")
+        self.assertTrue(Path(again["worktree"]).exists())
+        # The work is still there, and the task did not restart.
+        self.assertEqual(
+            (Path(again["worktree"]) / "src" / "schema.ts").read_text(encoding="utf-8"), "work\n"
+        )
+        self.assertEqual(store.read()["tasks"]["TASK-A"]["status"], "in_progress")
+
+    def test_reattach_then_continue_to_merge(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        first, _ = start_task(store, repo=repo, task_id="TASK-A")
+        self.commit_in(first["worktree"], "src/schema.ts", "work\n")
+        self.git(repo, "worktree", "remove", "--force", first["worktree"])
+
+        start_task(store, repo=repo, task_id="TASK-A")
+        submit_task(store, repo=repo, task_id="TASK-A")
+        record_verification(store, task_id="TASK-A", status="passed", repo=repo)
+        record_freshness(store, repo=repo, task_id="TASK-A")
+        merge_task(store, repo=repo, task_id="TASK-A")
+        self.assertEqual(store.read()["tasks"]["TASK-A"]["status"], "done")
+
+    def test_reattach_refuses_when_the_branch_is_missing(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        first, _ = start_task(store, repo=repo, task_id="TASK-A")
+        self.git(repo, "worktree", "remove", "--force", first["worktree"])
+        self.git(repo, "branch", "-D", "task/TASK-A")
+        with self.assertRaises(IllegalTransition) as raised:
+            start_task(store, repo=repo, task_id="TASK-A")
+        self.assertIn("fetch it", str(raised.exception))
 
 
 class ReconcileTests(BaseTest):
@@ -935,7 +1025,7 @@ class CliTests(BaseTest):
             run("constitution", "ratify", "--by", "tester", "--decision-fingerprint", "sha256:x"), 0
         )
         self.assertEqual(run("start", "--task", "TASK-A", "--repo", str(repo)), 0)
-        worktree = StateStore(state_path).read()["tasks"]["TASK-A"]["worktree"]
+        worktree = worktree_for(repo, "SCOPE-demo", "TASK-A")
         self.commit_in(worktree, "src/schema.ts", "cli change\n")
         self.assertEqual(run("submit", "--task", "TASK-A", "--repo", str(repo)), 0)
         self.assertEqual(

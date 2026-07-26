@@ -4,19 +4,27 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
 from .engine import utc_now
-from .git import branch_exists, require_repository, resolve_ref, run_git, worktree_at
+from .git import (
+    branch_exists,
+    require_repository,
+    resolve_ref,
+    worktree_for,
+    run_git,
+    worktree_at,
+)
 from .schema import copied_state
 from .store import StateStore
 
 
-def _observations(state: dict[str, Any], repo: str) -> tuple[dict[str, Any], list[dict[str, str]]]:
+def _observations(state: dict[str, Any], repo: Path) -> tuple[dict[str, Any], list[dict[str, str]]]:
     observations: dict[str, Any] = {}
     actions: list[dict[str, str]] = []
     for task_id, task in sorted(state["tasks"].items()):
-        item: dict[str, Any] = {"branch": task.get("branch"), "worktree": task.get("worktree")}
+        item: dict[str, Any] = {"branch": task.get("branch")}
         branch = task.get("branch")
         if branch and branch_exists(repo, branch):
             head_sha = resolve_ref(repo, branch)
@@ -26,11 +34,11 @@ def _observations(state: dict[str, Any], repo: str) -> tuple[dict[str, Any], lis
         elif branch:
             item["branchHead"] = None
             actions.append({"task": task_id, "action": "resolve_missing_branch"})
-        worktree = task.get("worktree")
-        if worktree:
-            entry = worktree_at(repo, worktree)
+        if (state.get("leases") or {}).get(task_id, {}).get("status") == "active":
+            resolved = worktree_for(repo, state["scope"]["id"], task_id, task.get("worktree"))
+            entry = worktree_at(repo, resolved)
             if entry:
-                status = run_git(worktree, "status", "--porcelain").stdout.strip()
+                status = run_git(resolved, "status", "--porcelain").stdout.strip()
                 item["worktreeStatus"] = "dirty" if status else "clean"
                 if status:
                     actions.append({"task": task_id, "action": "resolve_dirty_worktree"})
@@ -41,8 +49,8 @@ def _observations(state: dict[str, Any], repo: str) -> tuple[dict[str, Any], lis
     return observations, actions
 
 
-def monitor_once(store: StateStore, *, repo: str, dry_run: bool = False) -> dict[str, Any]:
-    repo = str(require_repository(repo))
+def monitor_once(store: StateStore, *, repo: Path | str, dry_run: bool = False) -> dict[str, Any]:
+    repo = require_repository(repo)
     with store.locked():
         state = store.read()
         observations, actions = _observations(state, repo)

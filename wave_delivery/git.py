@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -70,6 +71,36 @@ def worktree_at(repo: Path | str, path: Path | str) -> dict[str, str] | None:
 def wdd_root(repo: Path) -> Path:
     """Managed worktrees live beside the repository, never inside its working tree."""
     return repo.parent / f"{repo.name}.wdd"
+
+
+def worktree_override(repo: Path, path: Path | str, scope_id: str, task_id: str) -> str | None:
+    """Return a storable override, or None when the location is the default.
+
+    The default location is a pure function of (repo, scope, task), so storing
+    it would bake in the directory name of whichever checkout created it — a
+    clone into a differently-named directory would then resolve back to the
+    original machine's worktree. Only a caller-chosen path is worth recording,
+    and that is stored relative to the repository.
+    """
+    resolved = Path(path).resolve()
+    if resolved == task_worktree_path(repo, scope_id, task_id).resolve():
+        return None
+    try:
+        return os.path.relpath(resolved, repo.resolve())
+    except ValueError:
+        # Different drive on Windows; nothing relative can express it.
+        return str(resolved)
+
+
+def worktree_for(
+    repo: Path | str, scope_id: str, task_id: str, override: str | Path | None = None
+) -> Path:
+    """Where this task's worktree lives, for this checkout."""
+    repo = Path(repo)
+    if override:
+        path = Path(override)
+        return path if path.is_absolute() else (repo / path).resolve()
+    return task_worktree_path(repo, scope_id, task_id)
 
 
 def task_worktree_path(repo: Path, scope_id: str, task_id: str) -> Path:

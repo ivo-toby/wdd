@@ -10,6 +10,7 @@ from .errors import IllegalTransition, ValidationError
 from .freshness import check_freshness
 from .git import (
     ensure_worktree,
+    worktree_for,
     integration_worktree_path,
     is_ancestor,
     require_repository,
@@ -63,13 +64,17 @@ def refresh_task(
     state = store.read()
     task = _task(state, task_id)
     base_ref = _base_ref(state)
-    worktree = task.get("worktree")
     branch = task.get("branch")
-    if not worktree or not branch:
-        raise IllegalTransition(f"task {task_id} has no worktree; run 'wddctl start' first")
-    worktree_path = Path(worktree)
+    if not branch:
+        raise IllegalTransition(f"task {task_id} has no branch; run 'wddctl start' first")
+    worktree_path = worktree_for(
+        repo, state["scope"]["id"], task_id, task.get("worktree")
+    )
     if not worktree_path.exists():
-        raise IllegalTransition(f"task worktree is missing: {worktree_path}")
+        raise IllegalTransition(
+            f"task worktree is missing: {worktree_path}; "
+            f"run 'wddctl start --task {task_id} --repo .' to re-attach it"
+        )
     if run_git(worktree_path, "status", "--porcelain").stdout.strip():
         raise IllegalTransition(
             f"refusing to refresh {task_id}: worktree has uncommitted changes ({worktree_path})"

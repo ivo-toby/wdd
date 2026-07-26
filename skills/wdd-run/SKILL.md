@@ -26,7 +26,10 @@ yourself; the payload already did that.
 ## The judgment, action by action
 
 - **`start_task`** → run `command`, then dispatch a worker into the returned
-  worktree per `wdd-worker`.
+  worktree per `wdd-worker`. If you have picked up a scope someone else
+  started (a clone with work already in flight), run `start` on the
+  in-progress tasks too: it re-attaches their worktrees from their branches
+  without restarting them.
 - **`await_worker`** → the worker is still going. Nothing to do but wait.
 - **`run_review`** → dispatch a reviewer per `wdd-review`. Their findings go
   into `recordWith` in place of `'[]'`.
