@@ -22,7 +22,7 @@ from wave_delivery.engine import (
     admission_schedule,
     apply_event,
     bounded_next_actions,
-    derive_idempotency_key,
+    event_id,
     reconciliation_due,
     render_controller_state,
     status_summary,
@@ -313,7 +313,29 @@ class ConcurrencyTests(BaseTest):
                 expected_revision=0,
             )
 
-    def test_a_retried_identical_call_is_a_no_op(self) -> None:
+    def test_an_explicit_idempotency_key_gives_at_most_once(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        apply_event(
+            store,
+            event_type="note.added",
+            task_id=None,
+            data={"note": "same"},
+            idempotency_key="deploy-42",
+        )
+        revision = store.read()["revision"]
+        _, duplicate = apply_event(
+            store,
+            event_type="note.added",
+            task_id=None,
+            data={"note": "same"},
+            idempotency_key="deploy-42",
+        )
+        self.assertTrue(duplicate)
+        self.assertEqual(store.read()["revision"], revision)
+
+    def test_repeating_an_identical_event_is_not_silently_swallowed(self) -> None:
+        """Payload-derived keys cannot tell a retry from a legitimate repeat."""
         repo = self.repository()
         store = self.scope(repo)
         apply_event(store, event_type="note.added", task_id=None, data={"note": "same"})
@@ -321,14 +343,45 @@ class ConcurrencyTests(BaseTest):
         _, duplicate = apply_event(
             store, event_type="note.added", task_id=None, data={"note": "same"}
         )
-        self.assertTrue(duplicate)
-        self.assertEqual(store.read()["revision"], revision)
+        self.assertFalse(duplicate)
+        self.assertEqual(store.read()["revision"], revision + 1)
 
-    def test_distinct_payloads_are_not_collapsed(self) -> None:
+    def test_event_ids_are_unique_per_application(self) -> None:
         self.assertNotEqual(
-            derive_idempotency_key("note.added", None, {"note": "a"}),
-            derive_idempotency_key("note.added", None, {"note": "b"}),
+            event_id(1, "reconcile.completed", None, {}),
+            event_id(2, "reconcile.completed", None, {}),
         )
+
+    def test_reconcile_can_be_completed_more_than_once(self) -> None:
+        """Regression: a payload-derived key made this a one-shot per scope."""
+        repo = self.repository()
+        store = self.scope(repo)
+        for round_number in ("first", "second", "third"):
+            apply_event(
+                store, event_type="note.added", task_id=None, data={"note": round_number}
+            )
+            self.assertIsNotNone(reconciliation_due(store.read()))
+            apply_event(store, event_type="reconcile.completed", task_id=None, data={})
+            self.assertIsNone(
+                reconciliation_due(store.read()),
+                f"reconciliation stayed due after the {round_number} checkpoint",
+            )
+
+    def test_a_task_can_be_restarted_after_unblocking(self) -> None:
+        """Regression: the restart collided with the original start's key."""
+        repo = self.repository()
+        store = self.scope(repo)
+        start_task(store, repo=repo, task_id="TASK-A")
+        apply_event(
+            store, event_type="task.blocked", task_id="TASK-A", data={"reason": "no key"}
+        )
+        apply_event(store, event_type="task.unblocked", task_id="TASK-A", data={})
+        self.assertEqual(store.read()["tasks"]["TASK-A"]["status"], "todo")
+
+        result, duplicate = start_task(store, repo=repo, task_id="TASK-A")
+        self.assertFalse(duplicate)
+        self.assertNotEqual(result["action"], "duplicate")
+        self.assertEqual(store.read()["tasks"]["TASK-A"]["status"], "in_progress")
 
 
 class ReviewPolicyTests(BaseTest):
@@ -589,6 +642,27 @@ class MergeTests(BaseTest):
         self.assertEqual(
             refresh_task(store, repo=repo, task_id="TASK-A")["action"], "already_current"
         )
+
+    def test_refresh_adopts_a_conflict_resolved_by_hand(self) -> None:
+        """Regression: a hand-resolved merge left the task pinned to a stale head."""
+        repo = self.repository()
+        store = self.scope(repo)
+        started, _ = self.drive_to_merge_ready(store, repo, "TASK-A", "src/schema.ts"), None
+        stale = store.read()["tasks"]["TASK-A"]["headSha"]
+
+        # Someone finishes the merge in the worktree themselves.
+        worktree = worktree_for(repo, "SCOPE-demo", "TASK-A")
+        (worktree / "src" / "schema.ts").write_text("hand resolved\n", encoding="utf-8")
+        self.git(worktree, "add", "-A")
+        self.git(worktree, "commit", "-qm", "resolve by hand")
+        moved = self.git(worktree, "rev-parse", "HEAD")
+        self.assertNotEqual(moved, stale)
+
+        result = refresh_task(store, repo=repo, task_id="TASK-A")
+        self.assertEqual(result["action"], "adopted_external_merge")
+        self.assertEqual(store.read()["tasks"]["TASK-A"]["headSha"], moved)
+        # Evidence for the old head must not survive.
+        self.assertIsNone(store.read()["tasks"]["TASK-A"]["verification"])
 
     def test_release_refuses_a_dirty_worktree(self) -> None:
         repo = self.repository()

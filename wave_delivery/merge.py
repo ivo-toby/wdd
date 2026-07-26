@@ -83,7 +83,31 @@ def refresh_task(
     before = resolve_ref(repo, branch)
     base_sha = resolve_ref(repo, base_ref)
     if is_ancestor(repo, base_sha, before):
-        return {"task": task_id, "action": "already_current", "headSha": before}
+        recorded = task.get("headSha")
+        if not recorded or before == recorded:
+            # Nothing submitted yet, or state already matches the branch.
+            return {"task": task_id, "action": "already_current", "headSha": before}
+        # The branch moved without wddctl seeing it — typically a conflict
+        # resolved by hand in the worktree. Record the head so the task is not
+        # left reporting stale freshness against a commit that no longer exists.
+        state, duplicate = apply_event(
+            store,
+            event_type="task.head_updated",
+            task_id=task_id,
+            data={"headSha": before},
+            idempotency_key=idempotency_key,
+            expected_revision=expected_revision,
+        )
+        return {
+            "task": task_id,
+            "action": "adopted_external_merge",
+            "previousHeadSha": task.get("headSha"),
+            "headSha": before,
+            "baseSha": base_sha,
+            "revision": state["revision"],
+            "duplicate": duplicate,
+            "note": "branch was already current; recorded its head and invalidated evidence",
+        }
 
     merge = run_git(
         worktree_path,

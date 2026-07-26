@@ -136,6 +136,14 @@ See [`docs/wddctl.md`](docs/wddctl.md) for the full command reference and
 [`docs/artifact-schema.md`](docs/artifact-schema.md) for the `.wdd/` file
 formats.
 
+For how this actually plays out day to day — the two ways people drive it,
+the controller/worker/reviewer split, a gate-by-gate task lifecycle, and
+what to do when something goes wrong — see
+[`docs/workflow.md`](docs/workflow.md). For a full worked example (a
+refresh-token feature, decomposed, planned, run, and merged, including a
+reviewer catching a real security bug), see
+[`docs/example-auth-refresh.md`](docs/example-auth-refresh.md).
+
 ## Installation
 
 Clone the repository:

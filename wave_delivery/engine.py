@@ -23,15 +23,30 @@ def utc_now() -> str:
     )
 
 
-def derive_idempotency_key(event_type: str, task_id: str | None, data: dict[str, Any]) -> str:
-    """Derive a stable key so a retried identical call is a no-op, not a double-apply."""
+def event_id(
+    revision: int, event_type: str, task_id: str | None, data: dict[str, Any]
+) -> str:
+    """Mint a unique id for one applied event.
+
+    This deliberately does NOT dedupe by payload. Deduping on payload alone
+    cannot tell a retry from a legitimately repeated event, and getting that
+    wrong silently wedges a scope: `reconcile done` takes no arguments, so a
+    payload-derived key made it a one-shot per scope, and restarting a task
+    after `unblock` collided with its original start.
+
+    Retries are safe by construction instead: every transition is either
+    guarded by the status it requires, or writes evidence by overwriting it.
+    Callers that genuinely need at-most-once semantics pass an explicit
+    ``--idempotency-key``, which is honoured exactly.
+    """
     payload = json.dumps(
         {"event": event_type, "task": task_id, "data": data},
         sort_keys=True,
         separators=(",", ":"),
         default=str,
     )
-    return f"auto:{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24]}"
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return f"auto:{revision}:{digest}"
 
 
 def _task(state: dict[str, Any], task_id: str | None) -> dict[str, Any]:
@@ -394,14 +409,16 @@ def apply_mutation(
     """Apply one atomic, revisioned, idempotent state mutation.
 
     ``expected_revision`` and ``idempotency_key`` are optional. When omitted the
-    current revision is used under the same exclusive lock that guards the
-    write, and a key is derived from the event payload, so a retried identical
-    call collapses to a no-op instead of double-applying.
+    current revision is read under the same exclusive lock that guards the
+    write, and the event gets a unique id rather than a payload-derived one —
+    see :func:`event_id` for why deduping on payload is wrong.
     """
-    key = idempotency_key or derive_idempotency_key(event_type, task_id, data)
     with store.locked():
         state = store.read()
-        if key in state["appliedIdempotencyKeys"]:
+        key = idempotency_key or event_id(
+            state["revision"] + 1, event_type, task_id, data
+        )
+        if idempotency_key and key in state["appliedIdempotencyKeys"]:
             return state, True
         if expected_revision is not None and state["revision"] != expected_revision:
             raise RevisionConflict(

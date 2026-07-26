@@ -91,14 +91,12 @@ def probe_repository(root: Path | str) -> dict[str, Any]:
             "hasWddDirectory": (root / ".wdd").is_dir(),
         },
         "decisions": {
-            "storageMode": "local-markdown",
             "targetBranch": target_branch,
-            "epicBranchConvention": "epic/[epic-slug]",
-            "taskBranchConvention": "task/[task-id]-[task-slug]",
-            "profileDefault": "standard",
-            "reviewModeDefault": "risk_based",
-            "monitoringModeDefault": "adaptive",
-            "controllerMode": "schema_v2_controller_governed",
+            "baseRefConvention": "wdd/[scope-slug]",
+            "taskBranchConvention": "task/[task-id]",
+            "reviewPolicyDefault": "risk_based",
+            "reconcileEveryNMergesDefault": 3,
+            "maxConcurrentDefault": None,
         },
     }
     proposal["decisionFingerprint"] = decision_fingerprint(proposal)
