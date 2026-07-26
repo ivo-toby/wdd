@@ -432,6 +432,77 @@ class ReviewFindingRegressionTests(BaseTest):
         self.assertIn("nothing to submit", str(raised.exception))
 
 
+class ThirdRoundRegressionTests(BaseTest):
+    """Findings reproduced against 402ab3e."""
+
+    def test_refresh_refuses_before_moving_git_when_the_status_forbids_it(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        started, _ = start_task(store, repo=repo, task_id="TASK-A")
+        self.commit_in(started["worktree"], "src/schema.ts", "work\n")
+        submit_task(store, repo=repo, task_id="TASK-A")
+        apply_event(
+            store, event_type="task.blocked", task_id="TASK-A", data={"reason": "waiting"}
+        )
+
+        self.git(repo, "checkout", "-q", "wdd/demo")
+        (repo / "docs.md").write_text("base moved\n", encoding="utf-8")
+        self.git(repo, "add", "docs.md")
+        self.git(repo, "commit", "-qm", "advance base")
+        self.git(repo, "checkout", "-q", "-")
+
+        branch_before = self.git(repo, "rev-parse", "task/TASK-A")
+        head_before = store.read()["tasks"]["TASK-A"]["headSha"]
+        with self.assertRaises(IllegalTransition) as raised:
+            refresh_task(store, repo=repo, task_id="TASK-A")
+        self.assertIn("blocked", str(raised.exception))
+        # Git must not have moved while state stayed behind.
+        self.assertEqual(self.git(repo, "rev-parse", "task/TASK-A"), branch_before)
+        self.assertEqual(store.read()["tasks"]["TASK-A"]["headSha"], head_before)
+
+    def test_evidence_is_refused_for_an_empty_range(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo, self.plan_document(scope={"reviewPolicy": "always"}))
+        started, _ = start_task(store, repo=repo, task_id="TASK-A")
+        self.commit_in(started["worktree"], "src/schema.ts", "work\n")
+        submit_task(store, repo=repo, task_id="TASK-A")
+
+        # Merged outside wddctl: the head is now contained in the base, so the
+        # derived range collapses to head..head — a review of nothing.
+        self.git(repo, "checkout", "-q", "wdd/demo")
+        self.git(repo, "merge", "-q", "--no-ff", "-m", "external", "task/TASK-A")
+        self.git(repo, "checkout", "-q", "-")
+
+        with self.assertRaises(IllegalTransition) as raised:
+            record_review(store, task_id="TASK-A", findings=[], reviewer="nobody", repo=repo)
+        self.assertIn("empty range", str(raised.exception))
+        self.assertIsNone(store.read()["tasks"]["TASK-A"]["review"])
+
+        with self.assertRaises(IllegalTransition):
+            record_verification(store, task_id="TASK-A", status="passed", repo=repo)
+
+    def test_a_task_refreshed_before_its_first_submission_still_records_a_pr(self) -> None:
+        repo = self.repository()
+        store = self.scope(repo)
+        started, _ = start_task(store, repo=repo, task_id="TASK-A")
+
+        self.git(repo, "checkout", "-q", "wdd/demo")
+        (repo / "docs.md").write_text("base moved\n", encoding="utf-8")
+        self.git(repo, "add", "docs.md")
+        self.git(repo, "commit", "-qm", "advance base")
+        self.git(repo, "checkout", "-q", "-")
+
+        self.commit_in(started["worktree"], "src/schema.ts", "work\n")
+        refresh_task(store, repo=repo, task_id="TASK-A")
+        self.assertIsNotNone(store.read()["tasks"]["TASK-A"]["headSha"])
+
+        submit_task(store, repo=repo, task_id="TASK-A")
+        task = store.read()["tasks"]["TASK-A"]
+        self.assertIsNotNone(task["pr"], "submit after refresh never recorded a deliverable")
+        state = store.read()
+        self.assertNotEqual(task_gate(state, task), "no_pr")
+
+
 class MigrationTests(BaseTest):
     def v2_state(self) -> dict:
         return {

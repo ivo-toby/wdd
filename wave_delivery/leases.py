@@ -240,7 +240,10 @@ def submit_task(
                 "there is nothing to submit"
             )
     reference = pr or f"branch:{branch}@{head_sha[:12]}"
-    event = "task.pr_recorded" if task.get("headSha") is None else "task.head_updated"
+    # Keyed on the deliverable, not on headSha: refresh also populates headSha,
+    # so keying on it meant a task refreshed before its first submission never
+    # recorded a PR and stayed at the no_pr gate forever.
+    event = "task.pr_recorded" if task.get("pr") is None else "task.head_updated"
     data = {"pr": reference, "headSha": head_sha} if event == "task.pr_recorded" else {"headSha": head_sha}
     state, duplicate = apply_event(
         store,

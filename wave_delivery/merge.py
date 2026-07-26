@@ -22,6 +22,8 @@ from .store import StateStore
 
 
 BLOCKING_FRESHNESS = {"materially_stale", "conflicted"}
+# task.head_updated is only legal from these, so refuse before mutating Git.
+REFRESHABLE_STATUSES = {"in_progress", "review", "merge_ready"}
 
 
 class _NoChange(Exception):
@@ -124,6 +126,17 @@ def refresh_task(
         # Everything from here runs inside the store lock, so no other
         # controller can advance the revision between the Git mutation and the
         # state commit. Previously the branch moved and the commit then failed.
+        #
+        # Legality is checked before any Git work for the same reason: the
+        # transition validates status, and refreshing e.g. a blocked task moved
+        # its branch and only then raised, leaving state pointing at the old
+        # commit.
+        status = current["tasks"][task_id]["status"]
+        if status not in REFRESHABLE_STATUSES:
+            raise IllegalTransition(
+                f"cannot refresh {task_id}: it is {status}; expected one of "
+                f"{', '.join(sorted(REFRESHABLE_STATUSES))}"
+            )
         before = resolve_ref(repo, branch)
         base_sha = resolve_ref(repo, base_ref)
         recorded = current["tasks"][task_id].get("headSha")

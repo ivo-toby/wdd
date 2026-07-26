@@ -79,6 +79,16 @@ def evidence_shas(
             repository, "merge-base", base_ref, head_sha, check=False
         ).stdout.strip()
         if merge_base:
+            if merge_base == head_sha:
+                # The head is already contained in the base — typically it was
+                # merged outside wddctl. The derived range is empty, so review
+                # and verification would describe no changes at all, which is
+                # how a mandatory review got bypassed.
+                raise IllegalTransition(
+                    f"{task_id} describes an empty range against {base_ref}: its head "
+                    f"{head_sha} is already contained in the base, so there is nothing "
+                    "to review or verify"
+                )
             return merge_base, head_sha
     lease = (state.get("leases") or {}).get(task_id) or {}
     base_sha = lease.get("baseSha")
