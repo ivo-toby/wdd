@@ -3,13 +3,15 @@ import json
 import sys
 import tempfile
 import unittest
-from copy import deepcopy
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent.parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(0, str(REPO_ROOT))
 
 import wdd_github_project_sync as sync
+from wave_delivery.plan import validate_plan
 
 
 def remote_snapshot() -> dict:
@@ -18,37 +20,30 @@ def remote_snapshot() -> dict:
             "owner": "ivo-toby",
             "number": 4,
             "id": "PVT_kwExample",
-            "title": "GitHub Import",
+            "title": "Auth Refresh",
             "url": "https://github.com/orgs/ivo-toby/projects/4",
             "repo": "ivo-toby/example",
-            "wdd_id": "EPIC-github-import",
         },
         "items": [
             {
-                "kind": "ticket",
-                "wdd_id": "TICKET-001-runtime-smoke",
-                "item_id": "PVTI_ticket",
+                "item_id": "PVTI_token",
                 "issue_number": 7,
                 "url": "https://github.com/ivo-toby/example/issues/7",
-                "title": "Runtime smoke harness",
-                "body": "Build a durable smoke harness.",
+                "title": "Token type contract",
+                "body": "Define the RefreshToken/AccessToken types.",
                 "status": "Todo",
-                "state": "OPEN",
-                "updated_at": "2026-06-10T12:00:00Z",
+                "labels": ["auth"],
+                "conflict_domains": "src/auth/**, src/schema.ts",
             },
             {
-                "kind": "task",
-                "wdd_id": "TASK-001-seeded-smoke",
-                "ticket": "TICKET-001-runtime-smoke",
-                "wave": "WAVE-001",
-                "item_id": "PVTI_task",
+                "item_id": "PVTI_endpoint",
                 "issue_number": 8,
                 "url": "https://github.com/ivo-toby/example/issues/8",
-                "title": "Seed smoke fixture",
-                "body": "Create deterministic fixture data.",
+                "title": "Refresh token endpoint",
+                "body": "Implement the refresh endpoint.",
                 "status": "In Progress",
-                "state": "OPEN",
-                "updated_at": "2026-06-10T12:05:00Z",
+                "depends_on": "#7",
+                "conflict_domains": ["src/auth/routes/**"],
             },
         ],
     }
@@ -60,267 +55,300 @@ def write_text(path: Path, content: str) -> None:
 
 
 class WddGithubProjectSyncTests(unittest.TestCase):
-    def test_pull_plan_creates_missing_local_epic_ticket_and_task(self):
+    def test_pull_plan_creates_plan_and_task_briefs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            plan = sync.plan_sync(root, remote_snapshot(), mode="pull")
+            result = sync.plan_sync(root, remote_snapshot(), mode="pull")
 
-            actions = [operation["action"] for operation in plan["operations"]]
-
+            actions = [op["action"] for op in result["operations"]]
             self.assertEqual(
                 actions,
-                [
-                    "create_local_epic",
-                    "create_local_ticket",
-                    "create_local_task",
-                    "write_manifest",
-                ],
+                ["create_plan", "create_task_brief", "create_task_brief", "write_manifest"],
             )
-            self.assertEqual(plan["epic_id"], "EPIC-github-import")
-            self.assertEqual(plan["conflicts"], [])
+            self.assertEqual(result["scopeId"], "SCOPE-auth-refresh")
+            self.assertEqual(result["conflicts"], [])
 
-    def test_apply_local_pull_writes_wdd_artifacts_and_manifest(self):
+    def test_generated_plan_json_passes_the_real_validator(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            plan = sync.plan_sync(root, remote_snapshot(), mode="pull")
+            result = sync.plan_sync(root, remote_snapshot(), mode="pull")
+            sync.apply_local_operations(root, result)
 
-            sync.apply_local_operations(root, plan)
+            plan = json.loads((root / ".wdd" / "plan.json").read_text(encoding="utf-8"))
+            # Must not raise -- this is the authoritative plan.json contract.
+            validated = validate_plan(plan)
 
-            epic_dir = root / ".wdd" / "epics" / "EPIC-github-import"
-            self.assertTrue((epic_dir / "epic.md").exists())
-            self.assertTrue(
-                (
-                    epic_dir
-                    / "TICKET-001-runtime-smoke"
-                    / "ticket.md"
-                ).exists()
-            )
-            self.assertTrue(
-                (
-                    epic_dir
-                    / "TICKET-001-runtime-smoke"
-                    / "in-progress"
-                    / "TASK-001-seeded-smoke.md"
-                ).exists()
-            )
+            self.assertEqual(validated["scope"]["id"], "SCOPE-auth-refresh")
+            self.assertEqual(len(validated["tasks"]), 2)
+
+    def test_apply_local_pull_writes_plan_briefs_and_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = sync.plan_sync(root, remote_snapshot(), mode="pull")
+            sync.apply_local_operations(root, result)
+
+            plan = json.loads((root / ".wdd" / "plan.json").read_text(encoding="utf-8"))
+            task_ids = [task["id"] for task in plan["tasks"]]
+            self.assertEqual(task_ids, ["TASK-001-token-type-contract", "TASK-002-refresh-token-endpoint"])
+
+            first_task = plan["tasks"][0]
+            self.assertEqual(first_task["risk"], "high")  # "auth" label
+            self.assertEqual(first_task["conflictDomains"], ["src/auth/**", "src/schema.ts"])
+            second_task = plan["tasks"][1]
+            self.assertEqual(second_task["dependsOn"], ["TASK-001-token-type-contract"])
+
+            for task in plan["tasks"]:
+                self.assertTrue((root / ".wdd" / task["specPath"]).exists())
+
             manifest = json.loads(
-                (epic_dir / "adapters" / "github-project.json").read_text(
-                    encoding="utf-8"
-                )
+                (root / ".wdd" / "adapters" / "github-project.json").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["schemaVersion"], 1)
             self.assertEqual(
-                manifest["items"]["TASK-001-seeded-smoke"]["github"]["issueNumber"],
-                8,
+                manifest["items"]["TASK-001-token-type-contract"]["github"]["issueNumber"], 7
             )
 
-    def test_push_plan_creates_remote_issue_ops_for_unlinked_local_items(self):
+    def test_empty_conflict_domains_produce_a_loud_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            epic_dir = root / ".wdd" / "epics" / "EPIC-local-only"
+            snapshot = remote_snapshot()
+            del snapshot["items"][1]["conflict_domains"]  # no field at all
+            result = sync.plan_sync(root, snapshot, mode="pull")
+
+            warnings = [w for w in result["warnings"] if w["type"] == "empty_conflict_domains"]
+            self.assertEqual(len(warnings), 1)
+            self.assertEqual(warnings[0]["task"], "TASK-002-refresh-token-endpoint")
+
+            task_entry = result["planTasks"]["TASK-002-refresh-token-endpoint"]
+            self.assertEqual(task_entry["conflictDomains"], [])
+
+    def test_unresolved_dependency_reference_is_dropped_and_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot = remote_snapshot()
+            snapshot["items"][1]["depends_on"] = "#999, Nonexistent Item"
+            result = sync.plan_sync(root, snapshot, mode="pull")
+
+            unresolved = [w for w in result["warnings"] if w["type"] == "unresolved_dependency"]
+            self.assertEqual(len(unresolved), 2)
+            self.assertEqual(result["planTasks"]["TASK-002-refresh-token-endpoint"]["dependsOn"], [])
+
+    def test_sync_reports_conflict_when_local_and_remote_both_changed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_pull = sync.plan_sync(root, remote_snapshot(), mode="pull")
+            sync.apply_local_operations(root, first_pull)
+
+            # Simulate a human hand-editing the brief after import.
+            plan = json.loads((root / ".wdd" / "plan.json").read_text(encoding="utf-8"))
+            brief_path = root / ".wdd" / "tasks" / "TASK-001-token-type-contract.md"
+            write_text(brief_path, brief_path.read_text(encoding="utf-8") + "\nHuman edit.\n")
+
+            changed_remote = remote_snapshot()
+            changed_remote["items"][0]["body"] = "Remote changed the description."
+
+            result = sync.plan_sync(root, changed_remote, mode="sync")
+
+            self.assertEqual(len(result["conflicts"]), 1)
+            self.assertEqual(result["conflicts"][0]["task"], "TASK-001-token-type-contract")
+            self.assertEqual(result["operations"], [])
+
+    def test_remote_only_change_updates_local_without_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_pull = sync.plan_sync(root, remote_snapshot(), mode="pull")
+            sync.apply_local_operations(root, first_pull)
+
+            changed_remote = remote_snapshot()
+            changed_remote["items"][0]["title"] = "Token type contract (renamed)"
+
+            result = sync.plan_sync(root, changed_remote, mode="sync")
+
+            self.assertEqual(result["conflicts"], [])
+            update_ops = [op for op in result["operations"] if op["action"] == "update_task_brief"]
+            self.assertEqual(len(update_ops), 1)
+            self.assertEqual(update_ops[0]["task"], "TASK-001-token-type-contract")
+
+    def test_id_collision_with_unmanaged_local_task_is_reported_as_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
             write_text(
-                epic_dir / "epic.md",
-                """---
-id: EPIC-local-only
-kind: epic
-slug: local-only
-title: Local Only
-status: planned
-target_branch: main
-epic_branch: epic/local-only
-adapter_links:
-  github_issue: null
----
+                root / ".wdd" / "plan.json",
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "kind": "wdd_plan",
+                        "scope": {
+                            "id": "SCOPE-auth-refresh",
+                            "baseRef": "wdd/auth-refresh",
+                            "maxConcurrent": None,
+                            "reviewPolicy": "risk_based",
+                            "reconcileEveryNMerges": 3,
+                        },
+                        "tasks": [
+                            {
+                                "id": "TASK-001-token-type-contract",
+                                "title": "Hand-authored task, not from GitHub",
+                                "specPath": "tasks/TASK-001-token-type-contract.md",
+                                "risk": "normal",
+                                "dependsOn": [],
+                                "conflictDomains": ["src/hand-authored.ts"],
+                            }
+                        ],
+                    }
+                ),
+            )
 
-# Local Only
+            snapshot = remote_snapshot()
+            # Force the same id the hand-authored task already uses, since the
+            # generator otherwise steers new ids away from ones already taken.
+            snapshot["items"][0]["wdd_id"] = "TASK-001-token-type-contract"
+            result = sync.plan_sync(root, snapshot, mode="pull")
 
-## Summary
+            collisions = [c for c in result["conflicts"] if c["type"] == "id_collision"]
+            self.assertEqual(len(collisions), 1)
+            self.assertEqual(collisions[0]["task"], "TASK-001-token-type-contract")
+            self.assertEqual(result["operations"], [])
 
-Local epic.
-""",
+    def test_push_creates_remote_issue_ops_for_unlinked_local_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_text(
+                root / ".wdd" / "plan.json",
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "kind": "wdd_plan",
+                        "scope": {
+                            "id": "SCOPE-auth-refresh",
+                            "baseRef": "wdd/auth-refresh",
+                            "maxConcurrent": None,
+                            "reviewPolicy": "risk_based",
+                            "reconcileEveryNMerges": 3,
+                        },
+                        "tasks": [
+                            {
+                                "id": "TASK-001-api-contract",
+                                "title": "API contract",
+                                "specPath": "tasks/TASK-001-api-contract.md",
+                                "risk": "normal",
+                                "dependsOn": [],
+                                "conflictDomains": ["src/api/**"],
+                            }
+                        ],
+                    }
+                ),
             )
             write_text(
-                epic_dir / "TICKET-001-api" / "ticket.md",
-                """---
-id: TICKET-001-api
-kind: ticket
-epic: EPIC-local-only
-slug: api
-title: API Ticket
-status: planned
-adapter_links:
-  github_issue: null
----
-
-# API Ticket
-
-## Summary
-
-Create the API slice.
-""",
-            )
-            write_text(
-                epic_dir / "TICKET-001-api" / "todo" / "TASK-001-api-contract.md",
-                """---
-id: TASK-001-api-contract
-kind: task
-epic: EPIC-local-only
-ticket: TICKET-001-api
-wave: WAVE-001
-slug: api-contract
-title: API Contract
-status: todo
-adapter_links:
-  github_issue: null
----
-
-# TASK-001-api-contract: API Contract
-
-## Objective
-
-Define the API contract.
-""",
+                root / ".wdd" / "tasks" / "TASK-001-api-contract.md",
+                "# TASK-001-api-contract: API contract\n\n## Objective\n\nDefine the API contract.\n",
             )
 
-            plan = sync.plan_sync(
+            result = sync.plan_sync(
                 root,
-                {
-                    "project": {
-                        "owner": "ivo-toby",
-                        "number": 4,
-                        "id": "PVT_kwExample",
-                        "repo": "ivo-toby/example",
-                        "wdd_id": "EPIC-local-only",
-                    },
-                    "items": [],
-                },
+                {"project": {"owner": "ivo-toby", "number": 4, "repo": "ivo-toby/example", "title": "Auth Refresh"}, "items": []},
                 mode="push",
-                epic_id="EPIC-local-only",
+                scope_id="SCOPE-auth-refresh",
             )
 
-            actions = [operation["action"] for operation in plan["operations"]]
-
+            actions = [op["action"] for op in result["operations"]]
             self.assertIn("create_remote_issue", actions)
             self.assertIn("add_issue_to_project", actions)
             self.assertIn("update_project_fields", actions)
-            self.assertEqual(plan["conflicts"], [])
+            self.assertEqual(result["conflicts"], [])
 
-    def test_sync_reports_conflict_when_local_and_remote_changed(self):
+    def test_push_uses_state_json_status_read_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            epic_dir = root / ".wdd" / "epics" / "EPIC-github-import"
-            write_text(
-                epic_dir / "epic.md",
-                """---
-id: EPIC-github-import
-kind: epic
-slug: github-import
-title: GitHub Import
-status: planned
-target_branch: main
-epic_branch: epic/github-import
----
+            first_pull = sync.plan_sync(root, remote_snapshot(), mode="pull")
+            sync.apply_local_operations(root, first_pull)
 
-# GitHub Import
-""",
-            )
-            ticket_path = epic_dir / "TICKET-001-runtime-smoke" / "ticket.md"
-            old_ticket = """---
-id: TICKET-001-runtime-smoke
-kind: ticket
-epic: EPIC-github-import
-title: Runtime smoke harness
-status: planned
----
-
-# Runtime smoke harness
-
-## Summary
-
-Old synced summary.
-"""
-            write_text(ticket_path, old_ticket.replace("Old", "Locally changed"))
-            old_local_hash = sync.fingerprint_text(old_ticket)
-            old_remote_hash = sync.fingerprint_remote_item(
-                remote_snapshot()["items"][0]
-            )
-            manifest = {
-                "schemaVersion": 1,
-                "epic": {"id": "EPIC-github-import"},
-                "project": remote_snapshot()["project"],
-                "items": {
-                    "TICKET-001-runtime-smoke": {
-                        "kind": "ticket",
-                        "localPath": "TICKET-001-runtime-smoke/ticket.md",
-                        "github": {
-                            "itemId": "PVTI_ticket",
-                            "issueNumber": 7,
-                            "url": "https://github.com/ivo-toby/example/issues/7",
-                        },
-                        "fingerprints": {
-                            "local": old_local_hash,
-                            "remote": old_remote_hash,
-                        },
-                    }
+            state = {
+                "schemaVersion": 3,
+                "tasks": {
+                    "TASK-001-token-type-contract": {"status": "in_progress"},
+                    "TASK-002-refresh-token-endpoint": {"status": "todo"},
                 },
             }
-            write_text(
-                epic_dir / "adapters" / "github-project.json",
-                json.dumps(manifest, indent=2),
-            )
-            changed_remote = remote_snapshot()
-            changed_remote["items"][0]["body"] = "Remote changed the ticket body."
+            write_text(root / ".wdd" / "state.json", json.dumps(state))
+            state_before = json.loads((root / ".wdd" / "state.json").read_text(encoding="utf-8"))
 
-            plan = sync.plan_sync(root, changed_remote, mode="sync")
+            result = sync.plan_sync(root, remote_snapshot(), mode="push")
 
-            self.assertEqual(len(plan["conflicts"]), 1)
-            self.assertEqual(
-                plan["conflicts"][0]["wdd_id"], "TICKET-001-runtime-smoke"
-            )
-            self.assertEqual(plan["operations"], [])
+            field_ops = {op["task"]: op for op in result["operations"] if op["action"] == "update_project_fields"}
+            self.assertEqual(field_ops["TASK-001-token-type-contract"]["fields"]["Status"], "In Progress")
 
-    def test_apply_local_status_update_moves_task_between_kanban_folders(self):
+            # state.json on disk must be byte-for-byte unchanged -- read-only.
+            state_after = json.loads((root / ".wdd" / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state_before, state_after)
+
+    def test_scope_mismatch_blocks_without_touching_anything(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            initial_snapshot = remote_snapshot()
-            initial_snapshot["items"][1]["status"] = "Todo"
-            initial_plan = sync.plan_sync(root, initial_snapshot, mode="pull")
-            sync.apply_local_operations(root, initial_plan)
-
-            changed_snapshot = deepcopy(initial_snapshot)
-            changed_snapshot["items"][1]["status"] = "In Progress"
-            update_plan = sync.plan_sync(root, changed_snapshot, mode="sync")
-
-            task_ops = [
-                operation
-                for operation in update_plan["operations"]
-                if operation["action"] == "update_local_task"
-            ]
-            self.assertEqual(len(task_ops), 1)
-            self.assertEqual(
-                task_ops[0]["path"],
-                "TICKET-001-runtime-smoke/in-progress/TASK-001-seeded-smoke.md",
+            write_text(
+                root / ".wdd" / "plan.json",
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "kind": "wdd_plan",
+                        "scope": {
+                            "id": "SCOPE-something-else",
+                            "baseRef": "wdd/something-else",
+                            "maxConcurrent": None,
+                            "reviewPolicy": "risk_based",
+                            "reconcileEveryNMerges": 3,
+                        },
+                        "tasks": [
+                            {
+                                "id": "TASK-001-x",
+                                "title": "x",
+                                "specPath": "tasks/TASK-001-x.md",
+                                "risk": "normal",
+                                "dependsOn": [],
+                                "conflictDomains": [],
+                            }
+                        ],
+                    }
+                ),
             )
 
-            sync.apply_local_operations(root, update_plan)
+            result = sync.plan_sync(root, remote_snapshot(), mode="pull")
 
-            epic_dir = root / ".wdd" / "epics" / "EPIC-github-import"
-            self.assertFalse(
-                (
-                    epic_dir
-                    / "TICKET-001-runtime-smoke"
-                    / "todo"
-                    / "TASK-001-seeded-smoke.md"
-                ).exists()
-            )
-            self.assertTrue(
-                (
-                    epic_dir
-                    / "TICKET-001-runtime-smoke"
-                    / "in-progress"
-                    / "TASK-001-seeded-smoke.md"
-                ).exists()
-            )
+            self.assertEqual(len(result["conflicts"]), 1)
+            self.assertEqual(result["conflicts"][0]["type"], "scope_mismatch")
+            with self.assertRaises(RuntimeError):
+                sync.apply_local_operations(root, result)
+
+    def test_manifest_lives_at_new_adapter_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = sync.plan_sync(root, remote_snapshot(), mode="pull")
+            sync.apply_local_operations(root, result)
+
+            self.assertTrue((root / ".wdd" / "adapters" / "github-project.json").exists())
+            self.assertFalse((root / ".wdd" / "epics").exists())
+
+    def test_apply_reports_what_it_wrote_not_the_post_apply_plan(self):
+        """Regression: --apply-local re-plans to confirm convergence, and
+        reporting only that would always claim 'No operations' after writing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot = remote_snapshot()
+            planned = sync.plan_sync(root, snapshot, mode="pull")
+            self.assertTrue(planned["operations"])
+            applied_operations = list(planned["operations"])
+            sync.apply_local_operations(root, planned)
+            residual = sync.plan_sync(root, snapshot, mode="pull")
+            residual["appliedOperations"] = applied_operations
+
+            # Convergence: nothing left to do.
+            self.assertEqual(residual["operations"], [])
+            # But the applied work is still reported, with real action names.
+            self.assertEqual(len(residual["appliedOperations"]), len(applied_operations))
+            for operation in residual["appliedOperations"]:
+                self.assertIn("action", operation)
+            actions = {operation["action"] for operation in residual["appliedOperations"]}
+            self.assertIn("create_plan", actions)
 
 
 if __name__ == "__main__":

@@ -1,73 +1,79 @@
 # GitHub Projects Adapter Reference
 
-Read this before live GitHub sync work, nonstandard field mappings, larger-board
-imports, or conflict resolution.
+Read this before live GitHub sync work, nonstandard field mappings, or
+conflict resolution.
 
 ## Model
 
 WDD remains local-first. GitHub Projects are planning mirrors.
 
-Recommended MVP mapping:
-
 ```text
-one GitHub Project = one WDD epic
-GitHub Project item issue = WDD ticket or task
-GitHub custom fields = WDD metadata
+one GitHub Project  = one WDD scope (SCOPE-<project-slug>)
+GitHub Project item = one WDD task
+GitHub custom fields = WDD task metadata (risk, dependsOn, conflictDomains)
 ```
 
-Larger-board mapping is possible by first exporting or filtering only the items
-for one epic. Use `--epic-id` to force the local epic ID for that filtered
-subset.
+There are no epics or tickets in the current model, and no kanban status
+folders. `.wdd/plan.json` is the single planning input; each task also gets
+one brief at `.wdd/tasks/<TASK-ID>.md`. Task execution state lives in
+`.wdd/state.json`, owned exclusively by `wddctl` -- this adapter reads it,
+never writes it.
 
-## Preferred GitHub Project Fields
+## Preferred GitHub Project fields
 
-Use these fields when available:
+None of these are required; the adapter degrades gracefully when a field is
+missing.
 
 | Field | Purpose |
 |-------|---------|
-| `WDD ID` | `EPIC-*`, `TICKET-*`, or `TASK-*` stable ID |
-| `WDD Kind` | `epic`, `ticket`, or `task` |
-| `Ticket` | Parent ticket ID for tasks |
-| `Wave` | Planned WDD wave for tasks |
-| `Status` | Project status mapped to WDD status |
+| `WDD ID` / `wdd_id` | Force a stable `TASK-<n>-<slug>` id instead of a generated one |
+| `Depends On` / `Blocked By` | Comma/newline-separated issue numbers, item titles, or task ids |
+| `Conflict Domains` / `Area` / `Paths` | Comma/newline-separated paths/globs the task writes |
+| `Risk` / `WDD Risk` | Extra free-text signal fed into the risk heuristic |
+| `Status` | Mapped to/from the WDD task status on push |
+| `Labels` | Also scanned by the risk heuristic |
 
-The sync script also infers kind from IDs, title prefixes, or parent ticket
-metadata when fields are missing.
+## Risk heuristic
 
-## Status Mapping
+A task is `"risk": "high"` iff its title, labels, or an explicit
+`Risk`/`WDD Risk` field mentions: `auth`, `security`, `migrat*` (migration,
+migrating), `persist*` (persistence, persisted), `public api`, or
+`breaking change`. Everything else is `"normal"`. This is a small,
+best-effort heuristic -- always sanity-check imported risk levels by hand.
 
-Remote to local:
+## Conflict domains -- read this before trusting an import
 
-| GitHub status | WDD status |
-|---------------|------------|
-| `Backlog`, `Todo`, `To Do`, `Ready` | `todo` |
-| `In Progress`, `Doing` | `in-progress` |
-| `Review`, `In Review` | `review` |
-| `Blocked` | `blocked` |
-| `Cancelled`, `Canceled` | `cancelled` |
-| `Done`, `Closed` | `review` for tasks by default |
+If a GitHub item has no `Conflict Domains`/`Area`/`Paths` field, the
+imported task gets `"conflictDomains": []` and the dry-run output prints an
+explicit warning. **An empty list means the WDD engine provides no collision
+protection for that task** -- it can be admitted concurrently with another
+task that writes the same files. Always fill in conflict domains (directly
+in `plan.json`, or via the `wdd-plan` skill) before running
+`wddctl plan apply`.
 
-Use `--trust-remote-done` only when the user explicitly wants GitHub `Done` to
-be imported as WDD `done`. Without that flag, remote done tasks import as
-`review` so local verification evidence can be recorded before completion.
+## Status mapping (push only; pull does not touch status)
 
-Local to remote:
+`plan.json` and task briefs carry no status field -- only `.wdd/state.json`
+does, and only `wddctl` writes it. Pull therefore never needs a remote ->
+local status mapping. Push maps the other direction, local -> remote, using
+the task's current status from `.wdd/state.json`:
 
-| WDD status | GitHub status |
-|------------|---------------|
-| `todo`, `planned` | `Todo` |
-| `in-progress` | `In Progress` |
+| WDD status | GitHub `Status` field |
+|------------|------------------------|
+| `todo` | `Todo` |
+| `in_progress` | `In Progress` |
 | `review` | `Review` |
+| `merge_ready` | `Merge Ready` |
 | `done` | `Done` |
 | `blocked` | `Blocked` |
 | `cancelled` | `Cancelled` |
 
 ## Manifest
 
-Path:
+Path (repo-wide, not per-scope):
 
 ```text
-.wdd/epics/<EPIC-ID>/adapters/github-project.json
+.wdd/adapters/github-project.json
 ```
 
 Shape:
@@ -76,22 +82,17 @@ Shape:
 {
   "schemaVersion": 1,
   "updatedAt": "2026-06-12T10:00:00Z",
-  "epic": {
-    "id": "EPIC-example"
-  },
+  "scope": {"id": "SCOPE-example"},
   "project": {
     "owner": "OWNER",
     "number": 4,
-    "id": "PVT_...",
     "title": "Example",
     "url": "https://github.com/orgs/OWNER/projects/4",
-    "repo": "OWNER/REPO",
-    "wdd_id": "EPIC-example"
+    "repo": "OWNER/REPO"
   },
   "items": {
-    "TICKET-001-example": {
-      "kind": "ticket",
-      "localPath": "TICKET-001-example/ticket.md",
+    "TASK-001-example": {
+      "localPath": "tasks/TASK-001-example.md",
       "github": {
         "itemId": "PVTI_...",
         "issueNumber": 123,
@@ -106,56 +107,47 @@ Shape:
 }
 ```
 
-Fingerprints let the adapter detect three cases:
+Fingerprints let the adapter detect three cases per task:
 
-- Local changed, remote unchanged: plan a GitHub update.
+- Local changed, remote unchanged: local wins, nothing is written.
 - Remote changed, local unchanged: plan a local update.
-- Both changed: report a conflict and do not write either side.
+- Both changed: report a conflict and write neither side for that task.
+
+They also protect hand-filled `conflictDomains`/`dependsOn` edits: a later
+pull only overwrites a task when the remote side changed and the local side
+did not.
 
 ## Snapshot JSON
 
-For offline runs or larger-board filtering, pass `--remote-json snapshot.json`.
-The script accepts this compact shape:
+For offline runs, pass `--remote-json snapshot.json`. The script accepts
+this compact shape:
 
 ```json
 {
   "project": {
     "owner": "OWNER",
     "number": 4,
-    "id": "PVT_...",
-    "title": "Example Epic",
+    "title": "Example",
     "url": "https://github.com/orgs/OWNER/projects/4",
-    "repo": "OWNER/REPO",
-    "wdd_id": "EPIC-example"
+    "repo": "OWNER/REPO"
   },
   "items": [
     {
-      "kind": "ticket",
-      "wdd_id": "TICKET-001-api",
       "item_id": "PVTI_...",
       "issue_number": 123,
       "url": "https://github.com/OWNER/REPO/issues/123",
-      "title": "API",
-      "body": "Ticket body",
-      "status": "Todo"
-    },
-    {
-      "kind": "task",
-      "wdd_id": "TASK-001-contract",
-      "ticket": "TICKET-001-api",
-      "wave": "WAVE-001",
-      "item_id": "PVTI_...",
-      "issue_number": 124,
-      "url": "https://github.com/OWNER/REPO/issues/124",
-      "title": "Contract",
-      "body": "Task body",
-      "status": "In Progress"
+      "title": "Token type contract",
+      "body": "Item description",
+      "status": "Todo",
+      "labels": ["auth"],
+      "depends_on": "#124, Some other item title",
+      "conflict_domains": "src/auth/**, src/schema.ts"
     }
   ]
 }
 ```
 
-## Live GitHub Access
+## Live GitHub access
 
 The script uses GitHub CLI when no `--remote-json` is provided:
 
@@ -164,20 +156,20 @@ gh project view <number> --owner <owner> --format json
 gh project item-list <number> --owner <owner> --format json --limit 1000
 ```
 
-For remote writes, inspect the generated operation plan and then use the
-GitHub CLI or connector deliberately. GitHub Projects usually require separate
-steps to create an issue, add it to the Project, and update Project fields.
+For remote writes (push mode), inspect the generated operation plan, then
+apply it deliberately with the GitHub CLI or connector. This script never
+mutates GitHub itself -- it only produces the plan.
 
-## Conflict Handling
+## Conflict handling
 
 When conflicts are reported:
 
-1. Open the local file named by `local_path`.
-2. Open the GitHub issue URL.
-3. Decide which fields win, or manually merge both.
+1. Open the local brief named by `localPath` (or the task in `plan.json`).
+2. Open the GitHub item's URL.
+3. Decide which side wins, or manually merge both.
 4. Update one side.
-5. Rerun dry-run sync.
-6. Apply local writes only after the conflict list is empty.
+5. Rerun the dry-run.
+6. Apply local writes (`--apply-local`) only once the conflict list is empty.
 
 Do not delete manifest fingerprints to bypass conflict detection unless the
 user explicitly chooses to re-baseline sync state.
