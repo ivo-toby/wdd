@@ -263,18 +263,51 @@ def submit_task(
             # Nothing moved. task.head_updated invalidates review, verification
             # and freshness by design, so applying it here would let an
             # innocent retry discard passed evidence and demote the task.
-            raise NoChange(
+            #
+            # One deliberate exception: a pr-surface resubmission that upgrades
+            # a branch:<sha> fallback (recorded when an earlier 'gh pr create'
+            # failed after the push already succeeded) to a real PR URL once
+            # gh is healthy again. That upgrade changes only the pr string, not
+            # the code at head, so it must not go through a full
+            # task.head_updated -- doing so would wrongly demote a merge_ready
+            # task back to review/in_progress and discard passed review,
+            # verification, and freshness evidence for a purely cosmetic
+            # PR-reference change. It is applied as a direct field update
+            # instead of via transition(), the same way lease.reattached bypasses
+            # transition() above.
+            current_pr = task.get("pr")
+            upgrading_pr = (
+                isinstance(pr, str)
+                and pr
+                and not pr.startswith("branch:")
+                and isinstance(current_pr, str)
+                and current_pr.startswith("branch:")
+            )
+            if not upgrading_pr:
+                raise NoChange(
+                    {
+                        "task": task_id,
+                        "event": "none",
+                        "action": "already_recorded",
+                        "branch": branch,
+                        "pr": task.get("pr"),
+                        "headSha": head_sha,
+                        "status": task["status"],
+                        "revision": state["revision"],
+                    }
+                )
+            outcome.update(
                 {
                     "task": task_id,
-                    "event": "none",
-                    "action": "already_recorded",
+                    "event": "task.pr_upgraded",
+                    "action": "pr_upgraded",
                     "branch": branch,
-                    "pr": task.get("pr"),
                     "headSha": head_sha,
-                    "status": task["status"],
-                    "revision": state["revision"],
                 }
             )
+            updated = copied_state(state)
+            updated["tasks"][task_id]["pr"] = pr
+            return updated
         reference = pr or f"branch:{branch}@{head_sha[:12]}"
         data = (
             {"pr": reference, "headSha": head_sha}

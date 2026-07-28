@@ -23,7 +23,7 @@ from .store import StateStore
 
 
 def _observations(
-    state: dict[str, Any], repo: Path, *, state_path: str | None = None
+    state: dict[str, Any], repo: Path, *, state_path: str | None = None, repo_arg: str = "."
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     observations: dict[str, Any] = {}
     actions: list[dict[str, str]] = []
@@ -55,10 +55,13 @@ def _observations(
             head_sha = task.get("headSha")
             base_ref = state["scope"].get("baseRef")
             if head_sha and base_ref and is_ancestor(repo, head_sha, base_ref):
-                # Build the command string following the same pattern as engine.decorate_actions
-                state_path_str = str(state_path) if state_path else None
-                prefix = "wddctl" + (f" --state {shlex.quote(state_path_str)}" if state_path_str else "")
-                fields = {"task": shlex.quote(task_id), "repo": shlex.quote(".")}
+                # Build the command string following the same pattern as
+                # engine.decorate_actions: --state is only echoed back when
+                # the caller didn't use the default (mirrors cli.py's
+                # _state_option), and --repo reflects the actual argument
+                # monitor ran with, not a hardcoded ".".
+                prefix = "wddctl" + (f" --state {shlex.quote(state_path)}" if state_path else "")
+                fields = {"task": shlex.quote(task_id), "repo": shlex.quote(repo_arg)}
                 command = f"{prefix} merge --task {fields['task']} --repo {fields['repo']} --observed"
                 actions.append({
                     "task": task_id,
@@ -73,10 +76,13 @@ def _observations(
 def monitor_once(
     store: StateStore, *, repo: Path | str, dry_run: bool = False, state_path: str | None = None
 ) -> dict[str, Any]:
+    repo_arg = str(repo)
     repo = require_repository(repo)
     with store.locked():
         state = store.read()
-        observations, actions = _observations(state, repo, state_path=state_path)
+        observations, actions = _observations(
+            state, repo, state_path=state_path, repo_arg=repo_arg
+        )
         prior = (state["monitoring"].get("observations") or {})
         changed = observations != prior
         result = {

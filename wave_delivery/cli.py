@@ -583,20 +583,36 @@ def main(argv: list[str] | None = None) -> int:
                     # Push before any PR attempt: a push failure must abort
                     # with no state change at all, so it happens outside the
                     # try/except that downgrades PR-creation failures to a
-                    # warning.
+                    # warning. This runs on every submit, including
+                    # resubmissions of a task that already has a real PR --
+                    # the whole point of resubmitting is to publish a new head.
                     push_branch(repo, branch)
-                    head_sha = resolve_ref(repo, branch)
-                    title = task.get("title") or args.task
-                    body = f"wdd task {args.task}\nspec: {task.get('specPath')}\nhead: {head_sha}"
-                    try:
-                        pr = create_pr(repo, branch, base_ref, title, body)
-                    except IllegalTransition as error:
-                        # The branch is already pushed; losing the submission
-                        # here would silently orphan real work. Record it the
-                        # same way a local-surface submit would (a branch
-                        # reference), and surface the failure as a warning
-                        # instead of aborting.
-                        warning = f"PR creation failed after push: {error}"
+                    existing_pr = task.get("pr")
+                    # Only call gh when there is no PR yet, or the recorded
+                    # reference is still the branch:<sha> fallback left by an
+                    # earlier 'gh pr create' failure (the upgrade path). A
+                    # task that already has a real PR URL is being resubmitted
+                    # to publish a new head, not to open a second PR: gh has
+                    # no "replace this PR's URL" operation, so calling
+                    # create_pr again would either fail or open a duplicate.
+                    needs_pr_create = existing_pr is None or (
+                        isinstance(existing_pr, str) and existing_pr.startswith("branch:")
+                    )
+                    if needs_pr_create:
+                        head_sha = resolve_ref(repo, branch)
+                        title = task.get("title") or args.task
+                        body = f"wdd task {args.task}\nspec: {task.get('specPath')}\nhead: {head_sha}"
+                        try:
+                            pr = create_pr(repo, branch, base_ref, title, body)
+                        except IllegalTransition as error:
+                            # The branch is already pushed; losing the submission
+                            # here would silently orphan real work. Record it the
+                            # same way a local-surface submit would (a branch
+                            # reference), and surface the failure as a warning
+                            # instead of aborting.
+                            warning = f"PR creation failed after push: {error}"
+                    else:
+                        pr = existing_pr
             result, duplicate = submit_task(
                 store, repo=args.repo, task_id=args.task, pr=pr, **_concurrency(args)
             )
@@ -723,7 +739,29 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "refresh":
-            _print_json(refresh_task(store, repo=args.repo, task_id=args.task, **_concurrency(args)))
+            result = refresh_task(store, repo=args.repo, task_id=args.task, **_concurrency(args))
+            state = store.read()
+            config = (
+                load_config(store.path.parent)
+                if config_path(store.path.parent).exists()
+                else None
+            )
+            if merge_settings(state, config)["surface"] == "pr":
+                branch = (state["tasks"].get(args.task) or {}).get("branch")
+                if branch:
+                    try:
+                        push_branch(require_repository(args.repo), branch)
+                    except IllegalTransition as error:
+                        # The refresh itself already committed the new head to
+                        # state; the remote task branch is a projection of that
+                        # fact (same contract as merge's push of the advanced
+                        # base below), so a push failure degrades to a warning
+                        # instead of losing the refresh. Leaving the remote
+                        # stale here would make a human merge a stale PR
+                        # (never satisfying --observed ancestry) or a
+                        # pr-surface review mirror onto a stale diff.
+                        result["warning"] = f"push of {branch} to origin failed: {error}"
+            _print_json(result)
             return 0
 
         if args.command == "merge":
@@ -835,7 +873,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "monitor":
-            _print_json(monitor_once(store, repo=args.repo, dry_run=args.dry_run, state_path=args.state))
+            _print_json(
+                monitor_once(
+                    store, repo=args.repo, dry_run=args.dry_run, state_path=_state_option(args)
+                )
+            )
             return 0
 
         if args.command == "event" and args.event_command == "apply":

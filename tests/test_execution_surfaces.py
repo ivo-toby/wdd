@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -534,6 +535,67 @@ class PrSurfaceSubmitTest(unittest.TestCase):
             self.assertTrue(result["pr"].startswith("branch:"), result)
             self.assertIn("task/T1", self._branches(bare))
 
+    def test_resubmit_with_unchanged_head_does_not_recreate_pr(self) -> None:
+        # Regression: the CLI used to call `gh pr create` on every submit,
+        # even when the task already had a real PR URL. A resubmission with
+        # nothing new to publish must push (harmless, idempotent) but never
+        # call gh again -- a real URL can never be replaced by a fresh
+        # `gh pr create` call, and recreating it would at best waste calls.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = self._ready_task(tmp, surface="pr")
+            log_path = str(Path(tmp) / "gh.log")
+            with self._fake_gh(log_path):
+                code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            first = json.loads(out)
+            self.assertEqual(first["pr"], "https://github.invalid/pr/1")
+
+            with self._fake_gh(log_path):
+                code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            second = json.loads(out)
+            self.assertEqual(second["pr"], "https://github.invalid/pr/1")
+
+            log = self._gh_log(log_path)
+            creates = [entry for entry in log if entry[:2] == ["pr", "create"]]
+            self.assertEqual(len(creates), 1, log)
+
+    def test_resubmit_upgrades_branch_fallback_to_real_pr(self) -> None:
+        # Regression: once a submit falls back to branch:<sha> after a failed
+        # `gh pr create`, nothing ever upgraded it to a real URL on a later,
+        # healthy resubmission -- the CLI skipped gh entirely once a pr was
+        # already recorded, and even when it did call gh, submit_task's
+        # task.head_updated path (taken because pr was already non-None)
+        # silently dropped the new pr value since the head hadn't moved.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = self._ready_task(tmp, surface="pr")
+            log_path = str(Path(tmp) / "gh.log")
+            with self._fake_gh(log_path, fail=True):
+                code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            first = json.loads(out)
+            self.assertTrue(first["pr"].startswith("branch:"), first)
+            self.assertIn("warning", first)
+
+            with self._fake_gh(log_path):
+                code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            second = json.loads(out)
+            self.assertEqual(second["pr"], "https://github.invalid/pr/1")
+            self.assertNotIn("warning", second)
+
+            # Two calls total: the first failing attempt (recorded as the
+            # branch: fallback) and the second, successful upgrade attempt.
+            # The invariant this test protects is that a second call happens
+            # at all (see test_resubmit_with_unchanged_head_does_not_recreate_pr
+            # for the "already has a real URL" case, which must make none).
+            log = self._gh_log(log_path)
+            creates = [entry for entry in log if entry[:2] == ["pr", "create"]]
+            self.assertEqual(len(creates), 2, log)
+
+            task = StateStore(Path(state)).read()["tasks"]["T1"]
+            self.assertEqual(task["pr"], "https://github.invalid/pr/1")
+
 
 class ReviewMirrorTest(unittest.TestCase):
     """review record on the pr surface, with a real PR, mirrors findings as a comment."""
@@ -742,6 +804,100 @@ class PrControllerMergeTest(unittest.TestCase):
             self.assertEqual(_bare_ref(bare, base_ref), local_base)
 
 
+class RefreshSurfaceTest(unittest.TestCase):
+    """CLI `refresh` on the pr surface must push the refreshed task branch.
+
+    Regression: refresh had no surface logic at all -- after refresh recorded
+    a new local head, the remote task branch stayed stale. In pr/human that
+    left a human merging the stale PR, after which `merge --observed` could
+    never prove ancestry for the new head. In pr/controller, a review record
+    would mirror onto a diff that no longer matched what merge would use.
+    """
+
+    def test_refresh_pushes_task_branch_on_pr_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = str(Path(tmp) / "gh.log")
+            root, state, bare = _bootstrap_ready_scope(tmp, surface="pr", mode="controller")
+            _start_and_commit(state, root)
+            with _fake_gh(log_path):
+                code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            # Advance the base so refresh actually has something to merge in.
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+            subprocess.run(["git", "checkout", "-q", base_ref], cwd=root, check=True)
+            (root / "base_change.txt").write_text("base work\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                 "-c", "commit.gpgsign=false", "commit", "-qm", "base work"],
+                cwd=root, check=True,
+            )
+
+            code, out = _cli(state, "refresh", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["action"], "refreshed")
+            self.assertNotIn("warning", result)
+
+            task = StateStore(Path(state)).read()["tasks"]["T1"]
+            self.assertEqual(task["headSha"], result["headSha"])
+            self.assertEqual(_bare_ref(bare, task["branch"]), task["headSha"])
+
+
+class ObservedMergeEitherRefTest(unittest.TestCase):
+    """--observed must accept ancestry proof from either the local base ref
+    or origin/<base_ref>, not prefer origin unconditionally.
+
+    Regression: preferring a stale origin/<base_ref> that happened to already
+    exist (e.g. pushed once, before the human merge) falsely refused a
+    genuine local human merge -- even though monitor (which only ever checks
+    the local ref) already considered it proven, so its own recommended
+    record_human_merge command would then fail forever.
+    """
+
+    def test_local_merge_succeeds_despite_stale_origin_base_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _bootstrap_ready_scope(tmp, surface="local", mode="human")
+            _start_and_commit(state, root)
+            code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            _finish_to_merge_ready(state, root)
+
+            task = StateStore(Path(state)).read()["tasks"]["T1"]
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+
+            # Push the base ref now, before the human merge, so origin has a
+            # base ref that is about to go stale relative to the local merge.
+            subprocess.run(
+                ["git", "-C", str(root), "push", "-q", "origin", f"{base_ref}:{base_ref}"],
+                check=True,
+            )
+
+            # The human merges directly in the controller checkout; this is
+            # never pushed back, so origin/<base_ref> stays stale.
+            subprocess.run(["git", "checkout", "-q", base_ref], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                 "-c", "commit.gpgsign=false", "merge", "--no-ff", "-m", "human merge",
+                 task["branch"]],
+                cwd=root, check=True,
+            )
+
+            local_base_after = _git_output(root, "rev-parse", base_ref).strip()
+            origin_base_stale = _bare_ref(bare, base_ref)
+            self.assertNotEqual(
+                local_base_after, origin_base_stale,
+                "the test setup must leave origin's base ref stale",
+            )
+
+            code, out = _cli(state, "merge", "--task", "T1", "--repo", str(root), "--observed")
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["action"], "observed_human_merge")
+            self.assertEqual(StateStore(Path(state)).read()["tasks"]["T1"]["status"], "done")
+
+
 class MonitorHumanMergeTest(unittest.TestCase):
     def test_monitor_flags_merged_head(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -766,6 +922,49 @@ class MonitorHumanMergeTest(unittest.TestCase):
             action = actions[0]
             self.assertEqual(action["action"], "record_human_merge")
             self.assertIn("--observed", action["command"])
+            # Regression: the command used to hardcode "--repo ." regardless
+            # of the actual --repo monitor ran with.
+            self.assertIn(f"--repo {shlex.quote(str(root))}", action["command"])
+            # `state` here is a tmp-dir path, never the default -- so --state
+            # must be echoed back verbatim (unlike the default-state case,
+            # which now omits it; see test_monitor_omits_state_when_default).
+            self.assertIn(f"--state {shlex.quote(state)}", action["command"])
+
+    def test_monitor_omits_state_when_default(self) -> None:
+        # Regression: monitor used to always embed "--state ..." in the
+        # emitted record_human_merge command, even when --state was never
+        # passed (i.e. the default), unlike every other verb's commands
+        # (cli.py's _state_option / engine.decorate_actions), which omit it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ready_local_human_for_monitor(tmp)
+
+            task = StateStore(Path(state)).read()["tasks"]["T1"]
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+            subprocess.run(["git", "checkout", "-q", base_ref], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                 "-c", "commit.gpgsign=false", "merge", "--no-ff", "-m", "human merge",
+                 task["branch"]],
+                cwd=root, check=True,
+            )
+
+            # Run monitor with the default --state, by pointing cwd at root
+            # (where .wdd/state.json actually lives) and omitting the flag.
+            cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    code = main(["monitor", "--once", "--repo", "."])
+                out = stdout.getvalue()
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            actions = [a for a in result["actions"] if a["task"] == "T1"]
+            self.assertEqual(len(actions), 1, out)
+            self.assertNotIn("--state", actions[0]["command"])
+            self.assertIn("--repo .", actions[0]["command"])
 
     def test_monitor_quiet_when_not_merged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

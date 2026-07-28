@@ -342,26 +342,37 @@ def merge_task(
     return {**outcome, "revision": state["revision"], "duplicate": duplicate}
 
 
-def _fetched_base_sha(repo: Path, base_ref: str) -> str:
-    """Resolve the base SHA to prove ancestry against after a best-effort fetch.
+def _fetched_base_refs(repo: Path, base_ref: str) -> list[tuple[str, str]]:
+    """Resolve every ref that live Git can prove ancestry against, after a
+    best-effort fetch.
 
-    `git fetch origin <base_ref>` only ever advances the remote-tracking ref
-    `refs/remotes/origin/<base_ref>` -- it does not (and, without
-    `--update-head-ok`, cannot) touch the local `<base_ref>` branch, which may
-    be checked out elsewhere. A human merge that landed on the remote is
-    real, live-Git-provable evidence the instant the fetch completes, even
-    though the local base ref itself is still stale until someone pulls it.
-    Preferring `origin/<base_ref>` when the fetch produced one is what makes
-    `--observed` actually observe a remote-only human merge; falling back to
-    the local ref keeps the no-remote and offline paths working exactly as
-    before.
+    A human merge is provable evidence the instant it lands on *either* ref:
+
+    - The local `<base_ref>` branch: the human merged directly in the
+      controller checkout (local surface, or offline work before anything
+      was ever pushed).
+    - `refs/remotes/origin/<base_ref>`: the human merged the PR on the
+      remote. `git fetch origin <base_ref>` only ever advances this
+      remote-tracking ref -- it does not (and, without `--update-head-ok`,
+      cannot) touch the local `<base_ref>` branch, which may be checked out
+      elsewhere and may never have been pulled.
+
+    Neither ref is authoritative over the other: preferring origin
+    unconditionally (as this used to) falsely refused a genuine local merge
+    whenever a *stale* origin/<base_ref> happened to already exist (e.g. from
+    an earlier, unrelated fetch) -- monitor only ever checks the local ref,
+    so its record_human_merge command would then fail forever. Ancestry must
+    be accepted against either ref, since both are equally live-Git-proven.
     """
+    refs = [(base_ref, resolve_ref(repo, base_ref))]
     remote_ref = f"origin/{base_ref}"
     has_remote_ref = (
         run_git(repo, "show-ref", "--verify", "--quiet", f"refs/remotes/{remote_ref}", check=False).returncode
         == 0
     )
-    return resolve_ref(repo, remote_ref if has_remote_ref else base_ref)
+    if has_remote_ref:
+        refs.append((remote_ref, resolve_ref(repo, remote_ref)))
+    return refs
 
 
 def observe_merge(
@@ -412,12 +423,17 @@ def observe_merge(
             raise IllegalTransition(
                 f"task {task_id} head changed since observation began; re-run 'wddctl merge --observed'"
             )
-        base_sha = _fetched_base_sha(repo, base_ref)
-        if not is_ancestor(repo, head_sha, base_sha):
+        candidates = _fetched_base_refs(repo, base_ref)
+        proven = next(
+            (sha for _, sha in candidates if is_ancestor(repo, head_sha, sha)), None
+        )
+        if proven is None:
+            refs_desc = " nor ".join(f"{name} ({sha})" for name, sha in candidates)
             raise IllegalTransition(
-                f"task {task_id} head {head_sha} is not reachable from {base_ref} ({base_sha}); "
+                f"task {task_id} head {head_sha} is reachable from neither {refs_desc}; "
                 "the human merge has not happened"
             )
+        base_sha = proven
         return _apply_merge_event(
             current,
             task_id=task_id,
