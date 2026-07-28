@@ -38,6 +38,7 @@ from .errors import IllegalTransition, ValidationError, WaveDeliveryError
 from .schema import derived_phase
 from .freshness import check_freshness, record_freshness
 from .leases import release_task, start_task, submit_task
+from .lint import lint_plan
 from .merge import merge_task, refresh_task
 from .migration import apply_migration, plan_migration
 from .monitor import monitor_once
@@ -121,11 +122,15 @@ def build_parser() -> argparse.ArgumentParser:
     plan_apply.add_argument("--repo", type=Path, default=Path("."))
     plan_apply.add_argument("--from-ref", default=None, help="start point for a new base branch")
     plan_apply.add_argument("--dry-run", action="store_true")
+    plan_apply.add_argument("--strict", action="store_true")
     _add_concurrency_flags(plan_apply)
     plan_preview = plan_subparsers.add_parser(
         "preview", help="project the admission order (a view, not a gate)"
     )
     plan_preview.add_argument("--plan", type=Path)
+    plan_lint = plan_subparsers.add_parser("lint", help="report plan-quality warnings")
+    plan_lint.add_argument("--plan", type=Path, required=True)
+    plan_lint.add_argument("--strict", action="store_true")
 
     subparsers.add_parser("doctor", help="report optional controller capabilities").add_argument(
         "--json", action="store_true"
@@ -358,6 +363,22 @@ def _concurrency(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _overlaid_plan(args: argparse.Namespace, store: StateStore) -> tuple[dict[str, Any], Path]:
+    """Read a plan file and apply the same config overlays 'plan apply' does.
+
+    Shared by 'plan lint' and 'plan apply' so lint always sees exactly what
+    apply would see: raw scope defaults, then risk-rule overrides.
+    """
+    plan = read_plan(args.plan)
+    wdd_dir = store.path.parent
+    if config_path(wdd_dir).exists():
+        raw_plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+        config = load_config(wdd_dir)
+        plan = apply_config_defaults(plan, raw_plan["scope"], config)
+        plan = apply_risk_rules(plan, config)
+    return plan, wdd_dir
+
+
 def _simple_event(store: StateStore, args: argparse.Namespace, event: str, data: dict[str, Any]) -> int:
     state, duplicate = apply_event(
         store, event_type=event, task_id=getattr(args, "task", None), data=data, **_concurrency(args)
@@ -384,23 +405,31 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "plan" and args.plan_command == "apply":
-            plan = read_plan(args.plan)
-            wdd_dir = store.path.parent
-            if config_path(wdd_dir).exists():
-                raw_plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
-                config = load_config(wdd_dir)
-                plan = apply_config_defaults(plan, raw_plan["scope"], config)
-                plan = apply_risk_rules(plan, config)
-            _print_json(
-                apply_plan(
-                    store,
-                    plan,
-                    repo=args.repo,
-                    from_ref=args.from_ref,
-                    dry_run=args.dry_run,
-                    **_concurrency(args),
+            plan, wdd_dir = _overlaid_plan(args, store)
+            findings = lint_plan(plan, wdd_dir if wdd_dir.exists() else None)
+            if args.strict and findings:
+                raise ValidationError(
+                    "plan apply --strict: " + ", ".join(sorted({f["code"] for f in findings}))
                 )
+            result = apply_plan(
+                store,
+                plan,
+                repo=args.repo,
+                from_ref=args.from_ref,
+                dry_run=args.dry_run,
+                **_concurrency(args),
             )
+            _print_json({**result, "lint": findings})
+            return 0
+
+        if args.command == "plan" and args.plan_command == "lint":
+            plan_dict, wdd_dir = _overlaid_plan(args, store)
+            findings = lint_plan(plan_dict, wdd_dir if wdd_dir.exists() else None)
+            if args.strict and findings:
+                raise ValidationError(
+                    "plan lint --strict: " + ", ".join(sorted({f["code"] for f in findings}))
+                )
+            _print_json({"findings": findings, "strict": args.strict})
             return 0
 
         if args.command == "plan" and args.plan_command == "preview":

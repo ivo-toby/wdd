@@ -114,6 +114,29 @@ def _check_coarse_domains(plan_dict: dict[str, Any]) -> list[dict[str, Any]]:
     return findings
 
 
+def _check_briefs(plan_dict: dict[str, Any], wdd_dir: Path | str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for entry in plan_dict["tasks"]:
+        brief = Path(wdd_dir) / entry["specPath"]
+        content_lines = 0
+        if brief.is_file():
+            # Raw line count, not filtered to non-blank: a title + blank +
+            # one content line (3 lines total) is a real brief; filtering
+            # blanks would flag that exact shape as too short.
+            content_lines = len(brief.read_text(encoding="utf-8").splitlines())
+        if content_lines < 3:
+            reason = "does not exist" if not brief.is_file() else "is effectively empty"
+            findings.append(
+                {
+                    "code": "missing_brief",
+                    "severity": "warning",
+                    "task": entry["id"],
+                    "message": f"{entry['id']}: brief {entry['specPath']} {reason} — a worker dispatched on it will improvise.",
+                }
+            )
+    return findings
+
+
 def lint_plan(
     plan_dict: dict[str, Any], wdd_dir: Path | str | None = None
 ) -> list[dict[str, Any]]:
@@ -122,4 +145,6 @@ def lint_plan(
     findings.extend(_check_risk_distribution(plan_dict))
     findings.extend(_check_enumerated_domains(plan_dict))
     findings.extend(_check_coarse_domains(plan_dict))
+    if wdd_dir is not None:
+        findings.extend(_check_briefs(plan_dict, wdd_dir))
     return findings
