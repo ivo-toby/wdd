@@ -13,7 +13,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from .errors import ValidationError
+from .errors import IllegalTransition, ValidationError
 from .schema import REVIEW_POLICIES, RISK_LEVELS
 from .store import atomic_write_text
 
@@ -214,6 +214,36 @@ def governance_fingerprint(wdd_dir: Path | str) -> str:
         json.dumps(config, sort_keys=True, separators=(",", ":")) + "\x00" + constitution
     ).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def governance_drift(state: dict[str, Any], wdd_dir: Path | str) -> dict[str, Any] | None:
+    """Detect config/constitution edits made after ratification without an amend.
+
+    None covers three cases: unratified (nothing signed yet), fingerprints
+    still match, and legacy scopes that predate the config split (no
+    config.json/constitution.md to fingerprint — migration, not drift
+    detection, is their path forward; see Task 9).
+    """
+    ratification = state["constitution"].get("ratification")
+    if state["constitution"]["status"] != "ratified" or not isinstance(ratification, dict):
+        return None
+    if not config_path(wdd_dir).exists() or not constitution_path(wdd_dir).exists():
+        return None
+    actual = governance_fingerprint(wdd_dir)
+    ratified = ratification.get("decisionFingerprint")
+    if ratified == actual:
+        return None
+    return {"ratified": ratified, "actual": actual}
+
+
+def require_fresh_governance(state: dict[str, Any], wdd_dir: Path | str) -> None:
+    drift = governance_drift(state, wdd_dir)
+    if drift is not None:
+        raise IllegalTransition(
+            "governance drift: config.json or constitution.md changed since ratification "
+            f"(ratified {drift['ratified']}, current {drift['actual']}); "
+            "run 'wddctl constitution amend --by NAME' after the user re-approves"
+        )
 
 
 def check_ratifiable(wdd_dir: Path | str) -> None:

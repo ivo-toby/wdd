@@ -13,13 +13,14 @@ from wave_delivery.config import (
     check_ratifiable,
     default_config,
     get_value,
+    governance_drift,
     governance_fingerprint,
     load_config,
     save_config,
     set_value,
     validate_config,
 )
-from wave_delivery.errors import ValidationError
+from wave_delivery.errors import IllegalTransition, ValidationError
 from wave_delivery.schema import (
     SCHEMA_VERSION,
     derived_phase,
@@ -455,6 +456,60 @@ class PlanAdoptionTest(unittest.TestCase):
             self.assertEqual(adopted["scope"]["id"], "SCOPE-demo")
             self.assertIn("TASK-001-first", adopted["tasks"])
             self.assertEqual(adopted["constitution"]["status"], "ratified")
+
+
+class GovernanceDriftTest(unittest.TestCase):
+    def _ratified_repo(self, tmp: str) -> tuple[Path, Path]:
+        root = _git_repo(tmp)
+        wdd = root / ".wdd"
+        init_repository(wdd, root)
+        config = load_config(wdd)
+        config = set_value(config, "merge.surface", "local")
+        config = set_value(config, "verification.commands", ["true"])
+        save_config(wdd, config)
+        store = StateStore(wdd / "state.json")
+        state = store.read()
+        state["constitution"] = {
+            "status": "ratified",
+            "ratification": {
+                "by": "ivo",
+                "decisionFingerprint": governance_fingerprint(wdd),
+            },
+        }
+        store.write(state)
+        return root, wdd
+
+    def test_no_drift_after_ratification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, wdd = self._ratified_repo(tmp)
+            state = StateStore(wdd / "state.json").read()
+            self.assertIsNone(governance_drift(state, wdd))
+
+    def test_editing_config_after_ratification_is_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, wdd = self._ratified_repo(tmp)
+            save_config(wdd, set_value(load_config(wdd), "concurrency.maxConcurrent", 5))
+            state = StateStore(wdd / "state.json").read()
+            drift = governance_drift(state, wdd)
+            self.assertIsNotNone(drift)
+            self.assertNotEqual(drift["ratified"], drift["actual"])
+
+    def test_cli_start_refuses_on_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd = self._ratified_repo(tmp)
+            store = StateStore(wdd / "state.json")
+            apply_plan(store, _minimal_plan())
+            save_config(wdd, set_value(load_config(wdd), "concurrency.maxConcurrent", 5))
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = main(
+                    [
+                        "--state", str(wdd / "state.json"),
+                        "start", "--task", "TASK-001-first", "--repo", str(root),
+                    ]
+                )
+            self.assertNotEqual(code, 0)
+            self.assertIn("drift", stderr.getvalue())
 
 
 if __name__ == "__main__":

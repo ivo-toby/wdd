@@ -17,8 +17,10 @@ from .config import (
     check_ratifiable,
     config_path,
     get_value,
+    governance_drift,
     governance_fingerprint,
     load_config,
+    require_fresh_governance,
     save_config,
     set_value,
 )
@@ -45,6 +47,34 @@ from .store import StateStore
 
 
 DEFAULT_STATE = Path(".wdd/state.json")
+
+# Verbs that mutate execution state (or the record of it) and therefore must
+# refuse when config.json/constitution.md drifted from what was ratified.
+# Read-only verbs (status, next, render, freshness check, doctor, monitor),
+# init/config/plan/migrate, block/unblock/cancel/note, event, and
+# constitution itself are deliberately absent: they either don't act on
+# ratified governance or are how governance gets re-signed in the first place.
+GOVERNED_VERBS = {
+    ("start", None),
+    ("submit", None),
+    ("refresh", None),
+    ("merge", None),
+    ("review", "record"),
+    ("review", "collect"),
+    ("verify", "record"),
+    ("verify", "collect"),
+    ("reconcile", "done"),
+}
+
+
+def _subcommand(args: argparse.Namespace) -> str | None:
+    """The dispatched subcommand for commands that have one, else None.
+
+    Every subparser's dest follows "{command}_command" (review_command,
+    verify_command, reconcile_command, ...); plain verbs like "start" have
+    no such attribute.
+    """
+    return getattr(args, f"{args.command}_command", None)
 
 
 def _json_argument(value: str) -> Any:
@@ -336,6 +366,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     store = StateStore(args.state)
     try:
+        if (args.command, _subcommand(args)) in GOVERNED_VERBS and store.exists():
+            require_fresh_governance(store.read(), store.path.parent)
+
         if args.command == "doctor":
             _print_json(inspect_capabilities())
             return 0
@@ -395,14 +428,24 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 return 0
-            _print_json(
-                bounded_next_actions(
-                    state,
-                    max_bytes=args.max_bytes,
-                    state_path=_state_option(args),
-                    repo=str(args.repo),
-                )
+            result = bounded_next_actions(
+                state,
+                max_bytes=args.max_bytes,
+                state_path=_state_option(args),
+                repo=str(args.repo),
             )
+            drift = governance_drift(state, store.path.parent)
+            if drift is not None:
+                result["actions"] = []
+                result["blockers"].insert(
+                    0,
+                    {
+                        "code": "governance_drift",
+                        "message": "config/constitution changed since ratification; amend before executing",
+                        **drift,
+                    },
+                )
+            _print_json(result)
             return 0
 
         if args.command == "render":
