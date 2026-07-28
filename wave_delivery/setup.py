@@ -11,8 +11,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .config import config_path, constitution_path, default_config, save_config
+from .config import config_path, constitution_path, default_config, load_config, save_config
 from .constitution import probe_repository
+from .errors import ValidationError
 from .schema import new_setup_state
 from .store import StateStore, atomic_write_text
 
@@ -92,22 +93,41 @@ def init_repository(wdd_dir: Path | str, repo: Path | str) -> dict[str, Any]:
     proposal = probe_repository(repo)
     probed_commands = proposal["evidence"]["verificationCommands"]
 
-    config = default_config()
-    config["branching"]["targetBranch"] = proposal["decisions"]["targetBranch"]
-    config["verification"]["commands"] = probed_commands
-    config["openQuestions"] = _open_questions(probed_commands)
+    # Load existing config if present, otherwise create fresh one
+    config_file = config_path(wdd_dir)
+    if config_file.exists():
+        config = load_config(wdd_dir)
+    else:
+        config = default_config()
+        config["branching"]["targetBranch"] = proposal["decisions"]["targetBranch"]
+        config["verification"]["commands"] = probed_commands
+        config["openQuestions"] = _open_questions(probed_commands)
 
     created: list[str] = []
-    save_config(wdd_dir, config)
-    created.append(str(config_path(wdd_dir)))
+    if not config_file.exists():
+        save_config(wdd_dir, config)
+        created.append(str(config_file))
+
     if not constitution_path(wdd_dir).exists():
         atomic_write_text(constitution_path(wdd_dir), CONSTITUTION_TEMPLATE)
         created.append(str(constitution_path(wdd_dir)))
+
     for directory in ("tasks", "shared-context"):
         (wdd_dir / directory).mkdir(parents=True, exist_ok=True)
         created.append(str(wdd_dir / directory))
-    store.write(new_setup_state())
+
+    # Wrap state write in lock with re-check for race condition safety
+    with store.locked():
+        if store.exists():
+            return {
+                "alreadyInitialized": True,
+                "created": [],
+                "openQuestions": [],
+                "hint": "state exists; run 'wddctl next' for what to do",
+            }
+        store.write(new_setup_state())
     created.append(str(store.path))
+
     return {
         "alreadyInitialized": False,
         "created": created,

@@ -285,6 +285,32 @@ class InitTest(unittest.TestCase):
         for banned in ("```json", "TBD", "TODO", "<", "state which"):
             self.assertNotIn(banned, CONSTITUTION_TEMPLATE)
 
+    def test_init_preserves_existing_config(self) -> None:
+        """Existing config.json should not be overwritten; openQuestions should survive."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            # First init to create config
+            init_repository(wdd, root)
+            original_config = load_config(wdd)
+            # Manually modify an open question (simulate manual edits or prior resolution)
+            modified_config = original_config.copy()
+            modified_config["openQuestions"] = [
+                q for q in modified_config["openQuestions"] if q["path"] != "merge.surface"
+            ]
+            modified_config["customField"] = "preserved_value"
+            save_config(wdd, modified_config)
+            # Remove state.json to simulate partial failure
+            (wdd / "state.json").unlink()
+            # Second init should preserve the modified config
+            result = init_repository(wdd, root)
+            self.assertFalse(result["alreadyInitialized"])
+            reloaded_config = load_config(wdd)
+            self.assertNotIn("merge.surface", [q["path"] for q in reloaded_config["openQuestions"]])
+            self.assertEqual(reloaded_config.get("customField"), "preserved_value")
+            # Config should not be listed in created (since it already existed)
+            self.assertNotIn(str(wdd / "config.json"), result["created"])
+
 
 class InitCliTest(unittest.TestCase):
     def test_cli_init_prints_next_guidance(self) -> None:
