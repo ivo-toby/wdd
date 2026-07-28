@@ -120,11 +120,12 @@ def _check_briefs(plan_dict: dict[str, Any], wdd_dir: Path | str) -> list[dict[s
         brief = Path(wdd_dir) / entry["specPath"]
         content_lines = 0
         if brief.is_file():
-            # Raw line count, not filtered to non-blank: a title + blank +
-            # one content line (3 lines total) is a real brief; filtering
-            # blanks would flag that exact shape as too short.
-            content_lines = len(brief.read_text(encoding="utf-8").splitlines())
-        if content_lines < 3:
+            # Non-blank lines, not raw line count: a file of only blank
+            # lines has content-free "length" and must still be flagged.
+            content_lines = sum(
+                1 for line in brief.read_text(encoding="utf-8").splitlines() if line.strip()
+            )
+        if content_lines < 2:
             reason = "does not exist" if not brief.is_file() else "is effectively empty"
             findings.append(
                 {

@@ -195,6 +195,16 @@ class LintBriefTest(unittest.TestCase):
         plan = _plan([_task("T1")])
         self.assertNotIn("missing_brief", _codes(lint_plan(plan)))
 
+    def test_blank_only_brief_warns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            (wdd / "tasks").mkdir(parents=True)
+            (wdd / "tasks" / "T1.md").write_text("\n\n\n", encoding="utf-8")
+            plan = _plan([_task("T1")])
+            plan["tasks"][0]["specPath"] = "tasks/T1.md"
+            findings = [f for f in lint_plan(plan, wdd) if f["code"] == "missing_brief"]
+            self.assertEqual({f["task"] for f in findings}, {"T1"})
+
 
 class LintCliTest(unittest.TestCase):
     def test_plan_lint_reports_findings_exit_zero(self) -> None:
