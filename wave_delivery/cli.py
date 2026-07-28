@@ -23,7 +23,7 @@ from .config import (
     set_value,
 )
 from .constitution import probe_repository, ratification_status, read_proposal, write_proposal
-from .setup import init_repository
+from .setup import init_repository, setup_next_actions
 from .doctor import inspect_capabilities
 from .engine import (
     admission_schedule,
@@ -33,6 +33,7 @@ from .engine import (
     status_summary,
 )
 from .errors import IllegalTransition, ValidationError, WaveDeliveryError
+from .schema import derived_phase
 from .freshness import check_freshness, record_freshness
 from .leases import release_task, start_task, submit_task
 from .merge import merge_task, refresh_task
@@ -369,14 +370,34 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "status":
-            summary = status_summary(store.read())
+            state = store.read()
+            if derived_phase(state) == "setup":
+                config = load_config(store.path.parent)
+                _print_json(
+                    {
+                        "phase": "setup",
+                        "openQuestions": len(config["openQuestions"]),
+                        "constitution": state["constitution"]["status"],
+                        "scope": None,
+                    }
+                )
+                return 0
+            summary = status_summary(state)
             _print_json(summary) if args.json else print(_brief(summary))
             return 0
 
         if args.command == "next":
+            state = store.read()
+            if derived_phase(state) == "setup":
+                _print_json(
+                    setup_next_actions(
+                        state, store.path.parent, state_path=_state_option(args)
+                    )
+                )
+                return 0
             _print_json(
                 bounded_next_actions(
-                    store.read(),
+                    state,
                     max_bytes=args.max_bytes,
                     state_path=_state_option(args),
                     repo=str(args.repo),

@@ -27,7 +27,7 @@ from wave_delivery.schema import (
     new_state,
     validate_state,
 )
-from wave_delivery.setup import CONSTITUTION_TEMPLATE, init_repository
+from wave_delivery.setup import CONSTITUTION_TEMPLATE, init_repository, setup_next_actions
 from wave_delivery.store import StateStore
 
 
@@ -324,6 +324,43 @@ class InitCliTest(unittest.TestCase):
             payload = json.loads(stdout.getvalue())
             self.assertFalse(payload["alreadyInitialized"])
             self.assertTrue(payload["openQuestions"])
+
+
+class SetupNextTest(unittest.TestCase):
+    def _initialized(self, tmp: str) -> tuple[Path, Path]:
+        root = _git_repo(tmp)
+        wdd = root / ".wdd"
+        init_repository(wdd, root)
+        return root, wdd
+
+    def test_first_action_is_resolve_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, wdd = self._initialized(tmp)
+            state = StateStore(wdd / "state.json").read()
+            result = setup_next_actions(state, wdd)
+            self.assertEqual(result["actions"][0]["action"], "resolve_config")
+            self.assertTrue(result["actions"][0]["questions"])
+
+    def test_after_resolution_action_is_ratify(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, wdd = self._initialized(tmp)
+            config = load_config(wdd)
+            config = set_value(config, "merge.surface", "local")
+            config = set_value(config, "verification.commands", ["true"])
+            save_config(wdd, config)
+            state = StateStore(wdd / "state.json").read()
+            result = setup_next_actions(state, wdd)
+            self.assertEqual(result["actions"][0]["action"], "ratify")
+
+    def test_cli_next_routes_to_setup_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd = self._initialized(tmp)
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--state", str(wdd / "state.json"), "next"])
+            self.assertEqual(code, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["actions"][0]["action"], "resolve_config")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ rest (resolve open questions -> ratify -> plan).
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -133,4 +134,52 @@ def init_repository(wdd_dir: Path | str, repo: Path | str) -> dict[str, Any]:
         "created": created,
         "openQuestions": config["openQuestions"],
         "hint": "run 'wddctl next' and follow it",
+    }
+
+
+def setup_next_actions(
+    state: dict[str, Any], wdd_dir: Path | str, *, state_path: str | None = None
+) -> dict[str, Any]:
+    """The setup-phase counterpart of engine.next_actions.
+
+    Same output shape, one action at a time: setup is sequential, and a
+    single unambiguous action is what keeps an agent from improvising.
+    """
+    prefix = "wddctl" + (f" --state {shlex.quote(state_path)}" if state_path else "")
+    actions: list[dict[str, Any]] = []
+    config = load_config(wdd_dir)
+    if config["openQuestions"]:
+        actions.append(
+            {
+                "task": "-",
+                "action": "resolve_config",
+                "questions": config["openQuestions"],
+                "command": f"{prefix} config set <path> <value>",
+                "judgment": "ask the user every listed question in ONE round, then record each answer",
+            }
+        )
+    elif state["constitution"]["status"] != "ratified":
+        actions.append(
+            {
+                "task": "-",
+                "action": "ratify",
+                "command": f"{prefix} constitution ratify --by NAME",
+                "judgment": "show the user config.json and constitution.md; ratify only after explicit sign-off",
+            }
+        )
+    elif state.get("scope") is None:
+        actions.append(
+            {
+                "task": "-",
+                "action": "plan",
+                "command": f"{prefix} plan apply --plan plan.json --repo .",
+                "judgment": "decompose the work per the wdd-plan skill, write task briefs, then apply",
+            }
+        )
+    return {
+        "scope": (state.get("scope") or {}).get("id") if state.get("scope") else None,
+        "revision": state["revision"],
+        "phase": "setup",
+        "actions": actions,
+        "blockers": [],
     }
