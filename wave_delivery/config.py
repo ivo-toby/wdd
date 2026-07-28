@@ -176,6 +176,11 @@ def get_value(config: dict[str, Any], dotted: str) -> Any:
 
 
 def set_value(config: dict[str, Any], dotted: str, value: Any) -> dict[str, Any]:
+    if dotted == "openQuestions" or dotted.startswith("openQuestions."):
+        raise ValidationError(
+            "config: openQuestions cannot be set directly (it would silently drop the "
+            "ratify gate); resolve each question by setting the path it names instead"
+        )
     updated = deepcopy(config)
     parts = dotted.split(".")
     node: Any = updated
@@ -219,18 +224,22 @@ def governance_fingerprint(wdd_dir: Path | str) -> str:
 def governance_drift(state: dict[str, Any], wdd_dir: Path | str) -> dict[str, Any] | None:
     """Detect config/constitution edits made after ratification without an amend.
 
-    None covers three cases: unratified (nothing signed yet), fingerprints
-    still match, and legacy scopes that predate the config split (no
-    config.json/constitution.md to fingerprint — migration, not drift
-    detection, is their path forward; see Task 9).
+    None covers two no-op cases: unratified (nothing signed yet), and legacy
+    scopes that predate the config split (no config.json to fingerprint —
+    migration, not drift detection, is their path forward; see Task 9). Once
+    config.json exists, a missing constitution.md is NOT a legacy no-op: it
+    is drift (someone deleted the ratified prose), reported with a synthetic
+    "missing:constitution.md" actual fingerprint so the gate still fires.
     """
     ratification = state["constitution"].get("ratification")
     if state["constitution"]["status"] != "ratified" or not isinstance(ratification, dict):
         return None
-    if not config_path(wdd_dir).exists() or not constitution_path(wdd_dir).exists():
+    if not config_path(wdd_dir).exists():
         return None
-    actual = governance_fingerprint(wdd_dir)
     ratified = ratification.get("decisionFingerprint")
+    if not constitution_path(wdd_dir).exists():
+        return {"ratified": ratified, "actual": "missing:constitution.md"}
+    actual = governance_fingerprint(wdd_dir)
     if ratified == actual:
         return None
     return {"ratified": ratified, "actual": actual}

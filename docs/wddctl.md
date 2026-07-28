@@ -423,9 +423,11 @@ wddctl next --repo .
 Read-only verbs (`status`, `next` itself, `render`, `freshness check`,
 `doctor`, `monitor`), setup verbs (`init`, `config`, `plan`, `migrate`),
 task-state verbs that don't execute anything (`block`, `unblock`, `cancel`,
-`note`), `event`, and `constitution` itself are deliberately exempt — they
-either don't act on ratified governance, or are how governance gets
-re-signed in the first place.
+`note`), `event`, `constitution` itself, and `release` are deliberately
+exempt — they either don't act on ratified governance, or are how
+governance gets re-signed in the first place. `release` in particular is
+cleanup of an already-finished task: it runs after merge evidence has been
+recorded, so there is nothing left for a drift check to protect.
 
 ### `next`
 
@@ -877,7 +879,11 @@ wddctl event apply --event task.blocked --task TASK-001-token-types --data '{"re
 
 Optional capability report: Python version, and whether `git`, `gh`, `acli`,
 `codex`, `claude` are on `PATH`. The core controller works with none of the
-optional ones present.
+optional ones present. Also reports governance health —
+`governance.configPresent`, `governance.configValid` (with an `error` string
+on failure), and `governance.drift` (`null`, or the same shape `next` emits
+in its `governance_drift` blocker) — computed from `.wdd/config.json` and
+the current state if one exists. Doctor only reports; it never refuses.
 
 ```sh
 wddctl doctor [--json]

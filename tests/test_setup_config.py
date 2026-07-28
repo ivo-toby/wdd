@@ -116,6 +116,14 @@ class ConfigPathAccessTest(unittest.TestCase):
         updated = set_value(config, "merge.surface", "local")
         self.assertEqual(updated["openQuestions"], [])
 
+    def test_set_value_rejects_open_questions_path(self) -> None:
+        # 'config set openQuestions []' would silently wipe the ratify gate
+        # (and default merge.surface along with it) in one command.
+        with self.assertRaises(ValidationError):
+            set_value(default_config(), "openQuestions", [])
+        with self.assertRaises(ValidationError):
+            set_value(default_config(), "openQuestions.0.path", "merge.surface")
+
 
 class ConfigCliTest(unittest.TestCase):
     def _run(self, tmp: str, *argv: str) -> tuple[int, str]:
@@ -458,6 +466,59 @@ class PlanAdoptionTest(unittest.TestCase):
             self.assertEqual(adopted["constitution"]["status"], "ratified")
 
 
+class PlanConfigDefaultsTest(unittest.TestCase):
+    def _configured_repo(self, tmp: str) -> tuple[Path, Path]:
+        root = _git_repo(tmp)
+        wdd = root / ".wdd"
+        init_repository(wdd, root)
+        config = load_config(wdd)
+        config = set_value(config, "merge.surface", "local")
+        config = set_value(config, "verification.commands", ["true"])
+        config = set_value(config, "review.policy", "always")
+        save_config(wdd, config)
+        return root, wdd
+
+    def test_omitted_scope_field_defaults_from_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd = self._configured_repo(tmp)
+            plan = _minimal_plan()
+            del plan["scope"]["reviewPolicy"]  # omitted entirely -> config wins
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--state", str(wdd / "state.json"),
+                        "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            state = StateStore(wdd / "state.json").read()
+            self.assertEqual(state["scope"]["reviewPolicy"], "always")
+
+    def test_explicit_scope_field_is_not_overridden_by_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd = self._configured_repo(tmp)
+            plan = _minimal_plan()
+            plan["scope"]["reviewPolicy"] = "risk_based"  # explicit -> plan wins
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--state", str(wdd / "state.json"),
+                        "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            state = StateStore(wdd / "state.json").read()
+            self.assertEqual(state["scope"]["reviewPolicy"], "risk_based")
+
+
 class GovernanceDriftTest(unittest.TestCase):
     def _ratified_repo(self, tmp: str) -> tuple[Path, Path]:
         root = _git_repo(tmp)
@@ -511,6 +572,75 @@ class GovernanceDriftTest(unittest.TestCase):
             self.assertNotEqual(code, 0)
             self.assertIn("drift", stderr.getvalue())
 
+    def test_deleting_constitution_after_ratification_is_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd = self._ratified_repo(tmp)
+            store = StateStore(wdd / "state.json")
+            apply_plan(store, _minimal_plan())
+            (wdd / "constitution.md").unlink()
+
+            state = store.read()
+            drift = governance_drift(state, wdd)
+            self.assertIsNotNone(drift)
+            self.assertEqual(drift["actual"], "missing:constitution.md")
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = main(
+                    [
+                        "--state", str(wdd / "state.json"),
+                        "start", "--task", "TASK-001-first", "--repo", str(root),
+                    ]
+                )
+            self.assertNotEqual(code, 0)
+            self.assertIn("drift", stderr.getvalue())
+
+
+class DoctorGovernanceTest(unittest.TestCase):
+    def test_doctor_on_fresh_init_reports_valid_config_and_no_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            init_repository(wdd, root)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--state", str(wdd / "state.json"), "doctor"])
+            self.assertEqual(code, 0)
+            governance = json.loads(stdout.getvalue())["governance"]
+            self.assertTrue(governance["configPresent"])
+            self.assertTrue(governance["configValid"])
+            self.assertIsNone(governance["drift"])
+
+    def test_doctor_reports_drift_after_ratified_config_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            init_repository(wdd, root)
+            config = load_config(wdd)
+            config = set_value(config, "merge.surface", "local")
+            config = set_value(config, "verification.commands", ["true"])
+            save_config(wdd, config)
+            store = StateStore(wdd / "state.json")
+            state = store.read()
+            state["constitution"] = {
+                "status": "ratified",
+                "ratification": {"by": "ivo", "decisionFingerprint": governance_fingerprint(wdd)},
+            }
+            store.write(state)
+            # Edit after ratification without an amend: drift.
+            save_config(wdd, set_value(load_config(wdd), "concurrency.maxConcurrent", 5))
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--state", str(wdd / "state.json"), "doctor"])
+            # doctor reports, never refuses.
+            self.assertEqual(code, 0)
+            governance = json.loads(stdout.getvalue())["governance"]
+            self.assertTrue(governance["configPresent"])
+            self.assertTrue(governance["configValid"])
+            self.assertIsNotNone(governance["drift"])
+
 
 LEGACY_CONSTITUTION = """---
 id: WDD-CONSTITUTION
@@ -561,6 +691,39 @@ class GovernanceMigrationTest(unittest.TestCase):
             init_repository(wdd, root)
             result = migrate_governance(wdd)
             self.assertFalse(result["migrated"])
+
+
+class SetupStatusScopeTest(unittest.TestCase):
+    def test_status_reports_actual_scope_id_for_post_migrate_setup_state(self) -> None:
+        """migrate_governance invalidates ratification but keeps a legacy scope,
+        so the setup-shape status branch fires (derived_phase == 'setup') even
+        though a real scope exists; it must report that scope's id, not null.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            wdd.mkdir()
+            state = new_state("SCOPE-legacy", base_ref="wdd/legacy")
+            state["constitution"] = {
+                "status": "ratified",
+                "ratification": {"by": "ivo", "decisionFingerprint": "sha256:old"},
+            }
+            StateStore(wdd / "state.json").write(state)
+            (wdd / "constitution.md").write_text("# Constitution\n", encoding="utf-8")
+
+            result = migrate_governance(wdd)
+            self.assertTrue(result["ratificationInvalidated"])
+            migrated_state = StateStore(wdd / "state.json").read()
+            self.assertEqual(derived_phase(migrated_state), "setup")
+            self.assertIsNotNone(migrated_state["scope"])
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--state", str(wdd / "state.json"), "status", "--json"])
+            self.assertEqual(code, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["phase"], "setup")
+            self.assertEqual(payload["scope"], "SCOPE-legacy")
 
 
 class EndToEndSetupTest(unittest.TestCase):

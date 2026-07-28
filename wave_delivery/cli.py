@@ -41,7 +41,7 @@ from .leases import release_task, start_task, submit_task
 from .merge import merge_task, refresh_task
 from .migration import apply_migration, plan_migration
 from .monitor import monitor_once
-from .plan import apply_plan, read_plan, state_from_plan
+from .plan import apply_config_defaults, apply_plan, read_plan, state_from_plan
 from .review import record_review, record_verification, validate_findings
 from .store import StateStore
 
@@ -375,7 +375,8 @@ def main(argv: list[str] | None = None) -> int:
             require_fresh_governance(store.read(), store.path.parent)
 
         if args.command == "doctor":
-            _print_json(inspect_capabilities())
+            state = store.read() if store.exists() else None
+            _print_json(inspect_capabilities(store.path.parent, state))
             return 0
 
         if args.command == "init":
@@ -383,10 +384,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "plan" and args.plan_command == "apply":
+            plan = read_plan(args.plan)
+            wdd_dir = store.path.parent
+            if config_path(wdd_dir).exists():
+                raw_plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+                plan = apply_config_defaults(plan, raw_plan["scope"], load_config(wdd_dir))
             _print_json(
                 apply_plan(
                     store,
-                    read_plan(args.plan),
+                    plan,
                     repo=args.repo,
                     from_ref=args.from_ref,
                     dry_run=args.dry_run,
@@ -416,7 +422,7 @@ def main(argv: list[str] | None = None) -> int:
                         "phase": "setup",
                         "openQuestions": len(config["openQuestions"]),
                         "constitution": state["constitution"]["status"],
-                        "scope": None,
+                        "scope": (state.get("scope") or {}).get("id"),
                     }
                 )
                 return 0

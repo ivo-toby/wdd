@@ -16,7 +16,6 @@ from typing import Any
 
 from .config import config_path, constitution_path, default_config, load_config, save_config
 from .constitution import probe_repository
-from .errors import ValidationError
 from .schema import new_setup_state
 from .store import StateStore, atomic_write_text
 

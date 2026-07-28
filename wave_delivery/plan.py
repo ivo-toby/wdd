@@ -126,6 +126,29 @@ def validate_plan(plan: Any) -> dict[str, Any]:
     }
 
 
+def apply_config_defaults(
+    plan_dict: dict[str, Any], raw_scope: dict[str, Any], config: dict[str, Any]
+) -> dict[str, Any]:
+    """Overlay config.json's defaults onto scope fields the plan file omitted.
+
+    validate_plan() fills reviewPolicy/reconcileEveryNMerges with hardcoded
+    literals so it stays a pure, file-local function with no config
+    dependency. Config.json is the actual ratified source of truth for what
+    "default" means, so cli.py calls this afterward, at apply time, passing
+    the plan's raw (pre-validation) scope object: a field only gets
+    overridden here when the operator's plan file never mentioned it at
+    all — an explicit value in the plan always wins over config.
+    """
+    scope = dict(plan_dict["scope"])
+    if "reviewPolicy" not in raw_scope:
+        scope["reviewPolicy"] = config["review"]["policy"]
+    if "reconcileEveryNMerges" not in raw_scope:
+        scope["reconcileEveryNMerges"] = config["merge"]["reconcileEveryNMerges"]
+    if "maxConcurrent" not in raw_scope:
+        scope["maxConcurrent"] = config["concurrency"]["maxConcurrent"]
+    return {**plan_dict, "scope": scope}
+
+
 def state_from_plan(plan: dict[str, Any]) -> dict[str, Any]:
     scope = plan["scope"]
     state = new_state(
