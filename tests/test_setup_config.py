@@ -17,6 +17,13 @@ from wave_delivery.config import (
     validate_config,
 )
 from wave_delivery.errors import ValidationError
+from wave_delivery.schema import (
+    SCHEMA_VERSION,
+    derived_phase,
+    new_setup_state,
+    new_state,
+    validate_state,
+)
 
 
 class ConfigValidationTest(unittest.TestCase):
@@ -128,6 +135,53 @@ class ConfigCliTest(unittest.TestCase):
             code, _ = self._run(tmp, "config", "set", "merge.surface", "local")
             self.assertEqual(code, 0)
             self.assertEqual(load_config(wdd)["merge"]["surface"], "local")
+
+
+class SetupStateTest(unittest.TestCase):
+    def test_schema_version_is_4(self) -> None:
+        self.assertEqual(SCHEMA_VERSION, 4)
+
+    def test_new_setup_state_validates_with_null_scope(self) -> None:
+        state = new_setup_state()
+        validate_state(state)
+        self.assertIsNone(state["scope"])
+        self.assertEqual(state["tasks"], {})
+
+    def test_null_scope_with_tasks_is_rejected(self) -> None:
+        state = new_setup_state()
+        state["tasks"]["TASK-001"] = {"id": "TASK-001"}
+        with self.assertRaises(ValidationError):
+            validate_state(state)
+
+    def test_derived_phase(self) -> None:
+        setup = new_setup_state()
+        self.assertEqual(derived_phase(setup), "setup")
+        ratified = new_setup_state()
+        ratified["constitution"] = {
+            "status": "ratified",
+            "ratification": {"by": "ivo", "decisionFingerprint": "sha256:abc"},
+        }
+        self.assertEqual(derived_phase(ratified), "setup")  # still no scope
+        executing = new_state("SCOPE-x", base_ref="wdd/x")
+        executing["constitution"] = ratified["constitution"]
+        self.assertEqual(derived_phase(executing), "execute")
+
+
+class MigrationV3Test(unittest.TestCase):
+    def test_v3_state_migrates_to_v4(self) -> None:
+        from wave_delivery.migration import plan_migration
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = new_state("SCOPE-x", base_ref="wdd/x")
+            state["schemaVersion"] = 3
+            path = Path(tmp) / "state.json"
+            path.write_text(json.dumps(state), encoding="utf-8")
+            result = plan_migration(path)
+            # plan_migration's dry-run result carries migration metadata, not
+            # the converted state itself: {"state", "from", "to", "tasks",
+            # "backup", "notes"}. "to" is always SCHEMA_VERSION.
+            self.assertEqual(result["from"], 3)
+            self.assertEqual(result["to"], 4)
 
 
 if __name__ == "__main__":

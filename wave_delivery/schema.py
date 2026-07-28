@@ -8,7 +8,7 @@ from typing import Any
 from .errors import ValidationError
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 TASK_STATUSES = {
     "todo",
     "in_progress",
@@ -98,6 +98,24 @@ def new_state(
     }
 
 
+def new_setup_state() -> dict[str, Any]:
+    """State for an initialized repository that has no scope yet.
+
+    Created by `wddctl init` so `next` can drive setup; `plan apply` adopts
+    the scope into this state later.
+    """
+    state = new_state("__setup__")
+    state["scope"] = None
+    return state
+
+
+def derived_phase(state: dict[str, Any]) -> str:
+    """Phase is computed, never stored: setup until a scope exists."""
+    if state.get("scope") is None or state["constitution"]["status"] != "ratified":
+        return "setup"
+    return "execute"
+
+
 def _require_mapping(value: Any, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValidationError(f"{name} must be an object")
@@ -118,7 +136,7 @@ def validate_state(state: dict[str, Any]) -> None:
         found = state.get("schemaVersion")
         hint = (
             " run 'wddctl --state <path> migrate --dry-run' to convert it"
-            if found == 2
+            if found in {2, 3}
             else ""
         )
         raise ValidationError(
@@ -128,14 +146,21 @@ def validate_state(state: dict[str, Any]) -> None:
     if not isinstance(revision, int) or revision < 0:
         raise ValidationError("revision must be a non-negative integer")
 
-    scope = _require_mapping(state.get("scope"), "scope")
-    _require_string(scope.get("id"), "scope.id")
-    _require_string(scope.get("baseRef"), "scope.baseRef", nullable=True)
-    if scope.get("reviewPolicy") not in REVIEW_POLICIES:
-        raise ValidationError(f"scope.reviewPolicy must be one of {sorted(REVIEW_POLICIES)}")
-    max_concurrent = scope.get("maxConcurrent")
-    if max_concurrent is not None and (not isinstance(max_concurrent, int) or max_concurrent < 1):
-        raise ValidationError("scope.maxConcurrent must be a positive integer or null")
+    scope = state.get("scope")
+    if scope is None:
+        if state.get("tasks"):
+            raise ValidationError("scope must exist before tasks do; run 'wddctl plan apply'")
+    else:
+        scope = _require_mapping(scope, "scope")
+        _require_string(scope.get("id"), "scope.id")
+        _require_string(scope.get("baseRef"), "scope.baseRef", nullable=True)
+        if scope.get("reviewPolicy") not in REVIEW_POLICIES:
+            raise ValidationError(f"scope.reviewPolicy must be one of {sorted(REVIEW_POLICIES)}")
+        max_concurrent = scope.get("maxConcurrent")
+        if max_concurrent is not None and (
+            not isinstance(max_concurrent, int) or max_concurrent < 1
+        ):
+            raise ValidationError("scope.maxConcurrent must be a positive integer or null")
 
     constitution = _require_mapping(state.get("constitution"), "constitution")
     constitution_status = constitution.get("status")

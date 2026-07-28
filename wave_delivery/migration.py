@@ -1,8 +1,9 @@
-"""In-place conversion of schema-v2 controller state to v3.
+"""In-place conversion of older controller state (v2 or v3) to the current schema.
 
 Schema v2 was only reachable by running `wddctl init` directly — no documented
 workflow produced it — but state that exists must not become unreadable. This
-converts it rather than stranding it.
+converts it rather than stranding it. Schema v3 has no scope-optional state
+(see schema.py), so v3 -> v4 is a pure version bump once validated.
 
 The conversion is dry-run first and writes a backup beside the state file
 before touching anything.
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +22,7 @@ from .schema import SCHEMA_VERSION, validate_state
 from .store import StateStore, atomic_write_text
 
 
-SUPPORTED_SOURCE_VERSIONS = {2}
+SUPPORTED_SOURCE_VERSIONS = {2, 3}
 
 
 def read_source(path: Path | str) -> dict[str, Any]:
@@ -45,7 +47,16 @@ def read_source(path: Path | str) -> dict[str, Any]:
 
 
 def convert(state: dict[str, Any], *, review_policy: str = "always") -> dict[str, Any]:
-    """Return the v3 equivalent of a v2 state."""
+    """Return the current-schema equivalent of a v2 or v3 state."""
+    if state.get("schemaVersion") == 3:
+        # Every valid v3 state is already a valid v4 state (schema.py's
+        # scope-optional relaxation only adds a case v3 never produced), so
+        # the conversion is a pure version bump rather than a field remap.
+        migrated = deepcopy(state)
+        migrated["schemaVersion"] = SCHEMA_VERSION
+        validate_state(migrated)
+        return migrated
+
     scope = dict(state.get("scope") or {})
     migrated: dict[str, Any] = {
         "schemaVersion": SCHEMA_VERSION,

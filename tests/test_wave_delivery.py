@@ -780,7 +780,7 @@ class MigrationTests(BaseTest):
         self.assertTrue(Path(result["backup"]).exists())
 
         migrated = StateStore(path).read()
-        self.assertEqual(migrated["schemaVersion"], 3)
+        self.assertEqual(migrated["schemaVersion"], 4)
         self.assertEqual(migrated["tasks"]["T1"]["risk"], "normal")
         self.assertEqual(migrated["tasks"]["T1"]["title"], "T1")
         # v2 required review for every task; migrating must not drop that.
