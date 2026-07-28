@@ -573,18 +573,61 @@ ACTION_COMMANDS: dict[str, tuple[str | None, str | None]] = {
 }
 
 
+# Actions whose model comes from models["implementation"], tiered by the
+# task's own risk (not the scope's review policy).
+RISK_TIERED_ACTIONS = {"start_task", "assign_fix_writer"}
+
+
+def _resolve_model(
+    action: dict[str, Any],
+    models: dict[str, Any] | None,
+    task_risk: dict[str, str],
+) -> str | None:
+    """Resolve the model an action should carry, or None if it gets no key.
+
+    ``models`` mirrors config.json's ``models`` shape; ``task_risk`` maps task
+    id -> "high"/"normal" for the risk-tiered lookup. A value is only
+    returned when it is a non-null, non-empty string -- callers must not add
+    a "model" key otherwise.
+    """
+    if not models:
+        return None
+    kind = action["action"]
+    if kind in RISK_TIERED_ACTIONS:
+        implementation = models.get("implementation") or {}
+        tier = "highRisk" if task_risk.get(action["task"]) == "high" else "default"
+        value = implementation.get(tier)
+    elif kind == "run_review":
+        value = models.get("review")
+    else:
+        return None
+    return value if isinstance(value, str) and value else None
+
+
 def decorate_actions(
-    result: dict[str, Any], *, state_path: str | None = None, repo: str = "."
+    result: dict[str, Any],
+    *,
+    state_path: str | None = None,
+    repo: str = ".",
+    models: dict[str, Any] | None = None,
+    task_risk: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Attach the literal command for each action.
+    """Attach the literal command for each action, and the resolved model.
 
     ``command`` runs now. ``recordWith`` records the outcome once the judgment
     work (implementing, reviewing, verifying) is done.
+
+    ``models`` and ``task_risk`` are supplied by the caller -- the engine
+    never reads config.json or plan.json itself. ``task_risk`` (task id ->
+    "high"/"normal") is a purpose-built mapping rather than the full state:
+    decoration only ever needs one field per task, and this keeps the
+    decorator from taking on the whole state shape as a dependency.
     """
     # Every dynamic value is shell-quoted: these strings are documented as
     # copy-pasteable, and a task id containing shell metacharacters would
     # otherwise produce an executable injected command.
     prefix = "wddctl" + (f" --state {shlex.quote(state_path)}" if state_path else "")
+    task_risk = task_risk or {}
     for action in result["actions"]:
         run_now, record_with = ACTION_COMMANDS.get(action["action"], (None, None))
         fields = {"task": shlex.quote(action["task"]), "repo": shlex.quote(repo)}
@@ -592,6 +635,9 @@ def decorate_actions(
             action["command"] = f"{prefix} {run_now.format(**fields)}"
         if record_with:
             action["recordWith"] = f"{prefix} {record_with.format(**fields)}"
+        model = _resolve_model(action, models, task_risk)
+        if model:
+            action["model"] = model
     return result
 
 
@@ -656,14 +702,17 @@ def bounded_next_actions(
     max_bytes: int = 4096,
     state_path: str | None = None,
     repo: str = ".",
+    models: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Keep default next-action output small enough for an agent prompt.
 
     Commands are attached before the budget is measured, so the limit stays
-    honest rather than being blown by decoration afterwards.
+    honest rather than being blown by decoration afterwards; model routing
+    adds bytes the same way and is measured under the same budget.
     """
     limit = 8
     full_result = next_actions(state, max_actions=None)
+    task_risk = {task_id: task.get("risk") for task_id, task in state["tasks"].items()}
     while limit >= 0:
         result = next_actions(state, max_actions=limit)
         result["blockers"] = full_result["blockers"][:limit]
@@ -671,7 +720,7 @@ def bounded_next_actions(
             len(result["actions"]) < len(full_result["actions"])
             or len(result["blockers"]) < len(full_result["blockers"])
         )
-        decorate_actions(result, state_path=state_path, repo=repo)
+        decorate_actions(result, state_path=state_path, repo=repo, models=models, task_risk=task_risk)
         rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
         if len(rendered.encode("utf-8")) <= max_bytes:
             return result

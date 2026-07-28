@@ -477,11 +477,17 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 return 0
+            models = (
+                load_config(store.path.parent)["models"]
+                if config_path(store.path.parent).exists()
+                else None
+            )
             result = bounded_next_actions(
                 state,
                 max_bytes=args.max_bytes,
                 state_path=_state_option(args),
                 repo=str(args.repo),
+                models=models,
             )
             drift = governance_drift(state, store.path.parent)
             if drift is not None:

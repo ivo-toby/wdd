@@ -24,6 +24,8 @@ Each action carries the exact command to use:
 - **`command`** — run it as-is, now.
 - **`recordWith`** — the work needs judgment first (implement, review,
   verify). Do that, then run this to record the outcome.
+- **`model`** — when present, pass it verbatim as the model for the subagent
+  dispatch (worker or reviewer); when absent, use the dispatcher's default.
 
 Repeat until `next` is empty. Don't translate action names into commands
 yourself; the payload already did that.
