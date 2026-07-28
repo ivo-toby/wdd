@@ -174,6 +174,10 @@ wddctl plan preview [--plan plan.json]
 Without `--plan`, it projects from the current `state.json`. With `--plan`,
 it projects a plan that hasn't been applied yet.
 
+Note: unlike `plan lint` and `plan apply`, `preview --plan` reads the plan
+file as-is — it does not overlay `config.json` defaults or risk rules, so its
+projection can differ from what actually lands after a real apply.
+
 ### `plan lint`
 
 Deterministic, advisory-only plan-quality checks — every one of them exists
@@ -192,7 +196,7 @@ wddctl plan lint --plan plan.json [--strict]
     {
       "code": "serialized_plan",
       "severity": "warning",
-      "message": "4 tasks admit in 4 rounds — the plan is effectively serialized. Check dependsOn for vague sequencing and conflictDomains for accidental overlap; maxConcurrent buys nothing here."
+      "message": "4 tasks admit in 4 rounds — the plan is effectively serialized. Check dependsOn fan-out, conflictDomains overlap, and whether scope.maxConcurrent (currently 4) is the limiter."
     },
     {
       "code": "enumerated_domains",
@@ -217,7 +221,7 @@ Codes:
 | --- | --- |
 | `serialized_plan` | 3+ tasks admit one-per-round (or ≥75% of tasks do, for 4+ tasks) — dependencies or conflict domains have accidentally chained the whole plan into a queue. |
 | `uniform_risk` | 4+ tasks and every one shares the same `risk` — under `risk_based` review this means either "review everything" (`high`) or "review nothing" (`normal`); confirm that's intended. |
-| `enumerated_domains` | a task lists 4+ individual files (no wildcard) under the same directory — a candidate for the `dir/**` glob instead, unless another task genuinely needs to write there concurrently. |
+| `enumerated_domains` | a task lists 4+ individual files (no wildcard) under the same directory — a candidate for the `dir/**` glob instead, unless another task genuinely needs to write there concurrently (repo-root, top-level files are exempt from this grouping). |
 | `coarse_domain` | a single domain on one task overlaps 3+ other tasks' domains — it will serialize all of them; narrow it to what the task actually writes. |
 | `missing_brief` | a task's `specPath` file doesn't exist, or has fewer than 2 non-blank lines — a worker dispatched on it will improvise. |
 
@@ -233,7 +237,10 @@ wddctl plan lint --plan plan-bad.json --strict
 `plan apply` runs the same checks automatically on every call — the result
 carries a `"lint"` array (empty when clean) alongside the usual diff, and
 `plan apply --strict` refuses on the same terms `plan lint --strict` does,
-before anything is written:
+before anything is written. Combined with `--dry-run`, `--strict` still
+refuses (exit 2) on any finding — the refusal happens before the dry-run diff
+is computed or printed, so a strict dry run never shows you the diff it would
+have applied:
 
 ```sh
 wddctl plan apply --plan plan-bad.json --repo . --strict

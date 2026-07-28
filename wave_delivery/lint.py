@@ -31,8 +31,9 @@ def _check_serialization(plan_dict: dict[str, Any]) -> list[dict[str, Any]]:
             "severity": "warning",
             "message": (
                 f"{len(tasks)} tasks admit in {len(rounds)} rounds — the plan is "
-                "effectively serialized. Check dependsOn for vague sequencing and "
-                "conflictDomains for accidental overlap; maxConcurrent buys nothing here."
+                "effectively serialized. Check dependsOn fan-out, conflictDomains "
+                "overlap, and whether scope.maxConcurrent (currently "
+                f"{plan_dict['scope']['maxConcurrent']}) is the limiter."
             ),
         }
     ]
