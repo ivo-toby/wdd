@@ -277,5 +277,59 @@ class PrUpgradeEventTypeTest(unittest.TestCase):
             self.assertNotEqual(after["status"], "merge_ready")
 
 
+class SubmitIdempotencyRetryTest(unittest.TestCase):
+    """Review finding: persisted_event_type must never raise.
+
+    apply_mutation resolves event_type() BEFORE its idempotency-key
+    short-circuit (see engine.apply_mutation): the callable runs, then
+    the duplicate check happens, then (only for a non-duplicate) the
+    mutator runs. The original bare `chosen_event` callable never touched
+    git, so a duplicate-key retry was guaranteed to reach the cheap
+    short-circuit regardless of repo state. persisted_event_type (added to
+    fix the pr-upgrade mislabel above) resolves the branch tip via
+    resolve_ref, which raises when the branch is gone -- so without a
+    guard, a retry after the branch was deleted or pruned out-of-band would
+    fail instead of returning the recorded duplicate.
+    """
+
+    def test_retry_after_branch_deleted_returns_duplicate_not_raise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _bootstrap_ready_scope(tmp, surface="local")
+            _start_and_commit(state, root)
+
+            code, out = _cli(
+                state, "submit", "--task", "T1", "--repo", str(root),
+                "--idempotency-key", "fixed-key-1",
+            )
+            self.assertEqual(code, 0, out)
+            first = json.loads(out)
+            self.assertFalse(first["duplicate"], first)
+            self.assertTrue(first["pr"].startswith("branch:"), first)
+
+            read_state = StateStore(Path(state)).read()
+            task = read_state["tasks"]["T1"]
+            branch = task["branch"]
+            worktree = worktree_for(root, read_state["scope"]["id"], "T1", task.get("worktree"))
+
+            # Simulate the branch vanishing out-of-band (deleted, or pruned
+            # by GC) between the original submit and a client's retry of the
+            # same idempotency key. The worktree has it checked out, so it
+            # must go first.
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(worktree)], cwd=root, check=True
+            )
+            subprocess.run(["git", "branch", "-D", branch], cwd=root, check=True)
+
+            code, out = _cli(
+                state, "submit", "--task", "T1", "--repo", str(root),
+                "--idempotency-key", "fixed-key-1",
+            )
+            self.assertEqual(code, 0, out)
+            second = json.loads(out)
+            self.assertTrue(second["duplicate"], second)
+            self.assertEqual(second["event"], "duplicate")
+            self.assertEqual(second["pr"], first["pr"])
+
+
 if __name__ == "__main__":
     unittest.main()

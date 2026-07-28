@@ -239,11 +239,20 @@ def submit_task(
             return event
         task = _task(state, task_id)
         branch = task.get("branch")
-        if (
-            branch
-            and task.get("headSha") == resolve_ref(repo, branch)
-            and _is_pr_upgrade(task.get("pr"), pr)
-        ):
+        try:
+            # apply_mutation calls event_type() BEFORE its idempotency-key
+            # short-circuit, so this must never raise: a duplicate-key retry
+            # after the branch was deleted/GC'd out-of-band has to reach that
+            # short-circuit and return the recorded duplicate cleanly, not
+            # blow up resolving a ref nobody needs for that path. On the live
+            # (non-duplicate) path, a missing branch always fails the same
+            # way -- and with a clearer message -- when the mutator resolves
+            # it again below, so silently falling back to "unchanged" here
+            # (predicate false) costs nothing.
+            head_matches = branch and task.get("headSha") == resolve_ref(repo, branch)
+        except ValidationError:
+            head_matches = False
+        if head_matches and _is_pr_upgrade(task.get("pr"), pr):
             return "task.pr_upgraded"
         return event
 
