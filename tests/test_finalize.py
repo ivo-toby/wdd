@@ -243,6 +243,25 @@ def _scope_in_finalize(
     return root, state, bare
 
 
+def _deliver_scope(state: str, root: Path, *, by: str = "bob") -> None:
+    """Drive an already-finalize-phase scope (from `_scope_in_finalize`) the
+    rest of the way to "delivered": a local human merge of the epic branch
+    into the checked-out "main" (the default target), then `finalize
+    delivered`. Leaves derived_phase(state) == "delivered"."""
+    base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+         "merge", "--no-ff", "-m", "final merge", base_ref],
+        cwd=root, check=True,
+    )
+    code, out = _cli(state, "finalize", "delivered", "--by", by, "--repo", str(root))
+    assert code == 0, out
+    from wave_delivery.schema import derived_phase
+
+    assert derived_phase(StateStore(Path(state)).read()) == "delivered", out
+
+
 class PrUpgradeEventTypeTest(unittest.TestCase):
     """Task 1: submit's branch:<sha> -> real-URL upgrade must log its own event type.
 
@@ -711,6 +730,22 @@ class FinalizeReviewRecordTest(unittest.TestCase):
                 StateStore(Path(state)).read()["finalize"]["review"]["outcome"], "blocked"
             )
 
+    def test_review_record_after_delivered_is_refused(self) -> None:
+        # Reviewer finding: mutating finalize verbs must refuse once
+        # finalize.delivered is recorded -- recording new review evidence
+        # against a scope whose human merge already happened is meaningless.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            _deliver_scope(state, root)
+
+            code, out, err = _cli_full(
+                state, "finalize", "review", "record", "--reviewer", "r",
+                "--findings", "[]", "--repo", str(root),
+            )
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("already delivered", err)
+            self.assertIsNone(StateStore(Path(state)).read()["finalize"].get("review"))
+
 
 class FinalizeVerifyRecordTest(unittest.TestCase):
     """Task 3: `finalize verify record` -- mirrors task-level verify's status
@@ -909,6 +944,38 @@ class FinalizeHandoffTest(unittest.TestCase):
             self.assertNotEqual(code, 0, out)
             self.assertIn("migrate --governance", err)
 
+    def test_handoff_after_delivered_is_refused_with_no_new_gh_calls(self) -> None:
+        # Reviewer finding: with finalize.delivered already recorded,
+        # `finalize handoff` still exited 0, re-pushed the already-merged
+        # base branch, and (pr surface) issued a second, genuinely duplicate
+        # `gh pr create` against a branch that had already landed. Reproduce
+        # that exact shape: a real handoff first (so a PR genuinely exists),
+        # then deliver, then handoff again -- it must refuse before any push
+        # or gh call, leaving the log exactly as the first handoff left it.
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = str(Path(tmp) / "gh.log")
+            root, state, bare = _scope_in_finalize(tmp, surface="pr", mode="controller", gh_log=log_path)
+            self._clean_evidence(state, root)
+
+            with _fake_gh(log_path):
+                code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            _deliver_scope(state, root)
+            log_before = _gh_log(log_path)
+
+            with _fake_gh(log_path):
+                code, out, err = _cli_full(state, "finalize", "handoff", "--repo", str(root))
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("already delivered", err)
+
+            log_after = _gh_log(log_path)
+            self.assertEqual(log_after, log_before, "no new gh invocations must happen")
+
+            # The handoff record from before delivery is untouched.
+            handoff = StateStore(Path(state)).read()["finalize"]["handoff"]
+            self.assertEqual(handoff["pr"], "https://github.invalid/pr/1")
+
 
 class FinalizeDeliveredTest(unittest.TestCase):
     """Task 3: `finalize delivered` -- proves the epic branch head is
@@ -997,6 +1064,27 @@ class FinalizeDeliveredTest(unittest.TestCase):
                 check=True, text=True, stdout=subprocess.PIPE,
             ).stdout.strip()
             self.assertEqual(local_main_after, local_main_before)
+
+    def test_rerunning_delivered_is_refused_and_leaves_the_record_untouched(self) -> None:
+        # Pinned behavior (reviewer's "your judgment, documented" call):
+        # re-running `finalize delivered` refuses rather than silently
+        # re-verifying and overwriting `by`/`at` -- a second caller's name
+        # must not be able to overwrite who was actually recorded as having
+        # observed the merge.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            _deliver_scope(state, root, by="bob")
+            first = StateStore(Path(state)).read()["finalize"]["delivered"]
+            self.assertEqual(first["by"], "bob")
+
+            code, out, err = _cli_full(
+                state, "finalize", "delivered", "--by", "carol", "--repo", str(root)
+            )
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("already delivered", err)
+
+            second = StateStore(Path(state)).read()["finalize"]["delivered"]
+            self.assertEqual(second, first)
 
 
 class FinalizeStatusTest(unittest.TestCase):

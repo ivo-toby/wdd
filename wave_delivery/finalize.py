@@ -51,6 +51,22 @@ def _require_finalize_phase(state: dict[str, Any]) -> None:
         )
 
 
+def _require_not_delivered(state: dict[str, Any], *, what: str) -> None:
+    """Refuse a mutating finalize verb once the scope is already delivered.
+
+    ``_require_finalize_phase`` alone is not enough: it deliberately treats
+    "delivered" as a legal phase (so ``finalize status`` keeps working), but
+    once ``finalize.delivered`` is recorded the human's final merge has
+    already happened -- re-recording review/verification is meaningless, and
+    re-running handoff would re-push an already-merged branch and (on the pr
+    surface) open a second, genuinely duplicate PR against a landed branch.
+    """
+    if (state.get("finalize") or {}).get("delivered"):
+        raise IllegalTransition(
+            f"this scope is already delivered; there is nothing left to {what}"
+        )
+
+
 def _base_ref(state: dict[str, Any]) -> str:
     base_ref = (state.get("scope") or {}).get("baseRef")
     if not isinstance(base_ref, str) or not base_ref:
@@ -100,8 +116,16 @@ def record_final_review(
     repo_path = require_repository(repo)
     blocking = _blocking_severities(store.path.parent)
 
+    # Fail fast, before any (currently cheap, but not guaranteed to stay so)
+    # work below runs -- mirrors the pre-lock check prepare_handoff and
+    # record_delivered already do ahead of their own side effects.
+    state = store.read()
+    _require_finalize_phase(state)
+    _require_not_delivered(state, what="review")
+
     def mutator(state: dict[str, Any]) -> dict[str, Any]:
         _require_finalize_phase(state)
+        _require_not_delivered(state, what="review")
         base_sha = resolve_ref(repo_path, _base_ref(state))
         outcome = "blocked" if any(f["severity"] in blocking for f in validated) else "passed"
         updated = copied_state(state)
@@ -157,8 +181,15 @@ def record_final_verification(
             )
     repo_path = require_repository(repo)
 
+    # Fail fast, before any side effects run -- same two-stage pattern as
+    # record_final_review/prepare_handoff/record_delivered.
+    state = store.read()
+    _require_finalize_phase(state)
+    _require_not_delivered(state, what="verify")
+
     def mutator(state: dict[str, Any]) -> dict[str, Any]:
         _require_finalize_phase(state)
+        _require_not_delivered(state, what="verify")
         base_sha = resolve_ref(repo_path, _base_ref(state))
         updated = copied_state(state)
         updated.setdefault("finalize", {})
@@ -251,6 +282,7 @@ def prepare_handoff(
     wdd_dir = store.path.parent
     state = store.read()
     _require_finalize_phase(state)
+    _require_not_delivered(state, what="hand off")
     base_ref = _base_ref(state)
     base_sha = resolve_ref(repo_path, base_ref)
     _require_current_finalize_evidence(state, base_sha)
@@ -283,8 +315,11 @@ def prepare_handoff(
 
     def mutator(current: dict[str, Any]) -> dict[str, Any]:
         # Re-validated under the lock: the push/PR above ran outside it, so
-        # the base branch (and the evidence pinned to it) could have moved.
+        # the base branch (and the evidence pinned to it) could have moved --
+        # including a delivered record that landed in the meantime (a
+        # concurrent 'finalize delivered' racing this handoff).
         _require_finalize_phase(current)
+        _require_not_delivered(current, what="hand off")
         current_base_sha = resolve_ref(repo_path, base_ref)
         if current_base_sha != base_sha:
             raise IllegalTransition(
@@ -334,6 +369,14 @@ def record_delivered(
     over the other (see that function's docstring). wddctl performing this
     merge itself is deliberately not implemented anywhere: this only ever
     observes Git state a human already created.
+
+    Re-running this once delivery is already recorded is refused, not
+    silently re-verified: ``by``/``at`` name who observed the merge and
+    when, and letting a second caller overwrite that with their own name
+    would misattribute the record. Nothing about a genuine re-run is more
+    correct than the first one -- the ancestry proof cannot change once it
+    has succeeded -- so there is nothing legitimate for a retry to add. A
+    caller that actually needs the current record has ``finalize status``.
     """
     if not isinstance(by, str) or not by:
         raise ValidationError("by must be a non-empty string")
@@ -341,6 +384,7 @@ def record_delivered(
     wdd_dir = store.path.parent
     state = store.read()
     _require_finalize_phase(state)
+    _require_not_delivered(state, what="deliver")
     base_ref = _base_ref(state)
     target_branch, _config = _require_target_branch(wdd_dir)
 
@@ -352,6 +396,7 @@ def record_delivered(
         # Re-derived inside the lock: the fetch and the outer read happened
         # before it, so nothing here may be trusted stale.
         _require_finalize_phase(current)
+        _require_not_delivered(current, what="deliver")
         base_sha = resolve_ref(repo_path, base_ref)
         candidates = _fetched_base_refs(repo_path, target_branch)
         proven = next(
