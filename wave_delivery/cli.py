@@ -38,6 +38,13 @@ from .engine import (
 )
 from .errors import IllegalTransition, ValidationError, WaveDeliveryError
 from .schema import derived_phase
+from .finalize import (
+    finalize_status,
+    prepare_handoff,
+    record_delivered,
+    record_final_review,
+    record_final_verification,
+)
 from .freshness import check_freshness, record_freshness
 from .git import require_repository, resolve_ref
 from .github import comment_pr, create_pr, push_branch
@@ -69,6 +76,10 @@ GOVERNED_VERBS = {
     ("verify", "record"),
     ("verify", "collect"),
     ("reconcile", "done"),
+    ("finalize", "review"),
+    ("finalize", "verify"),
+    ("finalize", "handoff"),
+    ("finalize", "delivered"),
     # The escape hatch bypasses transitions, not governance.
     ("event", "apply"),
 }
@@ -219,6 +230,71 @@ def build_parser() -> argparse.ArgumentParser:
     verify_collect.add_argument("--result", required=True, type=Path)
     verify_collect.add_argument("--repo", type=Path, default=Path("."))
     _add_concurrency_flags(verify_collect)
+
+    finalize = subparsers.add_parser(
+        "finalize", help="scope-level finalize verbs: review, verify, handoff, delivered"
+    )
+    finalize_subparsers = finalize.add_subparsers(dest="finalize_command", required=True)
+
+    finalize_review = finalize_subparsers.add_parser(
+        "review", help="record the whole-epic-branch final review"
+    )
+    finalize_review_subparsers = finalize_review.add_subparsers(
+        dest="finalize_review_command", required=True
+    )
+    finalize_review_record = finalize_review_subparsers.add_parser(
+        "record", help="record final review findings; evidence is pinned to the current base head"
+    )
+    finalize_review_record.add_argument("--reviewer", required=True)
+    finalize_review_record.add_argument(
+        "--findings",
+        type=_json_argument,
+        default=[],
+        help='JSON array, e.g. \'[{"severity":"P1","summary":"...","file":"a.py","line":3}]\'; '
+        "omit or pass [] for a clean review",
+    )
+    finalize_review_record.add_argument("--repo", type=Path, default=Path("."))
+    _add_concurrency_flags(finalize_review_record)
+
+    finalize_verify = finalize_subparsers.add_parser(
+        "verify", help="record the whole-epic-branch final verification"
+    )
+    finalize_verify_subparsers = finalize_verify.add_subparsers(
+        dest="finalize_verify_command", required=True
+    )
+    finalize_verify_record = finalize_verify_subparsers.add_parser(
+        "record", help="record a final verification outcome"
+    )
+    finalize_verify_record.add_argument(
+        "--status", required=True, choices=("passed", "failed", "unavailable")
+    )
+    # dest must not be "command": that is the top-level subparser destination.
+    finalize_verify_record.add_argument(
+        "--command", dest="finalize_verify_command_text", help="the command that produced this result"
+    )
+    finalize_verify_record.add_argument(
+        "--justification",
+        help="required when --status unavailable and no config "
+        "verification.unavailableJustification exists",
+    )
+    finalize_verify_record.add_argument("--repo", type=Path, default=Path("."))
+    _add_concurrency_flags(finalize_verify_record)
+
+    finalize_handoff = finalize_subparsers.add_parser(
+        "handoff",
+        help="push the epic branch and open (pr surface) or instruct (local surface) the handoff",
+    )
+    finalize_handoff.add_argument("--repo", type=Path, default=Path("."))
+    _add_concurrency_flags(finalize_handoff)
+
+    finalize_delivered = finalize_subparsers.add_parser(
+        "delivered", help="record the observed human merge of the epic branch into the target"
+    )
+    finalize_delivered.add_argument("--by", required=True)
+    finalize_delivered.add_argument("--repo", type=Path, default=Path("."))
+    _add_concurrency_flags(finalize_delivered)
+
+    finalize_subparsers.add_parser("status", help="show the finalize section and phase")
 
     freshness = subparsers.add_parser("freshness", help="classify a task branch against the base")
     freshness_subparsers = freshness.add_subparsers(dest="freshness_command", required=True)
@@ -714,6 +790,68 @@ def main(argv: list[str] | None = None) -> int:
             _print_json({"revision": state["revision"], "duplicate": duplicate})
             return 0
 
+        if (
+            args.command == "finalize"
+            and args.finalize_command == "review"
+            and args.finalize_review_command == "record"
+        ):
+            findings = validate_findings(args.findings)
+            state, duplicate = record_final_review(
+                store,
+                findings=findings,
+                reviewer=args.reviewer,
+                repo=args.repo,
+                **_concurrency(args),
+            )
+            review = (state.get("finalize") or {}).get("review") or {}
+            _print_json(
+                {
+                    "revision": state["revision"],
+                    "duplicate": duplicate,
+                    "outcome": review.get("outcome"),
+                    "headSha": review.get("headSha"),
+                }
+            )
+            return 0
+
+        if (
+            args.command == "finalize"
+            and args.finalize_command == "verify"
+            and args.finalize_verify_command == "record"
+        ):
+            state, duplicate = record_final_verification(
+                store,
+                status=args.status,
+                command=args.finalize_verify_command_text,
+                justification=args.justification,
+                repo=args.repo,
+                **_concurrency(args),
+            )
+            verification = (state.get("finalize") or {}).get("verification") or {}
+            _print_json(
+                {
+                    "revision": state["revision"],
+                    "duplicate": duplicate,
+                    "status": verification.get("status"),
+                    "headSha": verification.get("headSha"),
+                }
+            )
+            return 0
+
+        if args.command == "finalize" and args.finalize_command == "handoff":
+            _print_json(prepare_handoff(store, repo=args.repo, **_concurrency(args)))
+            return 0
+
+        if args.command == "finalize" and args.finalize_command == "delivered":
+            _print_json(
+                record_delivered(store, by=args.by, repo=args.repo, **_concurrency(args))
+            )
+            return 0
+
+        if args.command == "finalize" and args.finalize_command == "status":
+            _print_json(finalize_status(store.read()))
+            return 0
+
         if args.command == "freshness" and args.freshness_command == "check":
             _print_json(
                 check_freshness(
@@ -886,6 +1024,13 @@ def main(argv: list[str] | None = None) -> int:
                 # completion cannot be asserted, only proved by 'wddctl merge'.
                 raise IllegalTransition(
                     "use 'wddctl merge --task ID --repo .' so live Git proves the merge"
+                )
+            if args.event == "scope.delivered":
+                # Same guarantee, at scope granularity: delivered can only be
+                # asserted by 'wddctl finalize delivered', which proves the
+                # human's final merge with live Git ancestry.
+                raise IllegalTransition(
+                    "use 'wddctl finalize delivered --by NAME --repo .' so live Git proves the merge"
                 )
             return _simple_event(store, args, args.event, args.data)
 

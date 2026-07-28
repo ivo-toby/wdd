@@ -32,6 +32,12 @@ def _git_repo(tmp: str) -> Path:
     root = Path(tmp) / "repo"
     root.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
+    # This environment's global gitconfig signs commits by default (gpg-agent
+    # is unreachable from the sandbox). wddctl's own internal git calls (e.g.
+    # merge_task's "wdd: merge ..." commit) never pass -c commit.gpgsign=false
+    # themselves -- only the explicit test-authored commits below do -- so
+    # disable it at the repo level once instead.
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=root, check=True)
     (root / "seed").write_text("x\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=root, check=True)
     subprocess.run(
@@ -181,15 +187,60 @@ def _extra_commit(state: str, root: Path, task_id: str = "T1", message: str = "m
 
 
 def _finish_to_merge_ready(state: str, root: Path, task_id: str = "T1") -> None:
-    """Assumes submit already ran; records the review/verification evidence
-    that takes the task from in_progress/review to merge_ready."""
+    """Assumes submit already ran; records the review/verification/freshness
+    evidence that takes the task from in_progress/review to merge_ready.
+
+    Freshness is required so a caller can go on to actually call `wddctl
+    merge`: task_gate's merge_ready branch re-checks freshness (unlike its
+    in_progress branch, which does not), so a task without it is stuck at
+    gate "needs_freshness" and `merge_task` refuses it.
+    """
     code, out = _cli(
         state, "review", "record", "--task", task_id, "--reviewer", "t", "--findings", "[]"
     )
     assert code == 0, out
     code, out = _cli(state, "verify", "record", "--task", task_id, "--status", "passed")
     assert code == 0, out
+    code, out = _cli(state, "freshness", "record", "--task", task_id, "--repo", str(root))
+    assert code == 0, out
     assert StateStore(Path(state)).read()["tasks"][task_id]["status"] == "merge_ready"
+
+
+def _scope_in_finalize(
+    tmp: str, *, surface: str = "local", mode: str = "controller", gh_log: str | None = None
+) -> tuple[Path, str, Path]:
+    """Drive a fresh scratch scope through one task to the finalize phase.
+
+    Shared across the finalize-verb test classes below: `wddctl finalize *`
+    verbs all require derived_phase(state) in {"finalize", "delivered"},
+    which only happens once every task is terminal. The cheapest path there
+    is one task through the full execute-phase loop (start -> commit ->
+    submit -> review/verify/freshness -> merge_ready -> merge), using the
+    same start/submit/merge surface machinery a real run would (fake gh
+    under the "pr" surface, exactly like test_execution_surfaces' HumanModeTest
+    scaffolding).
+    """
+    root, state, bare = _bootstrap_ready_scope(tmp, surface=surface, mode=mode)
+    _start_and_commit(state, root)
+    if surface == "pr":
+        assert gh_log is not None, "pr surface requires a gh_log path"
+        with _fake_gh(gh_log):
+            code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            assert code == 0, out
+            _finish_to_merge_ready(state, root)
+            code, out = _cli(state, "merge", "--task", "T1", "--repo", str(root))
+            assert code == 0, out
+    else:
+        code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+        assert code == 0, out
+        _finish_to_merge_ready(state, root)
+        code, out = _cli(state, "merge", "--task", "T1", "--repo", str(root))
+        assert code == 0, out
+    from wave_delivery.schema import derived_phase
+
+    scope_state = StateStore(Path(state)).read()
+    assert derived_phase(scope_state) == "finalize", scope_state
+    return root, state, bare
 
 
 class PrUpgradeEventTypeTest(unittest.TestCase):
@@ -596,6 +647,413 @@ class FinalizeStateValidationTest(unittest.TestCase):
         with self.assertRaises(ValidationError) as cm:
             validate_state(state)
         self.assertIn("finalize.delivered.at", str(cm.exception))
+
+
+class FinalizePhaseGateTest(unittest.TestCase):
+    """Task 3: every finalize verb refuses outside the finalize/delivered phases.
+
+    T1 stays "todo" here (nothing started) -- the cheapest state that is
+    ratified + has a scope + has a non-terminal task, so derived_phase is
+    "execute", not "finalize".
+    """
+
+    def test_all_finalize_verbs_refuse_in_execute_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _bootstrap_ready_scope(tmp, surface="local")
+            for argv in (
+                ("finalize", "review", "record", "--reviewer", "r", "--findings", "[]", "--repo", str(root)),
+                ("finalize", "verify", "record", "--status", "passed", "--repo", str(root)),
+                ("finalize", "handoff", "--repo", str(root)),
+                ("finalize", "delivered", "--by", "bob", "--repo", str(root)),
+            ):
+                code, out, err = _cli_full(state, *argv)
+                self.assertNotEqual(code, 0, (argv, out))
+                self.assertIn("finalize", err.lower(), (argv, err))
+
+
+class FinalizeReviewRecordTest(unittest.TestCase):
+    """Task 3: `finalize review record` -- Spec §6's whole-epic-branch review."""
+
+    def test_clean_review_records_passed_pinned_to_current_base_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "alice",
+                "--findings", "[]", "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["outcome"], "passed")
+
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+            base_sha = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", base_ref],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+            self.assertEqual(result["headSha"], base_sha)
+
+            review = StateStore(Path(state)).read()["finalize"]["review"]
+            self.assertEqual(review["reviewer"], "alice")
+            self.assertEqual(review["findings"], [])
+            self.assertEqual(review["headSha"], base_sha)
+
+    def test_p1_finding_blocks_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "alice",
+                "--findings", '[{"severity":"P1","summary":"missing acceptance criterion"}]',
+                "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["outcome"], "blocked")
+            self.assertEqual(
+                StateStore(Path(state)).read()["finalize"]["review"]["outcome"], "blocked"
+            )
+
+
+class FinalizeVerifyRecordTest(unittest.TestCase):
+    """Task 3: `finalize verify record` -- mirrors task-level verify's status
+    vocabulary, plus a required justification for "unavailable"."""
+
+    def test_passed_records_pinned_to_current_base_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--status", "passed",
+                "--command", "pytest -q", "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["status"], "passed")
+
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+            base_sha = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", base_ref],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+            self.assertEqual(result["headSha"], base_sha)
+
+            verification = StateStore(Path(state)).read()["finalize"]["verification"]
+            self.assertEqual(verification["command"], "pytest -q")
+            self.assertEqual(verification["headSha"], base_sha)
+
+    def test_unavailable_without_justification_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out, err = _cli_full(
+                state, "finalize", "verify", "record", "--status", "unavailable", "--repo", str(root)
+            )
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("justification", err.lower())
+            self.assertNotIn("verification", StateStore(Path(state)).read().get("finalize", {}))
+
+    def test_unavailable_with_explicit_justification_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--status", "unavailable",
+                "--justification", "no CI runner reachable from here", "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            verification = StateStore(Path(state)).read()["finalize"]["verification"]
+            self.assertEqual(verification["status"], "unavailable")
+            self.assertEqual(verification["justification"], "no CI runner reachable from here")
+
+    def test_unavailable_falls_back_to_configured_default_justification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            wdd = root / ".wdd"
+            assert _cli(
+                state, "config", "set", "verification.unavailableJustification",
+                '"no sandboxed network access"',
+            )[0] == 0
+            # Editing config.json after ratification is governance drift; a
+            # governed verb (finalize verify record is one) refuses until
+            # it is re-signed.
+            assert _cli(state, "constitution", "amend", "--by", "t")[0] == 0
+
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--status", "unavailable", "--repo", str(root)
+            )
+            self.assertEqual(code, 0, out)
+            verification = StateStore(Path(state)).read()["finalize"]["verification"]
+            self.assertEqual(verification["justification"], "no sandboxed network access")
+
+
+class FinalizeHandoffTest(unittest.TestCase):
+    """Task 3: `finalize handoff` -- pr surface pushes + opens the epic->target
+    PR; local surface records pr: None with operator instructions. Never
+    merges: there is no code path that performs the target merge itself."""
+
+    def _clean_evidence(self, state: str, root: Path) -> None:
+        code, out = _cli(
+            state, "finalize", "review", "record", "--reviewer", "r", "--findings", "[]",
+            "--repo", str(root),
+        )
+        assert code == 0, out
+        code, out = _cli(
+            state, "finalize", "verify", "record", "--status", "passed",
+            "--command", "pytest -q", "--repo", str(root),
+        )
+        assert code == 0, out
+
+    def test_pr_surface_pushes_base_and_creates_epic_to_target_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = str(Path(tmp) / "gh.log")
+            root, state, bare = _scope_in_finalize(tmp, surface="pr", mode="controller", gh_log=log_path)
+            self._clean_evidence(state, root)
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+
+            with _fake_gh(log_path):
+                code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["pr"], "https://github.invalid/pr/1")
+            self.assertEqual(result["targetBranch"], "main")
+            self.assertNotIn("instructions", result)
+
+            log = _gh_log(log_path)
+            creates = [entry for entry in log if entry[:2] == ["pr", "create"]]
+            # One from submit (task branch -> scope base), one from handoff
+            # (scope base -> target) -- the handoff call is the last.
+            self.assertGreaterEqual(len(creates), 2, log)
+            handoff_call = creates[-1]
+            self.assertEqual(handoff_call[handoff_call.index("--head") + 1], base_ref)
+            self.assertEqual(handoff_call[handoff_call.index("--base") + 1], "main")
+
+            base_ref_local = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", base_ref],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+            base_ref_remote = subprocess.run(
+                ["git", "--git-dir", str(bare), "rev-parse", base_ref],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+            self.assertEqual(base_ref_local, base_ref_remote, "handoff must push the base branch")
+
+            handoff = StateStore(Path(state)).read()["finalize"]["handoff"]
+            self.assertEqual(handoff["pr"], "https://github.invalid/pr/1")
+            self.assertEqual(handoff["targetBranch"], "main")
+
+    def test_local_surface_records_pr_none_with_operator_instructions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local", mode="controller")
+            self._clean_evidence(state, root)
+
+            code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertIsNone(result["pr"])
+            self.assertIn("instructions", result)
+            self.assertTrue(result["instructions"])
+
+            handoff = StateStore(Path(state)).read()["finalize"]["handoff"]
+            self.assertIsNone(handoff["pr"])
+
+    def test_blocked_review_refuses_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "r",
+                "--findings", '[{"severity":"P1","summary":"bad"}]', "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["outcome"], "blocked")
+
+            code, out, err = _cli_full(state, "finalize", "handoff", "--repo", str(root))
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("clean final review", err)
+            self.assertIsNone(
+                StateStore(Path(state)).read().get("finalize", {}).get("handoff")
+            )
+
+    def test_stale_evidence_after_new_base_commit_refuses_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            self._clean_evidence(state, root)
+            scope_state = StateStore(Path(state)).read()
+            base_ref = scope_state["scope"]["baseRef"]
+
+            # Something moved the epic branch after evidence was recorded --
+            # a direct commit, exactly like a task's evidence going stale
+            # after a new commit lands on its branch. root stays on "main"
+            # (merge_task's own base_ref checkout lives in the integration
+            # worktree beside it -- see merge.py's _integration_dir), so
+            # commit there directly instead of trying to check out base_ref
+            # a second time in root.
+            from wave_delivery.git import integration_worktree_path
+
+            integration = integration_worktree_path(root, scope_state["scope"]["id"])
+            (integration / "post_review_change.txt").write_text("late\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=integration, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+                 "commit", "-qm", "late change"],
+                cwd=integration, check=True,
+            )
+
+            code, out, err = _cli_full(state, "finalize", "handoff", "--repo", str(root))
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("stale", err)
+            # Names what to redo, not just that it is stale.
+            self.assertIn("finalize review record", err)
+
+    def test_legacy_scope_without_config_gets_clear_migration_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            self._clean_evidence(state, root)
+            (Path(state).parent / "config.json").unlink()
+
+            code, out, err = _cli_full(state, "finalize", "handoff", "--repo", str(root))
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("migrate --governance", err)
+
+
+class FinalizeDeliveredTest(unittest.TestCase):
+    """Task 3: `finalize delivered` -- proves the epic branch head is
+    reachable from the TARGET branch, reusing phase 4's either-ref ancestry
+    machinery. Never merges anything itself."""
+
+    def test_refuses_before_the_target_merge_has_happened(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out, err = _cli_full(state, "finalize", "delivered", "--by", "bob", "--repo", str(root))
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("has not happened", err)
+            self.assertIsNone(
+                StateStore(Path(state)).read().get("finalize", {}).get("delivered")
+            )
+
+    def test_succeeds_after_merging_base_into_target_locally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+
+            # The human performs the final merge directly -- no wddctl
+            # command involved, proving delivered needs none either.
+            subprocess.run(["git", "checkout", "-q", "main"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+                 "merge", "--no-ff", "-m", "final merge", base_ref],
+                cwd=root, check=True,
+            )
+
+            code, out = _cli(state, "finalize", "delivered", "--by", "bob", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["by"], "bob")
+            self.assertEqual(result["targetBranch"], "main")
+
+            from wave_delivery.schema import derived_phase
+
+            final_state = StateStore(Path(state)).read()
+            self.assertEqual(final_state["finalize"]["delivered"]["by"], "bob")
+            self.assertEqual(derived_phase(final_state), "delivered")
+
+    def test_succeeds_via_stale_local_target_but_merged_origin_target(self) -> None:
+        # Mirrors test_execution_surfaces.ObservedMergeEitherRefTest /
+        # HumanModeTest's remote-merge case, at scope granularity: the human
+        # merges the epic branch into target on a clone of origin and pushes
+        # -- the controller's local target branch never moves.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local", mode="controller")
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+
+            subprocess.run(["git", "-C", str(root), "push", "-q", "origin", "main:main"], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "push", "-q", "origin", f"{base_ref}:{base_ref}"], check=True
+            )
+
+            clone = Path(tmp) / "human-clone"
+            subprocess.run(["git", "clone", "-q", str(bare), str(clone)], check=True)
+            subprocess.run(["git", "-C", str(clone), "checkout", "-q", "main"], check=True)
+            subprocess.run(
+                ["git", "-C", str(clone), "-c", "user.email=t@t", "-c", "user.name=t",
+                 "-c", "commit.gpgsign=false", "merge", "--no-ff", "-m", "final merge",
+                 f"origin/{base_ref}"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(clone), "push", "-q", "origin", "main"], check=True)
+
+            local_main_before = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "main"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+            origin_main_after = subprocess.run(
+                ["git", "--git-dir", str(bare), "rev-parse", "main"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+            self.assertNotEqual(
+                local_main_before, origin_main_after,
+                "the test setup must leave the controller's local target stale",
+            )
+
+            code, out = _cli(state, "finalize", "delivered", "--by", "bob", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            local_main_after = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "main"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+            self.assertEqual(local_main_after, local_main_before)
+
+
+class FinalizeStatusTest(unittest.TestCase):
+    """Task 3: `finalize status` prints the finalize section and the phase."""
+
+    def test_status_reflects_phase_and_recorded_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out = _cli(state, "finalize", "status")
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["phase"], "finalize")
+            self.assertEqual(result["finalize"], {})
+
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "r", "--findings", "[]",
+                "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+
+            code, out = _cli(state, "finalize", "status")
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["finalize"]["review"]["outcome"], "passed")
+
+
+class FinalizeEscapeHatchTest(unittest.TestCase):
+    """Task 3: the escape hatch that already refuses `event apply --event
+    task.merged` refuses `scope.delivered` the same way."""
+
+    def test_event_apply_scope_delivered_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out, err = _cli_full(state, "event", "apply", "--event", "scope.delivered")
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("finalize delivered", err)
+            self.assertIsNone(
+                StateStore(Path(state)).read().get("finalize", {}).get("delivered")
+            )
+
+
+class FinalizeGovernedVerbTest(unittest.TestCase):
+    """Task 3: finalize review/verify/handoff/delivered are governed verbs --
+    they refuse when config.json/constitution.md drifted from what was
+    ratified, same as start/submit/merge/review/verify already do."""
+
+    def test_governance_drift_blocks_finalize_review_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            assert _cli(state, "config", "set", "review.blockingSeverities", '["P1"]')[0] == 0
+
+            code, out, err = _cli_full(
+                state, "finalize", "review", "record", "--reviewer", "r", "--findings", "[]",
+                "--repo", str(root),
+            )
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("drift", err.lower())
 
 
 if __name__ == "__main__":
