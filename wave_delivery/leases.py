@@ -40,6 +40,17 @@ def _task(state: dict[str, Any], task_id: str) -> dict[str, Any]:
         raise ValidationError(f"unknown task: {task_id}") from error
 
 
+def _is_pr_upgrade(current_pr: Any, new_pr: str | None) -> bool:
+    """True when ``new_pr`` is a real URL replacing a ``branch:<sha>`` fallback."""
+    return (
+        isinstance(new_pr, str)
+        and bool(new_pr)
+        and not new_pr.startswith("branch:")
+        and isinstance(current_pr, str)
+        and current_pr.startswith("branch:")
+    )
+
+
 def _reattach(
     state: dict[str, Any], repo: Path, task_id: str, outcome: dict[str, Any]
 ) -> dict[str, Any]:
@@ -206,7 +217,35 @@ def submit_task(
         # Keyed on the deliverable, not on headSha: refresh also populates
         # headSha, so keying on it meant a task refreshed before its first
         # submission never recorded a PR and stayed at the no_pr gate forever.
+        #
+        # This drives the mutator's own control flow (full transition() vs.
+        # the "nothing moved" shortcut below) and must keep meaning exactly
+        # "was a pr already recorded" -- it is deliberately NOT upgrade-aware.
+        # `persisted_event_type` below wraps it to fix up only what gets
+        # logged, so the mutation logic here stays byte-for-byte what it was.
         return "task.pr_recorded" if _task(state, task_id).get("pr") is None else "task.head_updated"
+
+    def persisted_event_type(state: dict[str, Any]) -> str:
+        # apply_mutation resolves this under the same lock the mutator runs
+        # under, before the mutator runs, so it can only ever mirror the
+        # mutator's predicate -- it cannot observe the mutator's actual
+        # outcome. It mirrors the exact upgrade predicate the mutator applies
+        # below (unchanged head + branch:<sha> fallback + real new pr URL),
+        # so the persisted event type says "task.pr_upgraded" for that one
+        # case instead of the misleading "task.head_updated" the outcome dict
+        # never claims.
+        event = chosen_event(state)
+        if event != "task.head_updated":
+            return event
+        task = _task(state, task_id)
+        branch = task.get("branch")
+        if (
+            branch
+            and task.get("headSha") == resolve_ref(repo, branch)
+            and _is_pr_upgrade(task.get("pr"), pr)
+        ):
+            return "task.pr_upgraded"
+        return event
 
     def mutator(state: dict[str, Any]) -> dict[str, Any]:
         # Every Git read below happens under the store lock. Resolving the head
@@ -275,14 +314,7 @@ def submit_task(
             # PR-reference change. It is applied as a direct field update
             # instead of via transition(), the same way lease.reattached bypasses
             # transition() above.
-            current_pr = task.get("pr")
-            upgrading_pr = (
-                isinstance(pr, str)
-                and pr
-                and not pr.startswith("branch:")
-                and isinstance(current_pr, str)
-                and current_pr.startswith("branch:")
-            )
+            upgrading_pr = _is_pr_upgrade(task.get("pr"), pr)
             if not upgrading_pr:
                 raise NoChange(
                     {
@@ -320,7 +352,7 @@ def submit_task(
     try:
         state, duplicate = apply_mutation(
             store,
-            event_type=chosen_event,
+            event_type=persisted_event_type,
             task_id=task_id,
             data={},
             idempotency_key=idempotency_key,
