@@ -129,5 +129,42 @@ class MergeSettingsTest(unittest.TestCase):
             validate_plan(_plan({"mergeMode": "carrier-pigeon"}))
 
 
+class BootstrapApplyMergeFieldsTest(unittest.TestCase):
+    # Regression coverage: apply_plan's store-missing branch builds state via
+    # state_from_plan() -> new_state(), neither of which knew about these
+    # fields, so a plan setting them on the very first apply (no prior
+    # init/state.json) silently lost them -- merge_settings() would then
+    # resolve to config defaults against the operator's stated override.
+
+    def test_first_apply_carries_scope_override_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            state_path = str(wdd / "state.json")
+            plan_file = root / "plan.json"
+            plan_file.write_text(
+                json.dumps(_plan({"mergeSurface": "local", "mergeMode": "human"})),
+                encoding="utf-8",
+            )
+            code, out = _cli(state_path, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            state = StateStore(wdd / "state.json").read()
+            self.assertEqual(state["scope"]["mergeSurface"], "local")
+            self.assertEqual(state["scope"]["mergeMode"], "human")
+
+    def test_first_apply_omitting_fields_leaves_them_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            state_path = str(wdd / "state.json")
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan()), encoding="utf-8")
+            code, out = _cli(state_path, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            state = StateStore(wdd / "state.json").read()
+            self.assertNotIn("mergeSurface", state["scope"])
+            self.assertNotIn("mergeMode", state["scope"])
+
+
 if __name__ == "__main__":
     unittest.main()

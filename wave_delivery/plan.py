@@ -217,6 +217,12 @@ def state_from_plan(plan: dict[str, Any]) -> dict[str, Any]:
         review_policy=scope["reviewPolicy"],
         reconcile_every_n_merges=scope["reconcileEveryNMerges"],
     )
+    # new_state() has no mergeSurface/mergeMode parameters (its signature stays
+    # stable); carry them here from the plan's normalized scope, same absent-
+    # key-when-omitted convention as validate_plan and _apply_plan_to_state.
+    for field in ("mergeSurface", "mergeMode"):
+        if field in scope:
+            state["scope"][field] = scope[field]
     for entry in plan["tasks"]:
         state["tasks"][entry["id"]] = task_state(
             entry["id"],
