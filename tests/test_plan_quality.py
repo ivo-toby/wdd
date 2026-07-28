@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from wave_delivery.config import default_config
+from wave_delivery.lint import lint_plan
 from wave_delivery.plan import apply_risk_rules
 
 
@@ -69,6 +70,47 @@ class RiskRulesTest(unittest.TestCase):
         plan = _plan([_task("T1", domains=[])])
         out = apply_risk_rules(plan, self._config([{"pattern": "**", "risk": "high"}]))
         self.assertEqual(out["tasks"][0]["risk"], "normal")
+
+
+def _codes(findings: list[dict]) -> set[str]:
+    return {finding["code"] for finding in findings}
+
+
+class LintSerializationTest(unittest.TestCase):
+    def test_full_chain_warns(self) -> None:
+        plan = _plan([
+            _task("T1"),
+            _task("T2", depends_on=["T1"]),
+            _task("T3", depends_on=["T2"]),
+        ])
+        self.assertIn("serialized_plan", _codes(lint_plan(plan)))
+
+    def test_parallel_plan_is_clean(self) -> None:
+        plan = _plan([_task("T1"), _task("T2"), _task("T3")])
+        self.assertNotIn("serialized_plan", _codes(lint_plan(plan)))
+
+    def test_two_tasks_never_warn_serialization(self) -> None:
+        plan = _plan([_task("T1"), _task("T2", depends_on=["T1"])])
+        self.assertNotIn("serialized_plan", _codes(lint_plan(plan)))
+
+
+class LintRiskDistributionTest(unittest.TestCase):
+    def test_all_high_warns(self) -> None:
+        plan = _plan([_task(f"T{n}", risk="high") for n in range(1, 5)])
+        self.assertIn("uniform_risk", _codes(lint_plan(plan)))
+
+    def test_all_normal_warns(self) -> None:
+        plan = _plan([_task(f"T{n}") for n in range(1, 5)])
+        self.assertIn("uniform_risk", _codes(lint_plan(plan)))
+
+    def test_mixed_risk_is_clean(self) -> None:
+        tasks = [_task(f"T{n}") for n in range(1, 5)]
+        tasks[0]["risk"] = "high"
+        self.assertNotIn("uniform_risk", _codes(lint_plan(_plan(tasks))))
+
+    def test_three_tasks_never_warn_uniform(self) -> None:
+        plan = _plan([_task(f"T{n}") for n in range(1, 4)])
+        self.assertNotIn("uniform_risk", _codes(lint_plan(plan)))
 
 
 if __name__ == "__main__":
