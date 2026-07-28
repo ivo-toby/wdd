@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .domains import domains_overlap
-from .engine import apply_mutation
+from .engine import apply_mutation, utc_now
 from .errors import IllegalTransition, ValidationError
 from .git import branch_exists, require_repository, resolve_ref, run_git, validate_ref_name
 from .schema import (
@@ -315,6 +315,12 @@ def _apply_plan_to_state(state: dict[str, Any], plan: dict[str, Any]) -> dict[st
     return state
 
 
+def _stamp_approval(state: dict[str, Any], approved_by: str | None) -> dict[str, Any]:
+    if approved_by:
+        state["scope"]["approval"] = {"by": approved_by, "at": utc_now()}
+    return state
+
+
 def ensure_base_branch(repo: Path | str, base_ref: str, *, from_ref: str | None) -> dict[str, Any]:
     """Create the scope base branch if it does not exist yet."""
     repo = require_repository(repo)
@@ -342,9 +348,11 @@ def apply_plan(
     dry_run: bool = False,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
+    approved_by: str | None = None,
 ) -> dict[str, Any]:
     if not store.exists():
         state = state_from_plan(plan)
+        _stamp_approval(state, approved_by)
         diff = {
             "added": sorted(state["tasks"]),
             "removed": [],
@@ -357,6 +365,8 @@ def apply_plan(
             "dryRun": dry_run,
             "diff": diff,
         }
+        if approved_by:
+            result["approvedBy"] = approved_by
         if dry_run:
             return result
         base = None
@@ -398,6 +408,7 @@ def apply_plan(
         # that a later corrected apply would silently adopt as its base.
         nonlocal base
         updated = _apply_plan_to_state(state, plan)
+        _stamp_approval(updated, approved_by)
         if repo is not None and plan["scope"]["baseRef"]:
             base = ensure_base_branch(repo, plan["scope"]["baseRef"], from_ref=from_ref)
         return updated
@@ -411,4 +422,7 @@ def apply_plan(
         expected_revision=expected_revision,
         mutator=mutator,
     )
-    return {**result, "revision": state["revision"], "duplicate": duplicate, "base": base}
+    result_dict = {**result, "revision": state["revision"], "duplicate": duplicate, "base": base}
+    if approved_by:
+        result_dict["approvedBy"] = approved_by
+    return result_dict

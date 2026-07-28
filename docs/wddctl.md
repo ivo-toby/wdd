@@ -146,13 +146,14 @@ state and adds, removes, or updates tasks. Editing or removing a task that
 has already left `todo` is refused.
 
 ```sh
-wddctl plan apply --plan plan.json --repo . [--from-ref REF] [--dry-run]
+wddctl plan apply --plan plan.json --repo . [--from-ref REF] [--dry-run] [--approved-by NAME]
 ```
 
 - `--from-ref` — start point for a newly created base branch (default
   `HEAD`).
 - `--dry-run` — compute and print the diff without writing state or creating
   a branch.
+- `--approved-by NAME` — record approval: stamps `{"by": NAME, "at": <utc_now>}` into `scope.approval`. Re-apply without this flag preserves the last recorded approval (via `scope.approval` in the written state).
 
 ```sh
 wddctl plan apply --plan plan.json --repo . --dry-run

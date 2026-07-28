@@ -161,6 +161,11 @@ def validate_state(state: dict[str, Any]) -> None:
             not isinstance(max_concurrent, int) or max_concurrent < 1
         ):
             raise ValidationError("scope.maxConcurrent must be a positive integer or null")
+        approval = scope.get("approval")
+        if approval is not None:
+            approval = _require_mapping(approval, "scope.approval")
+            _require_string(approval.get("by"), "scope.approval.by")
+            _require_string(approval.get("at"), "scope.approval.at")
 
     constitution = _require_mapping(state.get("constitution"), "constitution")
     constitution_status = constitution.get("status")

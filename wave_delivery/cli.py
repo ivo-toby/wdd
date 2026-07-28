@@ -125,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan_apply.add_argument("--from-ref", default=None, help="start point for a new base branch")
     plan_apply.add_argument("--dry-run", action="store_true")
     plan_apply.add_argument("--strict", action="store_true")
+    plan_apply.add_argument("--approved-by", dest="approved_by", default=None)
     _add_concurrency_flags(plan_apply)
     plan_preview = plan_subparsers.add_parser(
         "preview", help="project the admission order (a view, not a gate)"
@@ -420,6 +421,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo=args.repo,
                 from_ref=args.from_ref,
                 dry_run=args.dry_run,
+                approved_by=args.approved_by,
                 **_concurrency(args),
             )
             _print_json({**result, "lint": findings})

@@ -418,5 +418,48 @@ class MidScopeRiskRuleReapplyTest(unittest.TestCase):
             self.assertEqual(after["tasks"]["T2"]["risk"], "high")
 
 
+class PlanApprovalTest(unittest.TestCase):
+    def _ready_repo(self, tmp: str):
+        root = _git_repo(tmp)
+        wdd = root / ".wdd"
+        state = str(wdd / "state.json")
+        assert _cli(state, "init", "--repo", str(root))[0] == 0
+        assert _cli(state, "config", "set", "merge.surface", "local")[0] == 0
+        config = load_config(wdd)
+        if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
+            assert _cli(state, "config", "set", "verification.commands", '["true"]')[0] == 0
+        assert _cli(state, "constitution", "ratify", "--by", "t")[0] == 0
+        return root, wdd, state
+
+    def test_approved_by_is_stamped_into_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd, state = self._ready_repo(tmp)
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan([_task("T1")])), encoding="utf-8")
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file),
+                "--repo", str(root), "--approved-by", "ivo",
+            )
+            self.assertEqual(code, 0)
+            self.assertIn("ivo", out)
+            approval = StateStore(wdd / "state.json").read()["scope"]["approval"]
+            self.assertEqual(approval["by"], "ivo")
+            self.assertTrue(approval["at"])
+
+    def test_reapply_without_flag_preserves_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd, state = self._ready_repo(tmp)
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan([_task("T1")])), encoding="utf-8")
+            _cli(state, "plan", "apply", "--plan", str(plan_file),
+                 "--repo", str(root), "--approved-by", "ivo")
+            plan = _plan([_task("T1"), _task("T2")])
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            code, _ = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertEqual(code, 0)
+            approval = StateStore(wdd / "state.json").read()["scope"]["approval"]
+            self.assertEqual(approval["by"], "ivo")
+
+
 if __name__ == "__main__":
     unittest.main()
