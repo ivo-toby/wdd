@@ -31,6 +31,9 @@ the refresh endpoint (TASK-002) will implement against.
 
 `npm test -- src/auth/tokens.test.ts`
 
+Tests that must exist: `src/auth/tokens.test.ts` — type guard/validator
+cases the worker's red/green cycle produces.
+
 ## Definition of done
 
 - [ ] Types and storage interface committed.

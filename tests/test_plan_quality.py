@@ -477,6 +477,63 @@ class PlanApprovalTest(unittest.TestCase):
             approval = StateStore(wdd / "state.json").read()["scope"]["approval"]
             self.assertEqual(approval["by"], "ivo")
 
+    def test_empty_approved_by_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd, state = self._ready_repo(tmp)
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan([_task("T1")])), encoding="utf-8")
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file),
+                "--repo", str(root), "--approved-by", "   ",
+            )
+            self.assertNotEqual(code, 0)
+            # Rejected before any mutation: the plan was never applied, so
+            # scope stays unset just as it was right after init.
+            after = StateStore(wdd / "state.json").read()
+            self.assertIsNone(after["scope"])
+
+    def test_changed_plan_reapply_with_approved_by_stamps_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd, state = self._ready_repo(tmp)
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan([_task("T1")])), encoding="utf-8")
+            code, _ = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertEqual(code, 0)
+            # Re-apply a CHANGED plan (new task added) with --approved-by: goes
+            # through the mutator path, not the unchanged/dry-run shortcuts.
+            plan = _plan([_task("T1"), _task("T2")])
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            code, out = _cli(state, "plan", "apply", "--plan", str(plan_file),
+                             "--repo", str(root), "--approved-by", "ivo")
+            self.assertEqual(code, 0, out)
+            self.assertIn("ivo", out)
+            approval = StateStore(wdd / "state.json").read()["scope"]["approval"]
+            self.assertEqual(approval["by"], "ivo")
+            self.assertTrue(approval["at"])
+
+    def test_reapproval_with_different_name_overwrites_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd, state = self._ready_repo(tmp)
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan([_task("T1")])), encoding="utf-8")
+            code, _ = _cli(
+                state, "plan", "apply", "--plan", str(plan_file),
+                "--repo", str(root), "--approved-by", "ivo",
+            )
+            self.assertEqual(code, 0)
+            first = StateStore(wdd / "state.json").read()["scope"]["approval"]
+            self.assertEqual(first["by"], "ivo")
+
+            # Re-approve the identical plan under a different name: by/at
+            # must be overwritten, not left as the first approver's.
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file),
+                "--repo", str(root), "--approved-by", "someone-else",
+            )
+            self.assertEqual(code, 0, out)
+            second = StateStore(wdd / "state.json").read()["scope"]["approval"]
+            self.assertEqual(second["by"], "someone-else")
+
     def test_update_path_dry_run_echoes_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, wdd, state = self._ready_repo(tmp)

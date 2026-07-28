@@ -409,6 +409,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "plan" and args.plan_command == "apply":
+            if args.approved_by is not None and not args.approved_by.strip():
+                raise ValidationError("--approved-by requires a non-empty name")
             plan, wdd_dir = _overlaid_plan(args, store)
             findings = lint_plan(plan, wdd_dir if wdd_dir.exists() else None)
             if args.strict and findings:
