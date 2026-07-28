@@ -1387,5 +1387,50 @@ class FinalizeNextLadderE2ETest(unittest.TestCase):
             self.assertTrue(status_result["finalize"].get("delivered"))
 
 
+class FinalizeNextGovernanceDriftTest(unittest.TestCase):
+    """Task 4 fix round: `next` must not emit a finalize-ladder action whose
+    recordWith/command then fails the drift gate on exit 5 -- the same
+    governance_drift check the execute-phase branch already runs has to
+    cover the finalize-phase branch too."""
+
+    def test_finalize_phase_next_surfaces_drift_instead_of_a_stale_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+
+            # Sanity check: before any drift, next would otherwise propose
+            # final_review (see FinalizeNextLadderE2ETest) -- this confirms
+            # the drift branch is actually short-circuiting a real action,
+            # not just observing an already-empty one.
+            code, out = _cli(state, "next", "--repo", str(root))
+            assert code == 0, out
+            assert json.loads(out)["actions"][0]["action"] == "final_review"
+
+            assert _cli(state, "config", "set", "review.blockingSeverities", '["P1"]')[0] == 0
+
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["phase"], "finalize")
+            self.assertEqual(result["actions"], [])
+            self.assertEqual(result["blockers"][0]["code"], "governance_drift")
+
+    def test_delivered_phase_next_also_surfaces_drift_for_visibility(self) -> None:
+        # Delivered-phase actions are already empty, but a caller polling
+        # `next` after delivery should still see *why* config drifted,
+        # rather than a silently-empty action list with no explanation.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            _deliver_scope(state, root)
+
+            assert _cli(state, "config", "set", "review.blockingSeverities", '["P1"]')[0] == 0
+
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["phase"], "delivered")
+            self.assertEqual(result["actions"], [])
+            self.assertEqual(result["blockers"][0]["code"], "governance_drift")
+
+
 if __name__ == "__main__":
     unittest.main()

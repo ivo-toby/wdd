@@ -498,6 +498,34 @@ def _simple_event(store: StateStore, args: argparse.Namespace, event: str, data:
     return 0
 
 
+def _apply_governance_drift(
+    result: dict[str, Any], state: dict[str, Any], wdd_dir: Path
+) -> dict[str, Any]:
+    """Empty a `next` result's actions and surface a governance_drift blocker
+    when config/constitution changed since ratification.
+
+    Shared by every `next` branch (execute, finalize, delivered) so none of
+    them can emit an action whose recordWith/command then fails the drift
+    gate on exit 5 -- a consumer following recordWith verbatim would
+    otherwise be misled into believing the action is still runnable.
+    Delivered-phase actions are already empty, but drift is surfaced there
+    too (rather than only execute/finalize) so a caller polling `next` after
+    delivery still sees *why* nothing is happening if config drifted.
+    """
+    drift = governance_drift(state, wdd_dir)
+    if drift is not None:
+        result["actions"] = []
+        result["blockers"].insert(
+            0,
+            {
+                "code": "governance_drift",
+                "message": "config/constitution changed since ratification; amend before executing",
+                **drift,
+            },
+        )
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -588,11 +616,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 0
             if derived_phase(state) in {"finalize", "delivered"}:
-                _print_json(
-                    finalize_next_actions(
-                        state, store.path.parent, str(args.repo), state_path=_state_option(args)
-                    )
+                result = finalize_next_actions(
+                    state, store.path.parent, str(args.repo), state_path=_state_option(args)
                 )
+                _apply_governance_drift(result, state, store.path.parent)
+                _print_json(result)
                 return 0
             config = (
                 load_config(store.path.parent)
@@ -609,17 +637,7 @@ def main(argv: list[str] | None = None) -> int:
                 models=models,
                 mode=mode,
             )
-            drift = governance_drift(state, store.path.parent)
-            if drift is not None:
-                result["actions"] = []
-                result["blockers"].insert(
-                    0,
-                    {
-                        "code": "governance_drift",
-                        "message": "config/constitution changed since ratification; amend before executing",
-                        **drift,
-                    },
-                )
+            _apply_governance_drift(result, state, store.path.parent)
             _print_json(result)
             return 0
 
