@@ -20,6 +20,7 @@ from .config import (
     governance_drift,
     governance_fingerprint,
     load_config,
+    merge_settings,
     require_fresh_governance,
     save_config,
     set_value,
@@ -37,6 +38,8 @@ from .engine import (
 from .errors import IllegalTransition, ValidationError, WaveDeliveryError
 from .schema import derived_phase
 from .freshness import check_freshness, record_freshness
+from .git import require_repository, resolve_ref
+from .github import create_pr, push_branch
 from .leases import release_task, start_task, submit_task
 from .lint import lint_plan
 from .merge import merge_task, refresh_task
@@ -524,10 +527,53 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "submit":
+            warning = None
+            pr = args.pr
+            if pr is None:
+                state = store.read()
+                config = (
+                    load_config(store.path.parent)
+                    if config_path(store.path.parent).exists()
+                    else None
+                )
+                if merge_settings(state, config)["surface"] == "pr":
+                    try:
+                        task = state["tasks"][args.task]
+                    except KeyError as error:
+                        raise ValidationError(f"unknown task: {args.task}") from error
+                    branch = task.get("branch")
+                    if not branch:
+                        raise IllegalTransition(
+                            f"task {args.task} has no branch; run 'wddctl start' first"
+                        )
+                    base_ref = state["scope"].get("baseRef")
+                    if not base_ref:
+                        raise IllegalTransition("this scope has no configured base ref")
+                    repo = require_repository(args.repo)
+                    # Push before any PR attempt: a push failure must abort
+                    # with no state change at all, so it happens outside the
+                    # try/except that downgrades PR-creation failures to a
+                    # warning.
+                    push_branch(repo, branch)
+                    head_sha = resolve_ref(repo, branch)
+                    title = task.get("title") or args.task
+                    body = f"wdd task {args.task}\nspec: {task.get('specPath')}\nhead: {head_sha}"
+                    try:
+                        pr = create_pr(repo, branch, base_ref, title, body)
+                    except IllegalTransition as error:
+                        # The branch is already pushed; losing the submission
+                        # here would silently orphan real work. Record it the
+                        # same way a local-surface submit would (a branch
+                        # reference), and surface the failure as a warning
+                        # instead of aborting.
+                        warning = f"PR creation failed after push: {error}"
             result, duplicate = submit_task(
-                store, repo=args.repo, task_id=args.task, pr=args.pr, **_concurrency(args)
+                store, repo=args.repo, task_id=args.task, pr=pr, **_concurrency(args)
             )
-            _print_json({**result, "duplicate": duplicate})
+            payload = {**result, "duplicate": duplicate}
+            if warning:
+                payload["warning"] = warning
+            _print_json(payload)
             return 0
 
         if args.command == "review" and args.review_command == "record":

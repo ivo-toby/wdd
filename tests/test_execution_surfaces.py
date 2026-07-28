@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -15,6 +16,9 @@ from wave_delivery.errors import ValidationError
 from wave_delivery.plan import validate_plan
 from wave_delivery.schema import new_state, task_state
 from wave_delivery.store import StateStore
+
+
+FAKE_GH_DIR = str(Path(__file__).parent / "fixtures" / "fake-gh")
 
 
 def _git_repo(tmp: str) -> Path:
@@ -274,6 +278,144 @@ class ModelRoutingTest(unittest.TestCase):
             start_actions = [a for a in result["actions"] if a["action"] == "start_task"]
             self.assertEqual(len(start_actions), 1, out)
             self.assertEqual(start_actions[0]["model"], "opus")
+
+
+class PrSurfaceSubmitTest(unittest.TestCase):
+    """CLI `submit` on the pr surface: push + gh, with a fake gh on PATH.
+
+    Pushes target a local bare repo added as `origin`; no live network. The
+    fake gh fixture logs every invocation to $FAKE_GH_LOG and prints a
+    canned URL for `pr create`, matching real gh's contract of writing the
+    new PR's URL to stdout.
+    """
+
+    def _repo_with_origin(self, tmp: str) -> tuple[Path, Path]:
+        root = _git_repo(tmp)
+        bare = Path(tmp) / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True)
+        return root, bare
+
+    def _ready_task(self, tmp: str, *, surface: str) -> tuple[Path, str, Path]:
+        """Drive the real CLI flow until T1 has a commit ready to submit."""
+        root, bare = self._repo_with_origin(tmp)
+        wdd = root / ".wdd"
+        state = str(wdd / "state.json")
+        self.assertEqual(_cli(state, "init", "--repo", str(root))[0], 0)
+        self.assertEqual(_cli(state, "config", "set", "merge.surface", surface)[0], 0)
+        config = load_config(wdd)
+        if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
+            self.assertEqual(
+                _cli(state, "config", "set", "verification.commands", '["true"]')[0], 0
+            )
+        self.assertEqual(_cli(state, "constitution", "ratify", "--by", "t")[0], 0)
+        plan_file = root / "plan.json"
+        plan_file.write_text(json.dumps(_plan({"baseRef": "main"})), encoding="utf-8")
+        code, out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+        self.assertEqual(code, 0, out)
+        code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+        self.assertEqual(code, 0, out)
+        worktree = Path(json.loads(out)["worktree"])
+        (worktree / "change.txt").write_text("work\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=worktree, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+             "-c", "commit.gpgsign=false", "commit", "-qm", "do work"],
+            cwd=worktree, check=True,
+        )
+        return root, state, bare
+
+    @contextlib.contextmanager
+    def _fake_gh(self, log_path: str, *, fail: bool = False):
+        saved = {key: os.environ.get(key) for key in ("PATH", "FAKE_GH_LOG", "FAKE_GH_FAIL")}
+        os.environ["PATH"] = FAKE_GH_DIR + os.pathsep + saved["PATH"]
+        os.environ["FAKE_GH_LOG"] = log_path
+        if fail:
+            os.environ["FAKE_GH_FAIL"] = "1"
+        else:
+            os.environ.pop("FAKE_GH_FAIL", None)
+        try:
+            yield
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    @staticmethod
+    def _gh_log(log_path: str) -> list[list[str]]:
+        path = Path(log_path)
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+    @staticmethod
+    def _branches(bare: Path) -> str:
+        # --git-dir (not cwd) avoids "safe.bareRepository is 'explicit'"
+        # refusals some Git configs apply to commands run inside a bare repo.
+        return subprocess.run(
+            ["git", "--git-dir", str(bare), "branch", "--list"], check=True, text=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+
+    def test_pr_submit_pushes_and_creates_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = self._ready_task(tmp, surface="pr")
+            log_path = str(Path(tmp) / "gh.log")
+            with self._fake_gh(log_path):
+                code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["pr"], "https://github.invalid/pr/1")
+            self.assertNotIn("warning", result)
+            log = self._gh_log(log_path)
+            self.assertTrue(any(entry[:2] == ["pr", "create"] for entry in log), log)
+            self.assertIn("task/T1", self._branches(bare))
+
+    def test_manual_pr_flag_skips_gh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = self._ready_task(tmp, surface="pr")
+            log_path = str(Path(tmp) / "gh.log")
+            with self._fake_gh(log_path):
+                code, out = _cli(
+                    state, "submit", "--task", "T1", "--repo", str(root),
+                    "--pr", "https://example.invalid/manual/9",
+                )
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["pr"], "https://example.invalid/manual/9")
+            self.assertEqual(self._gh_log(log_path), [])
+            # A manual --pr never pushes either: only gh is bypassed by
+            # design, but this proves the branch was not force-published.
+            self.assertNotIn("task/T1", self._branches(bare))
+
+    def test_local_surface_never_touches_gh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = self._ready_task(tmp, surface="local")
+            log_path = str(Path(tmp) / "gh.log")
+            with self._fake_gh(log_path):
+                code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertTrue(result["pr"].startswith("branch:"), result)
+            self.assertEqual(self._gh_log(log_path), [])
+            self.assertNotIn("task/T1", self._branches(bare))
+
+    def test_pr_create_failure_still_records_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = self._ready_task(tmp, surface="pr")
+            log_path = str(Path(tmp) / "gh.log")
+            with self._fake_gh(log_path, fail=True):
+                code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertIn("warning", result)
+            # The push ran (and succeeded) before gh failed, so the state
+            # transition is never lost: submit_task falls back to the same
+            # branch reference a local-surface submit would record.
+            self.assertTrue(result["pr"].startswith("branch:"), result)
+            self.assertIn("task/T1", self._branches(bare))
 
 
 if __name__ == "__main__":
