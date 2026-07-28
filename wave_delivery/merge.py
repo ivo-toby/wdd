@@ -342,6 +342,28 @@ def merge_task(
     return {**outcome, "revision": state["revision"], "duplicate": duplicate}
 
 
+def _fetched_base_sha(repo: Path, base_ref: str) -> str:
+    """Resolve the base SHA to prove ancestry against after a best-effort fetch.
+
+    `git fetch origin <base_ref>` only ever advances the remote-tracking ref
+    `refs/remotes/origin/<base_ref>` -- it does not (and, without
+    `--update-head-ok`, cannot) touch the local `<base_ref>` branch, which may
+    be checked out elsewhere. A human merge that landed on the remote is
+    real, live-Git-provable evidence the instant the fetch completes, even
+    though the local base ref itself is still stale until someone pulls it.
+    Preferring `origin/<base_ref>` when the fetch produced one is what makes
+    `--observed` actually observe a remote-only human merge; falling back to
+    the local ref keeps the no-remote and offline paths working exactly as
+    before.
+    """
+    remote_ref = f"origin/{base_ref}"
+    has_remote_ref = (
+        run_git(repo, "show-ref", "--verify", "--quiet", f"refs/remotes/{remote_ref}", check=False).returncode
+        == 0
+    )
+    return resolve_ref(repo, remote_ref if has_remote_ref else base_ref)
+
+
 def observe_merge(
     store: StateStore,
     *,
@@ -390,7 +412,7 @@ def observe_merge(
             raise IllegalTransition(
                 f"task {task_id} head changed since observation began; re-run 'wddctl merge --observed'"
             )
-        base_sha = resolve_ref(repo, base_ref)
+        base_sha = _fetched_base_sha(repo, base_ref)
         if not is_ancestor(repo, head_sha, base_sha):
             raise IllegalTransition(
                 f"task {task_id} head {head_sha} is not reachable from {base_ref} ({base_sha}); "

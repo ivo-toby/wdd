@@ -642,6 +642,70 @@ class HumanModeTest(unittest.TestCase):
             self.assertEqual(result["action"], "observed_human_merge")
             self.assertEqual(StateStore(Path(state)).read()["tasks"]["T1"]["status"], "done")
 
+    def test_observed_merge_proves_ancestry_against_the_fetched_remote_base(self) -> None:
+        # Regression: `git fetch origin <base_ref>` only ever advances
+        # refs/remotes/origin/<base_ref>, never the local <base_ref> branch.
+        # A human merging the PR on the remote (GitHub) advances origin's
+        # base immediately, but the controller's local base ref stays stale
+        # until someone pulls it -- which nothing in this flow ever does.
+        # --observed must prove ancestry against the freshly fetched remote
+        # ref, not the stale local one, or it fails closed on the exact case
+        # the fetch exists for.
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = str(Path(tmp) / "gh.log")
+            root, state, bare = _bootstrap_ready_scope(tmp, surface="pr", mode="human")
+            _start_and_commit(state, root)
+            with _fake_gh(log_path):
+                code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            _finish_to_merge_ready(state, root)
+
+            task = StateStore(Path(state)).read()["tasks"]["T1"]
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+
+            # The base branch itself was never pushed by submit (only the
+            # task branch was); push it once now, as an initial pr-surface
+            # setup would, so the remote has a base ref to merge into.
+            subprocess.run(
+                ["git", "-C", str(root), "push", "-q", "origin", f"{base_ref}:{base_ref}"],
+                check=True,
+            )
+
+            # The human merges the PR on the remote: clone the bare origin,
+            # merge the task branch into base there, push back. The
+            # controller checkout in `root` is never touched.
+            clone = Path(tmp) / "human-clone"
+            subprocess.run(["git", "clone", "-q", str(bare), str(clone)], check=True)
+            subprocess.run(
+                ["git", "-C", str(clone), "checkout", "-q", "-b", base_ref, f"origin/{base_ref}"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(clone), "-c", "user.email=t@t", "-c", "user.name=t",
+                 "-c", "commit.gpgsign=false", "merge", "--no-ff", "-m", "human merge",
+                 f"origin/{task['branch']}"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(clone), "push", "-q", "origin", base_ref], check=True)
+
+            local_base_before = _git_output(root, "rev-parse", base_ref).strip()
+            origin_base_after = _bare_ref(bare, base_ref)
+            self.assertNotEqual(
+                local_base_before, origin_base_after,
+                "the test setup must leave the controller's local base stale",
+            )
+
+            code, out = _cli(state, "merge", "--task", "T1", "--repo", str(root), "--observed")
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["action"], "observed_human_merge")
+            self.assertEqual(StateStore(Path(state)).read()["tasks"]["T1"]["status"], "done")
+
+            # The controller's local base ref genuinely never moved --
+            # --observed proved ancestry via the fetched remote ref, not by
+            # mutating (or requiring) the local branch.
+            self.assertEqual(_git_output(root, "rev-parse", base_ref).strip(), local_base_before)
+
     def test_next_shows_await_human_merge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = self._ready_local_human(tmp)
