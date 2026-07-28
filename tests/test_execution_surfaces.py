@@ -81,6 +81,123 @@ def _ratified(state: dict) -> dict:
     return state
 
 
+def _cli_full(state: str, *argv: str) -> tuple[int, str, str]:
+    """Like _cli, but also captures stderr for asserting on refusal messages."""
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        code = main(["--state", state, *argv])
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+def _repo_with_origin(tmp: str) -> tuple[Path, Path]:
+    root = _git_repo(tmp)
+    bare = Path(tmp) / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True)
+    return root, bare
+
+
+@contextlib.contextmanager
+def _fake_gh(log_path: str, *, fail: bool = False):
+    saved = {key: os.environ.get(key) for key in ("PATH", "FAKE_GH_LOG", "FAKE_GH_FAIL")}
+    os.environ["PATH"] = FAKE_GH_DIR + os.pathsep + saved["PATH"]
+    os.environ["FAKE_GH_LOG"] = log_path
+    if fail:
+        os.environ["FAKE_GH_FAIL"] = "1"
+    else:
+        os.environ.pop("FAKE_GH_FAIL", None)
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _gh_log(log_path: str) -> list[list[str]]:
+    path = Path(log_path)
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def _git_output(repo: Path | str, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, text=True, stdout=subprocess.PIPE,
+    ).stdout
+
+
+def _bare_ref(bare: Path, ref: str) -> str:
+    return subprocess.run(
+        ["git", "--git-dir", str(bare), "rev-parse", ref], check=True, text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+
+
+def _bootstrap_ready_scope(
+    tmp: str, *, surface: str, mode: str, base_ref: str = "wdd/scope-x"
+) -> tuple[Path, str, Path]:
+    """repo + bare origin, configured for the given surface/mode, scope applied.
+
+    base_ref defaults to a NEW branch (created off the repo's initial commit),
+    deliberately distinct from the checked-out "main": merging into a base ref
+    that is also the repo's current branch takes a different path in
+    merge.py (in-place in the controller checkout, which then requires a
+    clean working tree) -- and the working tree always has an untracked
+    .wdd/ directory. Every other merge test in this codebase sidesteps this
+    the same way (see test_wave_delivery.py's "wdd/demo" baseRef).
+
+    Leaves task T1 admissible (todo); the caller drives it through start,
+    a commit, submit, and the review/verify/freshness evidence needed to
+    reach merge_ready.
+    """
+    root, bare = _repo_with_origin(tmp)
+    wdd = root / ".wdd"
+    state = str(wdd / "state.json")
+    assert _cli(state, "init", "--repo", str(root))[0] == 0
+    assert _cli(state, "config", "set", "merge.surface", surface)[0] == 0
+    assert _cli(state, "config", "set", "merge.mode", mode)[0] == 0
+    config = load_config(wdd)
+    if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
+        assert _cli(state, "config", "set", "verification.commands", '["true"]')[0] == 0
+    assert _cli(state, "constitution", "ratify", "--by", "t")[0] == 0
+    plan_file = root / "plan.json"
+    plan_file.write_text(json.dumps(_plan({"baseRef": base_ref})), encoding="utf-8")
+    code, out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+    assert code == 0, out
+    return root, state, bare
+
+
+def _start_and_commit(state: str, root: Path, task_id: str = "T1") -> None:
+    code, out = _cli(state, "start", "--task", task_id, "--repo", str(root))
+    assert code == 0, out
+    worktree = Path(json.loads(out)["worktree"])
+    (worktree / "change.txt").write_text("work\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+         "-c", "commit.gpgsign=false", "commit", "-qm", "do work"],
+        cwd=worktree, check=True,
+    )
+
+
+def _finish_to_merge_ready(state: str, root: Path, task_id: str = "T1") -> None:
+    """Assumes submit already ran; records the review/verification/freshness
+    evidence that takes the task from in_progress to merge_ready."""
+    code, out = _cli(
+        state, "review", "record", "--task", task_id, "--reviewer", "t", "--findings", "[]"
+    )
+    assert code == 0, out
+    code, out = _cli(state, "verify", "record", "--task", task_id, "--status", "passed")
+    assert code == 0, out
+    code, out = _cli(state, "freshness", "record", "--task", task_id, "--repo", str(root))
+    assert code == 0, out
+    assert StateStore(Path(state)).read()["tasks"][task_id]["status"] == "merge_ready"
+
+
 class MergeSettingsTest(unittest.TestCase):
     def _ready_repo(self, tmp: str):
         root = _git_repo(tmp)
@@ -416,6 +533,149 @@ class PrSurfaceSubmitTest(unittest.TestCase):
             # branch reference a local-surface submit would record.
             self.assertTrue(result["pr"].startswith("branch:"), result)
             self.assertIn("task/T1", self._branches(bare))
+
+
+class ReviewMirrorTest(unittest.TestCase):
+    """review record on the pr surface, with a real PR, mirrors findings as a comment."""
+
+    def _ready_task_with_pr(self, tmp: str, log_path: str) -> tuple[Path, str]:
+        root, state, _bare = _bootstrap_ready_scope(tmp, surface="pr", mode="controller")
+        _start_and_commit(state, root)
+        with _fake_gh(log_path):
+            code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+        self.assertEqual(code, 0, out)
+        result = json.loads(out)
+        self.assertNotIn("warning", result)
+        self.assertTrue(result["pr"].startswith("https://"), result)
+        return root, state
+
+    def test_findings_mirrored_as_pr_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = str(Path(tmp) / "gh.log")
+            root, state = self._ready_task_with_pr(tmp, log_path)
+            findings = json.dumps(
+                [{"severity": "P2", "summary": "tighten the check", "file": "a.py", "line": 3}]
+            )
+            with _fake_gh(log_path):
+                code, out = _cli(
+                    state, "review", "record", "--task", "T1",
+                    "--reviewer", "reviewer1", "--findings", findings,
+                )
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertNotIn("warning", result)
+            log = _gh_log(log_path)
+            comments = [entry for entry in log if entry[:2] == ["pr", "comment"]]
+            self.assertEqual(len(comments), 1, log)
+            body = comments[0][-1]
+            self.assertIn("P2", body)
+            self.assertIn("tighten the check", body)
+
+    def test_comment_failure_never_blocks_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = str(Path(tmp) / "gh.log")
+            root, state = self._ready_task_with_pr(tmp, log_path)
+            with _fake_gh(log_path, fail=True):
+                code, out = _cli(
+                    state, "review", "record", "--task", "T1",
+                    "--reviewer", "reviewer1", "--findings", "[]",
+                )
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertIn("warning", result)
+            self.assertEqual(result["outcome"], "passed")
+            task = StateStore(Path(state)).read()["tasks"]["T1"]
+            self.assertIsNotNone(task["review"], "a mirroring failure must not lose the review record")
+
+
+class HumanModeTest(unittest.TestCase):
+    def _ready_local_human(self, tmp: str) -> tuple[Path, str]:
+        root, state, _bare = _bootstrap_ready_scope(tmp, surface="local", mode="human")
+        _start_and_commit(state, root)
+        code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+        self.assertEqual(code, 0, out)
+        _finish_to_merge_ready(state, root)
+        return root, state
+
+    def test_merge_refused_in_human_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = self._ready_local_human(tmp)
+            code, out, err = _cli_full(state, "merge", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("human", err.lower())
+            self.assertIn("--observed", err)
+            self.assertEqual(
+                StateStore(Path(state)).read()["tasks"]["T1"]["status"], "merge_ready"
+            )
+
+    def test_observed_merge_requires_ancestry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = self._ready_local_human(tmp)
+
+            code, out, err = _cli_full(
+                state, "merge", "--task", "T1", "--repo", str(root), "--observed"
+            )
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("has not happened", err)
+            self.assertEqual(
+                StateStore(Path(state)).read()["tasks"]["T1"]["status"], "merge_ready"
+            )
+
+            # The human merges directly in the controller checkout -- no wddctl
+            # command involved, proving --observed does not need one. The repo
+            # stays on "main" day-to-day, so check out the scope's actual base
+            # ref first; merging into "main" instead would prove nothing about
+            # ancestry from the base the task is scoped against.
+            task = StateStore(Path(state)).read()["tasks"]["T1"]
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+            subprocess.run(["git", "checkout", "-q", base_ref], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                 "-c", "commit.gpgsign=false", "merge", "--no-ff", "-m", "human merge",
+                 task["branch"]],
+                cwd=root, check=True,
+            )
+
+            code, out = _cli(state, "merge", "--task", "T1", "--repo", str(root), "--observed")
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["action"], "observed_human_merge")
+            self.assertEqual(StateStore(Path(state)).read()["tasks"]["T1"]["status"], "done")
+
+    def test_next_shows_await_human_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = self._ready_local_human(tmp)
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            actions = [a for a in result["actions"] if a["task"] == "T1"]
+            self.assertEqual(len(actions), 1, out)
+            action = actions[0]
+            self.assertEqual(action["action"], "await_human_merge")
+            self.assertNotIn("command", action)
+            self.assertIn("judgment", action)
+            self.assertIn("--observed", action["recordWith"])
+
+
+class PrControllerMergeTest(unittest.TestCase):
+    def test_merge_pushes_base_after_local_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = str(Path(tmp) / "gh.log")
+            root, state, bare = _bootstrap_ready_scope(tmp, surface="pr", mode="controller")
+            _start_and_commit(state, root)
+            with _fake_gh(log_path):
+                code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            _finish_to_merge_ready(state, root)
+
+            code, out = _cli(state, "merge", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertNotIn("warning", result)
+
+            base_ref = result["baseRef"]
+            local_base = _git_output(root, "rev-parse", base_ref).strip()
+            self.assertEqual(_bare_ref(bare, base_ref), local_base)
 
 
 if __name__ == "__main__":

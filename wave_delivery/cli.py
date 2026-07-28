@@ -32,6 +32,7 @@ from .engine import (
     admission_schedule,
     apply_event,
     bounded_next_actions,
+    human_reference,
     render_to_path,
     status_summary,
 )
@@ -39,10 +40,10 @@ from .errors import IllegalTransition, ValidationError, WaveDeliveryError
 from .schema import derived_phase
 from .freshness import check_freshness, record_freshness
 from .git import require_repository, resolve_ref
-from .github import create_pr, push_branch
+from .github import comment_pr, create_pr, push_branch
 from .leases import release_task, start_task, submit_task
 from .lint import lint_plan
-from .merge import merge_task, refresh_task
+from .merge import merge_task, observe_merge, refresh_task
 from .migration import apply_migration, plan_migration
 from .monitor import monitor_once
 from .plan import apply_config_defaults, apply_plan, apply_risk_rules, read_plan, state_from_plan
@@ -241,6 +242,12 @@ def build_parser() -> argparse.ArgumentParser:
     merge = subparsers.add_parser("merge", help="merge a task into the scope base and record it")
     merge.add_argument("--task", required=True)
     merge.add_argument("--repo", type=Path, default=Path("."))
+    merge.add_argument(
+        "--observed",
+        action="store_true",
+        help="record a merge a human performed out-of-band; never mutates Git, "
+        "requires live-Git ancestry proof",
+    )
     _add_concurrency_flags(merge)
 
     release = subparsers.add_parser("release", help="remove a finished task's worktree")
@@ -341,6 +348,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _print_json(value: Any) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def _review_comment_body(findings: list[dict[str, Any]], reviewer: str) -> str:
+    """The markdown mirrored to a PR when review record runs on the pr surface."""
+    if not findings:
+        return f"wddctl review by {reviewer}: clean review, no findings."
+    lines = [
+        f"wddctl review by {reviewer}:",
+        "",
+        "| Severity | Summary | File | Line |",
+        "| --- | --- | --- | --- |",
+    ]
+    for finding in findings:
+        summary = str(finding.get("summary", "") or "").replace("|", "\\|")
+        file_ = finding.get("file") or ""
+        line = finding.get("line")
+        lines.append(
+            f"| {finding.get('severity', '')} | {summary} | {file_} | {line if line is not None else ''} |"
+        )
+    return "\n".join(lines)
 
 
 def _brief(summary: dict[str, Any]) -> str:
@@ -480,17 +507,20 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 return 0
-            models = (
-                load_config(store.path.parent)["models"]
+            config = (
+                load_config(store.path.parent)
                 if config_path(store.path.parent).exists()
                 else None
             )
+            models = config["models"] if config else None
+            mode = merge_settings(state, config)["mode"]
             result = bounded_next_actions(
                 state,
                 max_bytes=args.max_bytes,
                 state_path=_state_option(args),
                 repo=str(args.repo),
                 models=models,
+                mode=mode,
             )
             drift = governance_drift(state, store.path.parent)
             if drift is not None:
@@ -577,23 +607,45 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "review" and args.review_command == "record":
+            findings = validate_findings(args.findings)
             state, duplicate = record_review(
                 store,
                 task_id=args.task,
-                findings=validate_findings(args.findings),
+                findings=findings,
                 reviewer=args.reviewer,
                 repo=args.repo,
                 **_concurrency(args),
             )
             task = state["tasks"][args.task]
-            _print_json(
-                {
-                    "revision": state["revision"],
-                    "duplicate": duplicate,
-                    "outcome": (task.get("review") or {}).get("outcome"),
-                    "status": task["status"],
-                }
+            warning = None
+            config = (
+                load_config(store.path.parent)
+                if config_path(store.path.parent).exists()
+                else None
             )
+            pr = task.get("pr")
+            if (
+                merge_settings(state, config)["surface"] == "pr"
+                and isinstance(pr, str) and pr and not pr.startswith("branch:")
+            ):
+                try:
+                    comment_pr(
+                        require_repository(args.repo), pr, _review_comment_body(findings, args.reviewer)
+                    )
+                except IllegalTransition as error:
+                    # State is already recorded above; the PR is a projection
+                    # of it, not the source of truth, so a mirroring failure
+                    # degrades to a warning instead of losing the review.
+                    warning = f"PR comment failed: {error}"
+            payload = {
+                "revision": state["revision"],
+                "duplicate": duplicate,
+                "outcome": (task.get("review") or {}).get("outcome"),
+                "status": task["status"],
+            }
+            if warning:
+                payload["warning"] = warning
+            _print_json(payload)
             return 0
 
         if args.command == "review" and args.review_command == "run":
@@ -675,7 +727,42 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "merge":
-            _print_json(merge_task(store, repo=args.repo, task_id=args.task, **_concurrency(args)))
+            if args.observed:
+                _print_json(
+                    observe_merge(store, repo=args.repo, task_id=args.task, **_concurrency(args))
+                )
+                return 0
+            state = store.read()
+            config = (
+                load_config(store.path.parent)
+                if config_path(store.path.parent).exists()
+                else None
+            )
+            settings = merge_settings(state, config)
+            if settings["mode"] == "human":
+                try:
+                    task = state["tasks"][args.task]
+                except KeyError as error:
+                    raise ValidationError(f"unknown task: {args.task}") from error
+                reference = human_reference(task)
+                raise IllegalTransition(
+                    f"merge mode is human: {reference} must be merged by its human owner "
+                    "directly; wddctl will not merge it. Once merged, run "
+                    f"'wddctl merge --task {args.task} --repo {args.repo} --observed' to record it."
+                )
+            result = merge_task(store, repo=args.repo, task_id=args.task, **_concurrency(args))
+            if settings["surface"] == "pr":
+                base_ref = store.read()["scope"].get("baseRef")
+                if base_ref:
+                    try:
+                        push_branch(require_repository(args.repo), base_ref)
+                    except IllegalTransition as error:
+                        # The merge itself already committed to state; pushing
+                        # the advanced base is a projection of that fact and
+                        # is idempotent to retry, so a push failure degrades
+                        # to a warning instead of losing the merge.
+                        result["warning"] = f"push of {base_ref} to origin failed: {error}"
+            _print_json(result)
             return 0
 
         if args.command == "release":

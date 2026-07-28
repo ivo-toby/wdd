@@ -578,6 +578,21 @@ ACTION_COMMANDS: dict[str, tuple[str | None, str | None]] = {
 RISK_TIERED_ACTIONS = {"start_task", "assign_fix_writer"}
 
 
+def human_reference(task: dict[str, Any]) -> str:
+    """A human-readable reference for a task's PR, favoring a real URL.
+
+    ``task["pr"]`` may be a synthetic ``"branch:<name>@<sha>"`` fallback
+    recorded when PR creation failed or the surface is local (see
+    leases.submit_task). Naming that string as "the PR" in a message where a
+    URL is expected would be misleading, so fall back to the branch name.
+    """
+    pr = task.get("pr")
+    if isinstance(pr, str) and pr and not pr.startswith("branch:"):
+        return pr
+    branch = task.get("branch")
+    return f"branch {branch}" if branch else "an unrecorded reference"
+
+
 def _resolve_model(
     action: dict[str, Any],
     models: dict[str, Any] | None,
@@ -611,6 +626,8 @@ def decorate_actions(
     repo: str = ".",
     models: dict[str, Any] | None = None,
     task_risk: dict[str, str] | None = None,
+    mode: str = "controller",
+    task_ref: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Attach the literal command for each action, and the resolved model.
 
@@ -622,19 +639,40 @@ def decorate_actions(
     "high"/"normal") is a purpose-built mapping rather than the full state:
     decoration only ever needs one field per task, and this keeps the
     decorator from taking on the whole state shape as a dependency.
+
+    ``mode`` ("controller" or "human") likewise arrives from the caller
+    (config.merge_settings), never read here. In human mode, a merge_ready
+    task's action becomes "await_human_merge": wddctl will not merge it, so
+    there is no command to run, only a judgment (naming the PR via
+    ``task_ref``) and the ``merge --observed`` command that records the human
+    merge once it has happened. ``task_gate`` itself is untouched -- this is
+    decoration only.
     """
     # Every dynamic value is shell-quoted: these strings are documented as
     # copy-pasteable, and a task id containing shell metacharacters would
     # otherwise produce an executable injected command.
     prefix = "wddctl" + (f" --state {shlex.quote(state_path)}" if state_path else "")
     task_risk = task_risk or {}
+    task_ref = task_ref or {}
     for action in result["actions"]:
-        run_now, record_with = ACTION_COMMANDS.get(action["action"], (None, None))
         fields = {"task": shlex.quote(action["task"]), "repo": shlex.quote(repo)}
-        if run_now:
-            action["command"] = f"{prefix} {run_now.format(**fields)}"
-        if record_with:
-            action["recordWith"] = f"{prefix} {record_with.format(**fields)}"
+        if mode == "human" and action["action"] == "merge_task":
+            action["action"] = "await_human_merge"
+            reference = task_ref.get(action["task"], "an unrecorded reference")
+            action["judgment"] = (
+                f"{reference} must be merged by its human owner directly; wddctl will not "
+                "merge it in human mode. Once merged, record it with recordWith so live Git "
+                "can prove it happened."
+            )
+            action["recordWith"] = (
+                f"{prefix} merge --task {fields['task']} --repo {fields['repo']} --observed"
+            )
+        else:
+            run_now, record_with = ACTION_COMMANDS.get(action["action"], (None, None))
+            if run_now:
+                action["command"] = f"{prefix} {run_now.format(**fields)}"
+            if record_with:
+                action["recordWith"] = f"{prefix} {record_with.format(**fields)}"
         model = _resolve_model(action, models, task_risk)
         if model:
             action["model"] = model
@@ -703,16 +741,19 @@ def bounded_next_actions(
     state_path: str | None = None,
     repo: str = ".",
     models: dict[str, Any] | None = None,
+    mode: str = "controller",
 ) -> dict[str, Any]:
     """Keep default next-action output small enough for an agent prompt.
 
     Commands are attached before the budget is measured, so the limit stays
     honest rather than being blown by decoration afterwards; model routing
-    adds bytes the same way and is measured under the same budget.
+    and mode-aware merge decoration add bytes the same way and are measured
+    under the same budget.
     """
     limit = 8
     full_result = next_actions(state, max_actions=None)
     task_risk = {task_id: task.get("risk") for task_id, task in state["tasks"].items()}
+    task_ref = {task_id: human_reference(task) for task_id, task in state["tasks"].items()}
     while limit >= 0:
         result = next_actions(state, max_actions=limit)
         result["blockers"] = full_result["blockers"][:limit]
@@ -720,7 +761,15 @@ def bounded_next_actions(
             len(result["actions"]) < len(full_result["actions"])
             or len(result["blockers"]) < len(full_result["blockers"])
         )
-        decorate_actions(result, state_path=state_path, repo=repo, models=models, task_risk=task_risk)
+        decorate_actions(
+            result,
+            state_path=state_path,
+            repo=repo,
+            models=models,
+            task_risk=task_risk,
+            mode=mode,
+            task_ref=task_ref,
+        )
         rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
         if len(rendered.encode("utf-8")) <= max_bytes:
             return result

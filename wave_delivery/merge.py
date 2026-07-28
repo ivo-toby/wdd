@@ -71,6 +71,46 @@ def _base_ref(state: dict[str, Any]) -> str:
     return base_ref
 
 
+def _apply_merge_event(
+    current: dict[str, Any],
+    *,
+    task_id: str,
+    action: str,
+    branch: str | None,
+    base_ref: str,
+    base_sha: str,
+    head_sha: str,
+    outcome: dict[str, Any],
+) -> dict[str, Any]:
+    """Shared event-application tail for both a live and an observed merge.
+
+    Any Git mutation, or the human's out-of-band equivalent, has already
+    happened by the time this runs and been proven by ``is_ancestor``; this
+    only ever records the resulting state as ``task.merged``.
+    """
+    outcome.update(
+        {
+            "task": task_id,
+            "action": action,
+            "branch": branch or head_sha,
+            "baseRef": base_ref,
+            "baseSha": base_sha,
+            "headSha": head_sha,
+        }
+    )
+    return transition(
+        current,
+        "task.merged",
+        task_id,
+        {
+            "mergeVerified": True,
+            "baseRef": base_ref,
+            "baseSha": base_sha,
+            "headSha": head_sha,
+        },
+    )
+
+
 def _integration_dir(repo: Path, state: dict[str, Any], base_ref: str) -> Path:
     """Merge inside the controller checkout when it is already on the base branch."""
     current = run_git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
@@ -279,26 +319,92 @@ def merge_task(
             raise IllegalTransition(
                 f"task head {head_sha} is still not contained in {base_ref} ({base_sha}) after merging"
             )
-        outcome.update(
-            {
-                "task": task_id,
-                "action": action,
-                "branch": task.get("branch") or head_sha,
-                "baseRef": base_ref,
-                "baseSha": base_sha,
-                "headSha": head_sha,
-            }
-        )
-        return transition(
+        return _apply_merge_event(
             current,
-            "task.merged",
-            task_id,
-            {
-                "mergeVerified": True,
-                "baseRef": base_ref,
-                "baseSha": base_sha,
-                "headSha": head_sha,
-            },
+            task_id=task_id,
+            action=action,
+            branch=task.get("branch"),
+            base_ref=base_ref,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            outcome=outcome,
+        )
+
+    state, duplicate = apply_mutation(
+        store,
+        event_type="task.merged",
+        task_id=task_id,
+        data={},
+        idempotency_key=idempotency_key,
+        expected_revision=expected_revision,
+        mutator=mutator,
+    )
+    return {**outcome, "revision": state["revision"], "duplicate": duplicate}
+
+
+def observe_merge(
+    store: StateStore,
+    *,
+    repo: Path | str,
+    task_id: str,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Record a merge a human performed out-of-band -- never mutates Git.
+
+    Legal in both controller and human mode: a controller-mode scope a human
+    merged directly out-of-band is just as legitimately observable. Fetches
+    the base ref best-effort first (a stale local base ref must not block
+    observation when the merge already landed on the remote; a missing or
+    unreachable origin must not block it either when the base ref is already
+    current locally), then requires the task head to be a live-Git-proven
+    ancestor of the base before recording anything.
+    """
+    repo = require_repository(repo)
+    state = store.read()
+    if _preflight(state, expected_revision, idempotency_key):
+        return {"task": task_id, "action": "duplicate", "revision": state["revision"], "duplicate": True}
+    task = _task(state, task_id)
+    base_ref = _base_ref(state)
+    head_sha = task.get("headSha")
+    if not isinstance(head_sha, str) or not head_sha:
+        raise IllegalTransition(f"task {task_id} has no recorded head SHA")
+
+    run_git(repo, "fetch", "origin", base_ref, check=False)
+
+    outcome: dict[str, Any] = {}
+
+    def mutator(current: dict[str, Any]) -> dict[str, Any]:
+        # Re-derived inside the lock: the fetch and the outer read happened
+        # before it, so nothing here may be trusted stale.
+        require_ratified(current)
+        task = _task(current, task_id)
+        gate = task_gate(current, task)
+        if gate != "merge_ready":
+            raise IllegalTransition(
+                f"task {task_id} is at gate '{gate}', not 'merge_ready'; "
+                "run 'wddctl next' for the required step"
+            )
+        current_head = task.get("headSha")
+        if current_head != head_sha:
+            raise IllegalTransition(
+                f"task {task_id} head changed since observation began; re-run 'wddctl merge --observed'"
+            )
+        base_sha = resolve_ref(repo, base_ref)
+        if not is_ancestor(repo, head_sha, base_sha):
+            raise IllegalTransition(
+                f"task {task_id} head {head_sha} is not reachable from {base_ref} ({base_sha}); "
+                "the human merge has not happened"
+            )
+        return _apply_merge_event(
+            current,
+            task_id=task_id,
+            action="observed_human_merge",
+            branch=task.get("branch"),
+            base_ref=base_ref,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            outcome=outcome,
         )
 
     state, duplicate = apply_mutation(
