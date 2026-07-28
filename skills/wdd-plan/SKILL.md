@@ -29,9 +29,10 @@ one message, never trickle them one at a time.
 
 Once the gaps are closed, write the agreed understanding to `.wdd/spec.md`
 with exactly these four sections: Goal, In scope, Out of scope, Acceptance
-criteria. The finalize phase reviews the epic branch against this file, so
-acceptance criteria must be checkable — not "works well," but a condition a
-reviewer can confirm true or false from the diff.
+criteria. The finalize phase (phase 5, upcoming) will review the epic
+branch against this file, so acceptance criteria must be checkable — not
+"works well," but a condition a reviewer can confirm true or false from the
+diff.
 
 Skeleton:
 

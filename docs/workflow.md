@@ -15,11 +15,16 @@ scope?" You never type `wddctl` yourself. The agent reads a skill —
 `wave-driven-development`, `wdd-setup`, `wdd-plan`, `wdd-run`, `wdd-worker`,
 `wdd-review`, or `wdd-status` — decides it applies, and runs `wddctl`
 commands on your behalf. This is a hard rule, not a suggestion: every one
-of those skills opens with "you run every `wddctl` command in this skill
-yourself; presenting a command to the user instead of executing it is a
-protocol violation." Your intervention is prose: "actually split TASK-002
-differently," "block TASK-004." The agent translates that into
-`wddctl block` or a `plan.json` edit.
+of those skills but `wdd-worker` — which never runs `wddctl` at all — opens
+with "you run every `wddctl` command in this skill yourself; presenting a
+command to the user instead of executing it is a protocol violation." The
+worker is deliberately excepted: `wddctl` resolves `--state` and `--repo`
+relative to the working directory, and a worker's working directory is its
+own isolated worktree, not the controller's checkout — running `wddctl`
+there would read the wrong state file, or none at all. A worker commits and
+reports back; the controller records the submission. Your intervention is
+prose: "actually split TASK-002 differently," "block TASK-004." The agent
+translates that into `wddctl block` or a `plan.json` edit.
 
 **The hard rule is text, not enforcement.** A skill is a Markdown file
 loaded into an agent's context window. It has no execution privileges of
@@ -198,9 +203,11 @@ One call verified the task admissible, created its branch and an isolated
 worktree, and flipped it to `in_progress`. The controller dispatches a
 worker per `wdd-worker` into that worktree.
 
-**Worker implements, commits, submits.** The worker writes
+**Worker implements and commits; controller submits.** The worker writes
 `issueRefreshToken` — using `Math.random()`, as it happens — commits it in
-the worktree, never in the controller's own checkout, and calls `submit`:
+the worktree, never in the controller's own checkout, and reports back.
+The worker never runs `wddctl` itself; the controller records the
+submission on its behalf:
 
 ```
 $ wddctl submit --task TASK-001-token-types --repo .
@@ -266,8 +273,8 @@ $ wddctl next
   "recordWith": "wddctl submit --task TASK-001-token-types --repo ."}]}
 ```
 
-The fix worker replaces `Math.random()` with `crypto.randomBytes`, commits,
-and resubmits:
+The fix worker replaces `Math.random()` with `crypto.randomBytes`, commits
+in its worktree, and reports back; the controller records the resubmission:
 
 ```
 $ wddctl submit --task TASK-001-token-types --repo .
