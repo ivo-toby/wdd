@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 from pathlib import Path
 from typing import Any
 
 from .engine import utc_now
 from .git import (
     branch_exists,
+    is_ancestor,
     require_repository,
     resolve_ref,
     worktree_for,
@@ -20,7 +22,9 @@ from .schema import copied_state
 from .store import StateStore
 
 
-def _observations(state: dict[str, Any], repo: Path) -> tuple[dict[str, Any], list[dict[str, str]]]:
+def _observations(
+    state: dict[str, Any], repo: Path, *, state_path: str | None = None
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
     observations: dict[str, Any] = {}
     actions: list[dict[str, str]] = []
     for task_id, task in sorted(state["tasks"].items()):
@@ -45,15 +49,34 @@ def _observations(state: dict[str, Any], repo: Path) -> tuple[dict[str, Any], li
             else:
                 item["worktreeStatus"] = "missing"
                 actions.append({"task": task_id, "action": "resolve_missing_worktree"})
+
+        # Monitor for human merges: check if a merge_ready task has been merged into base_ref
+        if task["status"] == "merge_ready":
+            head_sha = task.get("headSha")
+            base_ref = state["scope"].get("baseRef")
+            if head_sha and base_ref and is_ancestor(repo, head_sha, base_ref):
+                # Build the command string following the same pattern as engine.decorate_actions
+                state_path_str = str(state_path) if state_path else None
+                prefix = "wddctl" + (f" --state {shlex.quote(state_path_str)}" if state_path_str else "")
+                fields = {"task": shlex.quote(task_id), "repo": shlex.quote(".")}
+                command = f"{prefix} merge --task {fields['task']} --repo {fields['repo']} --observed"
+                actions.append({
+                    "task": task_id,
+                    "action": "record_human_merge",
+                    "command": command,
+                })
+
         observations[task_id] = item
     return observations, actions
 
 
-def monitor_once(store: StateStore, *, repo: Path | str, dry_run: bool = False) -> dict[str, Any]:
+def monitor_once(
+    store: StateStore, *, repo: Path | str, dry_run: bool = False, state_path: str | None = None
+) -> dict[str, Any]:
     repo = require_repository(repo)
     with store.locked():
         state = store.read()
-        observations, actions = _observations(state, repo)
+        observations, actions = _observations(state, repo, state_path=state_path)
         prior = (state["monitoring"].get("observations") or {})
         changed = observations != prior
         result = {

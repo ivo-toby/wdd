@@ -742,5 +742,52 @@ class PrControllerMergeTest(unittest.TestCase):
             self.assertEqual(_bare_ref(bare, base_ref), local_base)
 
 
+class MonitorHumanMergeTest(unittest.TestCase):
+    def test_monitor_flags_merged_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ready_local_human_for_monitor(tmp)
+
+            # The human merges directly in the controller checkout.
+            task = StateStore(Path(state)).read()["tasks"]["T1"]
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+            subprocess.run(["git", "checkout", "-q", base_ref], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                 "-c", "commit.gpgsign=false", "merge", "--no-ff", "-m", "human merge",
+                 task["branch"]],
+                cwd=root, check=True,
+            )
+
+            code, out = _cli(state, "monitor", "--once", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            actions = [a for a in result["actions"] if a["task"] == "T1"]
+            self.assertEqual(len(actions), 1, out)
+            action = actions[0]
+            self.assertEqual(action["action"], "record_human_merge")
+            self.assertIn("--observed", action["command"])
+
+    def test_monitor_quiet_when_not_merged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ready_local_human_for_monitor(tmp)
+
+            # Don't merge the task branch - just run monitor.
+            code, out = _cli(state, "monitor", "--once", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            actions = [a for a in result["actions"] if a["task"] == "T1"]
+            self.assertEqual(len(actions), 0, out)
+
+
+def _ready_local_human_for_monitor(tmp: str) -> tuple[Path, str]:
+    """Like _ready_local_human but returns (root, state) ready for monitor to run."""
+    root, state, _bare = _bootstrap_ready_scope(tmp, surface="local", mode="human")
+    _start_and_commit(state, root)
+    code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+    assert code == 0, out
+    _finish_to_merge_ready(state, root)
+    return root, state
+
+
 if __name__ == "__main__":
     unittest.main()

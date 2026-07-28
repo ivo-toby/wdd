@@ -835,7 +835,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "monitor":
-            _print_json(monitor_once(store, repo=args.repo, dry_run=args.dry_run))
+            _print_json(monitor_once(store, repo=args.repo, dry_run=args.dry_run, state_path=args.state))
             return 0
 
         if args.command == "event" and args.event_command == "apply":
