@@ -460,6 +460,43 @@ class PlanApprovalTest(unittest.TestCase):
             approval = StateStore(wdd / "state.json").read()["scope"]["approval"]
             self.assertEqual(approval["by"], "ivo")
 
+    def test_reapply_identical_plan_with_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd, state = self._ready_repo(tmp)
+            plan_file = root / "plan.json"
+            plan = _plan([_task("T1")])
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            code, _ = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertEqual(code, 0)
+            # Re-apply identical plan with --approved-by
+            code, out = _cli(state, "plan", "apply", "--plan", str(plan_file),
+                             "--repo", str(root), "--approved-by", "ivo")
+            self.assertEqual(code, 0)
+            self.assertIn("ivo", out)
+            self.assertIn("unchanged", out)
+            approval = StateStore(wdd / "state.json").read()["scope"]["approval"]
+            self.assertEqual(approval["by"], "ivo")
+
+    def test_update_path_dry_run_echoes_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd, state = self._ready_repo(tmp)
+            plan_file = root / "plan.json"
+            plan = _plan([_task("T1")])
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            # First apply without approval
+            code, _ = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertEqual(code, 0)
+            # Dry-run with --approved-by
+            plan = _plan([_task("T1"), _task("T2")])
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            code, out = _cli(state, "plan", "apply", "--plan", str(plan_file),
+                             "--repo", str(root), "--dry-run", "--approved-by", "ivo")
+            self.assertEqual(code, 0)
+            self.assertIn("ivo", out)
+            # Approval should NOT be stamped in state
+            approval = StateStore(wdd / "state.json").read()["scope"].get("approval")
+            self.assertIsNone(approval)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -394,8 +394,37 @@ def apply_plan(
         "diff": diff,
         "revision": current["revision"],
     }
-    if dry_run or unchanged:
+
+    # Handle dry-run: echo approvedBy but don't write
+    if dry_run:
+        if approved_by:
+            result["approvedBy"] = approved_by
         return {**result, "unchanged": unchanged}
+
+    # Handle unchanged plan without approval: return early
+    if unchanged and not approved_by:
+        return {**result, "unchanged": unchanged}
+
+    # Handle unchanged plan with approval: stamp approval via apply_mutation
+    if unchanged and approved_by:
+        def approval_mutator(state: dict[str, Any]) -> dict[str, Any]:
+            state_copy = copied_state(state)
+            _stamp_approval(state_copy, approved_by)
+            return state_copy
+
+        state, duplicate = apply_mutation(
+            store,
+            event_type="plan.approved",
+            task_id=None,
+            data={"by": approved_by},
+            idempotency_key=idempotency_key,
+            expected_revision=expected_revision,
+            mutator=approval_mutator,
+        )
+        result_dict = {**result, "revision": state["revision"], "unchanged": True}
+        if not duplicate:
+            result_dict["approvedBy"] = approved_by
+        return result_dict
 
     base: dict[str, Any] | None = None
 
@@ -423,6 +452,6 @@ def apply_plan(
         mutator=mutator,
     )
     result_dict = {**result, "revision": state["revision"], "duplicate": duplicate, "base": base}
-    if approved_by:
+    if approved_by and not duplicate:
         result_dict["approvedBy"] = approved_by
     return result_dict
