@@ -331,5 +331,272 @@ class SubmitIdempotencyRetryTest(unittest.TestCase):
             self.assertEqual(second["pr"], first["pr"])
 
 
+class FinalizeAndDeliveredPhasesTest(unittest.TestCase):
+    """Task 2: Phase transitions for finalize and delivered.
+
+    derived_phase now computes finalize (scope present + ratified +
+    tasks non-empty + ALL task statuses in {done, cancelled}) and
+    delivered (finalize phase + finalize.delivered marker present).
+    """
+
+    def test_all_done_tasks_transitions_to_finalize_phase(self) -> None:
+        from wave_delivery.schema import derived_phase, new_state
+        from wave_delivery.schema import task_state
+
+        state = new_state("SCOPE-x", base_ref="main")
+        state["constitution"]["status"] = "ratified"
+        state["constitution"]["ratification"] = {
+            "by": "alice",
+            "decisionFingerprint": "fp",
+        }
+        state["tasks"]["T1"] = task_state("T1")
+        state["tasks"]["T1"]["status"] = "done"
+        state["tasks"]["T2"] = task_state("T2")
+        state["tasks"]["T2"]["status"] = "cancelled"
+
+        self.assertEqual(derived_phase(state), "finalize")
+
+    def test_finalize_with_delivered_marker_transitions_to_delivered_phase(self) -> None:
+        from wave_delivery.schema import derived_phase, new_state
+        from wave_delivery.schema import task_state
+
+        state = new_state("SCOPE-x", base_ref="main")
+        state["constitution"]["status"] = "ratified"
+        state["constitution"]["ratification"] = {
+            "by": "alice",
+            "decisionFingerprint": "fp",
+        }
+        state["tasks"]["T1"] = task_state("T1")
+        state["tasks"]["T1"]["status"] = "done"
+        state["finalize"] = {
+            "delivered": {
+                "at": "2024-01-01T00:00:00Z",
+                "by": "bob",
+                "headSha": "abc123",
+            }
+        }
+
+        self.assertEqual(derived_phase(state), "delivered")
+
+    def test_one_task_in_progress_stays_in_execute_phase(self) -> None:
+        from wave_delivery.schema import derived_phase, new_state
+        from wave_delivery.schema import task_state
+
+        state = new_state("SCOPE-x", base_ref="main")
+        state["constitution"]["status"] = "ratified"
+        state["constitution"]["ratification"] = {
+            "by": "alice",
+            "decisionFingerprint": "fp",
+        }
+        state["tasks"]["T1"] = task_state("T1")
+        state["tasks"]["T1"]["status"] = "done"
+        state["tasks"]["T2"] = task_state("T2")
+        state["tasks"]["T2"]["status"] = "in_progress"
+
+        self.assertEqual(derived_phase(state), "execute")
+
+    def test_unratified_stays_setup_phase(self) -> None:
+        from wave_delivery.schema import derived_phase, new_state
+        from wave_delivery.schema import task_state
+
+        state = new_state("SCOPE-x", base_ref="main")
+        state["constitution"]["status"] = "draft"
+        state["tasks"]["T1"] = task_state("T1")
+        state["tasks"]["T1"]["status"] = "done"
+
+        self.assertEqual(derived_phase(state), "setup")
+
+    def test_no_scope_stays_setup_phase(self) -> None:
+        from wave_delivery.schema import derived_phase, new_setup_state
+
+        state = new_setup_state()
+        self.assertEqual(derived_phase(state), "setup")
+
+
+class FinalizeStateValidationTest(unittest.TestCase):
+    """Task 2: Validate optional finalize section.
+
+    validate_state must accept:
+    - Absent finalize section (all existing states)
+    - Valid finalize sections with optional review/verification/handoff/delivered
+    And must reject:
+    - Malformed delivered (missing required fields or wrong types)
+    - Malformed review/verification/handoff (not dicts when present)
+    """
+
+    def test_absent_finalize_section_is_valid(self) -> None:
+        from wave_delivery.schema import validate_state, new_state
+
+        state = new_state("SCOPE-x")
+        # No finalize section at all
+        validate_state(state)  # Should not raise
+
+    def test_empty_finalize_section_is_valid(self) -> None:
+        from wave_delivery.schema import validate_state, new_state
+
+        state = new_state("SCOPE-x")
+        state["finalize"] = {}
+        validate_state(state)  # Should not raise
+
+    def test_finalize_with_review_dict_is_valid(self) -> None:
+        from wave_delivery.schema import validate_state, new_state
+
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "review": {
+                "findings": [],
+                "reviewer": "alice",
+                "outcome": "passed",
+            }
+        }
+        validate_state(state)  # Should not raise
+
+    def test_finalize_with_verification_dict_is_valid(self) -> None:
+        from wave_delivery.schema import validate_state, new_state
+
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "verification": {
+                "status": "passed",
+                "command": "make test",
+            }
+        }
+        validate_state(state)  # Should not raise
+
+    def test_finalize_with_handoff_dict_is_valid(self) -> None:
+        from wave_delivery.schema import validate_state, new_state
+
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "handoff": {
+                "pr": "https://github.com/org/repo/pull/123",
+                "headSha": "abc123",
+            }
+        }
+        validate_state(state)  # Should not raise
+
+    def test_finalize_with_valid_delivered_is_valid(self) -> None:
+        from wave_delivery.schema import validate_state, new_state
+
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "delivered": {
+                "at": "2024-01-01T00:00:00Z",
+                "by": "bob",
+                "headSha": "abc123",
+            }
+        }
+        validate_state(state)  # Should not raise
+
+    def test_finalize_review_not_dict_is_invalid(self) -> None:
+        from wave_delivery.schema import validate_state, new_state
+        from wave_delivery.errors import ValidationError
+
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "review": "not a dict"
+        }
+        with self.assertRaises(ValidationError) as cm:
+            validate_state(state)
+        self.assertIn("finalize.review", str(cm.exception))
+
+    def test_finalize_verification_not_dict_is_invalid(self) -> None:
+        from wave_delivery.schema import validate_state, new_state
+        from wave_delivery.errors import ValidationError
+
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "verification": []
+        }
+        with self.assertRaises(ValidationError) as cm:
+            validate_state(state)
+        self.assertIn("finalize.verification", str(cm.exception))
+
+    def test_finalize_handoff_not_dict_is_invalid(self) -> None:
+        from wave_delivery.schema import validate_state, new_state
+        from wave_delivery.errors import ValidationError
+
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "handoff": "not a dict"
+        }
+        with self.assertRaises(ValidationError) as cm:
+            validate_state(state)
+        self.assertIn("finalize.handoff", str(cm.exception))
+
+    def test_finalize_delivered_not_dict_is_invalid(self) -> None:
+        from wave_delivery.schema import validate_state, new_state
+        from wave_delivery.errors import ValidationError
+
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "delivered": "not a dict"
+        }
+        with self.assertRaises(ValidationError) as cm:
+            validate_state(state)
+        self.assertIn("finalize.delivered", str(cm.exception))
+
+    def test_finalize_delivered_missing_at_is_invalid(self) -> None:
+        from wave_delivery.schema import validate_state, new_state
+        from wave_delivery.errors import ValidationError
+
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "delivered": {
+                "by": "bob",
+                "headSha": "abc123",
+            }
+        }
+        with self.assertRaises(ValidationError) as cm:
+            validate_state(state)
+        self.assertIn("finalize.delivered.at", str(cm.exception))
+
+    def test_finalize_delivered_missing_by_is_invalid(self) -> None:
+        from wave_delivery.schema import validate_state, new_state
+        from wave_delivery.errors import ValidationError
+
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "delivered": {
+                "at": "2024-01-01T00:00:00Z",
+                "headSha": "abc123",
+            }
+        }
+        with self.assertRaises(ValidationError) as cm:
+            validate_state(state)
+        self.assertIn("finalize.delivered.by", str(cm.exception))
+
+    def test_finalize_delivered_missing_headSha_is_invalid(self) -> None:
+        from wave_delivery.schema import validate_state, new_state
+        from wave_delivery.errors import ValidationError
+
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "delivered": {
+                "at": "2024-01-01T00:00:00Z",
+                "by": "bob",
+            }
+        }
+        with self.assertRaises(ValidationError) as cm:
+            validate_state(state)
+        self.assertIn("finalize.delivered.headSha", str(cm.exception))
+
+    def test_finalize_delivered_empty_string_at_is_invalid(self) -> None:
+        from wave_delivery.schema import validate_state, new_state
+        from wave_delivery.errors import ValidationError
+
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "delivered": {
+                "at": "",
+                "by": "bob",
+                "headSha": "abc123",
+            }
+        }
+        with self.assertRaises(ValidationError) as cm:
+            validate_state(state)
+        self.assertIn("finalize.delivered.at", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

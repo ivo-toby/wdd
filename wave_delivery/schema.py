@@ -117,6 +117,23 @@ def derived_phase(state: dict[str, Any]) -> str:
     """Phase is computed, never stored: setup until a scope exists."""
     if state.get("scope") is None or state["constitution"]["status"] != "ratified":
         return "setup"
+
+    # When scope present + ratified, check if all tasks are terminal.
+    tasks = state.get("tasks", {})
+    if not tasks:
+        # Empty task list: stay in execute (plan validation forbids this anyway).
+        return "execute"
+
+    # Check if all tasks are in terminal states (done or cancelled).
+    terminal_statuses = {"done", "cancelled"}
+    if all(task.get("status") in terminal_statuses for task in tasks.values()):
+        # All tasks terminal: finalize phase, or delivered if marker exists.
+        finalize_section = state.get("finalize", {})
+        if finalize_section.get("delivered"):
+            return "delivered"
+        return "finalize"
+
+    # At least one task is not terminal.
     return "execute"
 
 
@@ -247,6 +264,22 @@ def validate_state(state: dict[str, Any]) -> None:
     keys = state.get("appliedIdempotencyKeys")
     if not isinstance(keys, list) or not all(isinstance(key, str) and key for key in keys):
         raise ValidationError("appliedIdempotencyKeys must be a non-empty-string list")
+
+    # Validate optional finalize section.
+    finalize = state.get("finalize")
+    if finalize is not None:
+        finalize = _require_mapping(finalize, "finalize")
+        # Optional keys: review, verification, handoff (each must be dict or absent).
+        for field in ("review", "verification", "handoff"):
+            value = finalize.get(field)
+            if value is not None and not isinstance(value, dict):
+                raise ValidationError(f"finalize.{field} must be an object or null")
+        # Optional key: delivered (dict with non-empty-string at, by, headSha when present).
+        delivered = finalize.get("delivered")
+        if delivered is not None:
+            delivered = _require_mapping(delivered, "finalize.delivered")
+            for field in ("at", "by", "headSha"):
+                _require_string(delivered.get(field), f"finalize.delivered.{field}")
 
 
 def detect_dependency_cycle(tasks: dict[str, Any]) -> None:
