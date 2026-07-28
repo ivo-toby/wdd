@@ -8,6 +8,8 @@ rest (resolve open questions -> ratify -> plan).
 
 from __future__ import annotations
 
+import json
+import re
 import shlex
 from pathlib import Path
 from typing import Any
@@ -53,6 +55,21 @@ domains. The controller merges only tasks whose review and verification
 evidence is current. The final merge to the target branch is made by a
 human, never by the controller.
 """
+
+
+_JSON_BLOCK = re.compile(r"```json\s*\n(.*?)\n\s*```", re.DOTALL)
+
+
+def _legacy_models(constitution_text: str) -> dict[str, Any] | None:
+    for match in _JSON_BLOCK.finditer(constitution_text):
+        try:
+            parsed = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        models = parsed.get("models") if isinstance(parsed, dict) else None
+        if isinstance(models, dict):
+            return models
+    return None
 
 
 def _open_questions(probed_commands: list[str]) -> list[dict[str, Any]]:
@@ -182,4 +199,52 @@ def setup_next_actions(
         "phase": "setup",
         "actions": actions,
         "blockers": [],
+    }
+
+
+def migrate_governance(wdd_dir: Path | str) -> dict[str, Any]:
+    """One-time conversion of a pre-split .wdd to config.json + prose constitution.
+
+    Ratification is deliberately invalidated: the fingerprint's meaning
+    changed (it now signs config.json too), so the user must see and approve
+    the new split once.
+    """
+    wdd_dir = Path(wdd_dir)
+    if config_path(wdd_dir).exists():
+        return {"migrated": False, "reason": "config.json already exists"}
+    constitution_file = constitution_path(wdd_dir)
+    old_text = (
+        constitution_file.read_text(encoding="utf-8") if constitution_file.exists() else ""
+    )
+
+    config = default_config()
+    legacy = _legacy_models(old_text)
+    if legacy:
+        for key in ("planning", "review"):
+            value = legacy.get(key)
+            if isinstance(value, str) and value:
+                config["models"][key] = value
+        implementation = legacy.get("implementation")
+        if isinstance(implementation, str) and implementation:
+            config["models"]["implementation"]["default"] = implementation
+    config["openQuestions"] = _open_questions(config["verification"]["commands"])
+    save_config(wdd_dir, config)
+
+    if old_text:
+        atomic_write_text(wdd_dir / "constitution.md.pre-config", old_text)
+    atomic_write_text(constitution_file, CONSTITUTION_TEMPLATE)
+
+    store = StateStore(wdd_dir / "state.json")
+    invalidated = False
+    if store.exists():
+        state = store.read()
+        if state["constitution"]["status"] == "ratified":
+            state["constitution"] = {"status": "draft", "ratification": None}
+            store.write(state)
+            invalidated = True
+    return {
+        "migrated": True,
+        "ratificationInvalidated": invalidated,
+        "modelsExtracted": bool(legacy),
+        "backup": str(wdd_dir / "constitution.md.pre-config") if old_text else None,
     }

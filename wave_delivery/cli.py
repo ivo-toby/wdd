@@ -25,7 +25,7 @@ from .config import (
     set_value,
 )
 from .constitution import probe_repository, ratification_status, read_proposal, write_proposal
-from .setup import init_repository, setup_next_actions
+from .setup import init_repository, migrate_governance, setup_next_actions
 from .doctor import inspect_capabilities
 from .engine import (
     admission_schedule,
@@ -265,6 +265,11 @@ def build_parser() -> argparse.ArgumentParser:
     migrate = subparsers.add_parser("migrate", help="convert schema-v2 state to the current schema")
     migrate.add_argument("--dry-run", action="store_true")
     migrate.add_argument("--apply", action="store_true")
+    migrate.add_argument(
+        "--governance",
+        action="store_true",
+        help="split a legacy constitution into config.json + prose (invalidates ratification)",
+    )
     migrate.add_argument(
         "--review-policy",
         choices=("always", "risk_based", "none"),
@@ -621,6 +626,22 @@ def main(argv: list[str] | None = None) -> int:
                 **_concurrency(args),
             )
             _print_json({"revision": state["revision"], "duplicate": duplicate})
+            return 0
+
+        if args.command == "migrate" and args.governance:
+            if args.apply == args.dry_run:
+                parser.error("choose exactly one of --dry-run or --apply")
+            wdd_dir = store.path.parent
+            if args.dry_run:
+                from .config import config_path as _config_path
+                _print_json(
+                    {
+                        "wouldMigrate": not _config_path(wdd_dir).exists(),
+                        "wddDir": str(wdd_dir),
+                    }
+                )
+                return 0
+            _print_json(migrate_governance(wdd_dir))
             return 0
 
         if args.command == "migrate":

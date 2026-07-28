@@ -29,7 +29,7 @@ from wave_delivery.schema import (
     validate_state,
 )
 from wave_delivery.plan import apply_plan
-from wave_delivery.setup import CONSTITUTION_TEMPLATE, init_repository, setup_next_actions
+from wave_delivery.setup import CONSTITUTION_TEMPLATE, init_repository, migrate_governance, setup_next_actions
 from wave_delivery.store import StateStore
 
 
@@ -510,6 +510,57 @@ class GovernanceDriftTest(unittest.TestCase):
                 )
             self.assertNotEqual(code, 0)
             self.assertIn("drift", stderr.getvalue())
+
+
+LEGACY_CONSTITUTION = """---
+id: WDD-CONSTITUTION
+kind: constitution
+---
+
+# Project Constitution
+
+## Model aliases
+
+```json
+{"models": {"planning": "model-a", "implementation": "model-b", "review": "model-c"}}
+```
+
+## Merge policy
+
+- Merge mode: controller-merges-automatically
+"""
+
+
+class GovernanceMigrationTest(unittest.TestCase):
+    def test_extracts_models_and_invalidates_ratification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            wdd.mkdir()
+            (wdd / "constitution.md").write_text(LEGACY_CONSTITUTION, encoding="utf-8")
+            state = new_state("SCOPE-legacy", base_ref="wdd/legacy")
+            state["constitution"] = {
+                "status": "ratified",
+                "ratification": {"by": "ivo", "decisionFingerprint": "sha256:old"},
+            }
+            StateStore(wdd / "state.json").write(state)
+            result = migrate_governance(wdd)
+            self.assertTrue(result["migrated"])
+            config = load_config(wdd)
+            self.assertEqual(config["models"]["planning"], "model-a")
+            self.assertEqual(config["models"]["implementation"]["default"], "model-b")
+            self.assertEqual(config["models"]["review"], "model-c")
+            self.assertTrue((wdd / "constitution.md.pre-config").is_file())
+            migrated_state = StateStore(wdd / "state.json").read()
+            self.assertEqual(migrated_state["constitution"]["status"], "draft")
+
+    def test_noop_when_config_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            init_repository(wdd, root)
+            result = migrate_governance(wdd)
+            self.assertFalse(result["migrated"])
 
 
 if __name__ == "__main__":
