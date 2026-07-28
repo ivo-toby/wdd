@@ -55,3 +55,7 @@ Findings are a JSON array:
 `severity` must be `P1`, `P2`, or `P3`; `summary` is required. Pass `[]` or
 omit `--findings` entirely for a clean review — don't invent a placeholder
 finding to signal "reviewed."
+
+On the `pr` merge surface, the controller mirrors what you just recorded as
+a comment on the task's PR — that's the controller's job, not yours; your
+contract here is unchanged either way.

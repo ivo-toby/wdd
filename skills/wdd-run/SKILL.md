@@ -55,6 +55,15 @@ yourself; the payload already did that.
   that invalidates prior evidence, so review and verification will reappear.
 - **`merge_task`** → run `command`. It performs the merge; never merge by
   hand. Afterwards `wddctl release --task ID --repo .` removes the worktree.
+- **`await_human_merge`** → `merge.mode: human`. There is no `command` and
+  you do not merge it yourself, by hand or otherwise — `judgment` names the
+  PR (or the branch, if there's no real PR yet); surface it to the user and
+  stop there for this tick. On a later controller tick, run `wddctl monitor
+  --once --repo .`: once the human has actually merged it, monitor reports
+  a `record_human_merge` action carrying the exact `merge --task ID --repo .
+  --observed` command — run that command verbatim to record the merge. It
+  proves ancestry in Git before recording anything, so there's nothing to
+  get wrong by waiting a few ticks before the human gets to it.
 - **`run_reconciliation`** → read `.wdd/shared-context/` and anything queued
   via `wddctl note`, resolve conflicting discoveries, update briefs for tasks
   not yet started, then record with `recordWith`.

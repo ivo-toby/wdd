@@ -592,6 +592,34 @@ stay copy-pasteable; the default `--state` is omitted for brevity.
 A single pass never proposes two conflicting starts: admission is simulated
 task by task within the same call.
 
+When `.wdd/config.json` has a non-empty `models` object, `start_task` and
+`assign_fix_writer` actions additionally carry a **`"model"`** key: the
+task's derived risk selects `models.implementation.highRisk` (task `risk`
+is `high`) or `models.implementation.default` (otherwise). `run_review`
+carries `models.review`. The key is present only when the resolved value is
+a real, non-empty string — a `models` object with a null or missing field
+for that action produces no key at all, so a caller can safely check for
+the key's presence rather than parsing a placeholder. No other action gains
+a model. This is decoration only: `wddctl` never chooses a model for you,
+it just routes the one already configured to the action that needs it —
+see [`skills/wdd-run/SKILL.md`](../skills/wdd-run/SKILL.md) for how the
+controller skill is expected to use it.
+
+```json
+{
+  "action": "start_task",
+  "command": "wddctl start --task T2 --repo .",
+  "model": "claude-opus-4.1",
+  "task": "T2"
+}
+```
+
+(`T2` above is `risk: high`, so it drew `models.implementation.highRisk`;
+a `risk: normal` task in the same scope draws `models.implementation.default`
+instead.) See "Merge surfaces and modes" below for the `merge.mode: human`
+decoration (`await_human_merge`), which also lives inside `next`'s action
+list.
+
 ### `status`
 
 ```sh
@@ -998,6 +1026,246 @@ the current state if one exists. Doctor only reports; it never refuses.
 ```sh
 wddctl doctor [--json]
 ```
+
+## Merge surfaces and modes
+
+Two independent knobs control where a task's review/merge lives and who
+performs the merge: `merge.surface` (`"pr"` or `"local"`) and `merge.mode`
+(`"controller"` or `"human"`). Both live under `.wdd/config.json`'s `merge`
+object (`wddctl config get merge.surface` / `wddctl config get merge.mode`),
+and both can be overridden per scope from `plan.json`'s `scope.mergeSurface`
+/ `scope.mergeMode` — a scope override always wins over the config default.
+`wave_delivery/config.py`'s `merge_settings(state, config)` resolves the
+effective pair everywhere in the codebase; a legacy repo with no
+`config.json` at all defaults to `{"surface": "local", "mode": "controller"}`
+so pre-existing behavior never changes underneath it.
+
+### The configuration matrix
+
+| surface | mode | `submit` | `review record` | `merge` |
+| --- | --- | --- | --- | --- |
+| `local` | `controller` | Records `branch:<name>@<sha>` — no network. | Recorded in `state.json` only. | `wddctl merge` performs the merge itself. |
+| `pr` | `controller` | Pushes the task branch, runs `gh pr create`, records the returned URL. | Recorded in state, then mirrored as one `gh pr comment` on the PR. | `wddctl merge` merges locally, then pushes the advanced base ref to `origin` so GitHub shows the PR merged. |
+| `pr` | `human` | Same as `pr`/`controller`: pushes and opens the PR. | Same as `pr`/`controller`: state first, PR comment mirrored. | `wddctl merge` refuses outright — the PR's human owner must merge it directly. `wddctl merge --observed` is the only way to record it (see below). |
+
+(`local`/`human` is legal too — `merge.mode` and `merge.surface` are
+orthogonal — but with no PR to point at, the `judgment` message in `next`
+falls back to naming the task's branch instead of a URL; see
+`engine.human_reference`.)
+
+Every mirroring step (PR creation, PR comments) degrades to a `"warning"`
+in the command's JSON result rather than losing the underlying state
+transition — `state.json` is always the source of truth, the PR is only a
+projection of it. Push failures are the one exception: a `submit` whose
+`git push` fails aborts before any state change (the state must never claim
+a submission that never left the machine), but once the push has succeeded,
+a subsequent `gh pr create` failure still records the submission using the
+same `branch:<name>@<sha>` fallback `local` surface uses, with the failure
+surfaced as a `"warning"` instead of losing the branch that's already on
+`origin`:
+
+```json
+{
+  "branch": "task/T1",
+  "duplicate": false,
+  "event": "task.pr_recorded",
+  "headSha": "8a6ccd619f5787d2f6b9a6377a6b5c4c9d90e2d0",
+  "pr": "branch:task/T1@8a6ccd619f57",
+  "revision": 4,
+  "status": "in_progress",
+  "task": "T1",
+  "warning": "PR creation failed after push: gh pr create --head task/T1 --base wdd/demo2 --title Add a greeting helper --body wdd task T1\nspec: tasks/T1.md\nhead: 8a6ccd619f5787d2f6b9a6377a6b5c4c9d90e2d0 failed: fake-gh: forced failure (FAKE_GH_FAIL=1)"
+}
+```
+
+(Captured with `FAKE_GH_FAIL=1` against the stub `gh` fixture described
+below — the push to the bare `origin` remote had already landed
+`task/T1` before `gh pr create` was made to fail.)
+
+### Transcripts: stub `gh` + bare origin remote
+
+Everything below is real output from a scratch repository, not
+hand-written JSON. Nothing here talks to a real GitHub: `PATH` was
+prepended with `tests/fixtures/fake-gh` (a fake `gh` executable that logs
+its argv to `$FAKE_GH_LOG` and prints a canned PR URL for `pr create`), and
+the scratch repo's `origin` remote is a local bare repository
+(`git init --bare`), not a hosted one. This is the same test double the
+test suite uses (`tests/test_execution_surfaces.py`), and it is the only
+honest way to show `pr`-surface output without a live network call — no
+part of these transcripts reached the real GitHub.
+
+Setup:
+
+```sh
+export PATH="<repo>/tests/fixtures/fake-gh:$PATH"
+export FAKE_GH_LOG=/path/to/gh.log
+git init --bare origin.git            # stands in for a GitHub remote
+git remote add origin ../origin.git
+wddctl config set merge.surface pr
+wddctl config set merge.mode controller
+```
+
+`pr`/`controller` submit — push, then `gh pr create`:
+
+```sh
+$ wddctl submit --task T1 --repo .
+{
+  "branch": "task/T1",
+  "duplicate": false,
+  "event": "task.pr_recorded",
+  "headSha": "5d8ccd5f8bfdc0211a1ddbde6876b67228962cdd",
+  "pr": "https://github.invalid/pr/1",
+  "revision": 4,
+  "status": "in_progress",
+  "task": "T1"
+}
+$ cat "$FAKE_GH_LOG"
+["pr", "create", "--head", "task/T1", "--base", "wdd/demo", "--title", "Add a greeting helper", "--body", "wdd task T1\nspec: tasks/T1.md\nhead: 5d8ccd5f8bfdc0211a1ddbde6876b67228962cdd"]
+```
+
+`pr`/`controller` merge — merges locally, then pushes the advanced base so
+the bare `origin`'s base ref (what a real GitHub-hosted branch would show)
+matches the local one:
+
+```sh
+$ wddctl merge --task T1 --repo .
+{
+  "action": "merged",
+  "baseRef": "wdd/demo",
+  "baseSha": "4b2bac01e6fe248f3149514fbb601b8f2ba91b50",
+  "branch": "task/T1",
+  "duplicate": false,
+  "headSha": "5d8ccd5f8bfdc0211a1ddbde6876b67228962cdd",
+  "revision": 7,
+  "task": "T1"
+}
+$ git --git-dir=../origin.git rev-parse wdd/demo
+4b2bac01e6fe248f3149514fbb601b8f2ba91b50   # matches local wdd/demo exactly
+```
+
+Review mirroring — `review record` on a task with a real PR posts one `gh
+pr comment` (a markdown findings table) after state is recorded:
+
+```sh
+$ wddctl review record --task T2 --reviewer codex-review \
+    --findings '[{"severity":"P2","summary":"hardcoded secret should come from config","file":"auth.py","line":2}]'
+{
+  "duplicate": false,
+  "outcome": "blocking",
+  "revision": 11,
+  "status": "in_progress"
+}
+$ cat "$FAKE_GH_LOG"
+["pr", "comment", "https://github.invalid/pr/1", "--body", "wddctl review by codex-review:\n\n| Severity | Summary | File | Line |\n| --- | --- | --- | --- |\n| P2 | hardcoded secret should come from config | auth.py | 2 |"]
+```
+
+A comment failure (`FAKE_GH_FAIL=1`) never loses the review — it degrades
+to a `"warning"`, and the recorded outcome (`passed`, here) stands:
+
+```sh
+$ FAKE_GH_FAIL=1 wddctl review record --task T2 --reviewer codex-review --findings '[]'
+{
+  "duplicate": false,
+  "outcome": "passed",
+  "revision": 12,
+  "status": "in_progress",
+  "warning": "PR comment failed: gh pr comment https://github.invalid/pr/1 --body wddctl review by codex-review: clean review, no findings. failed: fake-gh: forced failure (FAKE_GH_FAIL=1)"
+}
+```
+
+### `merge.mode: human` — `await_human_merge` and `--observed`
+
+Under `merge.mode: human`, `wddctl next` never offers `merge_task` for a
+`merge_ready` task — it offers **`await_human_merge`** instead: no
+`command` (there is nothing for `wddctl` to run), a `judgment` naming the
+PR (or the branch, if there is no real PR — see `human_reference` above),
+and a `recordWith` that is the exact `merge --observed` invocation needed
+once the human has actually merged it:
+
+```json
+{
+  "action": "await_human_merge",
+  "judgment": "https://github.invalid/pr/1 must be merged by its human owner directly; wddctl will not merge it in human mode. Once merged, record it with recordWith so live Git can prove it happened.",
+  "recordWith": "wddctl merge --task T2 --repo . --observed",
+  "task": "T2"
+}
+```
+
+Running plain `wddctl merge --task T2 --repo .` against that task refuses
+outright, naming the same PR and the same `--observed` escape hatch:
+
+```
+wddctl: merge mode is human: https://github.invalid/pr/1 must be merged by its human owner directly; wddctl will not merge it. Once merged, run 'wddctl merge --task T2 --repo . --observed' to record it.
+```
+
+`--observed` never mutates Git — it only proves a merge that already
+happened and records it. Concretely: `wddctl merge --task ID --repo . --observed`
+runs `git fetch origin <base_ref>` best-effort (tolerating no network or no
+`origin` at all), then resolves the SHA to prove ancestry against —
+preferring the freshly fetched `origin/<base_ref>` over the local
+`<base_ref>` branch when a remote-tracking ref for it exists, because `git
+fetch` only ever advances `refs/remotes/origin/<base_ref>`, never the local
+branch, and a human merge that landed on the remote (e.g. clicking "Merge"
+on GitHub) is real, provable evidence the instant the fetch completes even
+though nothing has pulled it into the local branch yet. It then requires
+`git merge-base --is-ancestor <task.headSha> <that SHA>` to be true. Fails
+before the human merge exists:
+
+```
+wddctl: task T2 head e34ce96575c2225a630c0ffd1e0a2d16988f43a7 is not reachable from wdd/demo (4b2bac01e6fe248f3149514fbb601b8f2ba91b50); the human merge has not happened
+```
+
+Succeeds once it's true, applying the same `task.merged` bookkeeping a
+normal merge records (revision bump, task -> `done`), without touching Git
+at all:
+
+```json
+{
+  "action": "observed_human_merge",
+  "baseRef": "wdd/demo",
+  "baseSha": "655eea9724fbe5caf8b1caee632cd589b43bc976",
+  "branch": "task/T2",
+  "duplicate": false,
+  "headSha": "e34ce96575c2225a630c0ffd1e0a2d16988f43a7",
+  "revision": 17,
+  "task": "T2"
+}
+```
+
+`--observed` works under **both** modes — a `controller`-mode scope a human
+merged directly out-of-band (bypassing `wddctl merge` entirely) is just as
+legitimately observable as a `human`-mode one; the flag only ever proves a
+merge, it never asks who the mode says should have performed it.
+
+### `monitor` and `record_human_merge`
+
+`wddctl monitor --once --repo .` is the cheap, zero-LLM tick that also
+watches for exactly this case: for any `merge_ready` task whose recorded
+`headSha` is already an ancestor of the scope's *local* base ref (no fetch
+— monitor is meant to be cheap, so it checks only what's already on disk),
+it emits a `record_human_merge` action carrying the literal `merge
+--observed` command, in any mode — an out-of-band merge is worth
+surfacing even in `controller` mode, not just `human` mode:
+
+```json
+{
+  "actions": [
+    {
+      "action": "record_human_merge",
+      "command": "wddctl --state .wdd/state.json merge --task T2 --repo . --observed",
+      "task": "T2"
+    }
+  ],
+  "changed": true,
+  "revision": 16,
+  "scope": "SCOPE-demo"
+}
+```
+
+This is how a controller running the ordinary `next` loop notices "someone
+merged this by hand" without a human having to say so — the next `monitor
+--once` tick surfaces the exact command to record it, and running that
+command is the same `--observed` path described above.
 
 ## Gates (what `next` emits per task)
 

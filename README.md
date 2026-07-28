@@ -112,6 +112,21 @@ repository:
    Want to see the projected schedule first? `wddctl plan preview` shows the
    admission order as rounds — a view, not a gate.
 
+`merge.surface` and `merge.mode` (both set via `wddctl config set`, and
+overridable per scope from `plan.json`) pick which of three setups fits a
+given repository: `local`/`controller` keeps the whole loop offline in
+`state.json` — good for a solo project or a repo with no PR workflow at
+all; `pr`/`controller` pushes each task's branch, opens a real PR via `gh`,
+mirrors review findings as PR comments, and pushes the merged base back to
+`origin` once `wddctl merge` lands it — good for a team that wants the
+normal GitHub review surface without giving up the mechanical merge; and
+`pr`/`human` does the same push-and-PR dance but refuses to merge
+automatically, instead surfacing `await_human_merge` until a person merges
+the PR themselves and `wddctl merge --observed` proves it happened in Git
+— good for repos where a human must be the one to click "Merge." See
+[`docs/wddctl.md`](docs/wddctl.md#merge-surfaces-and-modes) for the full
+matrix, mode-by-mode command behavior, and real transcripts.
+
 See [`docs/wddctl.md`](docs/wddctl.md) for the full command reference and
 [`docs/artifact-schema.md`](docs/artifact-schema.md) for the `.wdd/` file
 formats.
