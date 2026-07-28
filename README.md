@@ -75,46 +75,26 @@ for why.
 Install `wddctl` and the skills (see Installation below), then in a target
 repository:
 
-1. Write a plan. `plan.json` is the only planning input:
+1. Initialize. This scaffolds `.wdd/` — machine config with probed defaults,
+   a prose constitution draft, and controller state:
 
-   ```json
-   {
-     "schemaVersion": 1,
-     "kind": "wdd_plan",
-     "scope": {
-       "id": "SCOPE-auth-refresh",
-       "baseRef": "wdd/auth-refresh",
-       "maxConcurrent": 3,
-       "reviewPolicy": "risk_based",
-       "reconcileEveryNMerges": 3
-     },
-     "tasks": [
-       {
-         "id": "TASK-001-token-types",
-         "title": "Token type contract",
-         "specPath": "tasks/TASK-001-token-types.md",
-         "risk": "high",
-         "dependsOn": [],
-         "conflictDomains": ["src/auth/**", "src/schema.ts"]
-       }
-     ]
-   }
+   ```sh
+   wddctl init --repo .
    ```
 
-   Write the referenced task briefs under `.wdd/tasks/`.
+2. Follow the controller. `wddctl next` names each remaining setup step —
+   resolve the open config questions (`wddctl config set merge.surface pr`),
+   then ratify:
 
-2. Apply the plan. This creates `.wdd/state.json` and the scope's base
-   branch:
+   ```sh
+   wddctl next
+   wddctl constitution ratify --by "your-name"
+   ```
+
+3. Plan. Write `plan.json` and the task briefs (see `skills/wdd-plan`), then:
 
    ```sh
    wddctl plan apply --plan plan.json --repo .
-   ```
-
-3. Ratify the constitution. Execution is blocked until this happens:
-
-   ```sh
-   wddctl constitution probe --root . --output .wdd/constitution-proposal.json
-   wddctl constitution ratify --by "your-name" --proposal .wdd/constitution-proposal.json
    ```
 
 4. Run the loop. This is the whole engine:

@@ -66,6 +66,78 @@ releasing only ever removes the lock this process actually took.
 
 ## Commands
 
+### `init`
+
+Scaffold a fresh `.wdd/` directory: `config.json` (machine-consumed knobs,
+seeded with probed defaults), `constitution.md` (a prose draft — see
+[`docs/artifact-schema.md`](artifact-schema.md)), empty `tasks/` and
+`shared-context/` directories, and a pre-scope `state.json`. This replaces
+what used to be prose-improvised setup — everything mechanical now exists
+before an agent writes a line of `plan.json`.
+
+```sh
+wddctl init --repo .
+```
+
+```json
+{
+  "alreadyInitialized": false,
+  "created": [
+    ".wdd/config.json",
+    ".wdd/constitution.md",
+    ".wdd/tasks",
+    ".wdd/shared-context",
+    ".wdd/state.json"
+  ],
+  "hint": "run 'wddctl next' and follow it",
+  "openQuestions": [
+    {
+      "options": [
+        "pr",
+        "local"
+      ],
+      "path": "merge.surface",
+      "question": "Review/merge surface: 'pr' pushes task branches and mirrors review findings to pull-request comments; 'local' keeps the whole loop offline in state.json. Which should this repository use?"
+    },
+    {
+      "path": "verification.commands",
+      "question": "No verification command could be detected. What command(s) prove a change works here? (JSON list, e.g. [\"pytest -q\"])"
+    }
+  ]
+}
+```
+
+`init` probes the repository the same way `constitution probe` does (see
+below) to seed `config.json`'s `branching.targetBranch` and
+`verification.commands`, and turns anything it couldn't determine — the
+merge surface is always asked; a verification command only if none of the
+usual markers (`tests/`, `package.json`, the worktree-cleanup test script)
+were found — into `config.json`'s `openQuestions` array. That array is the
+setup-phase contract: `wddctl next` refuses to advance past
+`resolve_config` while it is non-empty, and `constitution ratify` refuses
+outright while any question remains (see below).
+
+Idempotent: run it again once `state.json` exists and nothing is touched —
+
+```json
+{
+  "alreadyInitialized": true,
+  "created": [],
+  "hint": "state exists; run 'wddctl next' for what to do",
+  "openQuestions": []
+}
+```
+
+— so `init` is safe to run defensively at the start of a session without
+risking a silent reset of already-answered questions or an already-ratified
+constitution. If `config.json` already exists but `state.json` doesn't (a
+partially-completed init, or a repo migrated with `migrate --governance`),
+`init` reuses the existing `config.json` instead of overwriting it.
+
+During setup, `wddctl status` and `wddctl next` report a reduced
+setup-phase shape (`"phase": "setup"`, no `scope`) instead of the normal
+summary — there is no scope yet for the normal shape to describe.
+
 ### `plan apply`
 
 Create or update a scope from `plan.json`. Creates the scope's base branch if
@@ -102,11 +174,82 @@ wddctl plan preview [--plan plan.json]
 Without `--plan`, it projects from the current `state.json`. With `--plan`,
 it projects a plan that hasn't been applied yet.
 
-### `constitution probe` / `ratify` / `status`
+### `config`
+
+Read or write `.wdd/config.json` — every knob `wddctl` (or a dispatching
+agent) mechanically consumes: branching conventions, verification commands,
+review policy, merge surface/mode, concurrency, model aliases, risk rules,
+task provider. The constitution stays prose for humans; this is its
+machine-readable counterpart, created by `wddctl init` (see above).
+
+```sh
+wddctl config get merge.surface
+# "pr"
+wddctl config get review.policy
+# "risk_based"
+```
+
+`get` takes a dotted path and prints the value as JSON. An unknown path
+(anything not present in the schema — see `wave_delivery/config.py`'s
+`DEFAULT_CONFIG`) is a validation error, not a silent `null`.
+
+```sh
+wddctl config set merge.surface pr
+```
+
+```json
+{
+  "openQuestions": 1,
+  "path": "merge.surface",
+  "value": "pr"
+}
+```
+
+```sh
+wddctl config set verification.commands '["python3 -m unittest"]'
+```
+
+```json
+{
+  "openQuestions": 0,
+  "path": "verification.commands",
+  "value": [
+    "python3 -m unittest"
+  ]
+}
+```
+
+`set` takes a dotted path and a value. The value is parsed as JSON first
+(so `'["python3 -m unittest"]'`, `3`, or `true` work as you'd expect); if
+that fails, it falls back to the literal string, which is what lets you
+write `pr` instead of `'"pr"'` for a plain string field. The full config is
+re-validated after the write, so setting `merge.surface` to anything other
+than `pr` or `local` is refused.
+
+Setting a path that appears in `config.json`'s `openQuestions` array
+resolves that question — it's removed from the list as a side effect of the
+write, which is how `set` doubles as the answer mechanism for the
+open-questions contract `init` establishes. The response echoes the
+remaining count so a caller resolving several questions in one pass can see
+its own progress without a separate `get`.
+
+```sh
+wddctl config show
+```
+
+Prints the whole config object. Useful for showing a user everything before
+`constitution ratify`, since ratifying signs this file's exact contents (see
+below).
+
+### `constitution probe` / `ratify` / `amend` / `status`
 
 Execution is blocked until the constitution is explicitly ratified — see
-`plan.json`'s companion, `.wdd/constitution.md`, in
-[`docs/artifact-schema.md`](artifact-schema.md).
+`.wdd/config.json`'s prose companion, `constitution.md`, in
+[`docs/artifact-schema.md`](artifact-schema.md). Ratifying signs both files
+at once: the fingerprint is computed over `config.json`'s exact contents
+*and* `constitution.md`'s exact text (`governance_fingerprint` in
+`wave_delivery/config.py`). Editing either one after ratification is drift,
+not a free edit — see "Governance drift" below.
 
 ```sh
 wddctl constitution probe --root . --output .wdd/constitution-proposal.json
@@ -114,36 +257,175 @@ wddctl constitution probe --root . --output .wdd/constitution-proposal.json
 
 `probe` gathers repository evidence (instruction files, verification
 commands it can detect, branch conventions) into a proposal JSON object with
-a `decisionFingerprint` — a hash of its `decisions`. It never ratifies
-anything by itself.
+its own `decisionFingerprint` — a hash of its `decisions`, independent of the
+config/constitution fingerprint above. It never ratifies anything by
+itself, and `init` already runs the same probe internally to seed
+`config.json`'s defaults — running it by hand is mostly useful for
+inspecting repository evidence, or for the deprecated `--proposal` pin
+below.
+
+Ratifying now needs only `--by`:
 
 ```sh
-wddctl constitution ratify --by "jordan" --proposal .wdd/constitution-proposal.json
-# or, if you already have a fingerprint from elsewhere:
-wddctl constitution ratify --by "jordan" --decision-fingerprint sha256:...
+wddctl constitution ratify --by "ivo"
 ```
 
-`--proposal` and `--decision-fingerprint` are mutually exclusive; exactly one
-is required.
+```json
+{
+  "decisionFingerprint": "sha256:0db6456b2f70f164e5408ce36db0aca6745477b82222eea21d443f6bc5377775",
+  "duplicate": false,
+  "revision": 1
+}
+```
+
+Ratification refuses outright while `config.json` still has open questions
+— tried against a fresh `init` before either question was answered:
+
+```
+wddctl: cannot ratify: 2 open config question(s) remain (merge.surface, verification.commands); resolve them with 'wddctl config set' first
+```
+
+`--decision-fingerprint` and `--proposal` still exist, mutually exclusive,
+both optional. They matter for two different cases:
+
+- A **legacy repository** with no `config.json` (predates `wddctl init`, or
+  not yet migrated — see `migrate --governance`) has nothing to fingerprint
+  automatically, so one of the two is required there, exactly as before.
+- A **current repository** (`config.json` present) computes its fingerprint
+  live from the files themselves; passing `--decision-fingerprint` there is
+  accepted only as an assertion — it must match the live value or ratify
+  refuses, on the theory that a caller pinning a fingerprint should get
+  caught if reality moved out from under it. `--proposal` is **deprecated**
+  in this case: it no longer contributes to the fingerprint at all, and the
+  response carries a `"warning"` field saying so instead of silently doing
+  nothing:
+
+```sh
+wddctl constitution amend --by "ivo" --proposal .wdd/constitution-proposal.json
+```
+
+```json
+{
+  "decisionFingerprint": "sha256:694622c3be36ad891308ea9735368b48bc5494878e360cb5ffeb0b90deda0017",
+  "duplicate": false,
+  "revision": 4,
+  "warning": "--proposal is deprecated; the fingerprint now covers .wdd/config.json + constitution.md"
+}
+```
 
 `ratify` is the initial act only — running it against an already-ratified
-scope fails. Every later governance change goes through `amend`, which takes
-the same flags:
+scope fails (`"constitution is already ratified; use 'wddctl constitution
+amend' to change it"`). Every later governance change goes through `amend`,
+which takes the same flags, requires a prior ratification, rejects a
+fingerprint identical to the current one (nothing changed — `"amendment
+fingerprint matches the ratified one; nothing changed"`), and records the
+superseded fingerprint as `constitution.ratification.amendedFrom` so
+governance history stays auditable.
 
 ```sh
-wddctl constitution amend --by "jordan" --proposal .wdd/constitution-proposal.json
+wddctl constitution status
 ```
 
-`amend` requires a prior ratification, rejects a fingerprint identical to the
-current one (nothing changed), and records the superseded fingerprint as
-`constitution.ratification.amendedFrom` so governance history stays auditable.
+```json
+{
+  "ratification": {
+    "at": "2026-07-28T14:39:50Z",
+    "by": "ivo",
+    "decisionFingerprint": "sha256:0db6456b2f70f164e5408ce36db0aca6745477b82222eea21d443f6bc5377775"
+  },
+  "stale": null,
+  "status": "ratified"
+}
+```
+
+`status --proposal FILE` additionally reports `"stale": true/false` against
+that specific proposal file's fingerprint — this is the older, explicit
+comparison and is independent of the live `config.json` + `constitution.md`
+drift check below; pass a proposal only when you specifically want to know
+whether a saved proposal file still matches what's ratified.
+
+#### Governance drift
+
+Once ratified, editing `config.json` or `constitution.md` without an `amend`
+is drift, not a free edit. `wddctl next` detects it live (no proposal file
+needed) and clears every action until it's resolved:
 
 ```sh
-wddctl constitution status [--proposal .wdd/constitution-proposal.json]
+wddctl next --repo .
 ```
 
-Reports the current ratification and, when a proposal is passed, whether it
-has drifted from what was ratified (`"stale": true`).
+```json
+{
+  "actions": [],
+  "blockers": [
+    {
+      "actual": "sha256:c01bf13c5ac11f4635b0119cecf419ebe5681a6e04a2e78874f66df85284ca04",
+      "code": "governance_drift",
+      "message": "config/constitution changed since ratification; amend before executing",
+      "ratified": "sha256:0db6456b2f70f164e5408ce36db0aca6745477b82222eea21d443f6bc5377775"
+    }
+  ],
+  "revision": 2,
+  "scope": "SCOPE-demo",
+  "truncated": false
+}
+```
+
+The refusal isn't only advisory in `next` — every execution verb that
+mutates task state (`start`, `submit`, `refresh`, `merge`, `review record`,
+`review collect`, `verify record`, `verify collect`, `reconcile done`)
+checks live governance before doing anything else, so bypassing `next`
+doesn't bypass the gate:
+
+```sh
+wddctl start --task TASK-001-demo --repo .
+```
+
+```
+wddctl: governance drift: config.json or constitution.md changed since ratification (ratified sha256:0db6456b2f70f164e5408ce36db0aca6745477b82222eea21d443f6bc5377775, current sha256:c01bf13c5ac11f4635b0119cecf419ebe5681a6e04a2e78874f66df85284ca04); run 'wddctl constitution amend --by NAME' after the user re-approves
+```
+
+`amend` clears it — the newly live fingerprint becomes the ratified one, and
+`next` resumes normal operation:
+
+```sh
+wddctl constitution amend --by "ivo"
+```
+
+```json
+{
+  "decisionFingerprint": "sha256:c01bf13c5ac11f4635b0119cecf419ebe5681a6e04a2e78874f66df85284ca04",
+  "duplicate": false,
+  "revision": 3
+}
+```
+
+```sh
+wddctl next --repo .
+```
+
+```json
+{
+  "actions": [
+    {
+      "action": "start_task",
+      "command": "wddctl start --task TASK-001-demo --repo .",
+      "task": "TASK-001-demo"
+    }
+  ],
+  "blockers": [],
+  "revision": 3,
+  "scope": "SCOPE-demo",
+  "truncated": false
+}
+```
+
+Read-only verbs (`status`, `next` itself, `render`, `freshness check`,
+`doctor`, `monitor`), setup verbs (`init`, `config`, `plan`, `migrate`),
+task-state verbs that don't execute anything (`block`, `unblock`, `cancel`,
+`note`), `event`, and `constitution` itself are deliberately exempt — they
+either don't act on ratified governance, or are how governance gets
+re-signed in the first place.
 
 ### `next`
 
@@ -207,6 +489,18 @@ wddctl status [--json]
 Without `--json`, a short human-readable brief (scope, revision,
 constitution status, task counts, active task count, reconciliation due
 flag). With `--json`, the full summary `next` and `render` are built from.
+
+During setup — before `plan apply` has created a scope — both forms print
+the reduced setup shape instead:
+
+```json
+{
+  "constitution": "draft",
+  "openQuestions": 2,
+  "phase": "setup",
+  "scope": null
+}
+```
 
 ### `render`
 
@@ -531,6 +825,35 @@ becomes `always`, because schema v2 required review for every task —
 migrating must not silently drop that obligation. Pass
 `--review-policy risk_based` to loosen it deliberately. Reading v2 state
 without migrating fails with a message pointing here.
+
+A separate `--governance` flag converts a pre-split repository (a
+`constitution.md` with no `config.json` sibling, from before the fingerprint
+covered both files) into the current split:
+
+```sh
+wddctl --state .wdd/state.json migrate --governance --dry-run
+# {"wddDir": ".wdd", "wouldMigrate": true}
+wddctl --state .wdd/state.json migrate --governance --apply
+```
+
+```json
+{
+  "backup": ".wdd/constitution.md.pre-config",
+  "migrated": true,
+  "modelsExtracted": true,
+  "ratificationInvalidated": false
+}
+```
+
+The old `constitution.md` is preserved at `constitution.md.pre-config` (only
+when it had content), any `models` object found in a legacy JSON code block
+is lifted into `config.json`'s `models`, and the constitution file itself is
+replaced with the current prose template. If the scope was already
+ratified, `ratificationInvalidated` comes back `true` and the constitution
+reverts to `draft` — the fingerprint's meaning changed, so the user has to
+see and approve the new split once via `wddctl constitution ratify` before
+execution resumes. A no-op if `config.json` already exists
+(`{"migrated": false, "reason": "config.json already exists"}`).
 
 ### `monitor`
 
