@@ -13,7 +13,7 @@ from wave_delivery.config import default_config, governance_fingerprint, load_co
 from wave_delivery.lint import lint_plan
 from wave_delivery.plan import apply_risk_rules
 from wave_delivery.schema import new_state
-from wave_delivery.setup import init_repository, migrate_governance
+from wave_delivery.setup import init_repository, migrate_governance, setup_next_actions
 from wave_delivery.store import StateStore
 
 
@@ -299,6 +299,47 @@ class MigrateGovernanceLockTest(unittest.TestCase):
             after = StateStore(wdd / "state.json").read()
             self.assertEqual(after["revision"], before + 1)
             self.assertEqual(after["events"][-1]["type"], "governance.migrated")
+
+
+class RepairConfigHintTest(unittest.TestCase):
+    def test_missing_config_yields_repair_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            init_repository(wdd, root)
+            (wdd / "config.json").unlink()
+            state = StateStore(wdd / "state.json").read()
+            result = setup_next_actions(state, wdd)
+            self.assertEqual(result["actions"][0]["action"], "repair_config")
+
+
+class ConfigOverlayEndToEndTest(unittest.TestCase):
+    def test_omitted_scope_fields_default_from_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            state = str(wdd / "state.json")
+            self.assertEqual(_cli(state, "init", "--repo", str(root))[0], 0)
+            self.assertEqual(_cli(state, "config", "set", "merge.surface", "local")[0], 0)
+            config = load_config(wdd)
+            if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
+                self.assertEqual(
+                    _cli(state, "config", "set", "verification.commands", '["true"]')[0], 0
+                )
+            self.assertEqual(_cli(state, "config", "set", "merge.reconcileEveryNMerges", "5")[0], 0)
+            self.assertEqual(_cli(state, "config", "set", "concurrency.maxConcurrent", "2")[0], 0)
+            self.assertEqual(_cli(state, "constitution", "ratify", "--by", "t")[0], 0)
+            plan = _plan([_task("T1")])
+            del plan["scope"]["reconcileEveryNMerges"]
+            del plan["scope"]["maxConcurrent"]
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            self.assertEqual(
+                _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))[0], 0
+            )
+            adopted = StateStore(wdd / "state.json").read()
+            self.assertEqual(adopted["reconcile"]["everyNMerges"], 5)
+            self.assertEqual(adopted["scope"]["maxConcurrent"], 2)
 
 
 if __name__ == "__main__":

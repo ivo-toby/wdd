@@ -162,6 +162,26 @@ def setup_next_actions(
     Same output shape, one action at a time: setup is sequential, and a
     single unambiguous action is what keeps an agent from improvising.
     """
+    wdd_dir = Path(wdd_dir)
+    if not config_path(wdd_dir).exists():
+        return {
+            "scope": None,
+            "revision": state["revision"],
+            "phase": "setup",
+            "actions": [
+                {
+                    "task": "-",
+                    "action": "repair_config",
+                    "judgment": (
+                        "state.json exists but config.json is missing. Restore "
+                        ".wdd/config.json from version control if it was committed; "
+                        "otherwise delete .wdd/state.json and re-run 'wddctl init' "
+                        "to regenerate both."
+                    ),
+                }
+            ],
+            "blockers": [],
+        }
     prefix = "wddctl" + (f" --state {shlex.quote(state_path)}" if state_path else "")
     actions: list[dict[str, Any]] = []
     config = load_config(wdd_dir)
