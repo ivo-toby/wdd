@@ -1311,12 +1311,14 @@ wddctl status --json
 # {"finalize": {}, "phase": "finalize"}
 ```
 
-Every finalize verb refuses outside `finalize`/`delivered` ("finalize
+Every **mutating** finalize verb (`review record`, `verify record`,
+`handoff`, `delivered`) refuses outside `finalize`/`delivered` ("finalize
 verbs require the scope to be in the finalize or delivered phase..."), and
-every mutating one (`review record`, `verify record`, `handoff`)
 additionally refuses once `delivered` is recorded — there is nothing left
 to review, verify, or hand off once the human has already merged
 ("this scope is already delivered; there is nothing left to \<review|verify|hand off\>").
+`finalize status` is the exception: it reports in any phase (setup,
+execute, finalize, delivered), the same way `wddctl status` always does.
 
 ### `finalize review record`
 
