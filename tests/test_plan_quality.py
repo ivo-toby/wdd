@@ -273,6 +273,111 @@ class LintCliTest(unittest.TestCase):
             self.assertIn("serialized_plan", out)
 
 
+def _cli_full(state: str, *argv: str) -> tuple[int, str, str]:
+    """Like _cli, but also captures stderr for asserting on refusal messages."""
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        code = main(["--state", state, *argv])
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+class BaseEqualsTargetBranchTest(unittest.TestCase):
+    """Finding 1's fix: scope.baseRef == branching.targetBranch makes the
+    epic branch the branch it delivers into, so finalize's human-merge
+    ancestry checks are vacuously satisfied (a ref is its own ancestor) --
+    the delivery ladder could self-certify without any human merge ever
+    happening. 'plan apply' refuses this outright (config-aware path only;
+    legacy scopes without config.json are unaffected); 'plan lint' surfaces
+    it as a warning finding (code base_is_target) so it is visible even
+    without --strict."""
+
+    def _ready_repo(self, tmp: str):
+        root = _git_repo(tmp)
+        wdd = root / ".wdd"
+        state = str(wdd / "state.json")
+        assert _cli(state, "init", "--repo", str(root))[0] == 0
+        assert _cli(state, "config", "set", "merge.surface", "local")[0] == 0
+        config = load_config(wdd)
+        if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
+            assert _cli(state, "config", "set", "verification.commands", '["true"]')[0] == 0
+        assert _cli(state, "constitution", "ratify", "--by", "t")[0] == 0
+        return root, wdd, state
+
+    def test_plan_apply_refuses_when_base_ref_equals_target_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd, state = self._ready_repo(tmp)
+            target_branch = load_config(wdd)["branching"]["targetBranch"]
+            plan = _plan([_task("T1")])
+            plan["scope"]["baseRef"] = target_branch
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+
+            code, out, err = _cli_full(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root)
+            )
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("scope.baseRef must differ from branching.targetBranch", err)
+            self.assertIn(target_branch, err)
+            self.assertIsNone(StateStore(wdd / "state.json").read()["scope"])
+
+    def test_plan_apply_unaffected_when_base_ref_differs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd, state = self._ready_repo(tmp)
+            plan = _plan([_task("T1")])
+            plan["scope"]["baseRef"] = "wdd/scope-q"
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+
+            code, out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+    def test_plan_apply_skips_check_without_config(self) -> None:
+        # Bootstrap/no-config (legacy) path: nothing to compare baseRef
+        # against, so the check is a no-op rather than a crash.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            state = str(wdd / "state.json")
+            plan = _plan([_task("T1")])
+            plan["scope"]["baseRef"] = "main"
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+
+            code, out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+    def test_plan_lint_surfaces_base_is_target_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd, state = self._ready_repo(tmp)
+            target_branch = load_config(wdd)["branching"]["targetBranch"]
+            plan = _plan([_task("T1")])
+            plan["scope"]["baseRef"] = target_branch
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+
+            code, out = _cli(state, "plan", "lint", "--plan", str(plan_file))
+            self.assertEqual(code, 0, out)
+            findings = json.loads(out)["findings"]
+            codes = {f["code"] for f in findings}
+            self.assertIn("base_is_target", codes)
+            finding = next(f for f in findings if f["code"] == "base_is_target")
+            self.assertEqual(finding["severity"], "warning")
+
+    def test_plan_lint_strict_fails_on_base_is_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd, state = self._ready_repo(tmp)
+            target_branch = load_config(wdd)["branching"]["targetBranch"]
+            plan = _plan([_task("T1")])
+            plan["scope"]["baseRef"] = target_branch
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+
+            code, out, err = _cli_full(state, "plan", "lint", "--plan", str(plan_file), "--strict")
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("base_is_target", err)
+
+
 class EventApplyGovernanceTest(unittest.TestCase):
     def test_event_apply_refuses_on_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

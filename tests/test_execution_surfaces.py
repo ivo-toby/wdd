@@ -428,7 +428,11 @@ class PrSurfaceSubmitTest(unittest.TestCase):
             )
         self.assertEqual(_cli(state, "constitution", "ratify", "--by", "t")[0], 0)
         plan_file = root / "plan.json"
-        plan_file.write_text(json.dumps(_plan({"baseRef": "main"})), encoding="utf-8")
+        # baseRef must differ from the default branching.targetBranch
+        # ("main"): the epic branch cannot be the branch it delivers into
+        # (cli.py's plan apply now refuses that, see wave_delivery/cli.py's
+        # _base_equals_target_branch).
+        plan_file.write_text(json.dumps(_plan({"baseRef": "wdd/scope-x"})), encoding="utf-8")
         code, out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
         self.assertEqual(code, 0, out)
         code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))

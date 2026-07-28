@@ -490,6 +490,28 @@ def _overlaid_plan(args: argparse.Namespace, store: StateStore) -> tuple[dict[st
     return plan, wdd_dir
 
 
+def _base_equals_target_branch(plan: dict[str, Any], wdd_dir: Path) -> str | None:
+    """Return the configured targetBranch when plan.scope.baseRef equals it, else None.
+
+    Shared by 'plan apply' (hard refusal) and 'plan lint' (warning, code
+    base_is_target): an epic branch that IS the branch it delivers into makes
+    finalize's human-merge ancestry checks vacuous -- a ref is trivially its
+    own ancestor, so the ladder could self-certify to delivered without any
+    human merge ever happening (finalize.py's prepare_handoff/record_delivered
+    now also guard this, but refusing at plan time catches it before any task
+    ever starts). Skipped for legacy scopes that predate config.json (no
+    targetBranch to compare against), and when baseRef is omitted (an
+    existing-scope diff apply that keeps its already-validated baseRef).
+    """
+    if not config_path(wdd_dir).exists():
+        return None
+    base_ref = plan["scope"].get("baseRef")
+    if not base_ref:
+        return None
+    target_branch = load_config(wdd_dir)["branching"]["targetBranch"]
+    return target_branch if base_ref == target_branch else None
+
+
 def _simple_event(store: StateStore, args: argparse.Namespace, event: str, data: dict[str, Any]) -> int:
     state, duplicate = apply_event(
         store, event_type=event, task_id=getattr(args, "task", None), data=data, **_concurrency(args)
@@ -547,6 +569,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.approved_by is not None and not args.approved_by.strip():
                 raise ValidationError("--approved-by requires a non-empty name")
             plan, wdd_dir = _overlaid_plan(args, store)
+            target_branch = _base_equals_target_branch(plan, wdd_dir)
+            if target_branch is not None:
+                raise ValidationError(
+                    f"scope.baseRef must differ from branching.targetBranch ({target_branch}): "
+                    "the epic branch cannot be the branch it delivers into"
+                )
             findings = lint_plan(plan, wdd_dir if wdd_dir.exists() else None)
             if args.strict and findings:
                 raise ValidationError(
@@ -567,6 +595,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "plan" and args.plan_command == "lint":
             plan_dict, wdd_dir = _overlaid_plan(args, store)
             findings = lint_plan(plan_dict, wdd_dir if wdd_dir.exists() else None)
+            target_branch = _base_equals_target_branch(plan_dict, wdd_dir)
+            if target_branch is not None:
+                findings.append(
+                    {
+                        "code": "base_is_target",
+                        "severity": "warning",
+                        "message": (
+                            f"scope.baseRef ({plan_dict['scope']['baseRef']}) equals "
+                            f"branching.targetBranch ({target_branch}): the epic branch "
+                            "cannot be the branch it delivers into -- finalize's human-merge "
+                            "ancestry checks would be vacuous."
+                        ),
+                    }
+                )
             if args.strict and findings:
                 raise ValidationError(
                     "plan lint --strict: " + ", ".join(sorted({f["code"] for f in findings}))

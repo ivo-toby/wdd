@@ -243,11 +243,36 @@ def _scope_in_finalize(
     return root, state, bare
 
 
+def _ensure_handoff(state: str, root: Path) -> None:
+    """Record review/verification/handoff evidence if a handoff isn't
+    already recorded. `finalize delivered` now refuses without one (see
+    finalize.py's `_require_handoff_recorded`), so every path to delivered
+    needs this first. A no-op when the caller already ran `finalize handoff`
+    itself (e.g. to assert on its own gh-call log)."""
+    scope_state = StateStore(Path(state)).read()
+    if (scope_state.get("finalize") or {}).get("handoff"):
+        return
+    code, out = _cli(
+        state, "finalize", "review", "record", "--reviewer", "t", "--findings", "[]",
+        "--repo", str(root),
+    )
+    assert code == 0, out
+    code, out = _cli(
+        state, "finalize", "verify", "record", "--status", "passed",
+        "--command", "true", "--repo", str(root),
+    )
+    assert code == 0, out
+    code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+    assert code == 0, out
+
+
 def _deliver_scope(state: str, root: Path, *, by: str = "bob") -> None:
     """Drive an already-finalize-phase scope (from `_scope_in_finalize`) the
-    rest of the way to "delivered": a local human merge of the epic branch
-    into the checked-out "main" (the default target), then `finalize
-    delivered`. Leaves derived_phase(state) == "delivered"."""
+    rest of the way to "delivered": ensures a handoff is recorded, then a
+    local human merge of the epic branch into the checked-out "main" (the
+    default target), then `finalize delivered`. Leaves derived_phase(state)
+    == "delivered"."""
+    _ensure_handoff(state, root)
     base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
     subprocess.run(["git", "checkout", "-q", "main"], cwd=root, check=True)
     subprocess.run(
@@ -737,6 +762,10 @@ class FinalizeReviewRecordTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state, bare = _scope_in_finalize(tmp, surface="local")
             _deliver_scope(state, root)
+            # _deliver_scope's own handoff prep already recorded a review
+            # (reviewer "t"); the assertion below is that the refused call
+            # leaves it untouched, not that no review was ever recorded.
+            review_before = StateStore(Path(state)).read()["finalize"]["review"]
 
             code, out, err = _cli_full(
                 state, "finalize", "review", "record", "--reviewer", "r",
@@ -744,7 +773,7 @@ class FinalizeReviewRecordTest(unittest.TestCase):
             )
             self.assertNotEqual(code, 0, out)
             self.assertIn("already delivered", err)
-            self.assertIsNone(StateStore(Path(state)).read()["finalize"].get("review"))
+            self.assertEqual(StateStore(Path(state)).read()["finalize"]["review"], review_before)
 
 
 class FinalizeVerifyRecordTest(unittest.TestCase):
@@ -977,6 +1006,73 @@ class FinalizeHandoffTest(unittest.TestCase):
             self.assertEqual(handoff["pr"], "https://github.invalid/pr/1")
 
 
+def _scope_in_finalize_with_no_merged_work(tmp: str) -> tuple[Path, str, Path]:
+    """Bootstrap a ready scope and cancel its only task while still "todo" --
+    the base branch never receives any commit beyond the point it was
+    created (the target branch's head at that moment), reaching finalize
+    with zero merged work and no human merge. Reproduces finding 1's case
+    (b): "all tasks cancelled"."""
+    root, state, bare = _bootstrap_ready_scope(tmp, surface="local")
+    code, out = _cli(state, "cancel", "--task", "T1")
+    assert code == 0, out
+    from wave_delivery.schema import derived_phase
+
+    assert derived_phase(StateStore(Path(state)).read()) == "finalize"
+    return root, state, bare
+
+
+class FinalizeVacuousAncestryTest(unittest.TestCase):
+    """Finding 1's fix: the human-merge guarantee must not self-certify via
+    vacuous ancestry. Case (a) -- scope.baseRef == branching.targetBranch --
+    is refused earlier, at plan-apply/lint time (see test_plan_quality's
+    BaseEqualsTargetBranchTest). Case (b) -- an epic branch with zero
+    commits beyond its merge-base with target (e.g. every task cancelled)
+    -- can only be caught here: cli.py's plan-time check cannot see ahead
+    to which tasks will end up merged vs. cancelled."""
+
+    def test_all_cancelled_scope_refuses_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize_with_no_merged_work(tmp)
+            code, out, err = _cli_full(state, "finalize", "handoff", "--repo", str(root))
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("nothing to deliver", err)
+            self.assertIsNone(
+                StateStore(Path(state)).read().get("finalize", {}).get("handoff")
+            )
+
+    def test_all_cancelled_scope_refuses_handoff_even_with_clean_evidence(self) -> None:
+        # The vacuous-ancestry guard must fire independently of (not merely
+        # alongside) the review/verification precondition -- clean evidence
+        # alone must not be enough to hand off nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize_with_no_merged_work(tmp)
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "r",
+                "--findings", "[]", "--repo", str(root),
+            )
+            assert code == 0, out
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--status", "passed",
+                "--command", "true", "--repo", str(root),
+            )
+            assert code == 0, out
+            code, out, err = _cli_full(state, "finalize", "handoff", "--repo", str(root))
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("nothing to deliver", err)
+
+    def test_all_cancelled_scope_never_reaches_delivered(self) -> None:
+        # Since handoff now refuses first, delivered's own
+        # _require_handoff_recorded guard closes the same walk a second
+        # way: even if a caller somehow forged ancestry (e.g. target was
+        # fast-forwarded onto the untouched base by accident), there is no
+        # recorded handoff to satisfy delivered's other precondition.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize_with_no_merged_work(tmp)
+            code, out, err = _cli_full(state, "finalize", "delivered", "--by", "bob", "--repo", str(root))
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("requires a recorded handoff", err)
+
+
 class FinalizeDeliveredTest(unittest.TestCase):
     """Task 3: `finalize delivered` -- proves the epic branch head is
     reachable from the TARGET branch, reusing phase 4's either-ref ancestry
@@ -985,6 +1081,7 @@ class FinalizeDeliveredTest(unittest.TestCase):
     def test_refuses_before_the_target_merge_has_happened(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state, bare = _scope_in_finalize(tmp, surface="local")
+            _ensure_handoff(state, root)
             code, out, err = _cli_full(state, "finalize", "delivered", "--by", "bob", "--repo", str(root))
             self.assertNotEqual(code, 0, out)
             self.assertIn("has not happened", err)
@@ -992,9 +1089,31 @@ class FinalizeDeliveredTest(unittest.TestCase):
                 StateStore(Path(state)).read().get("finalize", {}).get("delivered")
             )
 
+    def test_refuses_without_a_recorded_handoff(self) -> None:
+        # Finding 1's fix: delivered requires a handoff to already be
+        # recorded, closing the all-cancelled-scope walk where handoff
+        # itself now refuses (nothing to deliver) but delivered was
+        # previously reachable by ancestry proof alone.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+            subprocess.run(["git", "checkout", "-q", "main"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+                 "merge", "--no-ff", "-m", "final merge", base_ref],
+                cwd=root, check=True,
+            )
+            code, out, err = _cli_full(state, "finalize", "delivered", "--by", "bob", "--repo", str(root))
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("requires a recorded handoff", err)
+            self.assertIsNone(
+                StateStore(Path(state)).read().get("finalize", {}).get("delivered")
+            )
+
     def test_succeeds_after_merging_base_into_target_locally(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state, bare = _scope_in_finalize(tmp, surface="local")
+            _ensure_handoff(state, root)
             base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
 
             # The human performs the final merge directly -- no wddctl
@@ -1025,6 +1144,7 @@ class FinalizeDeliveredTest(unittest.TestCase):
         # -- the controller's local target branch never moves.
         with tempfile.TemporaryDirectory() as tmp:
             root, state, bare = _scope_in_finalize(tmp, surface="local", mode="controller")
+            _ensure_handoff(state, root)
             base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
 
             subprocess.run(["git", "-C", str(root), "push", "-q", "origin", "main:main"], check=True)

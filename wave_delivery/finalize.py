@@ -75,6 +75,53 @@ def _base_ref(state: dict[str, Any]) -> str:
     return base_ref
 
 
+def _require_something_to_deliver(repo_path: Path, base_sha: str, target_branch: str) -> None:
+    """Refuse when the epic branch has no commits beyond its merge-base with the target.
+
+    ``is_ancestor`` treats a commit as its own ancestor, so this single check
+    catches two vacuous-ancestry shapes the human-merge guarantee must not
+    self-certify against:
+
+    - scope.baseRef == branching.targetBranch (base_sha IS the target head).
+    - A scope whose epic branch never received any merged work (e.g. every
+      task cancelled): base_sha sits exactly at the merge-base with target,
+      so it is already an ancestor of the target head with no human merge
+      having happened.
+
+    This runs at handoff time, BEFORE the human's final merge can possibly
+    have landed -- a genuine handoff for real, unmerged work is always false
+    here (the epic branch has diverged from target with real commits), so
+    the normal flow (real commits -> handoff -> human merges -> delivered)
+    is unaffected. Plan-time validation (cli.py's plan apply/lint) already
+    refuses case one before any task ever starts; this is defense in depth
+    plus the only place that can catch case two, which plan time cannot see.
+    """
+    if is_ancestor(repo_path, base_sha, target_branch):
+        raise IllegalTransition(
+            "nothing to deliver: the epic branch has no commits beyond its merge-base "
+            f"with {target_branch}"
+        )
+
+
+def _require_handoff_recorded(state: dict[str, Any]) -> None:
+    """`finalize delivered`'s other precondition: a handoff must exist first.
+
+    Without this, a scope that never went through handoff (e.g. the
+    all-cancelled walk finding 1's fix in ``_require_something_to_deliver``
+    now blocks at handoff time) could still reach ``record_delivered``
+    directly and self-certify the moment its base head happens to already be
+    an ancestor of target -- exactly the vacuous case handoff itself now
+    refuses. Requiring a recorded handoff means that refusal always fires
+    first, for every path to delivered.
+    """
+    handoff = (state.get("finalize") or {}).get("handoff")
+    if not isinstance(handoff, dict):
+        raise IllegalTransition(
+            "finalize delivered requires a recorded handoff; run 'wddctl finalize handoff "
+            "--repo .' first"
+        )
+
+
 def _require_target_branch(wdd_dir: Path) -> tuple[str, dict[str, Any]]:
     if not config_path(wdd_dir).exists():
         raise IllegalTransition(
@@ -286,8 +333,15 @@ def prepare_handoff(
     _require_not_delivered(state, what="hand off")
     base_ref = _base_ref(state)
     base_sha = resolve_ref(repo_path, base_ref)
-    _require_current_finalize_evidence(state, base_sha)
     target_branch, config = _require_target_branch(wdd_dir)
+    # Checked before the review/verification evidence gate: there is no
+    # point asking for a clean review of a branch that has nothing to
+    # deliver, and this is the guard that closes the vacuous-ancestry
+    # self-certification (finding 1) -- it must be the first thing a scope
+    # with no merged work hits, not something masked by a missing-evidence
+    # message that would send the operator down the wrong path.
+    _require_something_to_deliver(repo_path, base_sha, target_branch)
+    _require_current_finalize_evidence(state, base_sha)
     surface = merge_settings(state, config)["surface"]
 
     pr_url: str | None = None
@@ -327,6 +381,7 @@ def prepare_handoff(
                 f"base branch {base_ref} moved since handoff began (was {base_sha}, now "
                 f"{current_base_sha}); re-run 'wddctl finalize handoff --repo .'"
             )
+        _require_something_to_deliver(repo_path, base_sha, target_branch)
         _require_current_finalize_evidence(current, base_sha)
         updated = copied_state(current)
         updated.setdefault("finalize", {})
@@ -378,6 +433,12 @@ def record_delivered(
     correct than the first one -- the ancestry proof cannot change once it
     has succeeded -- so there is nothing legitimate for a retry to add. A
     caller that actually needs the current record has ``finalize status``.
+
+    Also requires a recorded handoff (``_require_handoff_recorded``): without
+    it, a scope could reach delivered by ancestry proof alone, without ever
+    going through the handoff-time vacuous-ancestry guard
+    (``_require_something_to_deliver``) -- see that function's docstring for
+    the self-certification this closes.
     """
     if not isinstance(by, str) or not by:
         raise ValidationError("by must be a non-empty string")
@@ -386,6 +447,7 @@ def record_delivered(
     state = store.read()
     _require_finalize_phase(state)
     _require_not_delivered(state, what="deliver")
+    _require_handoff_recorded(state)
     base_ref = _base_ref(state)
     target_branch, _config = _require_target_branch(wdd_dir)
 
@@ -398,6 +460,7 @@ def record_delivered(
         # before it, so nothing here may be trusted stale.
         _require_finalize_phase(current)
         _require_not_delivered(current, what="deliver")
+        _require_handoff_recorded(current)
         base_sha = resolve_ref(repo_path, base_ref)
         candidates = _fetched_base_refs(repo_path, target_branch)
         proven = next(
