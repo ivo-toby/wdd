@@ -1,186 +1,264 @@
 # The developer workflow
 
 `docs/wddctl.md` documents commands. `docs/artifact-schema.md` documents file
-formats. Neither says how a developer actually spends a day working this
-way. This document does. Every command block below was run against a real
-scratch repository on this branch; nothing here is paraphrased output.
+formats. Neither says how a project actually moves from nothing to a merged
+scope. This document does. Every command block below was run for real
+against a scratch repository on this branch; nothing here is paraphrased
+output.
 
-## Two audiences
+## Talking to an agent
 
-WDD has two entry points, and it matters which one you're using, because
-they imply different things about who types what.
+This is the normal way to use WDD. You open a session with Claude Code (or
+Codex, or another agent with the skills installed) and say something like
+"let's add refresh tokens" or "what's the status of the auth-refresh
+scope?" You never type `wddctl` yourself. The agent reads a skill —
+`wave-driven-development`, `wdd-setup`, `wdd-plan`, `wdd-run`, `wdd-worker`,
+`wdd-review`, or `wdd-status` — decides it applies, and runs `wddctl`
+commands on your behalf. This is a hard rule, not a suggestion: every one
+of those skills opens with "you run every `wddctl` command in this skill
+yourself; presenting a command to the user instead of executing it is a
+protocol violation." Your intervention is prose: "actually split TASK-002
+differently," "block TASK-004." The agent translates that into
+`wddctl block` or a `plan.json` edit.
 
-**A developer talking to a coding agent.** This is the common case. You
-open a session with Claude Code (or Codex, or another agent with the skills
-installed) and say something like "let's add refresh tokens" or "what's the
-status of the auth-refresh scope?" You never type `wddctl` yourself. The
-agent reads a skill — `wave-driven-development`, `wdd-plan`, `wdd-run`,
-`wdd-worker`, `wdd-review`, `wdd-status`, or `wdd-setup` — decides
-it applies, and runs `wddctl` commands on your behalf, showing you the
-output or summarizing it. Your intervention, when you have one, is prose:
-"actually split TASK-002 differently" or "block TASK-004, we're rethinking
-the UI." The agent translates that into `wddctl block` or a `plan.json`
-edit.
-
-**Someone driving `wddctl` directly.** This is you, or an agent operating
-without a human in the loop turn by turn, running the commands yourself:
-scripting a CI step that checks `wddctl status --json`, debugging why a
-task won't admit, or just preferring the terminal over a chat transcript.
-Everything in `docs/wddctl.md` is written for this audience. This document
-is written for both, but the transcripts below show the literal commands
-so either audience can follow along.
-
-**The important part: skills do not call `wddctl`.** A skill is a Markdown
-file loaded into an agent's context window. It has no execution privileges
-of its own — it cannot run a shell command any more than this paragraph
-can. What a skill does is put text like this in front of the agent:
-
-> `run_review` → dispatch a reviewer per `wdd-review`. Their findings go
-> into `recordWith` in place of `'[]'`.
-
-The agent reads that instruction and — because it has shell access as part
-of its own tool set, not because the skill granted it one — decides to run
-`wddctl review record --task ... --findings '[...]'`. If the agent ignores
-the skill, nothing enforces the instruction; skill text is advisory, the
-way a code review comment is advisory. Contrast this with the state
+**The hard rule is text, not enforcement.** A skill is a Markdown file
+loaded into an agent's context window. It has no execution privileges of
+its own — it cannot run a shell command any more than this paragraph can.
+A step like `run_review → dispatch a reviewer per wdd-review; their
+findings go into recordWith` is just text the agent reads and, because it
+has shell access as part of its own tool set and not because the skill
+granted it one, decides to act on. If the agent ignores the skill, nothing
+stops it; the hard rule obligates, it doesn't enforce. Contrast the state
 machine in `wave_delivery/engine.py`: if two tasks share a conflict domain,
-the `task.started` transition raises `IllegalTransition` regardless of
-what any skill says. That distinction — prose that an agent might ignore,
-versus a transition function that cannot be argued with — is the whole
-design of WDD, and it recurs throughout this document as "enforced vs.
-convention."
+`task.started` raises `IllegalTransition` regardless of what any skill says
+or any agent intends. That distinction — prose an agent is obligated to
+follow but could still ignore, versus a transition function that cannot be
+argued with — is the whole design of WDD, and recurs throughout this
+document as "enforced vs. convention."
 
 ## The three roles
 
-WDD names three roles: controller, worker, reviewer. They are roles, not
-processes — how they map onto actual agent sessions depends on your setup.
+WDD names three roles: controller, worker, reviewer — roles, not
+processes; how they map onto actual agent sessions depends on your setup.
 
 **Controller.** Runs the `wddctl next` loop, dispatches workers and
 reviewers, routes P1/P2 findings back to a fix worker, runs reconciliation,
-merges. The controller never writes task code and never hand-edits
-`state.json`. In practice this is usually one long-lived agent session (or
-a human with a terminal) that stays alive for the whole scope, because it's
+merges. Never writes task code, never hand-edits `state.json`. Usually one
+long-lived agent session that stays alive for the whole scope, because it's
 the thing holding the "what's next" thread. Its skill is `wdd-run`.
 
 **Worker.** Implements exactly one task, in the worktree the controller's
-`wddctl start` created for it. A worker session is short-lived — it exists
-for one task's lifetime and then is done. In an agent-driven setup, the
-controller typically dispatches a worker as a subagent (Claude Code's Task
-tool, or an equivalent) with the task ID and worktree path, and gets back a
-status token when it finishes. Its skill is `wdd-worker`.
+`wddctl start` created for it. Short-lived — it exists for one task's
+lifetime and then is done. The controller typically dispatches it as a
+subagent (Claude Code's Task tool, or an equivalent) with the task ID and
+worktree path, and gets back a status token when it finishes. Its skill is
+`wdd-worker`.
 
 **Reviewer.** Reviews one task's diff against its brief and classifies
-findings as P1/P2/P3. A reviewer session is also short-lived, dispatched
-per review, and — this matters — should not be the same context that wrote
-the diff, for the same reason a human wouldn't approve their own PR. Its
-skill is `wdd-review`.
+findings as P1/P2/P3. Also short-lived, dispatched per review, and — this
+matters — should not be the same context that wrote the diff, for the same
+reason a human wouldn't approve their own PR. Its skill is `wdd-review`.
 
 In a small scope worked by one person and one agent, all three roles can be
-the same agent session switching hats: it reads `wdd-run`'s instructions to
-decide what's next, then reads `wdd-worker`'s instructions while it
-implements a task, then reads `wdd-review`'s instructions to review someone
-else's task. Nothing in `wddctl` requires three separate processes — the
-state machine doesn't know or care who ran a command, only that the
-transition is legal. What it does care about is evidence: a review's
-findings are pinned to a head SHA regardless of who produced them, so even
-a self-review that's honest still leaves an auditable trail.
+the same session switching hats — `wddctl` doesn't know or care who ran a
+command, only that the transition is legal. What it does care about is
+evidence: a review's findings are pinned to a head SHA regardless of who
+produced them, so even a self-review that's honest leaves an auditable
+trail.
 
-## The lifecycle of one task, gate by gate
+## From nothing to merged
 
-This is a real run. The scope is `SCOPE-auth-refresh`, four tasks (the full
-plan is in `docs/example-auth-refresh.md`); here we follow
-`TASK-001-token-types` from nothing to merged. `next` output is trimmed to
-the fields that matter for this task.
+A real run, `wddctl init` through a merged, reconciled scope, captured
+against a scratch repository seeded with one real commit.
 
-**Not started.** Before anything happens, `wddctl next` names the action
-and hands you the literal command:
+### Setup: init, resolve, ratify
+
+`wddctl init --repo .` scaffolds `.wdd/` deterministically — nothing here
+is prose-improvised anymore:
 
 ```
-$ wddctl next
+$ wddctl init --repo .
 {
-  "actions": [
-    {"task": "TASK-001-token-types", "action": "start_task",
-     "command": "wddctl start --task TASK-001-token-types --repo ."}
-  ],
-  ...
+  "alreadyInitialized": false,
+  "created": [".wdd/config.json", ".wdd/constitution.md", ".wdd/tasks",
+              ".wdd/shared-context", ".wdd/state.json"],
+  "hint": "run 'wddctl next' and follow it",
+  "openQuestions": [
+    {"path": "merge.surface", "options": ["pr", "local"],
+     "question": "Review/merge surface: 'pr' pushes task branches and mirrors review findings to pull-request comments; 'local' keeps the whole loop offline in state.json. Which should this repository use?"}
+  ]
 }
 ```
 
-Note the `command` field. This is a change from earlier documentation of
-this tool: `next` used to name an action and leave translating it into a
-command as an exercise for the caller. It no longer does. For
-`start_task`, `check_branch_freshness`, and `merge_task`, `command` is a
-verb to run as-is, no judgment required. For actions that need judgment —
-`await_worker`, `run_review`, `run_verification`, `assign_fix_writer`,
-`run_reconciliation` — the payload instead carries `recordWith`: do the
-work, then run the given command to record the outcome.
+`init` probed the repository and found a verification command (a `tests/`
+directory), so only the merge-surface question needs an answer. `next`
+during setup emits exactly one action at a time:
 
-The controller runs the command:
+```
+$ wddctl next
+{"actions": [{"action": "resolve_config", "task": "-",
+  "command": "wddctl config set <path> <value>",
+  "judgment": "ask the user every listed question in ONE round, then record each answer",
+  "questions": [...]}], "blockers": [], "phase": "setup", "revision": 0, "scope": null}
+$ wddctl config set merge.surface local
+{"openQuestions": 0, "path": "merge.surface", "value": "local"}
+```
+
+`next` moves to ratification, which signs `config.json` and
+`constitution.md` together — the fingerprint is computed over both files'
+exact contents:
+
+```
+$ wddctl next
+{"actions": [{"action": "ratify", "task": "-",
+  "command": "wddctl constitution ratify --by NAME",
+  "judgment": "show the user config.json and constitution.md; ratify only after explicit sign-off"}]}
+$ wddctl constitution ratify --by ivo
+{"decisionFingerprint": "sha256:b84d70...", "duplicate": false, "revision": 1}
+$ wddctl next
+{"actions": [{"action": "plan", "task": "-",
+  "command": "wddctl plan apply --plan plan.json --repo .",
+  "judgment": "decompose the work per the wdd-plan skill, write task briefs, then apply"}]}
+```
+
+### Intake: `wdd-plan`, `.wdd/spec.md`, and a recorded approval
+
+`wdd-plan` is the front door: it turns "let's add refresh tokens" into an
+agreed spec, a `plan.json`, and an applied, approved scope. It ingests
+whatever the user brings, pushes back on gaps in one compact round of
+questions, then writes the agreed understanding to `.wdd/spec.md` with
+exactly four sections — Goal, In scope, Out of scope, Acceptance
+criteria — checkable enough that a later finalize pass can review the epic
+branch against it. For this run, the acceptance criteria that matter are
+`issueRefreshToken` existing with a typed signature, and a 401 triggering
+exactly one silent refresh-and-retry, not a loop (the skill's template has
+the full four-section skeleton).
+
+From there it decomposes into tasks — one worker, one branch, one diff,
+one merge each — getting conflict domains right: too coarse serializes
+everything, too narrow lets two workers clobber the same file. Before
+applying, it shows the projected admission order and any lint findings:
+
+```
+$ wddctl plan preview --plan plan.json
+{"scope": "SCOPE-auth-refresh", "maxConcurrent": 3,
+ "note": "projected admission order; rounds are a view, not a gate",
+ "rounds": [{"round": 1, "tasks": ["TASK-001-token-types", "TASK-003-client-retry"]},
+            {"round": 2, "tasks": ["TASK-002-refresh-endpoint"]}]}
+$ wddctl plan lint --plan plan.json
+{"findings": [], "strict": false}
+```
+
+Only on explicit approval does it apply, and the approval is now recorded:
+
+```
+$ wddctl plan apply --plan plan.json --repo . --approved-by ivo
+{"approvedBy": "ivo", "created": false, "duplicate": false, "lint": [],
+ "revision": 3, "scope": "SCOPE-auth-refresh",
+ "diff": {"added": ["TASK-001-token-types", "TASK-002-refresh-endpoint",
+                     "TASK-003-client-retry"], "removed": [], "updated": []},
+ "base": {"action": "created", "baseRef": "wdd/auth-refresh", "from": "HEAD"}}
+```
+
+`scope.approval` is now part of state, visible in `status --json` for as
+long as the scope exists. Re-applying later without `--approved-by`
+(adding a task, fixing a domain) preserves it rather than erasing it.
+
+### The `next` loop, gate by gate
+
+Following `TASK-001-token-types` (risk `high`) and `TASK-003-client-retry`
+(risk `normal`) from nothing to merged; `next` output below is trimmed to
+the fields that matter for a given step. Both admit at once — they share no
+conflict domain and neither depends on the other:
+
+```
+$ wddctl next
+{"actions": [
+  {"task": "TASK-001-token-types", "action": "start_task",
+   "command": "wddctl start --task TASK-001-token-types --repo ."},
+  {"task": "TASK-003-client-retry", "action": "start_task",
+   "command": "wddctl start --task TASK-003-client-retry --repo ."}],
+ "blockers": [{"code": "dependencies", "task": "TASK-002-refresh-endpoint",
+               "dependsOn": ["TASK-001-token-types"]}]}
+```
+
+`command` is a verb to run as-is, no judgment required. For actions that
+need judgment instead (`await_worker`, `run_review`, `run_verification`,
+`assign_fix_writer`, `run_reconciliation`), the payload carries
+`recordWith`: do the work, then run the given command to record it.
 
 ```
 $ wddctl start --task TASK-001-token-types --repo .
-{
-  "task": "TASK-001-token-types",
-  "action": "create_branch_and_worktree",
-  "branch": "task/TASK-001-token-types",
-  "worktree": "/path/to/repo.wdd/worktrees/SCOPE-auth-refresh/TASK-001-token-types",
-  "baseRef": "wdd/auth-refresh",
-  "headSha": "34a4211...",
-  "specPath": "tasks/TASK-001-token-types.md",
-  "revision": 2
-}
+{"task": "TASK-001-token-types", "action": "create_branch_and_worktree",
+ "branch": "task/TASK-001-token-types", "baseRef": "wdd/auth-refresh",
+ "worktree": "/.../worktrees/SCOPE-auth-refresh/TASK-001-token-types", "revision": 4}
 ```
 
-This did three things in one call: verified the task is admissible
-(dependencies done, conflict domains free), created the branch and an
-isolated worktree, and flipped the task to `in_progress`. The controller
-now dispatches a worker into that worktree with the `wdd-worker` skill.
+One call verified the task admissible, created its branch and an isolated
+worktree, and flipped it to `in_progress`. The controller dispatches a
+worker per `wdd-worker` into that worktree.
 
-**Worker implements, commits, submits (`no_pr`).** The worker reads its
-brief at `specPath`, writes code, commits it in the worktree — never in the
-controller's own checkout — and calls `submit`:
+**Worker implements, commits, submits.** The worker writes
+`issueRefreshToken` — using `Math.random()`, as it happens — commits it in
+the worktree, never in the controller's own checkout, and calls `submit`:
 
 ```
 $ wddctl submit --task TASK-001-token-types --repo .
-{
-  "task": "TASK-001-token-types",
-  "event": "task.pr_recorded",
-  "branch": "task/TASK-001-token-types",
-  "headSha": "f9cdf2b...",
-  "pr": "branch:task/TASK-001-token-types@f9cdf2b86ab5",
-  "status": "review",
-  "revision": 4
-}
+{"task": "TASK-001-token-types", "event": "task.pr_recorded",
+ "headSha": "3f8edde...", "status": "review", "revision": 6}
 ```
 
 `submit` reads the head SHA from the branch itself — the worker never types
-a SHA. Status went straight to `review` because this task is `"risk":
-"high"` and the scope's `reviewPolicy` is `risk_based`. A normal-risk task
-under the same policy would go to `in_progress` and skip straight to
-verification; see `docs/example-auth-refresh.md` for that path (TASK-003
-and TASK-004 both take it).
-
-**Review finds a P1 (`needs_review` → `reviewing`).**
+one. Status went to `review` because this task is `"risk": "high"` under
+`reviewPolicy: risk_based`. `TASK-003-client-retry` is normal risk, so its
+`submit` goes straight to `in_progress`, and `next` shows it needing
+verification, not review:
 
 ```
 $ wddctl next
-{"actions": [{"task": "TASK-001-token-types", "action": "run_review",
-  "recordWith": "wddctl review record --task TASK-001-token-types --reviewer NAME --findings '[]'"}]}
+{"actions": [
+  {"task": "TASK-001-token-types", "action": "run_review",
+   "recordWith": "wddctl review record --task TASK-001-token-types --reviewer NAME --findings '[]'"},
+  {"task": "TASK-003-client-retry", "action": "run_verification",
+   "recordWith": "wddctl verify record --task TASK-003-client-retry --status passed --command '...'"}]}
 ```
 
-The controller dispatches a reviewer per `wdd-review`. The reviewer reads
-the diff, the brief, and finds something real:
+**Review finds a P1.** The reviewer reads the diff against the brief and
+finds something real:
 
 ```
 $ wddctl review record --task TASK-001-token-types --reviewer "codex-review" \
-  --findings '[{"severity":"P1","summary":"issueRefreshToken uses Math.random() for the token value; Math.random() is not cryptographically secure and refresh tokens must be unguessable","file":"src/auth/tokens.ts","line":9}]'
-{"duplicate": false, "outcome": "blocking", "revision": 5, "status": "in_progress"}
+  --findings '[{"severity":"P1","summary":"issueRefreshToken uses Math.random() for the token value; not cryptographically secure","file":"src/auth/tokens.ts","line":9}]'
+{"duplicate": false, "outcome": "blocking", "status": "in_progress", "revision": 8}
 ```
 
-A P1 or P2 finding sets `outcome: blocking` and drops the task's gate to
+A P1 or P2 finding sets `outcome: blocking` and drops the gate to
 `needs_fixes`, regardless of how far along verification or freshness were.
+`TASK-003-client-retry` has no such finding — verify, freshness, and merge
+run straight through:
 
-**Fix cycle (`needs_fixes`).**
+```
+$ wddctl verify record --task TASK-003-client-retry --status passed --command true
+{"duplicate": false, "status": "merge_ready", "revision": 9}
+$ wddctl freshness record --task TASK-003-client-retry --repo .
+{"classification": "current", "duplicate": false, "revision": 10}
+$ wddctl merge --task TASK-003-client-retry --repo .
+{"action": "merged", "baseRef": "wdd/auth-refresh", "headSha": "b489cf7...", "revision": 11}
+$ wddctl release --task TASK-003-client-retry --repo .
+{"cleanup": "cleaned_up", "duplicate": false, "revision": 12}
+```
+
+`verify record` jumped the status straight from `in_progress` to
+`merge_ready` in one call — a documented `ready_to_merge` gate sits between
+them, but the transition checks it internally and advances at once, so you
+never observe it in `next`'s output. `merge` performed a real `git merge
+--no-ff` into the scope's integration checkout, then called `git merge-base
+--is-ancestor` to prove the head actually landed before recording
+`task.merged` — no path records a merge without that check passing.
+
+**Fix cycle.** Back on `TASK-001-token-types`, `next` names the fix, and
+`recordWith` is plain `submit` — a fix is just more commits on the same
+branch, not a special verb:
 
 ```
 $ wddctl next
@@ -188,229 +266,159 @@ $ wddctl next
   "recordWith": "wddctl submit --task TASK-001-token-types --repo ."}]}
 ```
 
-Note `recordWith` here is `submit`, not a special "fix" verb — a fix is
-just more commits on the same branch. The controller dispatches a fix
-worker with the task and the findings, explicitly told not to broaden
-scope beyond what the P1 requires. The fix worker replaces `Math.random()`
-with `crypto.randomBytes`, commits, and resubmits:
+The fix worker replaces `Math.random()` with `crypto.randomBytes`, commits,
+and resubmits:
 
 ```
 $ wddctl submit --task TASK-001-token-types --repo .
-{"event": "task.head_updated", "headSha": "e6befd7...", "status": "review", "revision": 6}
+{"event": "task.head_updated", "headSha": "8f136d5...", "status": "review", "revision": 13}
 ```
 
-The event is `task.head_updated`, not `task.pr_recorded` — same PR
-reference, new head. This is the evidence-invalidation guarantee showing
-up directly: a new commit clears the task's `review`, `verification`, and
-`freshness` fields and sends it back to `review` because this task
-requires review. `wddctl next` immediately shows `run_review` again, with
-no memory that this exact diff already got flagged once — the reviewer
-re-reviews the new head from scratch.
+`task.head_updated`, not `task.pr_recorded` — same PR reference, new head.
+A new commit clears review, verification, and freshness outright and sends
+the task back to `review`, with no memory that this diff was flagged once
+already. The reviewer re-reviews from scratch, finds nothing, and the task
+runs the same verify → freshness → merge → release sequence `TASK-003` did.
 
-**Clean review, verification, freshness, merge.**
+### Reconciliation and governance drift
 
-```
-$ wddctl review record --task TASK-001-token-types --reviewer "codex-review" --findings '[]'
-{"outcome": "passed", "status": "in_progress", "revision": 6}
-
-$ wddctl verify record --task TASK-001-token-types --status passed --command "tsc --noEmit && vitest run tokens"
-{"status": "merge_ready", "revision": 9}
-```
-
-Watch the status field: it jumped straight from `in_progress` to
-`merge_ready` inside the `verify record` call itself, because passing
-verification was the last thing this task needed. There is a documented
-gate called `ready_to_merge` between "verification passed" and
-`merge_ready` — in practice you will never see it in `next`'s output. The
-transition that records verification checks internally whether the task
-has reached `ready_to_merge` and, if so, immediately advances it to
-`merge_ready` in the same call. By the time any external command reads the
-state back, the task is already past that gate. Don't design tooling
-around ever observing `ready_to_merge`.
+Every `reconcileEveryNMerges` merges (3, here), a checkpoint comes due —
+and this is where a durable discovery has to be written down or it's gone.
+`wddctl note` only queues text in `reconcile.pendingNotes`, and
+`reconcile done` *deletes* the queue, not marks it resolved. If a note
+matters beyond this moment, write it into `.wdd/shared-context/` first;
+nothing else remembers it:
 
 ```
-$ wddctl freshness record --task TASK-001-token-types --repo .
-{"classification": "current", "revision": 11}
-
-$ wddctl merge --task TASK-001-token-types --repo .
-{"action": "merged", "baseRef": "wdd/auth-refresh", "baseSha": "028b572...",
- "headSha": "e6befd7...", "revision": 13}
-
-$ wddctl release --task TASK-001-token-types --repo .
-{"cleanup": "cleaned_up", "revision": 15}
+$ wddctl next
+{"actions": [{"task": "-", "action": "run_reconciliation", "code": "merge_count",
+  "merges": 3, "recordWith": "wddctl reconcile done"}]}
+$ wddctl note --note "refresh tokens are opaque strings, not JWTs"
+{"duplicate": false, "revision": 25}
+$ wddctl reconcile done
+{"duplicate": false, "revision": 26}
 ```
 
-`merge` performed the actual `git merge` inside an integration worktree,
-then called `git merge-base --is-ancestor` to prove the task's head really
-landed in the base before it would record `task.merged` — there is no code
-path that records a merge without that live check passing. `release`
-removes the now-finished worktree. The task is `done`.
+Governance doesn't stay ratified through an unrecorded edit, either.
+Loosen the review policy directly in `config.json` without going through
+`amend`, and `next` refuses everything until it's re-signed:
 
-## Where a developer intervenes
+```
+$ wddctl config set review.policy always
+{"openQuestions": 0, "path": "review.policy", "value": "always"}
+$ wddctl next
+{"actions": [], "blockers": [{"code": "governance_drift",
+  "message": "config/constitution changed since ratification; amend before executing",
+  "ratified": "sha256:ef67ee...", "actual": "sha256:f5831c..."}]}
+$ wddctl constitution amend --by ivo
+{"decisionFingerprint": "sha256:f5831c...", "duplicate": false, "revision": 27}
+```
 
-The loop runs itself; a developer's job is to notice when it shouldn't.
+`next` unblocks the instant the fingerprint matches — this recurs for the
+life of the scope, any time `config.json` or `constitution.md` changes.
 
-**Reading state by hand.** `wddctl status` gives a one-line-per-concern
-brief; `wddctl status --json` gives the full summary that `next` and
-`render` are built from — useful for a script or for pasting into a
-question to an agent. `wddctl render --output .wdd/state.md` writes a
-generated Markdown snapshot; treat it exactly like `state.json` — read it,
-never edit it, regenerate it after anything changes.
+## Where you intervene
+
+The loop runs itself; your job is to notice when it shouldn't.
+
+**Reading state.** `wddctl status` gives a one-line brief; `status --json`
+is the full summary `next` and `render` are built from; `render --output
+.wdd/state.md` writes a generated Markdown snapshot — read it, never edit
+it, regenerate it after anything changes.
 
 **Editing `plan.json` mid-flight.** `plan apply` is re-runnable and diffs
-the new plan against current state. This came up for real in building the
-example in this repo: two independent tasks (client-side retry and a
-session-expiry banner) turned out to need a shared event-bus module
-neither task's first-draft `conflictDomains` listed. Fixing it looked like
-this:
+against current state — adding a task you missed is a plain re-apply:
 
 ```
 $ wddctl plan apply --plan plan.json --repo .
-{
-  "created": false,
-  "diff": {
-    "added": [], "removed": [],
-    "updated": [
-      {"task": "TASK-003-client-retry", "changes": ["conflictDomains"]},
-      {"task": "TASK-004-session-ui", "changes": ["conflictDomains"]}
-    ]
-  },
-  "revision": 11
-}
+{"created": false, "duplicate": false, "lint": [], "revision": 28,
+ "diff": {"added": ["TASK-004-session-ui", "TASK-005-token-rotate"],
+          "removed": [], "updated": []}}
 ```
 
-This is safe to do at any point *before* a task starts. `plan apply`
-refuses outright to edit or remove a task that has already left `todo` —
-you cannot retroactively redraw the domains of a task mid-flight; you can
-only fix the domains of tasks that haven't started yet, or add new tasks
-for work you missed.
+Safe at any point *before* a task starts — `plan apply` refuses outright to
+edit or remove a task that has already left `todo`; you can only fix
+domains on tasks that haven't started, or add new ones.
 
 **Blocking, unblocking, cancelling.**
 
 ```
-$ wddctl block --task TASK-B --reason "waiting on design sign-off"
-$ wddctl next   # TASK-B drops out of blockers-that-count-as-active;
-                # its conflict domains free up for other tasks
-$ wddctl unblock --task TASK-B
-$ wddctl cancel --task TASK-A   # terminal, no way back
+$ wddctl block --task TASK-004-session-ui --reason "waiting on design sign-off"
+{"duplicate": false, "revision": 29}
+$ wddctl unblock --task TASK-004-session-ui
+{"duplicate": false, "revision": 30}
 ```
 
-`unblock` returns a task to `todo` if it never got a PR, or `in_progress`
-if it did. See "Failure modes" below for a sharp edge in the `todo` case.
+Blocking frees the task's conflict domains immediately. `unblock` returns a
+task to `todo` if it never got a PR, or `in_progress` if it did; `cancel`
+is terminal.
 
-**Forcing a refresh.** When `next` reports `check_branch_freshness` and the
-classification comes back `materially_stale` or `conflicted`, don't wait
-for it to resolve itself:
-
-```
-$ wddctl refresh --task TASK-B --repo .
-```
-
-This merges the scope's base into the task branch and re-records the head
-— which, deliberately, invalidates any review or verification evidence
-that was pinned to the old head. `next` will show `run_review` /
-`run_verification` again even though nothing about the task's own logic
-changed. That's not wasted work: the diff against the base is genuinely
-different now, and the old approval was of a different diff.
+**Forcing a refresh.** When `next` reports `check_branch_freshness` with
+`materially_stale` or `conflicted`, run `wddctl refresh --task ID --repo .`
+rather than waiting for it to resolve itself — it merges the base into the
+task branch and re-records the head, deliberately invalidating any review
+or verification evidence pinned to the old one. Not wasted work: the diff
+against the base is genuinely different now.
 
 ## Failure modes and what to do
-
-**A task's branch goes stale.** `next` shows `check_branch_freshness` with
-a `materially_stale` classification (files the task touches, or that
-overlap its conflict domains, moved on the base since the task started).
-Run `wddctl refresh --task ID --repo .` — see above.
 
 **A refresh conflicts.**
 
 ```
-$ wddctl refresh --task TASK-B --repo .
-wddctl: refreshing TASK-B from wdd/demo2 conflicts in: src/b.ts; resolve it in the task worktree, then re-run
+$ wddctl refresh --task TASK-005-token-rotate --repo .
+wddctl: refreshing TASK-005-token-rotate from wdd/auth-refresh conflicts in:
+src/auth/tokens.ts; resolve it in the task worktree, then re-run
 ```
 
-Read this literally: `wddctl` already ran `git merge --abort` before
-printing that message. There are no conflict markers waiting for you in
-the worktree — `git status` there comes back clean. What you actually do
-is redo the merge yourself, by hand, in the task worktree:
+Read literally: `wddctl` already ran `git merge --abort` before printing
+that — `git status` in the worktree comes back clean, no conflict markers
+waiting for you. Redo the merge by hand, in the task worktree:
 
 ```
 $ cd <task worktree>
 $ git merge wdd/auth-refresh --no-edit
-Auto-merging src/b.ts
-CONFLICT (add/add): Merge conflict in src/b.ts
-$ # edit src/b.ts to resolve the conflict
-$ git add src/b.ts && git commit
+CONFLICT (content): Merge conflict in src/auth/tokens.ts
+$ # resolve the conflict in src/auth/tokens.ts
+$ git add src/auth/tokens.ts && git commit --no-edit
 ```
 
-After resolving by hand, run `wddctl refresh` again. It notices the branch
-already contains the base and adopts the head you produced:
+Run `wddctl refresh` again. It notices the branch already contains the
+base and adopts the head you produced:
 
 ```
-$ wddctl refresh --task TASK-B --repo .
-{
-  "action": "adopted_external_merge",
-  "previousHeadSha": "e7aa296...",
-  "headSha": "026ccd8...",
-  "note": "branch was already current; recorded its head and invalidated evidence"
-}
+$ wddctl refresh --task TASK-005-token-rotate --repo .
+{"action": "adopted_external_merge", "previousHeadSha": "a88f45d...",
+ "headSha": "e70a99c...", "duplicate": false, "revision": 33,
+ "note": "branch was already current; recorded its head and invalidated evidence"}
 ```
 
-Evidence is deliberately invalidated, because the commit that was reviewed
-and verified is no longer the tip. Review and verification reappear in
-`next`. `wddctl submit` does the same thing and is equally valid here —
-as far as `wddctl` is concerned, "resolved a conflict" and "have new work"
-are the same event.
+Evidence is deliberately invalidated: the reviewed commit is no longer the
+tip. `wddctl submit` does the same thing here and is equally valid — to
+`wddctl`, "resolved a conflict by hand" and "have new work" are the same
+event.
 
-**A worker returns `BLOCKED`.** Run `wddctl block --task ID --reason
-"..."`. This frees the task's conflict domains immediately so other tasks
-can proceed instead of waiting on a task that isn't moving.
-`wddctl unblock` returns it to the queue once the blocker is resolved
-(to `todo` if it never submitted, otherwise to `in_progress`);
-`wddctl cancel` if it's not coming back. Running `start` again after an
-unblock picks the task back up — re-attaching its worktree if one already
-exists rather than restarting the work.
+**A worker returns `BLOCKED`.** `wddctl block --task ID --reason "..."` —
+see above. Starting the task again after `unblock` re-attaches its
+worktree rather than restarting the work.
 
-**A P1 keeps reappearing.** If the same finding shows up on consecutive
-reviews after a claimed fix, the fix worker likely patched the symptom in
-a way the next commit's diff doesn't actually address the reviewer's
-concern, or the reviewer is being handed stale context. Read the actual
-diff between the two head SHAs yourself before dispatching a third fix
-attempt — don't assume the loop will converge by repetition alone.
-
-**Evidence invalidated by a new commit, and you didn't expect it.** This is
-almost always working as intended (see the fix-cycle transcript above) —
-but if a *verification* re-runs and now fails where it previously passed,
-that's a real regression the new commit introduced, not a bookkeeping
-artifact. Investigate the diff, don't just re-run verification hoping for
-a different answer.
+**A P1 keeps reappearing.** The fix worker likely patched the symptom
+without addressing what the reviewer flagged, or the reviewer is working
+from stale context. Read the diff between the two head SHAs yourself
+before dispatching a third attempt — don't assume repetition converges on
+its own.
 
 **`RevisionConflict` when two controllers share a scope.**
 
 ```
 $ wddctl note --note "..." --expected-revision 5
-wddctl: expected revision 5, found 14
+wddctl: expected revision 5, found 28
 ```
 
-This only happens when you explicitly pass `--expected-revision` — it's
-opt-in optimistic concurrency for the case where two controller processes
-(two agent sessions, a human and an agent, a script and a person) are
-racing on the same `state.json`. Re-read the current state
-(`wddctl status --json` or the error's own "found" value) and retry your
-call with the current revision. If you never pass `--expected-revision`,
-you cannot hit this — `wddctl` reads the live revision under the same lock
-that guards the write, so a lone controller never needs to think about it.
-
-**Constitution unratified.** Every mutating command except constitution
-commands refuses outright until `.wdd/constitution.md` has been ratified.
-`wddctl next` reports this as a blocker with no actions at all:
-
-```
-$ wddctl next
-{"actions": [], "blockers": [{"code": "constitution_unratified",
-  "message": "Run wddctl constitution ratify before execution."}]}
-```
-
-Run `wddctl constitution probe`, review what it inferred, and ratify — see
-`wdd-setup`.
+This only happens when you pass `--expected-revision` yourself — opt-in
+optimistic concurrency for two controllers racing on the same `state.json`.
+Re-read the current revision and retry. Omit the flag and you cannot hit
+this: `wddctl` reads the live revision under the same lock that guards the
+write.
 
 ## What is enforced vs. what is convention
 
@@ -419,66 +427,59 @@ trust the agent doing the work.
 
 **Enforced by the state machine — cannot be talked around:**
 
-- **Conflict-domain exclusion.** Checked inside `task.started` itself
-  (`admission_blocker`), not just advertised by `next`. Proven directly:
-  starting a task whose domain overlaps an active task fails even when you
-  bypass `next` and call `start` yourself —
-  `wddctl: task TASK-004-session-ui is not admissible yet: conflict_domains (src/client/session-events.ts)`.
-- **Dependency ordering.** A task with an unmet `dependsOn` cannot start;
-  `admission_blocker` returns a `dependencies` code, same enforcement path
-  as conflict domains.
-- **`scope.maxConcurrent`.** Once that many tasks are active, no further
-  task admits regardless of how free its domains are.
+- **Conflict-domain exclusion**, checked inside `task.started` itself, not
+  just advertised by `next`.
+- **Dependency ordering** — an unmet `dependsOn` blocks admission via the
+  same `admission_blocker` path as conflict domains.
+- **`scope.maxConcurrent`** — once that many tasks are active, nothing
+  further admits regardless of how free its domains are.
 - **Evidence pinned to head SHA.** `review.recorded` and
-  `verification.recorded` both reject data whose `headSha` doesn't match
-  the task's current head. A new commit — from a fix, or a `refresh` —
-  clears both fields outright; there is no code path to carry old evidence
-  forward onto a new commit.
-- **Git-verified merge.** `task.merged` requires `data.mergeVerified is
-  True`, which `wddctl merge` only sets after calling
-  `git merge-base --is-ancestor` for real. You cannot construct a call to
-  `event apply` that fakes this without actually performing a real,
-  verifiable merge first.
+  `verification.recorded` reject data whose `headSha` doesn't match the
+  current head; a new commit clears both fields outright.
+- **Git-verified merge.** `task.merged` requires a real
+  `git merge-base --is-ancestor` to have passed; no way to fake it.
+- **Governance drift.** An unratified edit to `config.json` or
+  `constitution.md` blocks every governed verb until `amend` re-signs it —
+  checked live from the files, no proposal snapshot required.
 
-**Convention — depends on the agent actually reading and following the
-skill:**
+**Convention — depends on the agent reading and following the skill:**
 
-- **Conflict-domain accuracy.** The state machine enforces that two tasks
-  sharing a listed domain don't run concurrently. It has no way to know if
-  a task's `conflictDomains` list is *missing* a file it actually writes.
-  If a worker strays outside its declared domains, nothing stops it —
-  that's the `wdd-worker` skill's "stay in scope" instruction doing
-  unenforced work, and the `wdd-review` skill's "diff stays inside declared
-  domains" check is the backstop, also unenforced beyond a reviewer
-  actually looking.
-- **Review quality.** `review record` will happily accept `--findings '[]'`
-  from a reviewer that didn't actually read the diff. The severity
-  classification, the decision to flag something as P1 versus P3 — all of
-  it is judgment the schema validates the *shape* of, not the *substance*
-  of.
-- **Task decomposition and sizing.** Nothing checks that a task is "one
-  independently executable unit" as `wdd-plan` recommends. You can write a
-  `plan.json` with one task that touches the entire repository, and
-  `plan apply` will accept it.
-- **`.wdd/shared-context/`.** `wddctl` never writes to this directory —
-  it's a plain folder of Markdown files that only exists because a
-  controller chooses to write into it. This matters more than it sounds:
-  `wddctl note`'s pending notes live only in `state.json`'s
-  `reconcile.pendingNotes`, and `reconcile done` deletes them — not marks
-  them resolved, deletes them. The event log doesn't even retain the note
-  text, only that a `note.added` event happened. If a discovery matters
-  beyond the moment reconciliation clears, the controller must write it
-  into `.wdd/shared-context/` *before* calling `reconcile done`; nothing
-  else will remember it.
-- **Verification honesty.** `verify record --status passed` takes your
-  word for it. The `wdd-run` skill's explicit instruction — "never record
-  `passed` you didn't observe" — is the only thing standing between this
-  and a rubber stamp.
+- **Conflict-domain accuracy.** Nothing checks whether a task's declared
+  domains are *missing* a file it actually writes — `wdd-worker`'s "stay
+  in scope" instruction, backstopped by an equally unenforced reviewer
+  check.
+- **Review and verification honesty.** `review record` and
+  `verify record --status passed` take your word for it; the schema
+  validates shape, not substance.
+- **Task decomposition and sizing.** Nothing stops a `plan.json` with one
+  task that touches the entire repository.
+- **Plan approval.** `--approved-by NAME` records who signed off, but
+  nothing refuses an apply that omits it — refusing an unapproved plan is
+  `wdd-plan`'s instruction, not a gate the state machine enforces.
+- **`.wdd/shared-context/`.** A plain folder `wddctl` never writes to; a
+  discovery that must survive `reconcile done` needs a controller to write
+  it there itself.
 
-The pattern across every enforced item: it's something a state machine can
-check mechanically from Git and JSON alone (does this SHA match, is this
-task active, is this ref an ancestor of that one). Everything on the
-convention list requires understanding what the code actually does — and
-that's exactly the half of the job WDD deliberately leaves to agents and
-skills rather than trying, and failing, to encode into a transition
+The pattern: every enforced item is checkable mechanically from Git and
+JSON alone — does this SHA match, is this ref an ancestor of that one, does
+this fingerprint match. Everything on the convention list requires
+understanding what the code actually does — exactly the half of the job
+WDD leaves to agents and skills rather than encoding into a transition
 function.
+
+## Appendix: driving `wddctl` yourself
+
+Everything above assumes an agent is running the commands. Nothing stops
+you from running them directly: scripting a CI step against `wddctl status
+--json`, debugging why a task won't admit, or preferring a terminal to a
+chat transcript. `docs/wddctl.md` is written for that audience — full flag
+reference, every JSON shape, no assumed narrative. Every transcript above is
+the literal command a person or an agent would type; there's no separate
+"human syntax."
+
+One thing changes: the hard rule binding an agent to a skill's obligations
+doesn't apply to you. You can apply an unapproved plan or record a
+verification you didn't run — nothing in `wddctl` stops a human operator,
+because those obligations live in the skills, and you aren't reading one.
+"Enforced vs. convention" above still tells you exactly what Git and JSON
+catch regardless of who's typing, and what's on you either way.
