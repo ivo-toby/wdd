@@ -41,7 +41,7 @@ from .leases import release_task, start_task, submit_task
 from .merge import merge_task, refresh_task
 from .migration import apply_migration, plan_migration
 from .monitor import monitor_once
-from .plan import apply_config_defaults, apply_plan, read_plan, state_from_plan
+from .plan import apply_config_defaults, apply_plan, apply_risk_rules, read_plan, state_from_plan
 from .review import record_review, record_verification, validate_findings
 from .store import StateStore
 
@@ -388,7 +388,9 @@ def main(argv: list[str] | None = None) -> int:
             wdd_dir = store.path.parent
             if config_path(wdd_dir).exists():
                 raw_plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
-                plan = apply_config_defaults(plan, raw_plan["scope"], load_config(wdd_dir))
+                config = load_config(wdd_dir)
+                plan = apply_config_defaults(plan, raw_plan["scope"], config)
+                plan = apply_risk_rules(plan, config)
             _print_json(
                 apply_plan(
                     store,

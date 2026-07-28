@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .domains import domains_overlap
 from .engine import apply_mutation
 from .errors import IllegalTransition, ValidationError
 from .git import branch_exists, require_repository, resolve_ref, run_git, validate_ref_name
@@ -147,6 +148,31 @@ def apply_config_defaults(
     if "maxConcurrent" not in raw_scope:
         scope["maxConcurrent"] = config["concurrency"]["maxConcurrent"]
     return {**plan_dict, "scope": scope}
+
+
+def apply_risk_rules(plan_dict: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Derive each task's risk from config riskRules; upward only.
+
+    Overlap semantics come from domains.py deliberately: where a rule and a
+    domain might cover the same file, the answer is "they overlap" — a task
+    wrongly reviewed costs a review, a task wrongly unreviewed costs a merge.
+    """
+    high_patterns = [
+        rule["pattern"] for rule in config.get("riskRules", []) if rule["risk"] == "high"
+    ]
+    if not high_patterns:
+        return plan_dict
+    tasks = []
+    for entry in plan_dict["tasks"]:
+        derived = entry["risk"]
+        if derived != "high" and any(
+            domains_overlap(pattern, domain)
+            for pattern in high_patterns
+            for domain in entry["conflictDomains"]
+        ):
+            derived = "high"
+        tasks.append({**entry, "risk": derived})
+    return {**plan_dict, "tasks": tasks}
 
 
 def state_from_plan(plan: dict[str, Any]) -> dict[str, Any]:
