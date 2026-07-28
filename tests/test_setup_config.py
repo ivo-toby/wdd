@@ -563,5 +563,61 @@ class GovernanceMigrationTest(unittest.TestCase):
             self.assertFalse(result["migrated"])
 
 
+class EndToEndSetupTest(unittest.TestCase):
+    def _cli(self, state: str, *argv: str) -> dict:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = main(["--state", state, *argv])
+        self.assertEqual(code, 0, f"wddctl {' '.join(argv)} failed")
+        return json.loads(stdout.getvalue())
+
+    def test_full_setup_reaches_start_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            (root / "README.md").write_text("seed\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c", "user.email=t@t",
+                    "-c", "user.name=t",
+                    "-c", "commit.gpgsign=false",
+                    "commit", "-qm", "seed",
+                ],
+                cwd=root, check=True,
+            )
+            wdd = root / ".wdd"
+            state = str(wdd / "state.json")
+
+            payload = self._cli(state, "init", "--repo", str(root))
+            self.assertFalse(payload["alreadyInitialized"])
+
+            payload = self._cli(state, "next")
+            self.assertEqual(payload["actions"][0]["action"], "resolve_config")
+
+            self._cli(state, "config", "set", "merge.surface", "local")
+            self._cli(state, "config", "set", "verification.commands", '["true"]')
+
+            payload = self._cli(state, "next")
+            self.assertEqual(payload["actions"][0]["action"], "ratify")
+
+            self._cli(state, "constitution", "ratify", "--by", "test")
+
+            payload = self._cli(state, "next")
+            self.assertEqual(payload["actions"][0]["action"], "plan")
+
+            plan_file = root / "plan.json"
+            plan = _minimal_plan()
+            plan["scope"]["baseRef"] = "wdd/demo"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            (wdd / "tasks").mkdir(exist_ok=True)
+            (wdd / "tasks" / "TASK-001-first.md").write_text("# Brief\n", encoding="utf-8")
+            self._cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+
+            payload = self._cli(state, "next", "--repo", str(root))
+            actions = [action["action"] for action in payload["actions"]]
+            self.assertIn("start_task", actions)
+
+
 if __name__ == "__main__":
     unittest.main()
