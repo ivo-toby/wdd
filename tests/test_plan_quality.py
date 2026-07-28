@@ -75,6 +75,28 @@ class RiskRulesTest(unittest.TestCase):
         out = apply_risk_rules(plan, self._config([{"pattern": "**", "risk": "high"}]))
         self.assertEqual(out["tasks"][0]["risk"], "normal")
 
+    def test_non_todo_task_keeps_stored_risk_on_new_matching_rule(self) -> None:
+        # A riskRule ratified mid-scope must not re-derive risk for a task
+        # that already left "todo" — that field becomes immutable the moment
+        # a task starts, so re-deriving it would make every later re-apply of
+        # the same plan file refuse forever (the exact bug this guards).
+        plan = _plan([
+            _task("T1", domains=["src/auth/token.py"]),
+            _task("T2", domains=["src/auth/session.py"]),
+        ])
+        state = {
+            "tasks": {
+                "T1": {"status": "in_progress", "risk": "normal"},
+                "T2": {"status": "todo", "risk": "normal"},
+            }
+        }
+        out = apply_risk_rules(
+            plan, self._config([{"pattern": "src/auth/**", "risk": "high"}]), state
+        )
+        by_id = {entry["id"]: entry for entry in out["tasks"]}
+        self.assertEqual(by_id["T1"]["risk"], "normal")
+        self.assertEqual(by_id["T2"]["risk"], "high")
+
 
 def _codes(findings: list[dict]) -> set[str]:
     return {finding["code"] for finding in findings}
@@ -340,6 +362,60 @@ class ConfigOverlayEndToEndTest(unittest.TestCase):
             adopted = StateStore(wdd / "state.json").read()
             self.assertEqual(adopted["reconcile"]["everyNMerges"], 5)
             self.assertEqual(adopted["scope"]["maxConcurrent"], 2)
+
+
+class MidScopeRiskRuleReapplyTest(unittest.TestCase):
+    def test_started_task_survives_new_matching_risk_rule_on_reapply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            state = str(wdd / "state.json")
+            self.assertEqual(_cli(state, "init", "--repo", str(root))[0], 0)
+            self.assertEqual(_cli(state, "config", "set", "merge.surface", "local")[0], 0)
+            config = load_config(wdd)
+            if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
+                self.assertEqual(
+                    _cli(state, "config", "set", "verification.commands", '["true"]')[0], 0
+                )
+            self.assertEqual(_cli(state, "constitution", "ratify", "--by", "t")[0], 0)
+
+            plan = _plan([_task("T1", domains=["src/auth/**"])])
+            plan["scope"]["baseRef"] = "wdd/scope-q"
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            code, _ = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertEqual(code, 0)
+
+            code, _ = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0)
+            self.assertEqual(StateStore(wdd / "state.json").read()["tasks"]["T1"]["status"], "in_progress")
+
+            code, _ = _cli(
+                state, "config", "set", "riskRules",
+                '[{"pattern": "src/auth/**", "risk": "high"}]',
+            )
+            self.assertEqual(code, 0)
+            code, _ = _cli(state, "constitution", "amend", "--by", "t")
+            self.assertEqual(code, 0)
+
+            # Re-applying the identical plan file must not refuse: T1 is
+            # in_progress and the new rule now matches its domain, but its
+            # stored risk ("normal") must be left alone.
+            code, out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            after = StateStore(wdd / "state.json").read()
+            self.assertEqual(after["tasks"]["T1"]["risk"], "normal")
+
+            # Adding a brand-new task to the same plan file must re-apply
+            # cleanly, with the new task's risk derived (high) since it was
+            # never in the "todo → started" path T1 went through.
+            plan["tasks"].append(_task("T2", domains=["src/auth/session.py"]))
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            code, out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            after = StateStore(wdd / "state.json").read()
+            self.assertEqual(after["tasks"]["T1"]["risk"], "normal")
+            self.assertEqual(after["tasks"]["T2"]["risk"], "high")
 
 
 if __name__ == "__main__":

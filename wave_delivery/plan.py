@@ -150,20 +150,36 @@ def apply_config_defaults(
     return {**plan_dict, "scope": scope}
 
 
-def apply_risk_rules(plan_dict: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+def apply_risk_rules(
+    plan_dict: dict[str, Any], config: dict[str, Any], state: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Derive each task's risk from config riskRules; upward only.
 
     Overlap semantics come from domains.py deliberately: where a rule and a
     domain might cover the same file, the answer is "they overlap" — a task
     wrongly reviewed costs a review, a task wrongly unreviewed costs a merge.
+
+    A newly ratified riskRule can match a task that already left "todo".
+    Re-deriving its risk would make `_apply_plan_to_state`'s immutability
+    check refuse the (identical, otherwise-unrelated) re-apply of the plan
+    file forever after, since risk is a MUTABLE_TASK_FIELD only while a task
+    is still todo. When `state` is given, tasks it already tracks with a
+    non-todo status keep their stored risk instead of the freshly derived
+    one — derivation still applies in full to todo tasks and to tasks new
+    to the plan.
     """
     high_patterns = [
         rule["pattern"] for rule in config.get("riskRules", []) if rule["risk"] == "high"
     ]
     if not high_patterns:
         return plan_dict
+    state_tasks = state["tasks"] if state is not None else {}
     tasks = []
     for entry in plan_dict["tasks"]:
+        existing = state_tasks.get(entry["id"])
+        if existing is not None and existing["status"] != "todo":
+            tasks.append({**entry, "risk": existing["risk"]})
+            continue
         derived = entry["risk"]
         if derived != "high" and any(
             domains_overlap(pattern, domain)

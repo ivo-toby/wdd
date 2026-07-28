@@ -377,7 +377,8 @@ def _overlaid_plan(args: argparse.Namespace, store: StateStore) -> tuple[dict[st
         raw_plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
         config = load_config(wdd_dir)
         plan = apply_config_defaults(plan, raw_plan["scope"], config)
-        plan = apply_risk_rules(plan, config)
+        state = store.read() if store.exists() else None
+        plan = apply_risk_rules(plan, config, state)
     return plan, wdd_dir
 
 
