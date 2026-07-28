@@ -27,6 +27,7 @@ from wave_delivery.schema import (
     new_state,
     validate_state,
 )
+from wave_delivery.plan import apply_plan
 from wave_delivery.setup import CONSTITUTION_TEMPLATE, init_repository, setup_next_actions
 from wave_delivery.store import StateStore
 
@@ -409,6 +410,51 @@ class LegacyStateRoutingTest(unittest.TestCase):
             # Find the constitution_unratified blocker
             blockers = payload.get("blockers", [])
             self.assertTrue(any(b.get("code") == "constitution_unratified" for b in blockers))
+
+
+def _minimal_plan() -> dict:
+    return {
+        "schemaVersion": 1,
+        "kind": "wdd_plan",
+        "scope": {
+            "id": "SCOPE-demo",
+            "baseRef": None,
+            "maxConcurrent": 2,
+            "reviewPolicy": "risk_based",
+            "reconcileEveryNMerges": 3,
+        },
+        "tasks": [
+            {
+                "id": "TASK-001-first",
+                "title": "First task",
+                "specPath": "tasks/TASK-001-first.md",
+                "risk": "normal",
+                "dependsOn": [],
+                "conflictDomains": ["src/**"],
+            }
+        ],
+    }
+
+
+class PlanAdoptionTest(unittest.TestCase):
+    def test_apply_onto_setup_state_adopts_scope_and_keeps_ratification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            init_repository(wdd, root)
+            store = StateStore(wdd / "state.json")
+            state = store.read()
+            state["constitution"] = {
+                "status": "ratified",
+                "ratification": {"by": "ivo", "decisionFingerprint": "sha256:abc"},
+            }
+            store.write(state)
+            result = apply_plan(store, _minimal_plan())
+            self.assertFalse(result["created"])
+            adopted = store.read()
+            self.assertEqual(adopted["scope"]["id"], "SCOPE-demo")
+            self.assertIn("TASK-001-first", adopted["tasks"])
+            self.assertEqual(adopted["constitution"]["status"], "ratified")
 
 
 if __name__ == "__main__":

@@ -148,6 +148,14 @@ def state_from_plan(plan: dict[str, Any]) -> dict[str, Any]:
 
 
 def _diff_plan(state: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    if state["scope"] is None:
+        scope_changes = dict(plan["scope"])
+        return {
+            "added": sorted(entry["id"] for entry in plan["tasks"]),
+            "removed": [],
+            "updated": [],
+            "scope": scope_changes,
+        }
     planned = {entry["id"]: entry for entry in plan["tasks"]}
     existing = state["tasks"]
     added = sorted(set(planned) - set(existing))
@@ -177,6 +185,17 @@ def _diff_plan(state: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
 def _apply_plan_to_state(state: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
     state = copied_state(state)
     planned = {entry["id"]: entry for entry in plan["tasks"]}
+
+    if state["scope"] is None:
+        # An init-created state has no scope yet; the first plan apply adopts
+        # it while keeping ratification and event history.
+        state["scope"] = {
+            "id": plan["scope"]["id"],
+            "baseRef": plan["scope"]["baseRef"],
+            "maxConcurrent": plan["scope"]["maxConcurrent"],
+            "reviewPolicy": plan["scope"]["reviewPolicy"],
+        }
+        state["reconcile"]["everyNMerges"] = plan["scope"]["reconcileEveryNMerges"]
 
     if plan["scope"]["id"] != state["scope"]["id"]:
         raise IllegalTransition(
