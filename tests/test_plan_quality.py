@@ -113,5 +113,46 @@ class LintRiskDistributionTest(unittest.TestCase):
         self.assertNotIn("uniform_risk", _codes(lint_plan(plan)))
 
 
+class LintDomainGranularityTest(unittest.TestCase):
+    def test_enumerated_file_list_warns_with_glob_suggestion(self) -> None:
+        plan = _plan([
+            _task("T1", domains=[
+                "src/ah/constants.py", "src/ah/endpoints.py",
+                "src/ah/errors.py", "src/ah/types.py",
+            ]),
+            _task("T2", domains=["docs/**"]),
+        ])
+        findings = [f for f in lint_plan(plan) if f["code"] == "enumerated_domains"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["task"], "T1")
+        self.assertIn("src/ah/**", findings[0]["message"])
+
+    def test_three_files_same_dir_is_clean(self) -> None:
+        plan = _plan([
+            _task("T1", domains=["src/a.py", "src/b.py", "src/c.py"]),
+            _task("T2", domains=["docs/**"]),
+        ])
+        self.assertNotIn("enumerated_domains", _codes(lint_plan(plan)))
+
+    def test_coarse_domain_overlapping_most_tasks_warns(self) -> None:
+        plan = _plan([
+            _task("T1", domains=["src/**"]),
+            _task("T2", domains=["src/api/**"]),
+            _task("T3", domains=["src/db/**"]),
+            _task("T4", domains=["src/ui/**"]),
+        ])
+        findings = [f for f in lint_plan(plan) if f["code"] == "coarse_domain"]
+        self.assertTrue(any("src/**" in f["message"] and f["task"] == "T1" for f in findings))
+
+    def test_disjoint_domains_are_clean(self) -> None:
+        plan = _plan([
+            _task("T1", domains=["src/api/**"]),
+            _task("T2", domains=["src/db/**"]),
+            _task("T3", domains=["docs/**"]),
+            _task("T4", domains=["tests/**"]),
+        ])
+        self.assertNotIn("coarse_domain", _codes(lint_plan(plan)))
+
+
 if __name__ == "__main__":
     unittest.main()

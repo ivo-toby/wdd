@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .domains import WILDCARDS, domains_overlap
 from .engine import admission_schedule
 from .plan import state_from_plan
 
@@ -58,10 +59,67 @@ def _check_risk_distribution(plan_dict: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _check_enumerated_domains(plan_dict: dict[str, Any]) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for entry in plan_dict["tasks"]:
+        by_dir: dict[str, int] = {}
+        for domain in entry["conflictDomains"]:
+            if any(wildcard in domain for wildcard in WILDCARDS):
+                continue
+            directory, _, _ = domain.rpartition("/")
+            if directory:
+                by_dir[directory] = by_dir.get(directory, 0) + 1
+        for directory, count in sorted(by_dir.items()):
+            if count >= 4:
+                findings.append(
+                    {
+                        "code": "enumerated_domains",
+                        "severity": "warning",
+                        "task": entry["id"],
+                        "message": (
+                            f"{entry['id']} lists {count} individual files under "
+                            f"{directory}/ — consider the glob {directory}/** unless "
+                            "another task must write there concurrently."
+                        ),
+                    }
+                )
+    return findings
+
+
+def _check_coarse_domains(plan_dict: dict[str, Any]) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    tasks = plan_dict["tasks"]
+    for entry in tasks:
+        for domain in entry["conflictDomains"]:
+            others = sum(
+                1
+                for other in tasks
+                if other["id"] != entry["id"]
+                and any(domains_overlap(domain, other_domain)
+                        for other_domain in other["conflictDomains"])
+            )
+            if others >= 3:
+                findings.append(
+                    {
+                        "code": "coarse_domain",
+                        "severity": "warning",
+                        "task": entry["id"],
+                        "message": (
+                            f"domain {domain!r} on {entry['id']} overlaps {others} other "
+                            "tasks — it will serialize them all; narrow it to what the "
+                            "task actually writes."
+                        ),
+                    }
+                )
+    return findings
+
+
 def lint_plan(
     plan_dict: dict[str, Any], wdd_dir: Path | str | None = None
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     findings.extend(_check_serialization(plan_dict))
     findings.extend(_check_risk_distribution(plan_dict))
+    findings.extend(_check_enumerated_domains(plan_dict))
+    findings.extend(_check_coarse_domains(plan_dict))
     return findings
