@@ -363,5 +363,53 @@ class SetupNextTest(unittest.TestCase):
             self.assertEqual(payload["actions"][0]["action"], "resolve_config")
 
 
+class LegacyStateRoutingTest(unittest.TestCase):
+    def test_legacy_state_with_scope_and_no_config_status(self) -> None:
+        """Verify status falls back to execute-phase when config.json is missing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            wdd.mkdir(parents=True)
+
+            # Create legacy state with scope but no config.json
+            state = new_state("SCOPE-legacy", base_ref="wdd/legacy")
+            StateStore(wdd / "state.json").write(state)
+
+            # Write minimal constitution to avoid unrelated errors
+            (wdd / "constitution.md").write_text("# Constitution\n", encoding="utf-8")
+
+            # status should exit 0 and output scope in JSON (not setup phase)
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--state", str(wdd / "state.json"), "status", "--json"])
+            self.assertEqual(code, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["scope"]["id"], "SCOPE-legacy")
+
+    def test_legacy_state_with_scope_and_no_config_next(self) -> None:
+        """Verify next falls back to execute-phase when config.json is missing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            wdd.mkdir(parents=True)
+
+            # Create legacy state with scope but no config.json
+            state = new_state("SCOPE-legacy", base_ref="wdd/legacy")
+            StateStore(wdd / "state.json").write(state)
+
+            # Write minimal constitution to avoid unrelated errors
+            (wdd / "constitution.md").write_text("# Constitution\n", encoding="utf-8")
+
+            # next should exit 0 and have constitution_unratified blocker
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--state", str(wdd / "state.json"), "next"])
+            self.assertEqual(code, 0)
+            payload = json.loads(stdout.getvalue())
+            # Find the constitution_unratified blocker
+            blockers = payload.get("blockers", [])
+            self.assertTrue(any(b.get("code") == "constitution_unratified" for b in blockers))
+
+
 if __name__ == "__main__":
     unittest.main()

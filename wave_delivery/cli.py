@@ -371,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "status":
             state = store.read()
-            if derived_phase(state) == "setup":
+            if derived_phase(state) == "setup" and (state["scope"] is None or config_path(store.path.parent).exists()):
                 config = load_config(store.path.parent)
                 _print_json(
                     {
@@ -388,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "next":
             state = store.read()
-            if derived_phase(state) == "setup":
+            if derived_phase(state) == "setup" and (state["scope"] is None or config_path(store.path.parent).exists()):
                 _print_json(
                     setup_next_actions(
                         state, store.path.parent, state_path=_state_option(args)
