@@ -254,14 +254,56 @@ JSON-block constitution has its machine values extracted into
 invalidated (the fingerprint changed — deliberately, so the user sees the
 new split once and re-ratifies).
 
+## Consolidation direction (decided 2026-07-28)
+
+There will be **one product**, living in this repository. The Jira
+connector is built here as a first-class `taskProvider` in a later phase;
+wdd-enterprise shrinks to a thin internal overlay: a pinned version of
+this package, an org config preset (`merge.mode: human`,
+`taskProvider: jira` with org defaults, P2 exception policy), the
+adoption docs, and nothing else. Audit of wdd-enterprise (2026-07-28)
+found all skill/fixture content already synthetic; internal references
+exist only in `renovate.json`, `docs/adoption/`, and git history.
+
+Additional knobs the enterprise preset needs, to be specified in the
+phase-2 provider design: `review.p2ExceptionPolicy`
+(`none` | `recorded-operator-exception`) and the Jira provider config
+(project, CLI, sync-blocking behavior, task↔issue adapter map). Provider
+hooks fire on state transitions; a sync failure is a first-class
+per-task blocker, not a scope-wide halt.
+
+### Leak-prevention policy (binding for all phases)
+
+Nothing from Contentful's internal workflows may reach this public
+repository:
+
+1. **No history transplant.** Content moving from wdd-enterprise
+   (fake-jira fixture, `fake_acli.py`, test patterns) is copied as fresh
+   commits authored here — never merged, cherry-picked, or subtreed from
+   the enterprise remote, whose history carries internal ticket
+   references and bot authors.
+2. **Clean-room Jira provider.** Written from this design plus public
+   Atlassian documentation. Enterprise skills may be read to extract
+   requirements; requirements flow through a spec — enterprise prose is
+   never copied into public files.
+3. **The overlay repo permanently owns anything org-shaped**: renovate
+   config, adoption docs, real Jira project keys, org model names, team
+   process prose. None of these ever appear here.
+4. **CI guard.** A deny-list check in this repo fails the build on
+   company terms, internal hostname patterns, and real-looking Jira keys
+   outside the synthetic prefixes (`PROJ-`, `STUB-`, `TASK-`, `SCOPE-`,
+   `EPIC-`).
+5. **Ambiguity defaults to the overlay.** If it is unclear whether
+   something is generic practice or internal workflow, it stays
+   internal.
+
 ## Non-goals this round
 
-- No Jira provider implementation (`taskProvider` schema stub only).
+- No Jira provider implementation (`taskProvider` schema stub only); the
+  provider and the enterprise overlay migration are phase 2, after this
+  design is implemented and proven.
 - No changes to admission-engine semantics; no wave barriers or
   checkpoint groups (revisit only on demonstrated need).
-- No consolidation of the two repositories yet; this design keeps the
-  seams (`taskProvider`, `merge.surface`, `merge.mode`) so the enterprise
-  port becomes configuration plus a Jira adapter.
 
 ## Configuration matrix
 
