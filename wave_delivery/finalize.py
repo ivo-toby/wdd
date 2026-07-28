@@ -25,6 +25,7 @@ supplies the revisioned/idempotent/locked envelope" pattern
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -424,3 +425,167 @@ def record_delivered(
         mutator=mutator,
     )
     return {**outcome, "revision": state["revision"], "duplicate": duplicate}
+
+
+def finalize_next_actions(
+    state: dict[str, Any],
+    wdd_dir: Path | str,
+    repo: Path | str,
+    *,
+    state_path: str | None = None,
+) -> dict[str, Any]:
+    """The finalize-phase counterpart of setup.setup_next_actions.
+
+    Same output shape and the same one-action-at-a-time discipline: once a
+    scope reaches finalize, exactly one rung of Spec Sec6's ladder is "the"
+    next thing to do, in priority order --
+
+      1. final_review     -- review absent, or stale against the current
+                              base head (a fresh-but-blocked review is NOT
+                              this rung; see assign_final_fixes below. New
+                              commits landed to address blocking findings
+                              re-stale the review and land back here
+                              naturally, so this rung also covers the
+                              "review fixes went in" loop-back).
+      2. assign_final_fixes -- review present, fresh, and blocked: no
+                              command exists for this (the fix is new
+                              commits on the base branch, which is exactly
+                              what re-stales the review above).
+      3. final_verification -- review passed+fresh; verification absent,
+                              not passed, or stale.
+      4. prepare_handoff   -- review and verification both passed+fresh;
+                              no handoff recorded, or the handoff itself is
+                              stale (handoff.headSha != current base head).
+                              In practice a new base commit re-stales review
+                              and verification at the same time (they are
+                              all three pinned to the same SHA), so rung 1
+                              or 3 will already have fired before this
+                              staleness is ever independently observable --
+                              the check exists anyway for defense in depth
+                              and because Task 3's own handoff precondition
+                              (_require_current_finalize_evidence) already
+                              treats "the base branch moved since I read it"
+                              as a first-class failure mode.
+      5. await_delivery    -- handoff recorded and fresh: nothing left to
+                              run, only the human-owned final merge to wait
+                              on (Spec Sec6: wddctl never performs it).
+
+    Unlike engine.py, this module already reads config.json directly
+    (record_final_review, prepare_handoff, ...) -- it lives outside
+    engine.py specifically so scope-level choreography can do that, the
+    same way setup_next_actions reads config for its own open-questions
+    gate. ``models.review`` is attached to final_review the same way
+    engine.decorate_actions attaches it to a task-level run_review action.
+    """
+    wdd_dir = Path(wdd_dir)
+    scope_id = (state.get("scope") or {}).get("id")
+    phase = derived_phase(state)
+    if phase == "delivered":
+        return {
+            "scope": scope_id,
+            "revision": state["revision"],
+            "phase": "delivered",
+            "actions": [],
+            "blockers": [],
+        }
+
+    prefix = "wddctl" + (f" --state {shlex.quote(state_path)}" if state_path else "")
+    repo_arg = shlex.quote(str(repo))
+    repo_path = require_repository(repo)
+    base_sha = resolve_ref(repo_path, _base_ref(state))
+
+    finalize = state.get("finalize") or {}
+    review = finalize.get("review")
+    verification = finalize.get("verification")
+    handoff = finalize.get("handoff")
+
+    review_fresh = isinstance(review, dict) and review.get("headSha") == base_sha
+    verification_fresh = (
+        isinstance(verification, dict) and verification.get("headSha") == base_sha
+    )
+    handoff_fresh = isinstance(handoff, dict) and handoff.get("headSha") == base_sha
+
+    action: dict[str, Any]
+    if review is None or not review_fresh:
+        action = {
+            "task": "-",
+            "action": "final_review",
+            "recordWith": (
+                f"{prefix} finalize review record --reviewer NAME --findings '[]' "
+                f"--repo {repo_arg}"
+            ),
+            "judgment": (
+                "dispatch a reviewer against the whole epic branch diff, per wdd-review's "
+                "final-review contract, checked against .wdd/spec.md"
+            ),
+        }
+        config = load_config(wdd_dir) if config_path(wdd_dir).exists() else None
+        model = (config["models"].get("review") if config else None)
+        if isinstance(model, str) and model:
+            action["model"] = model
+    elif review.get("outcome") == "blocked":
+        blocking = _blocking_severities(wdd_dir)
+        findings = [f for f in review.get("findings", []) if f.get("severity") in blocking]
+        named = "; ".join(f"{f['severity']}: {f['summary']}" for f in findings)
+        action = {
+            "task": "-",
+            "action": "assign_final_fixes",
+            "judgment": (
+                f"assign fixes for the blocking findings from the final review ({named}); "
+                "new commits on the base branch re-stale the review, which brings the scope "
+                "back to final_review automatically"
+            ),
+            "findings": findings,
+        }
+    elif (
+        verification is None
+        or not verification_fresh
+        or verification.get("status") != "passed"
+    ):
+        action = {
+            "task": "-",
+            "action": "final_verification",
+            "recordWith": (
+                f"{prefix} finalize verify record --status passed "
+                f"--command '<verification command>' --repo {repo_arg}"
+            ),
+            "judgment": "run full verification against the current epic branch head and record the result",
+        }
+    elif handoff is None or not handoff_fresh:
+        action = {
+            "task": "-",
+            "action": "prepare_handoff",
+            "command": f"{prefix} finalize handoff --repo {repo_arg}",
+            "judgment": (
+                "push the epic branch and open the handoff to the human who performs the "
+                "final merge (pr surface), or record local handoff instructions (local surface)"
+            ),
+        }
+    else:
+        target_branch = handoff.get("targetBranch")
+        pr = handoff.get("pr")
+        if pr:
+            reference = f"the handoff PR {pr}"
+        else:
+            base_ref = _base_ref(state)
+            reference = (
+                f"the local handoff: push {base_ref} to your remote and open a pull request "
+                f"into {target_branch} yourself; wddctl does not perform this on the local surface"
+            )
+        action = {
+            "task": "-",
+            "action": "await_delivery",
+            "recordWith": f"{prefix} finalize delivered --by NAME --repo {repo_arg}",
+            "judgment": (
+                f"wait for the human-owned final merge via {reference}; once it lands, record "
+                "it with recordWith so live Git can prove it happened"
+            ),
+        }
+
+    return {
+        "scope": scope_id,
+        "revision": state["revision"],
+        "phase": "finalize",
+        "actions": [action],
+        "blockers": [],
+    }

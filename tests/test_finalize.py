@@ -1144,5 +1144,248 @@ class FinalizeGovernedVerbTest(unittest.TestCase):
             self.assertIn("drift", err.lower())
 
 
+class FinalizeNextActionsLadderTest(unittest.TestCase):
+    """Task 4: `finalize_next_actions` drives the finalize ladder one rung at
+    a time (mirroring setup_next_actions' one-action-at-a-time shape):
+    final_review -> assign_final_fixes -> final_verification ->
+    prepare_handoff -> await_delivery -> delivered (empty)."""
+
+    def _actions(self, state_path: str, root: Path) -> dict:
+        from wave_delivery.finalize import finalize_next_actions
+
+        state = StateStore(Path(state_path)).read()
+        return finalize_next_actions(state, Path(state_path).parent, str(root))
+
+    def test_absent_review_yields_final_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            result = self._actions(state, root)
+            self.assertEqual(result["phase"], "finalize")
+            self.assertEqual(len(result["actions"]), 1)
+            action = result["actions"][0]
+            self.assertEqual(action["action"], "final_review")
+            self.assertIn("finalize review record", action["recordWith"])
+            self.assertNotIn("command", action)
+            self.assertIn("judgment", action)
+
+    def test_review_carries_configured_review_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            assert _cli(state, "config", "set", "models.review", '"claude-review-model"')[0] == 0
+            assert _cli(state, "constitution", "amend", "--by", "t")[0] == 0
+            result = self._actions(state, root)
+            self.assertEqual(result["actions"][0].get("model"), "claude-review-model")
+
+    def test_stale_review_yields_final_review_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "r",
+                "--findings", "[]", "--repo", str(root),
+            )
+            assert code == 0, out
+
+            from wave_delivery.git import integration_worktree_path
+
+            scope_state = StateStore(Path(state)).read()
+            integration = integration_worktree_path(root, scope_state["scope"]["id"])
+            (integration / "post_review_change.txt").write_text("late\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=integration, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+                 "commit", "-qm", "late change"],
+                cwd=integration, check=True,
+            )
+
+            result = self._actions(state, root)
+            self.assertEqual(result["actions"][0]["action"], "final_review")
+
+    def test_blocked_fresh_review_yields_assign_final_fixes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "r",
+                "--findings", '[{"severity":"P1","summary":"missing acceptance criterion"}]',
+                "--repo", str(root),
+            )
+            assert code == 0, out
+            result = self._actions(state, root)
+            action = result["actions"][0]
+            self.assertEqual(action["action"], "assign_final_fixes")
+            self.assertNotIn("command", action)
+            self.assertNotIn("recordWith", action)
+            self.assertIn("P1", action["judgment"])
+            self.assertIn("missing acceptance criterion", action["judgment"])
+
+    def test_passed_review_no_verification_yields_final_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "r",
+                "--findings", "[]", "--repo", str(root),
+            )
+            assert code == 0, out
+            result = self._actions(state, root)
+            action = result["actions"][0]
+            self.assertEqual(action["action"], "final_verification")
+            self.assertIn("finalize verify record", action["recordWith"])
+            self.assertNotIn("command", action)
+
+    def test_failed_verification_yields_final_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "r",
+                "--findings", "[]", "--repo", str(root),
+            )
+            assert code == 0, out
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--status", "failed",
+                "--command", "pytest -q", "--repo", str(root),
+            )
+            assert code == 0, out
+            result = self._actions(state, root)
+            self.assertEqual(result["actions"][0]["action"], "final_verification")
+
+    def test_both_passed_no_handoff_yields_prepare_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "r",
+                "--findings", "[]", "--repo", str(root),
+            )
+            assert code == 0, out
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--status", "passed",
+                "--command", "pytest -q", "--repo", str(root),
+            )
+            assert code == 0, out
+            result = self._actions(state, root)
+            action = result["actions"][0]
+            self.assertEqual(action["action"], "prepare_handoff")
+            self.assertIn("finalize handoff", action["command"])
+            self.assertNotIn("recordWith", action)
+
+    def test_handoff_recorded_and_fresh_yields_await_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "r",
+                "--findings", "[]", "--repo", str(root),
+            )
+            assert code == 0, out
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--status", "passed",
+                "--command", "pytest -q", "--repo", str(root),
+            )
+            assert code == 0, out
+            code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+            assert code == 0, out
+            result = self._actions(state, root)
+            action = result["actions"][0]
+            self.assertEqual(action["action"], "await_delivery")
+            self.assertIn("finalize delivered --by NAME", action["recordWith"])
+            self.assertNotIn("command", action)
+
+    def test_stale_handoff_yields_prepare_handoff_again(self) -> None:
+        # Not reachable through the normal CLI flow: a new commit that stales
+        # the handoff also stales review/verification (all three are pinned
+        # to the same base head SHA), which take priority in the ladder.
+        # This exercises the ladder's handoff-freshness predicate in
+        # isolation, per the plan's documented choice that prepare_handoff
+        # re-emits when handoff.headSha != the current base head.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "r",
+                "--findings", "[]", "--repo", str(root),
+            )
+            assert code == 0, out
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--status", "passed",
+                "--command", "pytest -q", "--repo", str(root),
+            )
+            assert code == 0, out
+            code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+            assert code == 0, out
+
+            store = StateStore(Path(state))
+            mutated = store.read()
+            mutated["finalize"]["handoff"]["headSha"] = "0" * 40
+            store.write(mutated)
+
+            result = self._actions(state, root)
+            self.assertEqual(result["actions"][0]["action"], "prepare_handoff")
+
+    def test_delivered_phase_yields_empty_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+            _deliver_scope(state, root)
+            result = self._actions(state, root)
+            self.assertEqual(result["phase"], "delivered")
+            self.assertEqual(result["actions"], [])
+
+
+class FinalizeNextLadderE2ETest(unittest.TestCase):
+    """Task 4: `wddctl next`/`wddctl status` route derived_phase in
+    {finalize, delivered} through the finalize ladder end-to-end, driven
+    entirely through the CLI (not calling finalize_next_actions directly)."""
+
+    def test_ladder_drives_next_and_status_to_delivered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, bare = _scope_in_finalize(tmp, surface="local")
+
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["phase"], "finalize")
+            self.assertEqual(result["actions"][0]["action"], "final_review")
+
+            code, out = _cli(state, "status")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["phase"], "finalize")
+
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "r",
+                "--findings", "[]", "--repo", str(root),
+            )
+            assert code == 0, out
+
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "final_verification")
+
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--status", "passed",
+                "--command", "pytest -q", "--repo", str(root),
+            )
+            assert code == 0, out
+
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "prepare_handoff")
+
+            code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+            assert code == 0, out
+
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "await_delivery")
+
+            _deliver_scope(state, root)
+
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["phase"], "delivered")
+            self.assertEqual(result["actions"], [])
+
+            code, out = _cli(state, "status")
+            self.assertEqual(code, 0, out)
+            status_result = json.loads(out)
+            self.assertEqual(status_result["phase"], "delivered")
+            self.assertTrue(status_result["finalize"].get("delivered"))
+
+
 if __name__ == "__main__":
     unittest.main()

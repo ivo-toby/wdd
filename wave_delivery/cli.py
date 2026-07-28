@@ -39,6 +39,7 @@ from .engine import (
 from .errors import IllegalTransition, ValidationError, WaveDeliveryError
 from .schema import derived_phase
 from .finalize import (
+    finalize_next_actions,
     finalize_status,
     prepare_handoff,
     record_delivered,
@@ -570,6 +571,9 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
                 return 0
+            if derived_phase(state) in {"finalize", "delivered"}:
+                _print_json(finalize_status(state))
+                return 0
             summary = status_summary(state)
             _print_json(summary) if args.json else print(_brief(summary))
             return 0
@@ -580,6 +584,13 @@ def main(argv: list[str] | None = None) -> int:
                 _print_json(
                     setup_next_actions(
                         state, store.path.parent, state_path=_state_option(args)
+                    )
+                )
+                return 0
+            if derived_phase(state) in {"finalize", "delivered"}:
+                _print_json(
+                    finalize_next_actions(
+                        state, store.path.parent, str(args.repo), state_path=_state_option(args)
                     )
                 )
                 return 0
