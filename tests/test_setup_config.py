@@ -9,8 +9,10 @@ from pathlib import Path
 
 from wave_delivery.cli import main
 from wave_delivery.config import (
+    check_ratifiable,
     default_config,
     get_value,
+    governance_fingerprint,
     load_config,
     save_config,
     set_value,
@@ -182,6 +184,48 @@ class MigrationV3Test(unittest.TestCase):
             # "backup", "notes"}. "to" is always SCHEMA_VERSION.
             self.assertEqual(result["from"], 3)
             self.assertEqual(result["to"], 4)
+
+
+def _write_governance(wdd: Path, *, questions: list | None = None) -> None:
+    config = default_config()
+    config["openQuestions"] = questions or []
+    save_config(wdd, config)
+    (wdd / "constitution.md").write_text("# Constitution\n\nProse only.\n", encoding="utf-8")
+
+
+class GovernanceFingerprintTest(unittest.TestCase):
+    def test_fingerprint_is_stable_and_prefixed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            _write_governance(wdd)
+            first = governance_fingerprint(wdd)
+            self.assertTrue(first.startswith("sha256:"))
+            self.assertEqual(first, governance_fingerprint(wdd))
+
+    def test_fingerprint_changes_when_constitution_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            _write_governance(wdd)
+            before = governance_fingerprint(wdd)
+            (wdd / "constitution.md").write_text("# Changed\n", encoding="utf-8")
+            self.assertNotEqual(before, governance_fingerprint(wdd))
+
+    def test_fingerprint_changes_when_config_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            _write_governance(wdd)
+            before = governance_fingerprint(wdd)
+            save_config(wdd, set_value(load_config(wdd), "merge.surface", "local"))
+            self.assertNotEqual(before, governance_fingerprint(wdd))
+
+    def test_ratifiable_refused_with_open_questions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            _write_governance(
+                wdd, questions=[{"path": "merge.surface", "question": "pr or local?"}]
+            )
+            with self.assertRaises(ValidationError):
+                check_ratifiable(wdd)
 
 
 if __name__ == "__main__":

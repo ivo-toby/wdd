@@ -7,6 +7,7 @@ this package has no runtime dependencies and keeps it that way.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -190,3 +191,37 @@ def set_value(config: dict[str, Any], dotted: str, value: Any) -> dict[str, Any]
     ]
     validate_config(updated)
     return updated
+
+
+def constitution_path(wdd_dir: Path | str) -> Path:
+    return Path(wdd_dir) / "constitution.md"
+
+
+def governance_fingerprint(wdd_dir: Path | str) -> str:
+    """One fingerprint over both governance files.
+
+    Ratifying signs the exact config values AND the exact constitution prose;
+    editing either afterwards is drift until an amend re-signs them.
+    """
+    config = load_config(wdd_dir)
+    try:
+        constitution = constitution_path(wdd_dir).read_text(encoding="utf-8")
+    except FileNotFoundError as error:
+        raise ValidationError(
+            f"constitution does not exist: {constitution_path(wdd_dir)}; run 'wddctl init'"
+        ) from error
+    encoded = (
+        json.dumps(config, sort_keys=True, separators=(",", ":")) + "\x00" + constitution
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def check_ratifiable(wdd_dir: Path | str) -> None:
+    config = load_config(wdd_dir)
+    open_questions = config["openQuestions"]
+    if open_questions:
+        paths = ", ".join(question["path"] for question in open_questions)
+        raise ValidationError(
+            f"cannot ratify: {len(open_questions)} open config question(s) remain ({paths}); "
+            "resolve them with 'wddctl config set' first"
+        )

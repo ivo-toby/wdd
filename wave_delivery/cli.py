@@ -13,7 +13,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .config import get_value, load_config, save_config, set_value
+from .config import (
+    check_ratifiable,
+    config_path,
+    get_value,
+    governance_fingerprint,
+    load_config,
+    save_config,
+    set_value,
+)
 from .constitution import probe_repository, ratification_status, read_proposal, write_proposal
 from .doctor import inspect_capabilities
 from .engine import (
@@ -23,7 +31,7 @@ from .engine import (
     render_to_path,
     status_summary,
 )
-from .errors import IllegalTransition, WaveDeliveryError
+from .errors import IllegalTransition, ValidationError, WaveDeliveryError
 from .freshness import check_freshness, record_freshness
 from .leases import release_task, start_task, submit_task
 from .merge import merge_task, refresh_task
@@ -250,7 +258,10 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         command = constitution_subparsers.add_parser(name, help=help_text)
         command.add_argument("--by", required=True)
-        fingerprint_source = command.add_mutually_exclusive_group(required=True)
+        # Optional since the fingerprint is now computed from .wdd/config.json +
+        # constitution.md; --decision-fingerprint / --proposal are legacy pins,
+        # kept for callers that want to assert what they were shown still matches.
+        fingerprint_source = command.add_mutually_exclusive_group(required=False)
         fingerprint_source.add_argument("--decision-fingerprint")
         fingerprint_source.add_argument("--proposal", type=Path)
         _add_concurrency_flags(command)
@@ -584,11 +595,33 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
         if args.command == "constitution" and args.constitution_command in {"ratify", "amend"}:
-            fingerprint = (
-                read_proposal(args.proposal)["decisionFingerprint"]
-                if args.proposal
-                else args.decision_fingerprint
-            )
+            wdd_dir = store.path.parent
+            result: dict[str, Any] = {}
+            # Legacy fallback: repos that predate config.json (e.g. no
+            # 'wddctl init' schema-v4 setup) have no governance file to
+            # fingerprint. Keep signing whatever the caller pins via
+            # --proposal/--decision-fingerprint for them; new repos with a
+            # config.json get the governance fingerprint and the
+            # openQuestions gate below.
+            if config_path(wdd_dir).exists():
+                check_ratifiable(wdd_dir)
+                fingerprint = governance_fingerprint(wdd_dir)
+                if args.decision_fingerprint and args.decision_fingerprint != fingerprint:
+                    raise ValidationError(
+                        "provided --decision-fingerprint does not match the current "
+                        "config.json + constitution.md; re-read the files before ratifying"
+                    )
+                if args.proposal:
+                    result["warning"] = (
+                        "--proposal is deprecated; the fingerprint now covers "
+                        ".wdd/config.json + constitution.md"
+                    )
+            else:
+                fingerprint = (
+                    read_proposal(args.proposal)["decisionFingerprint"]
+                    if args.proposal
+                    else args.decision_fingerprint
+                )
             state, duplicate = apply_event(
                 store,
                 event_type=f"constitution.{'ratified' if args.constitution_command == 'ratify' else 'amended'}",
@@ -596,7 +629,14 @@ def main(argv: list[str] | None = None) -> int:
                 data={"by": args.by, "decisionFingerprint": fingerprint},
                 **_concurrency(args),
             )
-            _print_json({"revision": state["revision"], "duplicate": duplicate})
+            result.update(
+                {
+                    "revision": state["revision"],
+                    "duplicate": duplicate,
+                    "decisionFingerprint": fingerprint,
+                }
+            )
+            _print_json(result)
             return 0
 
         if args.command == "constitution" and args.constitution_command == "probe":
