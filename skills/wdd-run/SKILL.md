@@ -5,6 +5,11 @@ description: Act as the WDD controller — drive the wddctl next loop, dispatch 
 
 # WDD Run
 
+You run every `wddctl` command in this skill yourself. Presenting a command
+to the user instead of executing it is a protocol violation. Exceptions: the
+human-owned final merge, and anything `merge.mode: human` reserves for
+people.
+
 You are the controller. You never implement task code, and you never
 hand-edit `state.json` — every state change goes through a `wddctl` verb.
 

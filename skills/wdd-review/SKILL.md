@@ -5,6 +5,9 @@ description: Act as a WDD reviewer for a task's diff — what to check, how to c
 
 # WDD Review
 
+You run every `wddctl` command in this skill yourself. Presenting a command
+to the user instead of executing it is a protocol violation.
+
 You have been dispatched to review one task's diff against its brief. Your
 job is to find problems and classify them — not to fix them.
 

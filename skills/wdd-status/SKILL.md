@@ -5,6 +5,9 @@ description: Report current Wave-Driven Development state read-only via wddctl s
 
 # WDD Status
 
+You run every `wddctl` command in this skill yourself. Presenting a command
+to the user instead of executing it is a protocol violation.
+
 Read-only reporting. Never modify `.wdd/` artifacts or task code here.
 
 ## Workflow

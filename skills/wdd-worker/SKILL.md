@@ -32,6 +32,20 @@ controller already created for you.
 - Follow the task's verification command exactly; don't invent a different
   check.
 
+## TDD
+
+- **Red first**: before writing implementation code, write the failing
+  test(s) the brief's objective implies. Run them and confirm they fail for
+  the expected reason — not a collection error or a typo.
+- **Green**: implement the minimal change to make them pass. Run them again
+  and confirm they pass.
+- **Honest exception**: some tasks have no meaningful red/green cycle (pure
+  docs, config-only changes). Say so plainly in the final report instead of
+  faking a cycle.
+- **Evidence**: the final report includes the RED command and its failure
+  output, and the GREEN command and its pass output. A reviewer treats
+  missing TDD evidence as a finding.
+
 ## Finish
 
 - Commit your work in your worktree. That is your whole deliverable.

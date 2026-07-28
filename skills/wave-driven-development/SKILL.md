@@ -10,6 +10,11 @@ executable tasks. `wddctl` owns every mechanical action — branch and worktree
 creation, state transitions, conflict-domain enforcement, merging. These
 skills cover only the judgment `wddctl` cannot make for you.
 
+Agents run every `wddctl` command themselves; presenting a command to the
+user instead of executing it is a protocol violation. Exceptions: the
+human-owned final merge, and anything `merge.mode: human` reserves for
+people.
+
 ## When to use it
 
 Use WDD when work naturally splits into several tasks that can run
