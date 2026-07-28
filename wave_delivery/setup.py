@@ -16,7 +16,8 @@ from typing import Any
 
 from .config import config_path, constitution_path, default_config, load_config, save_config
 from .constitution import probe_repository
-from .schema import new_setup_state
+from .engine import apply_mutation
+from .schema import copied_state, new_setup_state
 from .store import StateStore, atomic_write_text
 
 
@@ -236,10 +237,24 @@ def migrate_governance(wdd_dir: Path | str) -> dict[str, Any]:
     store = StateStore(wdd_dir / "state.json")
     invalidated = False
     if store.exists():
-        state = store.read()
-        if state["constitution"]["status"] == "ratified":
-            state["constitution"] = {"status": "draft", "ratification": None}
-            store.write(state)
+        if store.read()["constitution"]["status"] == "ratified":
+
+            def _invalidate(state: dict[str, Any]) -> dict[str, Any]:
+                state = copied_state(state)
+                if state["constitution"]["status"] != "ratified":
+                    return state
+                state["constitution"] = {"status": "draft", "ratification": None}
+                return state
+
+            apply_mutation(
+                store,
+                event_type="governance.migrated",
+                task_id=None,
+                data={},
+                idempotency_key=None,
+                expected_revision=None,
+                mutator=_invalidate,
+            )
             invalidated = True
     return {
         "migrated": True,

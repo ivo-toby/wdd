@@ -52,9 +52,9 @@ DEFAULT_STATE = Path(".wdd/state.json")
 # Verbs that mutate execution state (or the record of it) and therefore must
 # refuse when config.json/constitution.md drifted from what was ratified.
 # Read-only verbs (status, next, render, freshness check, doctor, monitor),
-# init/config/plan/migrate, block/unblock/cancel/note, event, and
-# constitution itself are deliberately absent: they either don't act on
-# ratified governance or are how governance gets re-signed in the first place.
+# init/config/plan/migrate, block/unblock/cancel/note, and constitution
+# itself are deliberately absent: they either don't act on ratified
+# governance or are how governance gets re-signed in the first place.
 GOVERNED_VERBS = {
     ("start", None),
     ("submit", None),
@@ -65,6 +65,8 @@ GOVERNED_VERBS = {
     ("verify", "record"),
     ("verify", "collect"),
     ("reconcile", "done"),
+    # The escape hatch bypasses transitions, not governance.
+    ("event", "apply"),
 }
 
 

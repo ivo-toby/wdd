@@ -423,11 +423,13 @@ wddctl next --repo .
 Read-only verbs (`status`, `next` itself, `render`, `freshness check`,
 `doctor`, `monitor`), setup verbs (`init`, `config`, `plan`, `migrate`),
 task-state verbs that don't execute anything (`block`, `unblock`, `cancel`,
-`note`), `event`, `constitution` itself, and `release` are deliberately
-exempt — they either don't act on ratified governance, or are how
-governance gets re-signed in the first place. `release` in particular is
-cleanup of an already-finished task: it runs after merge evidence has been
-recorded, so there is nothing left for a drift check to protect.
+`note`), `constitution` itself, and `release` are deliberately exempt —
+they either don't act on ratified governance, or are how governance gets
+re-signed in the first place. `release` in particular is cleanup of an
+already-finished task: it runs after merge evidence has been recorded, so
+there is nothing left for a drift check to protect. `event apply` is
+governed, not exempt: it is a raw state transition, and the escape hatch
+bypasses transitions, not governance.
 
 ### `next`
 

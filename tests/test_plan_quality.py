@@ -9,9 +9,12 @@ import unittest
 from pathlib import Path
 
 from wave_delivery.cli import main
-from wave_delivery.config import default_config
+from wave_delivery.config import default_config, governance_fingerprint, load_config, save_config, set_value
 from wave_delivery.lint import lint_plan
 from wave_delivery.plan import apply_risk_rules
+from wave_delivery.schema import new_state
+from wave_delivery.setup import init_repository, migrate_governance
+from wave_delivery.store import StateStore
 
 
 def _plan(tasks: list[dict]) -> dict:
@@ -246,6 +249,56 @@ class LintCliTest(unittest.TestCase):
             )
             self.assertEqual(code, 0)
             self.assertIn("serialized_plan", out)
+
+
+class EventApplyGovernanceTest(unittest.TestCase):
+    def test_event_apply_refuses_on_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            init_repository(wdd, root)
+            config = load_config(wdd)
+            config = set_value(config, "merge.surface", "local")
+            if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
+                config = set_value(config, "verification.commands", ["true"])
+            save_config(wdd, config)
+            store = StateStore(wdd / "state.json")
+            state = store.read()
+            state["constitution"] = {
+                "status": "ratified",
+                "ratification": {"by": "t", "decisionFingerprint": governance_fingerprint(wdd)},
+            }
+            store.write(state)
+            save_config(wdd, set_value(load_config(wdd), "concurrency.maxConcurrent", 9))
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code, _ = _cli(
+                    str(wdd / "state.json"),
+                    "event", "apply", "--event", "note.added", "--data", '{"note": "x"}',
+                )
+            self.assertNotEqual(code, 0)
+            self.assertIn("drift", stderr.getvalue())
+
+
+class MigrateGovernanceLockTest(unittest.TestCase):
+    def test_invalidation_bumps_revision_and_records_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            wdd.mkdir()
+            (wdd / "constitution.md").write_text("# Old\n", encoding="utf-8")
+            state = new_state("SCOPE-legacy", base_ref="wdd/legacy")
+            state["constitution"] = {
+                "status": "ratified",
+                "ratification": {"by": "t", "decisionFingerprint": "sha256:old"},
+            }
+            StateStore(wdd / "state.json").write(state)
+            before = StateStore(wdd / "state.json").read()["revision"]
+            result = migrate_governance(wdd)
+            self.assertTrue(result["ratificationInvalidated"])
+            after = StateStore(wdd / "state.json").read()
+            self.assertEqual(after["revision"], before + 1)
+            self.assertEqual(after["events"][-1]["type"], "governance.migrated")
 
 
 if __name__ == "__main__":
