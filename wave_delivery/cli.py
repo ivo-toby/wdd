@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .config import get_value, load_config, save_config, set_value
 from .constitution import probe_repository, ratification_status, read_proposal, write_proposal
 from .doctor import inspect_capabilities
 from .engine import (
@@ -260,6 +261,17 @@ def build_parser() -> argparse.ArgumentParser:
         "status", help="check ratification and proposal drift"
     )
     constitution_status.add_argument("--proposal", type=Path)
+
+    config_cmd = subparsers.add_parser("config", help="read or write .wdd/config.json")
+    config_subparsers = config_cmd.add_subparsers(dest="config_command", required=True)
+    config_get = config_subparsers.add_parser("get", help="print one value as JSON")
+    config_get.add_argument("path", help="dotted path, e.g. merge.surface")
+    config_set = config_subparsers.add_parser(
+        "set", help="set one value (JSON literal, or bare string fallback)"
+    )
+    config_set.add_argument("path", help="dotted path, e.g. merge.surface")
+    config_set.add_argument("value", help='e.g. local or \'["pytest -q"]\'')
+    config_subparsers.add_parser("show", help="print the whole config")
     return parser
 
 
@@ -545,6 +557,31 @@ def main(argv: list[str] | None = None) -> int:
                     "use 'wddctl merge --task ID --repo .' so live Git proves the merge"
                 )
             return _simple_event(store, args, args.event, args.data)
+
+        if args.command == "config":
+            wdd_dir = store.path.parent
+            config = load_config(wdd_dir)
+            if args.config_command == "get":
+                _print_json(get_value(config, args.path))
+                return 0
+            if args.config_command == "show":
+                _print_json(config)
+                return 0
+            if args.config_command == "set":
+                try:
+                    value = json.loads(args.value)
+                except json.JSONDecodeError:
+                    value = args.value
+                updated = set_value(config, args.path, value)
+                save_config(wdd_dir, updated)
+                _print_json(
+                    {
+                        "path": args.path,
+                        "value": get_value(updated, args.path),
+                        "openQuestions": len(updated["openQuestions"]),
+                    }
+                )
+                return 0
 
         if args.command == "constitution" and args.constitution_command in {"ratify", "amend"}:
             fingerprint = (

@@ -163,3 +163,30 @@ def load_config(wdd_dir: Path | str) -> dict[str, Any]:
 def save_config(wdd_dir: Path | str, config: dict[str, Any]) -> None:
     validate_config(config)
     atomic_write_text(config_path(wdd_dir), json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+
+def get_value(config: dict[str, Any], dotted: str) -> Any:
+    node: Any = config
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            raise ValidationError(f"config: unknown path '{dotted}'")
+        node = node[part]
+    return node
+
+
+def set_value(config: dict[str, Any], dotted: str, value: Any) -> dict[str, Any]:
+    updated = deepcopy(config)
+    parts = dotted.split(".")
+    node: Any = updated
+    for part in parts[:-1]:
+        if not isinstance(node, dict) or part not in node:
+            raise ValidationError(f"config: unknown path '{dotted}'")
+        node = node[part]
+    if not isinstance(node, dict) or parts[-1] not in node:
+        raise ValidationError(f"config: unknown path '{dotted}'")
+    node[parts[-1]] = value
+    updated["openQuestions"] = [
+        question for question in updated["openQuestions"] if question.get("path") != dotted
+    ]
+    validate_config(updated)
+    return updated
