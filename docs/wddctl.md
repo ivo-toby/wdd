@@ -174,6 +174,77 @@ wddctl plan preview [--plan plan.json]
 Without `--plan`, it projects from the current `state.json`. With `--plan`,
 it projects a plan that hasn't been applied yet.
 
+### `plan lint`
+
+Deterministic, advisory-only plan-quality checks — every one of them exists
+because an agent-authored plan exhibited the failure in the wild. Lint sees
+exactly what `plan apply` would see: the plan file overlaid with `config.json`
+defaults and risk rules (see riskRules below), so a finding here is a finding
+apply would also see.
+
+```sh
+wddctl plan lint --plan plan.json [--strict]
+```
+
+```json
+{
+  "findings": [
+    {
+      "code": "serialized_plan",
+      "severity": "warning",
+      "message": "4 tasks admit in 4 rounds — the plan is effectively serialized. Check dependsOn for vague sequencing and conflictDomains for accidental overlap; maxConcurrent buys nothing here."
+    },
+    {
+      "code": "enumerated_domains",
+      "severity": "warning",
+      "task": "TASK-003-utils-helpers",
+      "message": "TASK-003-utils-helpers lists 4 individual files under src/utils/ — consider the glob src/utils/** unless another task must write there concurrently."
+    },
+    {
+      "code": "missing_brief",
+      "severity": "warning",
+      "task": "TASK-004-session-ui",
+      "message": "TASK-004-session-ui: brief tasks/TASK-004-session-ui.md is effectively empty — a worker dispatched on it will improvise."
+    }
+  ],
+  "strict": false
+}
+```
+
+Codes:
+
+| code | trigger |
+| --- | --- |
+| `serialized_plan` | 3+ tasks admit one-per-round (or ≥75% of tasks do, for 4+ tasks) — dependencies or conflict domains have accidentally chained the whole plan into a queue. |
+| `uniform_risk` | 4+ tasks and every one shares the same `risk` — under `risk_based` review this means either "review everything" (`high`) or "review nothing" (`normal`); confirm that's intended. |
+| `enumerated_domains` | a task lists 4+ individual files (no wildcard) under the same directory — a candidate for the `dir/**` glob instead, unless another task genuinely needs to write there concurrently. |
+| `coarse_domain` | a single domain on one task overlaps 3+ other tasks' domains — it will serialize all of them; narrow it to what the task actually writes. |
+| `missing_brief` | a task's `specPath` file doesn't exist, or has fewer than 2 non-blank lines — a worker dispatched on it will improvise. |
+
+Every finding is `"severity": "warning"` — lint never blocks by default. Pass
+`--strict` to turn any finding into a refusal (exit 2), naming the offending
+codes:
+
+```sh
+wddctl plan lint --plan plan-bad.json --strict
+# wddctl: plan lint --strict: enumerated_domains, missing_brief, serialized_plan
+```
+
+`plan apply` runs the same checks automatically on every call — the result
+carries a `"lint"` array (empty when clean) alongside the usual diff, and
+`plan apply --strict` refuses on the same terms `plan lint --strict` does,
+before anything is written:
+
+```sh
+wddctl plan apply --plan plan-bad.json --repo . --strict
+# wddctl: plan apply --strict: enumerated_domains, missing_brief, serialized_plan
+wddctl plan apply --plan plan-good.json --repo .
+# {"scope": "SCOPE-auth-refresh", "created": false, "diff": {...}, "lint": [], ...}
+```
+
+Lint is advisory everywhere lint runs, on `plan apply` included: nothing in
+this check changes admission or merge semantics, only what gets printed.
+
 ### `config`
 
 Read or write `.wdd/config.json` — every knob `wddctl` (or a dispatching
@@ -232,6 +303,35 @@ write, which is how `set` doubles as the answer mechanism for the
 open-questions contract `init` establishes. The response echoes the
 remaining count so a caller resolving several questions in one pass can see
 its own progress without a separate `get`.
+
+`riskRules` — a list of `{"pattern": "<conflict-domain glob>", "risk":
+"high"}` objects — is how a scope declares "these paths are always high risk"
+once, instead of every plan re-deciding it per task:
+
+```sh
+wddctl config set riskRules '[{"pattern": "src/auth/**", "risk": "high"}]'
+```
+
+At `plan apply` (and `plan lint`, which overlays the same config so it sees
+what apply would see), every task's `risk` is checked against the high
+patterns: if any of the task's `conflictDomains` overlaps a pattern (the same
+semantic overlap `domains.py` uses for admission, not string equality), the
+task's risk becomes `high` regardless of what the plan file said. This is
+strictly upward — a plan can request `high` risk that no rule matches and
+keep it, but nothing in a rule ever downgrades a task the plan already marked
+`high`. Concretely, with the rule above, a plan declaring all four tasks
+`"risk": "normal"` came out of `plan apply` as:
+
+```
+TASK-001-token-types  -> high    # conflictDomains: ["src/auth/types.py"]
+TASK-002-refresh-route -> high   # conflictDomains: ["src/auth/routes/refresh.py"]
+TASK-003-utils-helpers -> normal # conflictDomains: ["src/utils/**"]
+TASK-004-session-ui    -> high   # conflictDomains: ["src/auth/session.py"]
+```
+
+only `TASK-003` fell outside `src/auth/**` and kept the plan's declared
+`normal`. An empty `riskRules` list (the default) is a no-op: risk stays
+exactly what the plan file says.
 
 ```sh
 wddctl config show

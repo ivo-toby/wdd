@@ -43,12 +43,28 @@ conflict domains.
 
 ## Risk and review
 
-Mark a task `"risk": "high"` when it touches auth, security, data
-persistence, migrations, a public API/contract, or generated code — anything
-where a bad merge is expensive to unwind. Under `reviewPolicy: risk_based`
-(the default), only high-risk tasks get a separate reviewer pass; `always`
-reviews everything, `none` reviews nothing. Set this per scope based on how
-much you trust the worker model and how expensive mistakes are here.
+Check `wddctl config get riskRules` before hand-assigning anything. When the
+scope has `riskRules` configured — `{"pattern": "<glob>", "risk": "high"}`
+entries matched against each task's `conflictDomains` — `plan apply` derives
+`risk: high` for any task whose domains overlap a high-risk pattern,
+overriding whatever the plan file said. This is upward-only: it can raise a
+task's risk, never lower it, so writing `"risk": "high"` in the plan for a
+task you know is dangerous is still meaningful even when riskRules exist —
+you just don't need to write `"risk": "high"` for every task under a path a
+rule already covers. In practice this means: once a scope's `riskRules`
+exist, stop hand-assigning `"risk": "high"` to every auth/persistence/API
+task by inspection — let the rule do it, and reserve an explicit `"high"` in
+the plan for a task you believe is risky for reasons no path-based rule would
+catch. If the scope has no `riskRules` yet, mark a task `"risk": "high"`
+directly when it touches auth, security, data persistence, migrations, a
+public API/contract, or generated code — anything where a bad merge is
+expensive to unwind — and consider proposing a `riskRules` entry for the
+scope's config so future plans don't have to repeat the judgment per task.
+
+Under `reviewPolicy: risk_based` (the default), only high-risk tasks — plan-
+declared or rule-derived — get a separate reviewer pass; `always` reviews
+everything, `none` reviews nothing. Set this per scope based on how much you
+trust the worker model and how expensive mistakes are here.
 
 ## maxConcurrent
 
@@ -69,5 +85,18 @@ missing, and workers will collide on files nobody declared. Run
 the real apply to check for structural errors. Note `plan apply` is
 re-runnable: it adds/removes/updates tasks, but refuses to edit or remove a
 task that has already started.
+
+Then run `wddctl plan lint --plan plan.json` — it overlays the same config
+defaults and riskRules `plan apply` will, so it sees exactly what apply would
+see, and catches what `preview` doesn't: a plan that's effectively serialized
+(`serialized_plan`), every task sharing one risk level (`uniform_risk`), a
+task's `conflictDomains` enumerated file-by-file where a glob would do
+(`enumerated_domains`), one domain coarse enough to serialize three or more
+other tasks (`coarse_domain`), and a task whose brief is missing or
+effectively empty (`missing_brief`). Lint is advisory — it never blocks
+`plan apply` unless you pass `--strict` — so address every warning it
+reports, or, if a warning is a deliberate choice (two tasks genuinely must
+share a file; a scope really is all high-risk), say so explicitly in the
+plan-approval message rather than silently applying over it.
 
 See `templates/plan.json` and `templates/task.md` for the exact shapes.
