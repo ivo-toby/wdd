@@ -168,7 +168,7 @@ queue. This plan's two rounds of two tasks each is a reasonable middle.
 
 ## The run
 
-Plan applied, constitution ratified (see `wdd-constitution` and
+Plan applied, constitution ratified (see `wdd-setup` and
 `docs/wddctl.md`), and `wddctl next` opens the loop:
 
 ```

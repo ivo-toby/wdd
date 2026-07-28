@@ -15,7 +15,7 @@ open a session with Claude Code (or Codex, or another agent with the skills
 installed) and say something like "let's add refresh tokens" or "what's the
 status of the auth-refresh scope?" You never type `wddctl` yourself. The
 agent reads a skill — `wave-driven-development`, `wdd-plan`, `wdd-run`,
-`wdd-worker`, `wdd-review`, `wdd-status`, or `wdd-constitution` — decides
+`wdd-worker`, `wdd-review`, `wdd-status`, or `wdd-setup` — decides
 it applies, and runs `wddctl` commands on your behalf, showing you the
 output or summarizing it. Your intervention, when you have one, is prose:
 "actually split TASK-002 differently" or "block TASK-004, we're rethinking
@@ -410,7 +410,7 @@ $ wddctl next
 ```
 
 Run `wddctl constitution probe`, review what it inferred, and ratify — see
-`wdd-constitution`.
+`wdd-setup`.
 
 ## What is enforced vs. what is convention
 

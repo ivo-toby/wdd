@@ -1,6 +1,6 @@
 ---
 name: wave-driven-development
-description: Overview and router for Wave-Driven Development (WDD) — running coding agents on work larger than one prompt via the wddctl controller. Use this first to decide whether WDD applies, to learn the .wdd/ artifact layout and controller/worker/reviewer roles, and to find the right WDD skill (wdd-plan, wdd-run, wdd-worker, wdd-review, wdd-status, wdd-constitution).
+description: Overview and router for Wave-Driven Development (WDD) — running coding agents on work larger than one prompt via the wddctl controller. Use this first to decide whether WDD applies, to learn the .wdd/ artifact layout and controller/worker/reviewer roles, and to find the right WDD skill (wdd-plan, wdd-run, wdd-worker, wdd-review, wdd-status, wdd-setup).
 ---
 
 # Wave-Driven Development
@@ -20,7 +20,8 @@ small, self-contained edit — just make the change directly.
 
 ```
 .wdd/
-  constitution.md     # human-authored governance
+  constitution.md     # human-authored prose governance
+  config.json         # machine config; edit via wddctl config set
   plan.json           # the only planning input
   state.json          # wddctl-owned; never hand-edit
   state.md            # generated projection (wddctl render)
@@ -48,7 +49,8 @@ wddctl <verb> --task ID         # record it
 
 That is the whole engine. Everything else is judgment:
 
-- No `.wdd/constitution.md`, or it isn't ratified: use `wdd-constitution`.
+- No `.wdd/state.json`: run `wddctl init --repo .`, then follow `wdd-setup`.
+- Open config questions or an unratified constitution: use `wdd-setup`.
 - No `.wdd/plan.json`, or new work to decompose: use `wdd-plan`.
 - Plan exists and tasks need dispatching, reviewing, or merging: use
   `wdd-run` (controller), `wdd-worker` (if you are the dispatched worker),

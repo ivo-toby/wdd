@@ -12,7 +12,7 @@ Read-only reporting. Never modify `.wdd/` artifacts or task code here.
 1. If `.wdd/` is missing, say WDD isn't initialized and point at
    `wave-driven-development` to get started.
 2. If `.wdd/constitution.md` exists but isn't ratified, report that and
-   point at `wdd-constitution` — execution is blocked until then.
+   point at `wdd-setup` — execution is blocked until then.
 3. Otherwise, run:
    - `wddctl status --json` for a concise summary of the scope and its
      tasks.
