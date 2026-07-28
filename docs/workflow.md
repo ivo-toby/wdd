@@ -474,6 +474,107 @@ understanding what the code actually does — exactly the half of the job
 WDD leaves to agents and skills rather than encoding into a transition
 function.
 
+## Finishing a scope
+
+Everything above ends the moment the last task merges — that used to be
+where the narrative, and the scope, went quiet. It doesn't anymore. The
+instant every task reaches `done` (or `cancelled`), `derived_phase` moves
+the scope into `finalize`, and `wddctl next` stops returning empty: it
+starts naming scope-level work, one action at a time, the same discipline
+it used per task. There is no separate command to trigger this — `status`
+and `next` detect the phase and switch shape on their own.
+
+The ladder mirrors a task's own gates, but at the whole-epic-branch level:
+a final review against `.wdd/spec.md`'s acceptance criteria (the same
+document `wdd-plan` wrote at intake — see above), full verification, a
+handoff to the human who performs the actual merge, and `delivered` only
+once that merge is Git-provably real. `wddctl` never merges the epic
+branch into the target branch itself — that step is human-owned by
+design, the same way `merge.mode: human` reserves a task's own merge for
+a person; there is no code path anywhere that lets `wddctl` do it. This
+run continues in a fresh scratch repository, one task, `merge.surface:
+local`, verification `python3 -m unittest`:
+
+```
+$ wddctl next --repo .
+{"actions": [{"action": "final_review", "task": "-",
+  "recordWith": "wddctl finalize review record --reviewer NAME --findings '[]' --repo .",
+  "judgment": "dispatch a reviewer against the whole epic branch diff, per wdd-review's final-review contract, checked against .wdd/spec.md"}]}
+```
+
+`final_review` dispatches per `wdd-review`'s final-review contract: review
+the whole diff between the epic branch and the target branch, not one
+task's diff, checked against the acceptance criteria rather than a task
+brief. Same P1/P2/P3 vocabulary, same blocking severities:
+
+```
+$ wddctl finalize review record --reviewer codex-review --findings '[]' --repo .
+{"duplicate": false, "headSha": "3ff80c2...", "outcome": "passed", "revision": 9}
+$ wddctl next --repo .
+{"actions": [{"action": "final_verification", "task": "-",
+  "recordWith": "wddctl finalize verify record --status passed --command '<verification command>' --repo .",
+  "judgment": "run full verification against the current epic branch head and record the result"}]}
+$ wddctl finalize verify record --status passed --command "python3 -m unittest" --repo .
+{"duplicate": false, "headSha": "3ff80c2...", "revision": 10, "status": "passed"}
+```
+
+A clean review and a passed verification, both pinned to the current base
+head, unlock `prepare_handoff`:
+
+```
+$ wddctl next --repo .
+{"actions": [{"action": "prepare_handoff", "task": "-",
+  "command": "wddctl finalize handoff --repo ."}]}
+$ wddctl finalize handoff --repo .
+{"duplicate": false, "headSha": "3ff80c2...", "pr": null, "revision": 11,
+ "targetBranch": "main",
+ "instructions": "push wdd/finalize-demo to your remote (e.g. 'git push origin wdd/finalize-demo') and open a pull request into main yourself; wddctl does not perform this on the local surface. Once the human merge lands, run 'wddctl finalize delivered --by NAME --repo .' to record it."}
+```
+
+On the `local` surface, `handoff` only records that it happened and
+returns instructions — the push and the PR are the operator's to run. On
+the `pr` surface it pushes the base branch itself and opens the
+epic→target PR via `gh`, the same way task-level `submit` opens one (see
+[`docs/wddctl.md`](wddctl.md#the-finalize-phase) for a real transcript of
+that path against the stub `gh` fixture). Either way, `next` now names the
+one thing left:
+
+```
+$ wddctl next --repo .
+{"actions": [{"action": "await_delivery", "task": "-",
+  "recordWith": "wddctl finalize delivered --by NAME --repo .",
+  "judgment": "wait for the human-owned final merge via the local handoff: push wdd/finalize-demo to your remote and open a pull request into main yourself; wddctl does not perform this on the local surface; once it lands, record it with recordWith so live Git can prove it happened"}]}
+```
+
+The merge itself is not a `wddctl` command — it's an ordinary `git merge`
+(or clicking "Merge" on the handoff PR), performed by whoever owns the
+target branch, entirely outside the controller's reach:
+
+```
+$ git merge --no-ff -q wdd/finalize-demo -m "merge scope SCOPE-finalize-demo into main"
+$ wddctl finalize delivered --by ivo --repo .
+{"by": "ivo", "duplicate": false, "headSha": "3ff80c2...", "revision": 12, "targetBranch": "main"}
+$ wddctl next --repo .
+{"actions": [], "blockers": [], "phase": "delivered", "revision": 12, "scope": "SCOPE-finalize-demo"}
+```
+
+`finalize delivered` proves this the same way `merge --observed` proves a
+human task merge (see "`merge.mode: human`" above): it fetches the target
+branch best-effort and requires the base branch's head to be a real
+ancestor of it — of either the freshly fetched `origin/<target>` or the
+local `<target>`, whichever actually has the merge. Run it before the
+merge happens and it refuses, naming exactly that: "the final merge has
+not happened." A P1 against the acceptance criteria blocks the ladder
+exactly like a task-level P1 blocks merge — `next` reports
+`assign_final_fixes` instead of `final_verification`, with no `command` of
+its own, because the fix is new commits on the base branch, and any new
+commit re-stales the review and routes back to `final_review` on its own.
+
+A scope's lifecycle sentence, end to end: a scope starts at `plan apply`
+and ends at an **observed human merge** — `delivered` is never recorded on
+trust, only on live Git proof that the epic branch actually landed in the
+target branch.
+
 ## Appendix: driving `wddctl` yourself
 
 Everything above assumes an agent is running the commands. Nothing stops

@@ -68,6 +68,38 @@ yourself; the payload already did that.
   via `wddctl note`, resolve conflicting discoveries, update briefs for tasks
   not yet started, then record with `recordWith`.
 
+## Finishing a scope
+
+Once every task is `done` or `cancelled`, `next` stops emitting per-task
+actions and starts driving the finalize ladder instead — same one-action,
+`command`/`recordWith` shape as above, at scope granularity:
+
+- **`final_review`** → dispatch a reviewer against the whole epic branch
+  diff per `wdd-review`'s final-review contract, checked against
+  `.wdd/spec.md`. Their findings go into `recordWith` in place of `'[]'`,
+  same as `run_review`.
+- **`assign_final_fixes`** → the epic-branch equivalent of
+  `assign_fix_writer`: unresolved P1/P2 findings from the final review.
+  There is no `command` — the fix is new commits on the base branch, which
+  re-stales the final review and routes the scope back to `final_review`
+  on its own.
+- **`final_verification`** → run the constitution's verification command
+  against the current epic branch head, then record the real result —
+  same discipline as `run_verification`.
+- **`prepare_handoff`** → run `command`. On the `pr` surface this pushes
+  the epic branch and opens the epic→target PR; on `local` it records
+  handoff instructions for you to act on. It never merges anything.
+- **`await_delivery`** → the human-owned final merge this skill's opening
+  exception already carves out. Don't perform it yourself, don't ask the
+  user to run a `wddctl` command for it — `judgment` names the handoff PR
+  or the local instructions; surface it and wait. Once the merge has
+  genuinely landed, run `recordWith` (`wddctl finalize delivered --by
+  NAME --repo .`) so live Git proves it before the scope is marked
+  `delivered`.
+
+Once `delivered` is recorded, `next` returns empty actions with
+`"phase": "delivered"` — there is nothing left to do for this scope.
+
 ## Worker status tokens
 
 `DONE` / `DONE_WITH_CONCERNS` continue the loop; carry concerns into review.

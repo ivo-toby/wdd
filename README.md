@@ -27,6 +27,11 @@ review and verification, and merges it once the evidence is in. Shared
 context carries durable discoveries across tasks. Nothing about this requires
 trusting an agent to remember a rule.
 
+A scope's own lifecycle ends the same way, one level up: once every task is
+merged, `wddctl` runs the whole epic branch through a final review and
+verification, then waits — a scope reaches `delivered` only on an observed
+human merge into the target branch, never one `wddctl` performs itself.
+
 The goal is not to make agents faster at blindly editing files. The goal is
 to make parallel agent work controlled enough that a senior engineer can
 trust the process, inspect the state, interrupt it, resume it, and review the

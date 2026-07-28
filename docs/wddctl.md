@@ -1293,6 +1293,362 @@ to `needs_review` / `needs_verification` even if it passed before. This is
 deliberate: evidence about a commit that no longer exists proves nothing
 about the commit that replaced it.
 
+## The finalize phase
+
+Once every task in a scope reaches `done` or `cancelled`, `derived_phase`
+stops returning `execute`: the scope enters `finalize`, and `wddctl next` /
+`wddctl status` switch to a reduced, scope-level shape — no more per-task
+gates. A new family of verbs — `finalize review`, `finalize verify`,
+`finalize handoff`, `finalize delivered`, `finalize status` — choreographs
+what Spec §6 calls the finalize ladder: review the whole epic branch,
+verify it, hand it off, and record the human's final merge.
+`derived_phase` returns `delivered` once that merge is observed; there is
+no phase after it. `wddctl status` and `wddctl next` (no special flag
+needed) detect the phase automatically and switch shape:
+
+```sh
+wddctl status --json
+# {"finalize": {}, "phase": "finalize"}
+```
+
+Every finalize verb refuses outside `finalize`/`delivered` ("finalize
+verbs require the scope to be in the finalize or delivered phase..."), and
+every mutating one (`review record`, `verify record`, `handoff`)
+additionally refuses once `delivered` is recorded — there is nothing left
+to review, verify, or hand off once the human has already merged
+("this scope is already delivered; there is nothing left to \<review|verify|hand off\>").
+
+### `finalize review record`
+
+Reviews the **whole epic branch** — not one task's diff — against
+`.wdd/spec.md`'s acceptance criteria. Same P1/P2/P3 vocabulary and
+`review.blockingSeverities` (default P1/P2) as task-level review, but
+evidence is pinned to the scope's **base-branch head SHA**, not a task
+head — there is no task head left once every task is terminal.
+
+```sh
+wddctl finalize review record --reviewer NAME --findings '[...]' --repo .
+```
+
+Omit `--findings` or pass `[]` for a clean review. Outcome is `passed`
+when no finding's severity is in `review.blockingSeverities`, else
+`blocked`.
+
+### `finalize verify record`
+
+Mirrors the task-level contract, at scope granularity:
+
+```sh
+wddctl finalize verify record --status passed|failed|unavailable --command CMD --repo .
+```
+
+`--status unavailable` requires `--justification` (or falls back to a
+configured `verification.unavailableJustification`) — skipping
+verification silently is no more acceptable at scope granularity than it
+is per task.
+
+### `finalize handoff`
+
+Requires a clean, fresh final review and a passed, fresh final
+verification — "fresh" meaning both are pinned to the *current*
+base-branch head; a new commit on the base after either was recorded
+makes it stale, and the refusal names exactly which one to redo. The
+target branch comes from `branching.targetBranch` (a scope that predates
+`config.json` gets a clear error pointing at `migrate --governance`).
+
+```sh
+wddctl finalize handoff --repo .
+```
+
+- **`pr` surface**: pushes the base branch, then opens the epic→target PR
+  via `gh` (title `WDD scope <id>`, body a generated summary of tasks and
+  evidence) — the same `github.py` machinery task-level `submit` already
+  uses.
+- **`local` surface**: records the handoff with `pr: null`; the response's
+  `instructions` field names the push-and-PR steps as the operator's to
+  perform.
+
+`wddctl` never merges the PR it opens — that code path does not exist
+anywhere in `finalize.py`. See the transcripts below for both surfaces.
+
+### `finalize delivered`
+
+Proves — never performs — the human's final merge, reusing phase 4's
+either-ref ancestry check against the **target** branch instead of a task
+base: fetches `origin/<target>` best-effort, then requires the base
+branch's head to be an ancestor of either the freshly-fetched
+`origin/<target>` or the local `<target>` branch — neither is
+authoritative over the other.
+
+```sh
+wddctl finalize delivered --by NAME --repo .
+```
+
+Fails by naming exactly what hasn't happened yet ("...the final merge has
+not happened") before the merge lands; once it lands, `scope.delivered` is
+recorded (`at`, `by`, `headSha`) and every later mutating finalize verb
+refuses. Re-running `finalize delivered` itself after delivery is refused
+too, not silently re-verified — `by`/`at` name who observed the merge and
+when, and a retry cannot legitimately add anything the first call didn't
+already prove.
+
+### `finalize status`
+
+```sh
+wddctl finalize status
+```
+
+Prints `{"phase": ..., "finalize": {...}}` — the finalize section plus the
+derived phase. `wddctl status` (no subcommand) already prints exactly this
+once the scope reaches `finalize`/`delivered` — see above.
+
+### The finalize ladder
+
+`wddctl next` drives the same "exactly one action" discipline scope-level
+that it does per task, in priority order:
+
+```
+final_review              (no review yet, or stale against the current base head)
+  -> assign_final_fixes     (review present, fresh, and blocked — no command)
+  -> final_verification     (review passed+fresh; verification missing/stale/not passed)
+    -> prepare_handoff        (review + verification both passed+fresh; no handoff yet)
+      -> await_delivery         (handoff recorded and fresh)
+        -> delivered                (next returns empty actions, "phase": "delivered")
+```
+
+`assign_final_fixes` carries no `command`/`recordWith` deliberately: the
+fix is new commits on the base branch, and any new commit re-stales the
+review, which routes back to `final_review` on its own — the same
+self-healing loop task-level `needs_fixes` already relies on.
+`final_review` carries `models.review` when configured, exactly like
+task-level `run_review`.
+
+### Transcript: the finalize ladder, local surface, start to `delivered`
+
+Real, unedited output from one continuous scratch repository —
+`wddctl init` through a single task (`reviewPolicy: none`, so no
+task-level review gate) — merged, then the finalize ladder driven straight
+through to `delivered`. No network, no `gh`: `merge.surface local`.
+
+```sh
+$ wddctl status --json
+{"finalize": {}, "phase": "finalize"}
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "final_review",
+      "judgment": "dispatch a reviewer against the whole epic branch diff, per wdd-review's final-review contract, checked against .wdd/spec.md",
+      "recordWith": "wddctl finalize review record --reviewer NAME --findings '[]' --repo .",
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "finalize",
+  "revision": 8,
+  "scope": "SCOPE-finalize-demo"
+}
+$ wddctl finalize review record --reviewer "codex-review" --findings '[]' --repo .
+{
+  "duplicate": false,
+  "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d",
+  "outcome": "passed",
+  "revision": 9
+}
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "final_verification",
+      "judgment": "run full verification against the current epic branch head and record the result",
+      "recordWith": "wddctl finalize verify record --status passed --command '<verification command>' --repo .",
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "finalize",
+  "revision": 9,
+  "scope": "SCOPE-finalize-demo"
+}
+$ wddctl finalize verify record --status passed --command "python3 -m unittest" --repo .
+{
+  "duplicate": false,
+  "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d",
+  "revision": 10,
+  "status": "passed"
+}
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "prepare_handoff",
+      "command": "wddctl finalize handoff --repo .",
+      "judgment": "push the epic branch and open the handoff to the human who performs the final merge (pr surface), or record local handoff instructions (local surface)",
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "finalize",
+  "revision": 10,
+  "scope": "SCOPE-finalize-demo"
+}
+$ wddctl finalize handoff --repo .
+{
+  "duplicate": false,
+  "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d",
+  "instructions": "push wdd/finalize-demo to your remote (e.g. 'git push origin wdd/finalize-demo') and open a pull request into main yourself; wddctl does not perform this on the local surface. Once the human merge lands, run 'wddctl finalize delivered --by NAME --repo .' to record it.",
+  "pr": null,
+  "revision": 11,
+  "targetBranch": "main"
+}
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "await_delivery",
+      "judgment": "wait for the human-owned final merge via the local handoff: push wdd/finalize-demo to your remote and open a pull request into main yourself; wddctl does not perform this on the local surface; once it lands, record it with recordWith so live Git can prove it happened",
+      "recordWith": "wddctl finalize delivered --by NAME --repo .",
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "finalize",
+  "revision": 11,
+  "scope": "SCOPE-finalize-demo"
+}
+```
+
+The human merge is not simulated JSON — it is a real `git merge` into the
+target branch (`main`, here), performed exactly the way an operator would
+click "Merge" on a PR or run it from their own terminal, entirely outside
+`wddctl`:
+
+```sh
+$ git merge --no-ff -q wdd/finalize-demo -m "merge scope SCOPE-finalize-demo into main"
+$ wddctl finalize delivered --by ivo --repo .
+{
+  "by": "ivo",
+  "duplicate": false,
+  "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d",
+  "revision": 12,
+  "targetBranch": "main"
+}
+$ wddctl next --repo .
+{"actions": [], "blockers": [], "phase": "delivered", "revision": 12, "scope": "SCOPE-finalize-demo"}
+$ wddctl status --json
+{
+  "finalize": {
+    "delivered": {
+      "at": "2026-07-28T23:05:04Z",
+      "by": "ivo",
+      "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d"
+    },
+    "handoff": {
+      "at": "2026-07-28T23:05:03Z",
+      "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d",
+      "pr": null,
+      "targetBranch": "main"
+    },
+    "review": {
+      "at": "2026-07-28T23:05:03Z",
+      "findings": [],
+      "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d",
+      "outcome": "passed",
+      "reviewer": "codex-review"
+    },
+    "verification": {
+      "at": "2026-07-28T23:05:03Z",
+      "command": "python3 -m unittest",
+      "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d",
+      "justification": null,
+      "status": "passed"
+    }
+  },
+  "phase": "delivered"
+}
+```
+
+### Transcript: a blocked final review
+
+A P1 against `.wdd/spec.md`'s acceptance criteria blocks the ladder
+exactly like a task-level P1 blocks merge:
+
+```sh
+$ wddctl finalize review record --reviewer "codex-review" --repo . \
+    --findings '[{"severity":"P1","summary":"acceptance criterion missing: no test proves greeting() returns exactly \"hello\"","file":".wdd/spec.md","line":0}]'
+{
+  "duplicate": false,
+  "headSha": "20742a47bb8c834df23247e93aaeffb63f53e0da",
+  "outcome": "blocked",
+  "revision": 9
+}
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "assign_final_fixes",
+      "findings": [
+        {
+          "file": ".wdd/spec.md",
+          "line": 0,
+          "severity": "P1",
+          "summary": "acceptance criterion missing: no test proves greeting() returns exactly \"hello\""
+        }
+      ],
+      "judgment": "assign fixes for the blocking findings from the final review (P1: acceptance criterion missing: no test proves greeting() returns exactly \"hello\"); new commits on the base branch re-stale the review, which brings the scope back to final_review automatically",
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "finalize",
+  "revision": 9,
+  "scope": "SCOPE-finalize-demo"
+}
+$ wddctl finalize handoff --repo .
+wddctl: handoff requires a clean final review; run 'wddctl finalize review record --reviewer NAME --findings [] --repo .'
+```
+
+### Transcript: `finalize handoff` on the `pr` surface (stub `gh`)
+
+Same stub-`gh` + bare-origin double documented above for task-level `pr`
+surface transcripts (`tests/fixtures/fake-gh`, prepended onto `PATH`, no
+real network) — this is the only honest way to show `pr`-surface finalize
+output. The stub always prints the same canned PR URL regardless of
+arguments, which is why the task's PR and the epic's PR below show the
+identical `https://github.invalid/pr/1`; a real `gh` would not do that —
+only the logged argv distinguishes the two calls.
+
+```sh
+$ wddctl finalize handoff --repo .
+{
+  "duplicate": false,
+  "headSha": "9a4c80ff17be3b71f39d6aeb4382cb210a409389",
+  "pr": "https://github.invalid/pr/1",
+  "revision": 11,
+  "targetBranch": "main"
+}
+$ cat "$FAKE_GH_LOG"
+["pr", "create", "--head", "task/TASK-001-greeting", "--base", "wdd/finalize-demo", "--title", "Add greeting helper", "--body", "wdd task TASK-001-greeting\nspec: tasks/TASK-001-greeting.md\nhead: a3de4188d96267b96d6bce7edeb265e3e6e65356"]
+["pr", "create", "--head", "wdd/finalize-demo", "--base", "main", "--title", "WDD scope SCOPE-finalize-demo", "--body", "wdd scope SCOPE-finalize-demo\n\nTasks:\n- TASK-001-greeting: Add greeting helper (done)\n\nFinal review: passed by codex-review\nFinal verification: passed (python3 -m unittest)"]
+$ git ls-remote origin "wdd/finalize-demo"
+9a4c80ff17be3b71f39d6aeb4382cb210a409389	refs/heads/wdd/finalize-demo
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "await_delivery",
+      "judgment": "wait for the human-owned final merge via the handoff PR https://github.invalid/pr/1; once it lands, record it with recordWith so live Git can prove it happened",
+      "recordWith": "wddctl finalize delivered --by NAME --repo .",
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "finalize",
+  "revision": 11,
+  "scope": "SCOPE-finalize-demo"
+}
+```
+
 ## Guarantees
 
 - **Atomic, revisioned writes.** State is written to a same-directory
