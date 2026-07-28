@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .config import MERGE_MODES, MERGE_SURFACES
 from .domains import domains_overlap
 from .engine import apply_mutation, utc_now
 from .errors import IllegalTransition, ValidationError
@@ -62,6 +63,12 @@ def validate_plan(plan: Any) -> dict[str, Any]:
     every = scope.get("reconcileEveryNMerges", 3)
     if every is not None and (not isinstance(every, int) or every < 1):
         raise ValidationError("plan.scope.reconcileEveryNMerges must be a positive integer or null")
+    merge_surface = scope.get("mergeSurface")
+    if merge_surface is not None and merge_surface not in MERGE_SURFACES:
+        raise ValidationError(f"plan.scope.mergeSurface must be one of {sorted(MERGE_SURFACES)}")
+    merge_mode = scope.get("mergeMode")
+    if merge_mode is not None and merge_mode not in MERGE_MODES:
+        raise ValidationError(f"plan.scope.mergeMode must be one of {sorted(MERGE_MODES)}")
 
     tasks = plan.get("tasks")
     if not isinstance(tasks, list) or not tasks:
@@ -113,16 +120,26 @@ def validate_plan(plan: Any) -> dict[str, Any]:
             raise ValidationError(f"task {entry['id']} cannot depend on itself")
     detect_dependency_cycle({entry["id"]: entry for entry in normalized})
 
+    normalized_scope: dict[str, Any] = {
+        "id": scope_id,
+        "baseRef": base_ref,
+        "maxConcurrent": limit,
+        "reviewPolicy": policy,
+        "reconcileEveryNMerges": every,
+    }
+    # Omitted means absent from the normalized scope (and later, state), not
+    # null: merge_settings() distinguishes "no override" from "override to
+    # a falsy value" -- neither field has one, but keeping the same absent-
+    # key convention as everything else here avoids a special case later.
+    if merge_surface is not None:
+        normalized_scope["mergeSurface"] = merge_surface
+    if merge_mode is not None:
+        normalized_scope["mergeMode"] = merge_mode
+
     return {
         "schemaVersion": 1,
         "kind": PLAN_KIND,
-        "scope": {
-            "id": scope_id,
-            "baseRef": base_ref,
-            "maxConcurrent": limit,
-            "reviewPolicy": policy,
-            "reconcileEveryNMerges": every,
-        },
+        "scope": normalized_scope,
         "tasks": normalized,
     }
 
@@ -244,6 +261,14 @@ def _diff_plan(state: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
         scope_changes["baseRef"] = plan["scope"]["baseRef"]
     if state["reconcile"].get("everyNMerges") != plan["scope"]["reconcileEveryNMerges"]:
         scope_changes["reconcileEveryNMerges"] = plan["scope"]["reconcileEveryNMerges"]
+    # mergeSurface/mergeMode follow the baseRef "omitted means keep" pattern,
+    # not maxConcurrent's "always overwrite" one: a plan that never mentions
+    # the field leaves whatever is already stored alone rather than clearing
+    # it, since the field is only present in the plan scope at all when the
+    # operator explicitly set it (validate_plan's absent-key convention).
+    for field in ("mergeSurface", "mergeMode"):
+        if field in plan["scope"] and plan["scope"][field] != state["scope"].get(field):
+            scope_changes[field] = plan["scope"][field]
     return {"added": added, "removed": removed, "updated": updated, "scope": scope_changes}
 
 
@@ -261,6 +286,9 @@ def _apply_plan_to_state(state: dict[str, Any], plan: dict[str, Any]) -> dict[st
             "reviewPolicy": plan["scope"]["reviewPolicy"],
         }
         state["reconcile"]["everyNMerges"] = plan["scope"]["reconcileEveryNMerges"]
+        for field in ("mergeSurface", "mergeMode"):
+            if field in plan["scope"]:
+                state["scope"][field] = plan["scope"][field]
 
     if plan["scope"]["id"] != state["scope"]["id"]:
         raise IllegalTransition(
@@ -312,6 +340,14 @@ def _apply_plan_to_state(state: dict[str, Any], plan: dict[str, Any]) -> dict[st
     state["scope"]["maxConcurrent"] = scope["maxConcurrent"]
     state["scope"]["reviewPolicy"] = scope["reviewPolicy"]
     state["reconcile"]["everyNMerges"] = scope["reconcileEveryNMerges"]
+    # Adoptable like reviewPolicy (a scope change, allowed any time -- these
+    # only gate future actions) but, like baseRef, omission means "leave the
+    # stored value alone" rather than "clear it": a re-apply of a plan file
+    # that never mentions the field must not silently drop an override that
+    # a previous apply recorded.
+    for field in ("mergeSurface", "mergeMode"):
+        if field in scope:
+            state["scope"][field] = scope[field]
     return state
 
 

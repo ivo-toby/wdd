@@ -255,6 +255,25 @@ def require_fresh_governance(state: dict[str, Any], wdd_dir: Path | str) -> None
         )
 
 
+def merge_settings(state: dict[str, Any] | None, config: dict[str, Any] | None) -> dict[str, str]:
+    """Effective merge surface/mode for a scope: scope override wins, else config.
+
+    config=None models a legacy repo predating config.json; it defaults to
+    {"surface": "local", "mode": "controller"} to preserve legacy behavior.
+    A scope-level override (state["scope"]["mergeSurface"/"mergeMode"]) still
+    applies on top of either source when present.
+    """
+    if config is None:
+        surface, mode = "local", "controller"
+    else:
+        surface = config["merge"]["surface"]
+        mode = config["merge"]["mode"]
+    scope = (state or {}).get("scope") or {}
+    surface = scope.get("mergeSurface", surface)
+    mode = scope.get("mergeMode", mode)
+    return {"surface": surface, "mode": mode}
+
+
 def check_ratifiable(wdd_dir: Path | str) -> None:
     config = load_config(wdd_dir)
     open_questions = config["openQuestions"]

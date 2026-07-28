@@ -21,6 +21,10 @@ TASK_STATUSES = {
 CONSTITUTION_STATUSES = {"draft", "ratified"}
 REVIEW_POLICIES = {"always", "risk_based", "none"}
 RISK_LEVELS = {"normal", "high"}
+# Duplicated from config.py (not imported) to avoid a circular import: config.py
+# already imports REVIEW_POLICIES/RISK_LEVELS from this module.
+MERGE_SURFACES = {"pr", "local"}
+MERGE_MODES = {"controller", "human"}
 
 
 def task_state(
@@ -166,6 +170,12 @@ def validate_state(state: dict[str, Any]) -> None:
             approval = _require_mapping(approval, "scope.approval")
             _require_string(approval.get("by"), "scope.approval.by")
             _require_string(approval.get("at"), "scope.approval.at")
+        merge_surface = scope.get("mergeSurface")
+        if merge_surface is not None and merge_surface not in MERGE_SURFACES:
+            raise ValidationError(f"scope.mergeSurface must be one of {sorted(MERGE_SURFACES)}")
+        merge_mode = scope.get("mergeMode")
+        if merge_mode is not None and merge_mode not in MERGE_MODES:
+            raise ValidationError(f"scope.mergeMode must be one of {sorted(MERGE_MODES)}")
 
     constitution = _require_mapping(state.get("constitution"), "constitution")
     constitution_status = constitution.get("status")
