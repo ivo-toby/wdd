@@ -23,6 +23,7 @@ from .config import (
     set_value,
 )
 from .constitution import probe_repository, ratification_status, read_proposal, write_proposal
+from .setup import init_repository
 from .doctor import inspect_capabilities
 from .engine import (
     admission_schedule,
@@ -98,6 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("doctor", help="report optional controller capabilities").add_argument(
         "--json", action="store_true"
     )
+
+    init = subparsers.add_parser(
+        "init", help="scaffold .wdd/: config, constitution draft, and pre-scope state"
+    )
+    init.add_argument("--repo", type=Path, default=Path("."))
 
     status = subparsers.add_parser("status", help="show a concise state summary")
     status.add_argument("--json", action="store_true")
@@ -331,6 +337,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "doctor":
             _print_json(inspect_capabilities())
+            return 0
+
+        if args.command == "init":
+            _print_json(init_repository(store.path.parent, args.repo))
             return 0
 
         if args.command == "plan" and args.plan_command == "apply":

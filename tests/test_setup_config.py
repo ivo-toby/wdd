@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +27,8 @@ from wave_delivery.schema import (
     new_state,
     validate_state,
 )
+from wave_delivery.setup import CONSTITUTION_TEMPLATE, init_repository
+from wave_delivery.store import StateStore
 
 
 class ConfigValidationTest(unittest.TestCase):
@@ -226,6 +229,75 @@ class GovernanceFingerprintTest(unittest.TestCase):
             )
             with self.assertRaises(ValidationError):
                 check_ratifiable(wdd)
+
+
+def _git_repo(tmp: str) -> Path:
+    root = Path(tmp) / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
+    return root
+
+
+class InitTest(unittest.TestCase):
+    def test_init_scaffolds_everything(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            result = init_repository(wdd, root)
+            self.assertFalse(result["alreadyInitialized"])
+            self.assertTrue((wdd / "config.json").is_file())
+            self.assertTrue((wdd / "constitution.md").is_file())
+            self.assertTrue((wdd / "tasks").is_dir())
+            self.assertTrue((wdd / "shared-context").is_dir())
+            state = StateStore(wdd / "state.json").read()
+            self.assertIsNone(state["scope"])
+
+    def test_init_always_asks_about_merge_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            init_repository(root / ".wdd", root)
+            config = load_config(root / ".wdd")
+            self.assertIn("merge.surface", [q["path"] for q in config["openQuestions"]])
+
+    def test_init_asks_verification_only_when_undetected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            (root / "package.json").write_text("{}", encoding="utf-8")
+            init_repository(root / ".wdd", root)
+            config = load_config(root / ".wdd")
+            self.assertEqual(config["verification"]["commands"], ["npm test"])
+            self.assertNotIn(
+                "verification.commands", [q["path"] for q in config["openQuestions"]]
+            )
+
+    def test_init_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            init_repository(root / ".wdd", root)
+            marker = (root / ".wdd" / "constitution.md").read_text(encoding="utf-8")
+            result = init_repository(root / ".wdd", root)
+            self.assertTrue(result["alreadyInitialized"])
+            self.assertEqual(
+                (root / ".wdd" / "constitution.md").read_text(encoding="utf-8"), marker
+            )
+
+    def test_template_has_no_placeholders_or_json(self) -> None:
+        for banned in ("```json", "TBD", "TODO", "<", "state which"):
+            self.assertNotIn(banned, CONSTITUTION_TEMPLATE)
+
+
+class InitCliTest(unittest.TestCase):
+    def test_cli_init_prints_next_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            state = str(root / ".wdd" / "state.json")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--state", state, "init", "--repo", str(root)])
+            self.assertEqual(code, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertFalse(payload["alreadyInitialized"])
+            self.assertTrue(payload["openQuestions"])
 
 
 if __name__ == "__main__":
