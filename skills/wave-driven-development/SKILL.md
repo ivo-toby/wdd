@@ -55,6 +55,10 @@ wddctl <verb> --task ID         # record it
 That is the whole engine. Everything else is judgment:
 
 - No `.wdd/state.json`: run `wddctl init --repo .`, then follow `wdd-setup`.
+  Never restore a `.wdd/` that only exists in git history to satisfy this
+  check — deleted WDD artifacts are a decommissioned scope, not a shortcut;
+  a resurrected state is stale by definition and may predate the current
+  schema.
 - Open config questions or an unratified constitution: use `wdd-setup`.
 - No `.wdd/plan.json`, or new work to decompose: use `wdd-plan`.
 - Plan exists and tasks need dispatching, reviewing, or merging: use

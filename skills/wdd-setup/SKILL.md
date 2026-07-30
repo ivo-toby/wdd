@@ -10,6 +10,11 @@ to the user instead of executing it is a protocol violation.
 
 ## Fresh repository
 
+A repository whose git history contains a deleted `.wdd/` still counts as
+fresh: do not `git checkout` or otherwise restore those artifacts — they
+belong to a decommissioned scope and may predate the current state schema.
+Initialize from scratch.
+
 1. Run `wddctl init --repo .`. It scaffolds `.wdd/` deterministically:
    `config.json` with probed defaults plus an `openQuestions` list,
    a prose `constitution.md` draft, `tasks/`, `shared-context/`, and
