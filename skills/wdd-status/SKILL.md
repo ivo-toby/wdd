@@ -9,6 +9,9 @@ You run every `wddctl` command in this skill yourself. Presenting a command
 to the user instead of executing it is a protocol violation.
 
 Read-only reporting. Never modify `.wdd/` artifacts or task code here.
+Translate what you read for the user per the router's "Talking to the
+user" section: phase, what's in flight, what's blocked and why, what needs
+them — not raw JSON, revisions, or scope IDs.
 
 ## Workflow
 

@@ -15,6 +15,16 @@ user instead of executing it is a protocol violation. Exceptions: the
 human-owned final merge, and anything `merge.mode: human` reserves for
 people.
 
+## Talking to the user
+
+`wddctl` output is your instrument panel, not your voice. Report in plain
+language: what happened, what is in flight, what needs the user. Revision
+numbers, scope IDs, event names, lint codes, config paths, and command
+strings are for you and the record — surface one to the user only when
+they must act on it personally (a PR to merge, a file to read). "Plan
+applied: ten tasks, the scaffold task is starting now, everything else
+waits on it" beats a paraphrase of the state file.
+
 ## When to use it
 
 Use WDD when work naturally splits into several tasks that can run

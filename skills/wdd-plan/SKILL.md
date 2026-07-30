@@ -165,6 +165,10 @@ wddctl plan apply --plan plan.json --repo . --approved-by <name>
 Never apply an unapproved plan. `<name>` is the human who approved the plan,
 not the agent.
 
+Report the outcome the way the router's "Talking to the user" section
+demands: what was agreed, how many tasks, which starts first — not
+revisions, scope IDs, or the commands you ran.
+
 ## Done when
 
 - The scope is applied (`wddctl plan apply` succeeded).

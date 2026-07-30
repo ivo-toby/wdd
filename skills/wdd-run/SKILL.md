@@ -28,7 +28,9 @@ Each action carries the exact command to use:
   dispatch (worker or reviewer); when absent, use the dispatcher's default.
 
 Repeat until `next` is empty. Don't translate action names into commands
-yourself; the payload already did that.
+yourself; the payload already did that. When you narrate progress, follow
+the router's "Talking to the user" section: task titles and outcomes in
+plain language, not verbs, revisions, or action names.
 
 ## The judgment, action by action
 
