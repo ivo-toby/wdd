@@ -90,24 +90,31 @@ $ wddctl init --repo .
   "hint": "run 'wddctl next' and follow it",
   "openQuestions": [
     {"path": "merge.surface", "options": ["pr", "local"],
-     "question": "Should each task ship as a real GitHub pull request, or stay fully local? Pull requests give you the familiar review surface (branches pushed, findings mirrored as PR comments); local keeps the whole loop offline with no pushes — good for solo or offline work."}
+     "question": "Should each task ship as a real GitHub pull request, or stay fully local? Pull requests give you the familiar review surface (branches pushed, findings mirrored as PR comments); local keeps the whole loop offline with no pushes — good for solo or offline work."},
+    {"path": "models",
+     "question": "Which models should do the work? Three roles matter: everyday implementation, a stronger model for high-risk tasks, and review (usually your strongest — it guards the merges). Name models your agent harness understands, or say the harness defaults are fine."}
   ]
 }
 ```
 
 `init` probed the repository and found a verification command (a `tests/`
-directory), so only the merge-surface question needs an answer. `next`
-during setup emits exactly one action at a time:
+directory), so that question is pre-answered; the merge-surface and model
+questions remain. `next` during setup emits exactly one action at a time:
 
 ```
 $ wddctl next
 {"actions": [{"action": "resolve_config", "task": "-",
   "command": "wddctl config set <path> <value>",
-  "judgment": "ask the user every listed question in ONE round, then record each answer",
+  "judgment": "relay every listed question to the user in ONE round, in plain language (never show config paths or JSON syntax), then translate the answers into config set yourself",
   "questions": [...]}], "blockers": [], "phase": "setup", "revision": 0, "scope": null}
 $ wddctl config set merge.surface local
-{"openQuestions": 0, "path": "merge.surface", "value": "local"}
+{"openQuestions": 1, "path": "merge.surface", "value": "local"}
+$ wddctl config set models '{"planning": null, "implementation": {"default": null, "highRisk": null}, "review": null}'
+{"openQuestions": 0, "path": "models", "value": {"implementation": {"default": null, "highRisk": null}, "planning": null, "review": null}}
 ```
+
+(The user said "harness defaults are fine," so the model mapping is
+recorded as all nulls — dispatchers pick their own default.)
 
 `next` moves to ratification, which signs `config.json` and
 `constitution.md` together — the fingerprint is computed over both files'

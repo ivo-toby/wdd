@@ -100,6 +100,10 @@ wddctl init --repo .
       "question": "Should each task ship as a real GitHub pull request, or stay fully local? Pull requests give you the familiar review surface (branches pushed, findings mirrored as PR comments); local keeps the whole loop offline with no pushes — good for solo or offline work."
     },
     {
+      "path": "models",
+      "question": "Which models should do the work? Three roles matter: everyday implementation, a stronger model for high-risk tasks, and review (usually your strongest — it guards the merges). Name models your agent harness understands, or say the harness defaults are fine."
+    },
+    {
       "path": "verification.commands",
       "question": "I couldn't detect a test or verification command in this repository. What command should prove a change works — for example 'npm test' or 'pytest -q'? If nothing runnable exists yet, say so and verification will be recorded as unavailable with your justification."
     }
@@ -278,7 +282,7 @@ wddctl config set merge.surface pr
 
 ```json
 {
-  "openQuestions": 1,
+  "openQuestions": 2,
   "path": "merge.surface",
   "value": "pr"
 }
@@ -290,11 +294,30 @@ wddctl config set verification.commands '["python3 -m unittest"]'
 
 ```json
 {
-  "openQuestions": 0,
+  "openQuestions": 1,
   "path": "verification.commands",
   "value": [
     "python3 -m unittest"
   ]
+}
+```
+
+```sh
+wddctl config set models '{"planning": null, "implementation": {"default": null, "highRisk": null}, "review": null}'
+```
+
+```json
+{
+  "openQuestions": 0,
+  "path": "models",
+  "value": {
+    "implementation": {
+      "default": null,
+      "highRisk": null
+    },
+    "planning": null,
+    "review": null
+  }
 }
 ```
 

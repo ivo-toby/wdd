@@ -90,7 +90,17 @@ def _open_questions(probed_commands: list[str]) -> list[dict[str, Any]]:
                 "offline work."
             ),
             "options": ["pr", "local"],
-        }
+        },
+        {
+            "path": "models",
+            "question": (
+                "Which models should do the work? Three roles matter: everyday "
+                "implementation, a stronger model for high-risk tasks, and review "
+                "(usually your strongest — it guards the merges). Name models "
+                "your agent harness understands, or say the harness defaults are "
+                "fine."
+            ),
+        },
     ]
     if not probed_commands:
         questions.append(

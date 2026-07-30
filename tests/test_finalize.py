@@ -144,6 +144,7 @@ def _bootstrap_ready_scope(
     state = str(wdd / "state.json")
     assert _cli(state, "init", "--repo", str(root))[0] == 0
     assert _cli(state, "config", "set", "merge.surface", surface)[0] == 0
+    assert _cli(state, "config", "set", "models", '{"planning": null, "implementation": {"default": null, "highRisk": null}, "review": null}')[0] == 0
     assert _cli(state, "config", "set", "merge.mode", mode)[0] == 0
     config = load_config(wdd)
     if any(q["path"] == "verification.commands" for q in config["openQuestions"]):

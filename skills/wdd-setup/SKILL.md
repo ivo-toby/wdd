@@ -29,7 +29,12 @@ Initialize from scratch.
      (values are JSON when structured, `'["npm test"]'`; bare strings
      otherwise, `local`). "We have no tests yet" is an answer too: set
      `verification.commands` to `[]` and put the user's reason in
-     `verification.unavailableJustification`.
+     `verification.unavailableJustification`. The model question maps the
+     user's answer onto three roles in one set — for example
+     `wddctl config set models '{"planning": null, "implementation":
+     {"default": "haiku", "highRisk": "sonnet"}, "review": "sonnet"}'` —
+     and "harness defaults are fine" is a valid answer: record it as all
+     nulls so the question resolves and dispatchers use their own default.
    - `ratify` — show the user the current `config.json` values and the
      `constitution.md` text (summarize, link the files), get explicit
      sign-off, then run `wddctl constitution ratify --by <name>`. Never

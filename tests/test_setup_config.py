@@ -357,6 +357,11 @@ class SetupNextTest(unittest.TestCase):
             config = load_config(wdd)
             config = set_value(config, "merge.surface", "local")
             config = set_value(config, "verification.commands", ["true"])
+            config = set_value(
+                config,
+                "models",
+                {"planning": None, "implementation": {"default": None, "highRisk": None}, "review": None},
+            )
             save_config(wdd, config)
             state = StateStore(wdd / "state.json").read()
             result = setup_next_actions(state, wdd)
@@ -759,6 +764,7 @@ class EndToEndSetupTest(unittest.TestCase):
             self.assertEqual(payload["actions"][0]["action"], "resolve_config")
 
             self._cli(state, "config", "set", "merge.surface", "local")
+            self._cli(state, "config", "set", "models", '{"planning": null, "implementation": {"default": null, "highRisk": null}, "review": null}')
             self._cli(state, "config", "set", "verification.commands", '["true"]')
 
             payload = self._cli(state, "next")
