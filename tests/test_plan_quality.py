@@ -238,6 +238,25 @@ class LintBriefTest(unittest.TestCase):
             plan = _plan([_task("T1")])
             self.assertNotIn("nonprose_brief", _codes(lint_plan(plan, wdd)))
 
+    def test_missing_spec_warns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            (wdd / "tasks").mkdir(parents=True)
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nDo it.\n", encoding="utf-8")
+            plan = _plan([_task("T1")])
+            self.assertIn("missing_spec", _codes(lint_plan(plan, wdd)))
+
+    def test_present_spec_is_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            (wdd / "tasks").mkdir(parents=True)
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nDo it.\n", encoding="utf-8")
+            (wdd / "spec.md").write_text(
+                "# Spec\n\n## Goal\n\nShip the thing.\n", encoding="utf-8"
+            )
+            plan = _plan([_task("T1")])
+            self.assertNotIn("missing_spec", _codes(lint_plan(plan, wdd)))
+
     def test_no_wdd_dir_skips_brief_check(self) -> None:
         plan = _plan([_task("T1")])
         self.assertNotIn("missing_brief", _codes(lint_plan(plan)))

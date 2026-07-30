@@ -156,6 +156,29 @@ def _check_briefs(plan_dict: dict[str, Any], wdd_dir: Path | str) -> list[dict[s
     return findings
 
 
+def _check_spec(wdd_dir: Path | str) -> list[dict[str, Any]]:
+    spec = Path(wdd_dir) / "spec.md"
+    content_lines = 0
+    if spec.is_file():
+        content_lines = sum(
+            1 for line in spec.read_text(encoding="utf-8").splitlines() if line.strip()
+        )
+    if content_lines >= 2:
+        return []
+    reason = "does not exist" if not spec.is_file() else "is effectively empty"
+    return [
+        {
+            "code": "missing_spec",
+            "severity": "warning",
+            "message": (
+                f".wdd/spec.md {reason} — the finalize phase reviews the epic "
+                "branch against it, and without it there is no agreed record of "
+                "what this scope delivers. Run the intake (wdd-plan) first."
+            ),
+        }
+    ]
+
+
 def lint_plan(
     plan_dict: dict[str, Any], wdd_dir: Path | str | None = None
 ) -> list[dict[str, Any]]:
@@ -165,5 +188,6 @@ def lint_plan(
     findings.extend(_check_enumerated_domains(plan_dict))
     findings.extend(_check_coarse_domains(plan_dict))
     if wdd_dir is not None:
+        findings.extend(_check_spec(wdd_dir))
         findings.extend(_check_briefs(plan_dict, wdd_dir))
     return findings
