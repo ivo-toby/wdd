@@ -41,11 +41,12 @@ plain language, not verbs, revisions, or action names.
   If you have picked up a scope someone else started (a clone with work
   already in flight), run `start` on the in-progress tasks too: it
   re-attaches their worktrees from their branches without restarting them.
-- **`await_worker`** → the worker is still going. When it reports back, you
-  run `recordWith` — workers never run `wddctl` themselves, because it
-  resolves `--state` and `--repo` from the working directory and theirs is
-  the worktree, not your checkout. Queue anything durable they reported with
-  `wddctl note`.
+- **`await_worker`** → the worker is still going. Waiting is active, not
+  passive — see "Keeping the loop alive" below. When the worker reports
+  back, you run `recordWith` — workers never run `wddctl` themselves,
+  because it resolves `--state` and `--repo` from the working directory and
+  theirs is the worktree, not your checkout. Queue anything durable they
+  reported with `wddctl note`.
 - **`run_review`** → dispatch a reviewer per `wdd-review`. Their findings go
   into `recordWith` in place of `'[]'`.
 - **`run_verification`** → run the constitution's verification command, then
@@ -111,6 +112,39 @@ more work to bring? That's a new plan (`wdd-plan`); otherwise you're done.
 blocker. `BLOCKED` → `wddctl block --task ID --reason "..."`, which frees the
 task's conflict domains so others proceed; `wddctl unblock` returns it to the
 queue, `wddctl cancel` drops it.
+
+## Keeping the loop alive
+
+The loop only runs if you keep running it. A controller that dispatches a
+worker and then ends its turn has not delegated the work — it has halted
+the scope. Dispatch is step one of a watch, and how you watch depends on
+what your harness gives you. In order of preference:
+
+1. **Synchronous dispatch.** If your harness can wait for a subagent's
+   result inside your turn, use that: dispatch, block, handle the report,
+   run `next`, repeat. Nothing else is needed.
+2. **Completion wake-ups.** If dispatch is asynchronous but your harness
+   notifies you when a subagent finishes (task notifications, callbacks),
+   rely on those — and on every wake-up, handle the report, then run
+   `wddctl monitor --once --repo .` and `wddctl next` before dispatching
+   more.
+3. **Scheduled checks.** If your harness supports scheduled or recurring
+   tasks (timers, cron-like scheduling, a "check again in N minutes"
+   primitive), schedule a tick whenever work is in flight or the scope
+   waits on a human (`await_human_merge`, `await_delivery`). Each tick:
+   `wddctl monitor --once --repo .`, then `wddctl next`, then act on what
+   it says. Cancel the schedule when `next` goes empty.
+4. **Manual fallback.** If your harness has none of the above, say so —
+   never silently stop. Tell the user exactly how to resume: what to say
+   ("continue the scope"), and when to say it ("once the workers have had
+   a few minutes" / "after you merge the PR"). State is durable; any
+   future session picks up from `wddctl next` exactly where this one
+   stopped.
+
+`wddctl monitor` exists for exactly these wake-ups: one cheap Git
+observation tick that flags changed task heads, missing branches or
+worktrees, and merge-ready tasks a human already merged — each with the
+command that records it.
 
 ## Discipline
 

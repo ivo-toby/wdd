@@ -53,8 +53,9 @@ small, self-contained edit — just make the change directly.
 ## Roles
 
 - **Controller** — plans, dispatches workers, routes review findings,
-  reconciles, merges. Never implements task code, never hand-edits
-  `state.json`. See `wdd-run`.
+  reconciles, merges — and keeps the loop alive until the scope is done.
+  Dispatching is not delegating the watching. Never implements task code,
+  never hand-edits `state.json`. See `wdd-run`.
 - **Worker** — implements exactly one task in its assigned worktree. See
   `wdd-worker`.
 - **Reviewer** — reviews one task's diff and classifies findings. See
