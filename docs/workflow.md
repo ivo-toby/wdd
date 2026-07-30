@@ -90,7 +90,7 @@ $ wddctl init --repo .
   "hint": "run 'wddctl next' and follow it",
   "openQuestions": [
     {"path": "merge.surface", "options": ["pr", "local"],
-     "question": "Review/merge surface: 'pr' pushes task branches and mirrors review findings to pull-request comments; 'local' keeps the whole loop offline in state.json. Which should this repository use?"}
+     "question": "Should each task ship as a real GitHub pull request, or stay fully local? Pull requests give you the familiar review surface (branches pushed, findings mirrored as PR comments); local keeps the whole loop offline with no pushes — good for solo or offline work."}
   ]
 }
 ```

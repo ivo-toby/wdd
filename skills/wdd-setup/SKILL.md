@@ -21,10 +21,15 @@ Initialize from scratch.
    `state.json`. Re-running it is a safe no-op.
 2. Run `wddctl next` and do what it says. During setup it emits exactly one
    action at a time:
-   - `resolve_config` — ask the user every listed question in ONE compact
-     round (not one message per question), then record each answer with
-     `wddctl config set <path> <value>`. Values are JSON when structured
-     (`'["pytest -q"]'`), bare strings otherwise (`local`).
+   - `resolve_config` — relay every listed question to the user in ONE
+     compact round (not one message per question), as plain decisions in
+     your own words. Never show the user config paths, JSON syntax, or CLI
+     flags — the `path` on each question is for YOU. Once they answer,
+     translate each answer yourself into `wddctl config set <path> <value>`
+     (values are JSON when structured, `'["npm test"]'`; bare strings
+     otherwise, `local`). "We have no tests yet" is an answer too: set
+     `verification.commands` to `[]` and put the user's reason in
+     `verification.unavailableJustification`.
    - `ratify` — show the user the current `config.json` values and the
      `constitution.md` text (summarize, link the files), get explicit
      sign-off, then run `wddctl constitution ratify --by <name>`. Never

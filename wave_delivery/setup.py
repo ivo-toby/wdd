@@ -73,13 +73,21 @@ def _legacy_models(constitution_text: str) -> dict[str, Any] | None:
 
 
 def _open_questions(probed_commands: list[str]) -> list[dict[str, Any]]:
+    """Setup decisions the agent must relay to the user.
+
+    ``question`` is written for the HUMAN: a plain decision, no config paths,
+    no JSON syntax — the agent asks it as-is (or better) and translates the
+    answer into ``wddctl config set`` itself using ``path``.
+    """
     questions: list[dict[str, Any]] = [
         {
             "path": "merge.surface",
             "question": (
-                "Review/merge surface: 'pr' pushes task branches and mirrors review "
-                "findings to pull-request comments; 'local' keeps the whole loop "
-                "offline in state.json. Which should this repository use?"
+                "Should each task ship as a real GitHub pull request, or stay "
+                "fully local? Pull requests give you the familiar review surface "
+                "(branches pushed, findings mirrored as PR comments); local keeps "
+                "the whole loop offline with no pushes — good for solo or "
+                "offline work."
             ),
             "options": ["pr", "local"],
         }
@@ -89,8 +97,11 @@ def _open_questions(probed_commands: list[str]) -> list[dict[str, Any]]:
             {
                 "path": "verification.commands",
                 "question": (
-                    "No verification command could be detected. What command(s) prove "
-                    'a change works here? (JSON list, e.g. ["pytest -q"])'
+                    "I couldn't detect a test or verification command in this "
+                    "repository. What command should prove a change works — for "
+                    "example 'npm test' or 'pytest -q'? If nothing runnable "
+                    "exists yet, say so and verification will be recorded as "
+                    "unavailable with your justification."
                 ),
             }
         )
@@ -192,7 +203,7 @@ def setup_next_actions(
                 "action": "resolve_config",
                 "questions": config["openQuestions"],
                 "command": f"{prefix} config set <path> <value>",
-                "judgment": "ask the user every listed question in ONE round, then record each answer",
+                "judgment": "relay every listed question to the user in ONE round, in plain language (never show config paths or JSON syntax), then translate the answers into config set yourself",
             }
         )
     elif state["constitution"]["status"] != "ratified":
