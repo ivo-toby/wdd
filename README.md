@@ -75,8 +75,58 @@ both a text-only workflow with no CLI and a `wddctl`-based one, side by side.
 That's gone — see [`docs/spec-kit-mini-spec-findings.md`](docs/spec-kit-mini-spec-findings.md)
 for why.
 
-## Quickstart
+## Getting started
 
+The normal way to use WDD is to talk to a coding agent that has the skills
+installed. You never type `wddctl` yourself — the skills obligate the agent
+to run it, and the state machine keeps the agent honest. Your side of the
+conversation is judgment: answering setup questions, agreeing on scope,
+approving the plan, and merging the final PR.
+
+Install the skills and `wddctl` (see [Installation](#installation)), open an
+agent session in the target repository, and drive it with prose:
+
+1. **Set up.** Say: *"Set up WDD in this repo."*
+   The agent runs `wddctl init`, which scaffolds `.wdd/` and leaves a short
+   list of open questions. The agent asks you all of them in one round —
+   which merge surface (real PRs or fully local), the verification command
+   if it couldn't be probed — then shows you the config and constitution
+   and asks you to sign off. Ratification is the first gate: nothing
+   executes until you have approved.
+
+2. **Bring the work.** Say: *"Let's build \<feature\> — here's the spec"*
+   (a doc, an issue, a design note; if there is no spec yet, write one
+   first — that part is still your job).
+   The agent challenges gaps, asks clarifying questions in batches, and
+   writes the agreed understanding to `.wdd/spec.md`. Then it decomposes
+   the work into tasks with dependencies and conflict domains, lints the
+   plan for the classic failure modes (serialized chains, everything
+   high-risk, per-file domain lists), and presents the plan plus the
+   projected schedule. Nothing is applied until you approve — your name
+   goes into the record.
+
+3. **Let it run.** Say: *"Run the scope."*
+   The controller loop dispatches a worker per task (test-first, in an
+   isolated worktree), routes each diff through review, blocks merges on
+   P1/P2 findings, and merges tasks as their evidence lands. On the `pr`
+   surface every task is a real pull request; in `pr`/`human` mode nothing
+   merges until a person clicks the button. Interrupt with prose any time:
+   "block TASK-004, we're rethinking the UI."
+
+4. **Finish.** When the last task merges, the agent walks the finalize
+   ladder: a final review of the whole epic branch against `.wdd/spec.md`,
+   full verification, and a handoff PR from the epic branch into your
+   target branch. **The final merge is yours** — `wddctl` has no code path
+   to perform it, and the scope only reaches `delivered` once Git proves
+   you did.
+
+"Where are we?" works at any point — the agent reads the state and reports
+the phase, active tasks, and blockers. For the full day-to-day narrative,
+see [`docs/workflow.md`](docs/workflow.md).
+
+## Quickstart (driving wddctl yourself)
+
+Prefer the terminal — or scripting a CI step? The same flow, verb by verb.
 Install `wddctl` and the skills (see Installation below), then in a target
 repository:
 
