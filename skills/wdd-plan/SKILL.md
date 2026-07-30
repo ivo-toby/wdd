@@ -123,7 +123,12 @@ rebase churn, not task count. Set it low (2-3) when tasks share nearby code
 and rebases are likely painful even without a hard conflict-domain overlap;
 raise it when tasks are genuinely isolated.
 
-See `templates/plan.json` and `templates/task.md` for the exact shapes.
+Two artifacts, two formats — do not mix them up. `plan.json` is JSON for
+the machine. Each task's brief (the file at its `specPath`, under
+`.wdd/tasks/`) is **Markdown prose for the worker** — objective, scope,
+non-scope, verification — never JSON. A worker exercises judgment against
+sentences, not a data blob. See `templates/plan.json` and
+`templates/task.md` for the exact shapes.
 
 ## Present for approval
 

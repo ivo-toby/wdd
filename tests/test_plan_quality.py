@@ -216,6 +216,28 @@ class LintBriefTest(unittest.TestCase):
             findings = [f for f in lint_plan(plan, wdd) if f["code"] == "missing_brief"]
             self.assertEqual({f["task"] for f in findings}, {"T2", "T3"})
 
+    def test_json_blob_brief_warns_nonprose(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            (wdd / "tasks").mkdir(parents=True)
+            (wdd / "tasks" / "T1.md").write_text(
+                '{\n  "objective": "scaffold",\n  "files": ["a.py"]\n}\n',
+                encoding="utf-8",
+            )
+            plan = _plan([_task("T1")])
+            findings = [f for f in lint_plan(plan, wdd) if f["code"] == "nonprose_brief"]
+            self.assertEqual([f["task"] for f in findings], ["T1"])
+
+    def test_prose_brief_is_clean_of_nonprose(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            (wdd / "tasks").mkdir(parents=True)
+            (wdd / "tasks" / "T1.md").write_text(
+                "# T1\n\nBuild the thing properly.\n", encoding="utf-8"
+            )
+            plan = _plan([_task("T1")])
+            self.assertNotIn("nonprose_brief", _codes(lint_plan(plan, wdd)))
+
     def test_no_wdd_dir_skips_brief_check(self) -> None:
         plan = _plan([_task("T1")])
         self.assertNotIn("missing_brief", _codes(lint_plan(plan)))

@@ -229,6 +229,7 @@ Codes:
 | `enumerated_domains` | a task lists 4+ individual files (no wildcard) under the same directory — a candidate for the `dir/**` glob instead, unless another task genuinely needs to write there concurrently (repo-root, top-level files are exempt from this grouping). |
 | `coarse_domain` | a single domain on one task overlaps 3+ other tasks' domains — it will serialize all of them; narrow it to what the task actually writes. |
 | `missing_brief` | a task's `specPath` file doesn't exist, or has fewer than 2 non-blank lines — a worker dispatched on it will improvise. |
+| `nonprose_brief` | a task's brief starts with `{` or `[` — it reads as JSON/data, not the Markdown prose (objective, scope, verification) a worker needs. |
 
 Every finding is `"severity": "warning"` — lint never blocks by default. Pass
 `--strict` to turn any finding into a refusal (exit 2), naming the offending

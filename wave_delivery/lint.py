@@ -136,6 +136,23 @@ def _check_briefs(plan_dict: dict[str, Any], wdd_dir: Path | str) -> list[dict[s
                     "message": f"{entry['id']}: brief {entry['specPath']} {reason} — a worker dispatched on it will improvise.",
                 }
             )
+            continue
+        # Briefs are prose for the worker; a JSON/YAML-shaped blob means the
+        # author confused the brief with plan.json (seen with small models).
+        stripped = brief.read_text(encoding="utf-8").lstrip()
+        if stripped[:1] in "{[":
+            findings.append(
+                {
+                    "code": "nonprose_brief",
+                    "severity": "warning",
+                    "task": entry["id"],
+                    "message": (
+                        f"{entry['id']}: brief {entry['specPath']} reads as JSON/data, "
+                        "not prose — a worker needs sentences (objective, scope, "
+                        "verification), not a second plan.json."
+                    ),
+                }
+            )
     return findings
 
 
