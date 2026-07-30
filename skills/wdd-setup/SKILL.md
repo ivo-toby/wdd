@@ -58,3 +58,7 @@ ratification — walk the user through re-approval as for a fresh setup.
 
 - `wddctl next` no longer emits `resolve_config` or `ratify`.
 - The user has explicitly approved what was ratified.
+
+Close with the handoff: offer to start planning — "Setup's done. Should I
+start planning? Point me at a spec or describe the feature." Planning is
+`wdd-plan`; don't make the user discover that.

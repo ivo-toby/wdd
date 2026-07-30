@@ -100,7 +100,9 @@ actions and starts driving the finalize ladder instead — same one-action,
   `delivered`.
 
 Once `delivered` is recorded, `next` returns empty actions with
-`"phase": "delivered"` — there is nothing left to do for this scope.
+`"phase": "delivered"` — there is nothing left to do for this scope. Say
+so, summarize what shipped against `.wdd/spec.md`, and offer the handoff:
+more work to bring? That's a new plan (`wdd-plan`); otherwise you're done.
 
 ## Worker status tokens
 

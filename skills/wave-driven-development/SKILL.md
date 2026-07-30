@@ -25,6 +25,12 @@ they must act on it personally (a PR to merge, a file to read). "Plan
 applied: ten tasks, the scaffold task is starting now, everything else
 waits on it" beats a paraphrase of the state file.
 
+Every phase ends with a handoff, not a full stop. When a skill's work is
+done, name the natural next step in the user's terms and offer to take it
+— "Setup is ratified. Should I start planning? Point me at a spec or
+describe the feature." — instead of waiting to be asked. The user should
+never need to know which skill comes next; offering it is your job.
+
 ## When to use it
 
 Use WDD when work naturally splits into several tasks that can run

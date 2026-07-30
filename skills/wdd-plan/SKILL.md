@@ -175,3 +175,6 @@ revisions, scope IDs, or the commands you ran.
 - Approval is recorded — `scope.approval` is present in state (`by` the
   approving human, `at` a timestamp).
 - `wddctl next` shows `start_task` actions.
+
+Close with the handoff: offer to start the work — "Plan's applied. Want me
+to run it?" Running the scope is `wdd-run`.

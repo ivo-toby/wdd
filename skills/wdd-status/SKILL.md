@@ -32,8 +32,10 @@ them — not raw JSON, revisions, or scope IDs.
    `cancelled` — plus open P1/P2 findings and any reconciliation due.
    `wddctl next` reports the matching *action* for each gate; don't confuse
    the two vocabularies when summarizing.
-5. Name the next concrete action and which skill handles it: `wdd-run` for
-   controller work, `wdd-plan` if the plan needs reshaping.
+5. Close with the next concrete step, and when it is the agent's to take,
+   offer to take it now ("Two tasks are merge-ready — want me to
+   continue?"). Controller work is `wdd-run`; reshaping the plan is
+   `wdd-plan`.
 
 Never hand-repair `state.json` or task file paths — if something looks
 wrong, that's a bug to report, not to patch.
