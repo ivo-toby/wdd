@@ -113,6 +113,22 @@ blocker. `BLOCKED` → `wddctl block --task ID --reason "..."`, which frees the
 task's conflict domains so others proceed; `wddctl unblock` returns it to the
 queue, `wddctl cancel` drops it.
 
+## Where each role runs
+
+You — the session reading this — are the controller. Run the loop in your
+own context; never dispatch "act as the controller" into a subagent.
+Dispatch depth is usually one level, so a controller inside a subagent has
+no way to spawn workers and ends up implementing tasks itself — the one
+thing a controller must never do. Spend subagent dispatch on workers and
+reviewers, nothing else.
+
+If your harness offers no subagent dispatch at all, the roles collapse
+into you: implement the task yourself in its worktree following
+`wdd-worker`, then switch hats and review the diff per `wdd-review` before
+recording. Tell the user this is the degraded single-session mode —
+self-review is weaker than an independent reviewer, and the review record
+should name you honestly rather than a phantom reviewer.
+
 ## Keeping the loop alive
 
 The loop only runs if you keep running it. A controller that dispatches a
