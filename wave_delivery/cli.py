@@ -595,25 +595,14 @@ def _apply_execution_drift(
     too (rather than only execute/finalize) so a caller polling `next` after
     delivery still sees *why* nothing is happening if governance drifted.
 
-    Governance drift is checked first (unchanged from before Task 4), then
-    the intake/plan gate (`plan.intake_gate_status`, `require_fresh_intake`'s
-    non-raising twin): each match inserts its own blocker at position 0, so
-    whichever fires last leads -- in practice the two are independent axes
-    (config/constitution vs spec/design/plan bytes) and rarely coexist, but
-    nothing here assumes exclusivity.
+    The chokepoint in `main()` (`require_fresh_governance` then
+    `require_fresh_intake`) raises governance drift first when both are
+    present, so this must surface the same blocker at position 0: the
+    intake/plan gate is checked and inserted FIRST, then governance drift is
+    checked and inserted last -- since both insert at position 0, governance
+    (inserted last) ends up leading whenever both fire, matching the raise
+    order, while either single-drift case is unaffected by the reordering.
     """
-    drift = governance_drift(state, wdd_dir)
-    if drift is not None:
-        result["actions"] = []
-        result["blockers"].insert(
-            0,
-            {
-                "code": "governance_drift",
-                "message": "config/constitution changed since ratification; amend before executing",
-                **drift,
-            },
-        )
-
     gate = intake_gate_status(state, wdd_dir)
     if gate is not None:
         code, detail = gate
@@ -632,6 +621,18 @@ def _apply_execution_drift(
                 "approved); run 'wddctl plan apply --approved-by NAME' to re-stamp"
             )
         result["blockers"].insert(0, {"code": code, "message": message, **detail})
+
+    drift = governance_drift(state, wdd_dir)
+    if drift is not None:
+        result["actions"] = []
+        result["blockers"].insert(
+            0,
+            {
+                "code": "governance_drift",
+                "message": "config/constitution changed since ratification; amend before executing",
+                **drift,
+            },
+        )
     return result
 
 

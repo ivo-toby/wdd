@@ -1875,5 +1875,164 @@ class IntakeGateStatusUnitTest(unittest.TestCase):
             require_fresh_intake(current, wdd)  # must not raise
 
 
+class CompositeHashesEffectivePlanTest(unittest.TestCase):
+    """Task 4 fix round CRITICAL: apply_plan's recorded composite must be
+    computed from the EFFECTIVE (post-apply) plan -- via the same
+    `_reconstruct_plan_from_state` the gate uses -- not the raw submitted
+    plan dict. baseRef/mergeSurface/mergeMode are "omission means keep":
+    a legitimate re-apply that omits them must not manufacture a false,
+    unrecoverable plan_drift that locks every governed verb.
+    """
+
+    def _first_apply_with_overrides(self, state: str, wdd: Path, root: Path) -> None:
+        _walk_intake(state, wdd)
+        (wdd / "tasks").mkdir(exist_ok=True)
+        (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+        plan = {
+            "schemaVersion": 1,
+            "kind": "wdd_plan",
+            "scope": {
+                "id": "SCOPE-x",
+                "baseRef": "wdd/scope-x",
+                "mergeSurface": "local",
+                "mergeMode": "controller",
+            },
+            "tasks": [{"id": "T1", "specPath": "tasks/T1.md"}],
+        }
+        plan_file = root / "plan.json"
+        plan_file.write_text(json.dumps(plan), encoding="utf-8")
+        code, out = _cli(
+            state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+            "--approved-by", "t",
+        )
+        assert code == 0, out
+
+    def test_reapply_with_task_change_omitting_overrides_is_not_drift(self) -> None:
+        """Nonempty-diff re-apply path (the `mutator` closure): a task field
+        change forces a real apply (not the unchanged-diff shortcut), while
+        the scope omits baseRef/mergeSurface/mergeMode entirely."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            self._first_apply_with_overrides(state, wdd, root)
+
+            plan2 = {
+                "schemaVersion": 1,
+                "kind": "wdd_plan",
+                "scope": {"id": "SCOPE-x"},
+                "tasks": [{"id": "T1", "specPath": "tasks/T1.md", "title": "T1 renamed"}],
+            }
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan2), encoding="utf-8")
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+
+            current = StateStore(Path(state)).read()
+            self.assertIsNone(intake_gate_status(current, wdd))
+
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+    def test_unchanged_reapply_omitting_overrides_restamp_is_not_drift(self) -> None:
+        """Unchanged-diff + --approved-by re-stamp path (`approval_mutator`):
+        an otherwise identical plan that omits baseRef/mergeSurface/
+        mergeMode must still re-stamp a composite matching the kept
+        (effective) scope, not "absent" overrides."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            self._first_apply_with_overrides(state, wdd, root)
+
+            plan2 = {
+                "schemaVersion": 1,
+                "kind": "wdd_plan",
+                "scope": {"id": "SCOPE-x"},
+                "tasks": [{"id": "T1", "specPath": "tasks/T1.md"}],
+            }
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan2), encoding="utf-8")
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+            self.assertTrue(json.loads(out)["unchanged"])
+
+            current = StateStore(Path(state)).read()
+            self.assertIsNone(intake_gate_status(current, wdd))
+
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+    def test_reviewer_repro_omit_baseref_on_second_apply_is_not_drift(self) -> None:
+        """Regression pin for the reviewer's exact live repro: a second apply
+        that omits ONLY baseRef (mergeSurface/mergeMode repeated verbatim)
+        must not drift."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            self._first_apply_with_overrides(state, wdd, root)
+
+            plan2 = {
+                "schemaVersion": 1,
+                "kind": "wdd_plan",
+                "scope": {
+                    "id": "SCOPE-x",
+                    "mergeSurface": "local",
+                    "mergeMode": "controller",
+                },
+                "tasks": [{"id": "T1", "specPath": "tasks/T1.md"}],
+            }
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan2), encoding="utf-8")
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+
+            current = StateStore(Path(state)).read()
+            self.assertIsNone(intake_gate_status(current, wdd))
+            require_fresh_intake(current, wdd)  # must not raise
+
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+
+class BothDriftBlockerOrderTest(unittest.TestCase):
+    """Task 4 fix round IMPORTANT: when both governance and intake/plan
+    drift are present, `next`'s blockers[0] must be governance_drift --
+    matching the chokepoint's raise order (`require_fresh_governance` then
+    `require_fresh_intake` in `main()`), not whichever gate happened to
+    insert last."""
+
+    def test_both_drift_blocker_zero_is_governance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_ladder_and_plan(state, wdd, root)
+
+            # Intake/plan drift: edit the spec after the ladder + plan were
+            # approved.
+            (wdd / "spec.md").write_text(
+                _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
+            )
+            # Governance drift: constitution ratified against a config that
+            # has since been amended without re-ratifying.
+            assert _cli(state, "config", "set", "review.blockingSeverities", '["P1"]')[0] == 0
+
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["actions"], [])
+            codes = [b["code"] for b in result["blockers"]]
+            self.assertIn("governance_drift", codes)
+            self.assertIn("intake_drift", codes)
+            self.assertEqual(result["blockers"][0]["code"], "governance_drift")
+
+
 if __name__ == "__main__":
     unittest.main()

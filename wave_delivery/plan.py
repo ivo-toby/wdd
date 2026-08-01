@@ -674,12 +674,6 @@ def apply_plan(
             "--approved-by NAME once the user has reviewed the diff"
         )
 
-    # The composite is recomputed every time an approval is (re-)stamped --
-    # including the unchanged-diff re-stamp path -- so an edit to a brief or
-    # context file (invisible to _diff_plan, which only compares task
-    # fields) is still captured in the bytes the next approval binds to.
-    composite = None if legacy or not approved_by else plan_composite(plan, wdd_dir)
-
     result = {
         "scope": plan["scope"]["id"],
         "created": created,
@@ -702,6 +696,18 @@ def apply_plan(
     if unchanged and approved_by:
         def approval_mutator(state: dict[str, Any]) -> dict[str, Any]:
             state_copy = copied_state(state)
+            # The composite must hash the EFFECTIVE (post-apply) plan, not the
+            # raw submitted one: baseRef/mergeSurface/mergeMode have
+            # "omission means keep" semantics, so a legitimate re-apply that
+            # omits them would otherwise hash "absent" here while the gate's
+            # _reconstruct_plan_from_state (what require_fresh_intake compares
+            # against) sees the real, kept value -- an unrecoverable false
+            # plan_drift no re-apply of the same minimal file could heal.
+            # Reconstructing from state_copy after the (no-op, diff-empty)
+            # apply keeps both sides symmetric by construction.
+            composite = (
+                None if legacy else plan_composite(_reconstruct_plan_from_state(state_copy), wdd_dir)
+            )
             _stamp_approval(state_copy, approved_by, composite)
             return state_copy
 
@@ -730,6 +736,16 @@ def apply_plan(
         # that a later corrected apply would silently adopt as its base.
         nonlocal base
         updated = _apply_plan_to_state(state, plan)
+        # Same symmetry as the unchanged-plan re-stamp path above: hash the
+        # EFFECTIVE state _apply_plan_to_state just produced (via the same
+        # _reconstruct_plan_from_state the gate uses), not the raw plan dict
+        # -- covers the scope-adoption path too (scope adopted from null),
+        # since `updated` already reflects the post-adoption scope.
+        composite = (
+            None
+            if legacy or not approved_by
+            else plan_composite(_reconstruct_plan_from_state(updated), wdd_dir)
+        )
         _stamp_approval(updated, approved_by, composite)
         if repo is not None and plan["scope"]["baseRef"]:
             base = ensure_base_branch(repo, plan["scope"]["baseRef"], from_ref=from_ref)
