@@ -157,7 +157,7 @@ wddctl plan apply --plan plan.json --repo . [--from-ref REF] [--dry-run] [--appr
   `HEAD`).
 - `--dry-run` — compute and print the diff without writing state or creating
   a branch.
-- `--approved-by NAME` — record approval: stamps `{"by": NAME, "at": <utc_now>}` into `scope.approval`. Re-apply without this flag preserves the last recorded approval (via `scope.approval` in the written state).
+- `--approved-by NAME` — record approval: stamps `{"by": NAME, "at": <utc_now>, "sha256": <composite>}` into `scope.approval`, where the composite is a SHA-256 over the normalized plan plus every task brief and context file (see "The plan-approval composite" below). A nonempty diff requires this flag on v5 scopes; re-apply without it preserves the recorded approval. Legacy scopes keep the old `{by, at}` behavior.
 
 ```sh
 wddctl plan apply --plan plan.json --repo . --dry-run
@@ -1388,9 +1388,9 @@ pending notes and stamps the checkpoint time.
 
 ### `migrate`
 
-Convert schema-v2 controller state (produced by `wddctl init` on older
-revisions) to the current schema. Dry-run first; `--apply` writes a
-`.v2.bak` backup beside the state file before converting.
+Convert schema-v2, v3, or v4 controller state to the current v5 schema.
+Dry-run first; `--apply` writes a `.v2.bak` backup beside the state file
+before converting.
 
 ```sh
 wddctl --state .wdd/state.json migrate --dry-run
@@ -1399,13 +1399,16 @@ wddctl --state .wdd/state.json migrate --apply
 
 `--state` is a global option, so it goes before the subcommand.
 
-Waves are dropped (scheduling is derived from dependencies and conflict
-domains), every task defaults to `risk: normal`, and recorded worktree paths
-are cleared because the location is derived per checkout. `reviewPolicy`
-becomes `always`, because schema v2 required review for every task —
-migrating must not silently drop that obligation. Pass
-`--review-policy risk_based` to loosen it deliberately. Reading v2 state
-without migrating fails with a message pointing here.
+All sources (v2, v3, v4) chain through an intermediate v4 shape, then the
+v4 → v5 step is a pure schema bump plus `intake: {"legacy": true}` — a
+wholesale exemption from the intake ladder (spec, research, design) and
+plan-approval composite enforcement. Waves are dropped (scheduling is
+derived from dependencies and conflict domains), every task defaults to
+`risk: normal`, and recorded worktree paths are cleared because the location
+is derived per checkout. Schema v2 required review for every task, so
+`reviewPolicy` becomes `always` by default to preserve that obligation;
+pass `--review-policy risk_based` to loosen it deliberately. Reading v2–v4
+state without migrating fails with a message pointing here.
 
 A separate `--governance` flag converts a pre-split repository (a
 `constitution.md` with no `config.json` sibling, from before the fingerprint
