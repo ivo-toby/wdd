@@ -144,7 +144,41 @@ The lever is judgment content, not size. Normative rules in `wdd-plan`:
 - **Finalize tie-in** — `final_review`'s judgment references the numbered
   criteria and design.md's epic deliverable statement (prose change only).
 
-## 6. Compatibility and migration
+## 6. Runners: generic dispatch beyond the harness
+
+A worker is file-in, file-out: worktree + brief + context in, commits +
+status token out. Nothing requires it to be a subagent of the controller's
+harness. An optional `runners` map in config.json makes the `model` field
+resolvable to an external agent CLI:
+
+```json
+"runners": {
+  "qwen-local": {"command": ["pi", "--headless", "--model", "qwen3.6",
+                              "--cd", "{worktree}", "-p", "{prompt}"]},
+  "codex":      {"command": ["codex", "exec", "--cd", "{worktree}", "{prompt}"]}
+}
+```
+
+- Resolution: a `model` value (per-task override or tier config) naming a
+  runner dispatches via that runner; any other value is harness-native,
+  exactly as today. Fully backward compatible.
+- `wddctl dispatch --task ID --role worker|reviewer` owns the mechanical
+  part: assemble the dispatch packet (§5's contract) into the prompt, exec
+  the runner in the task's worktree, capture output to
+  `.wdd/dispatch/<task>-<role>.log`, report exit code and the trailing
+  status token. The controller reads the log as it would read any worker
+  report; all evidence still flows through git and `wddctl` verbs.
+- `doctor`'s existing CLI probes (`codex`, `claude`, …) report which
+  runners' commands are actually present.
+
+**Hard non-goals, stated to stay out of harness territory:** no streaming,
+no interactive sessions, no tool-permission mediation, no supervision or
+retries. One-shot headless exec with exit-code semantics; `NEEDS_CONTEXT`
+in the output is handled like any worker saying it — re-dispatch with more
+context. The child agent's own sandboxing, permissions, and timeouts are
+its runner command's business, authored per machine by the operator.
+
+## 7. Compatibility and migration
 
 - Legacy states (no `intake` key): everything keeps working; the ladder is
   init-created-state-only. No state migration needed (the section is
