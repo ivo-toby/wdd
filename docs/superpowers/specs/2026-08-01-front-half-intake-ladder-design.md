@@ -89,6 +89,15 @@ from absence — a post-release scope cannot masquerade as grandfathered.
 Clarification is not a rung; it is what happens at each approval. Every
 rung ends in explicit, attributed user sign-off.
 
+The ladder also gets its final transition. `wddctl scope archive`
+(delivered-phase only) moves the completed scope's records — scope, tasks,
+intake, finalize, plan approval — to `.wdd/archive/<scope-id>.json` and
+resets state to post-ratification setup: governance stands, the intake
+ladder restarts for the next scope, and nothing scope-specific (the
+deliverable command included) leaks forward. This closes the long-deferred
+"retire a scope" gap: `delivered` stops being a dead end, and one
+repository can run successive scopes without hand-surgery on state.
+
 Phase derivation: `setup` extends through the intake rungs (scope is still
 null); `derived_phase` itself is unchanged. `setup_next_actions` gains the
 rung logic, each action carrying the recording command and a `judgment`
@@ -114,9 +123,11 @@ pointing at the owning skill stage.
      a surface with producers and no owning task is a design error caught
      mechanically, not at review.
   4. **Epic deliverable** — what observably runs when the scope is done,
-     and the command that proves it. That command is recorded **on the
-     scope** at design approval (`intake design --deliverable-command
-     "..."`), fingerprinted with the design: finalize's
+     and the command that proves it. That command is recorded **in the
+     intake record** (`state.intake.design.deliverableCommand`) at design
+     approval (`intake design --deliverable-command "..."`) — the scope
+     itself stays null throughout intake — fingerprinted with the design:
+     finalize's
      `final_verification` runs the ratified global `verification.commands`
      **plus** this scope command. Global config is never mutated
      mid-intake — no governance drift, and an epic-specific smoke check
@@ -140,7 +151,11 @@ pointing at the owning skill stage.
   carry the resolved absolute paths; artifact integrity is already
   guaranteed by the fingerprint-bound approvals (§1). Lint warns
   (`missing_context`) when a scope has intake artifacts and a task carries
-  no refs.
+  no refs. Refs of the form `spec.md#AC-N` are the **authoritative
+  mapping** from tasks to acceptance criteria — they are what the reviewer
+  packet's "criteria it discharges" means, and what finalize walks per
+  task. Lint warns (`missing_criteria`) when a task discharges no
+  criterion; advisory, since genuinely internal tasks exist.
 - `"model": "..."` — per-task override of the risk-tiered implementation
   model. Precedence in `next` payload decoration: task override →
   risk-tiered config → absent. This enables heterogeneous routing: the
@@ -172,9 +187,27 @@ recorded approval. Post-approval edits to briefs or context files are plan
 drift, caught by the same execution gate as intake drift; the remedy is a
 fresh `plan apply --approved-by` (empty diff, re-stamp) after the user has
 seen the change — which makes reconciliation's brief updates an explicit,
-signed-off step rather than a silent mutation. `start`/`dispatch`
-revalidate the hashes of the specific brief and context refs they are
-about to hand over.
+signed-off step rather than a silent mutation. Handover itself is immutable: at `start`/`dispatch` the
+brief and every context ref are materialized into a read-only **attempt
+snapshot** (`.wdd/dispatch/<task>-<attempt>/`, transient and gitignored
+like all dispatch scratch), their digests recorded on the attempt. Workers
+and reviewers receive snapshot paths, never live controller files — a file
+edited (or edited-and-restored) after validation cannot reach a worker,
+and the old absolute-path-into-the-controller-checkout subtlety in the
+worker contract disappears.
+
+Those recorded digests also give evidence a version to bind to
+(**input-version binding**): a task's review and verification evidence is
+valid only while the task's recorded input digests match the currently
+approved bytes. When a re-approval changes a task's *own* brief or context,
+that task's in-flight attempt and unmerged evidence are invalidated —
+`next` reports `inputs_changed`, and the controller either re-dispatches
+or records an explicit human decision that the existing work stands
+(`wddctl rebind --task ID --by NAME`). Tasks whose own inputs did not
+change are untouched by composite changes elsewhere: the composite gates
+the plan, per-task digests gate the task. Merged evidence is history —
+already-merged work is judged by the finalize review against the current
+spec, not retroactively unmade.
 
 Optional, minimal instrumentation (cuttable if the implementation plan
 finds it dead weight): `submit --tokens N` records the worker's reported
@@ -285,7 +318,13 @@ resolvable to an external agent CLI:
   where the command is explicit in the invocation. Task dispatch
   (`dispatch --task`) is likewise governed, so an unratified runner can
   never run a task. The `wdd-runners` skill ends every registration with a passing
-  probe — a runner that was never probed is configuration fiction.
+  probe — a runner that was never probed is configuration fiction. The
+  guarantee is mechanical, not promissory: a passing probe records
+  `{sha256(command), at}` in state as an ungoverned observation (the
+  `monitor` precedent), and `dispatch --task` refuses a runner whose
+  ratified command digest has no passing probe record. Probe-then-edit
+  breaks the digest match and re-refuses; the evidence follows the exact
+  command bytes, in either registration order.
 
 Documentation ships with the feature: a "Runners" section in
 `docs/wddctl.md` (config shape, resolution order, `dispatch`/`--probe`
@@ -302,8 +341,12 @@ its runner command's business, authored per machine by the operator.
 ## 7. Compatibility and migration
 
 - Schema v5: `intake` always present. `migrate` converts v4 by adding
-  `intake: {"legacy": true}` (ladder-exempt); the exemption is explicit
-  migration metadata, never inferred from absence. The no-state
+  `intake: {"legacy": true}`, which exempts the scope **wholesale** from
+  the new doctrine: the ladder, the plan-approval composite, and
+  input-version binding alike — a v4 scope has no approved-bytes baseline
+  and none can be legitimately manufactured, so pretending otherwise would
+  be fiction. New-doctrine gating applies only to v5-born scopes. The
+  exemption is explicit migration metadata, never inferred from absence. The no-state
   `plan apply` bootstrap is removed — `init` is the only way to create
   state.
 - Existing plans without `context`/`model`/Deliverable: valid; lint warns
@@ -319,7 +362,9 @@ its runner command's business, authored per machine by the operator.
   review).
 - No changes to execution or finalize mechanics beyond: payload
   decoration precedence, the intake/plan drift extension of the existing
-  execution gate, and the multi-command `final_verification` evidence
+  execution gate (with attempt snapshots and input-version binding, §3),
+  the runner dispatch/probe mechanics of §6, the `scope archive`
+  transition of §1, and the multi-command `final_verification` evidence
   shape defined in §5.
 - Jira provider and enterprise overlay remain the separate consolidation
   phase.
