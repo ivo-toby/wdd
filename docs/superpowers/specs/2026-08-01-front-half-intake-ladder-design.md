@@ -37,10 +37,29 @@ twin), written through new verbs:
 
 Every approval is **bound to the approved bytes** — the same doctrine as
 the governance fingerprint. Each record carries a SHA-256 of the artifact
-at approval time; `next` and `plan apply` re-hash and treat a mismatch as
-intake drift: the affected rung is re-emitted for re-approval, and
-`plan apply` refuses until it happens. An approval of text that has since
-changed approves nothing.
+at approval time. Drift is enforced in three places:
+
+- **Before apply**: `next` re-hashes; a mismatched rung is re-emitted for
+  re-approval, and `plan apply` refuses until it happens.
+- **After apply**: intake joins the existing execution gate. The
+  governance check that already guards every governed verb (`start`,
+  `submit`, `review`/`verify record`, `merge`, `dispatch --task`, …)
+  extends to intake fingerprints for non-legacy states — editing spec.md
+  mid-execution refuses admission and merges, not just planning. The
+  execute-phase `next` surfaces an `intake_drift` blocker (actions
+  emptied, the stale rung named with its recording command), exactly like
+  `governance_drift`. Intake verbs stay legal in the execute phase for
+  precisely this re-approval.
+- **Downstream cascade**: the ladder is ordered; re-approving a rung
+  invalidates everything after it. A new spec approval clears the research
+  and design records; a new research record clears design. And because an
+  applied plan was approved against the old upstream, any rung
+  re-approval also requires a fresh `plan apply --approved-by` before
+  execution resumes — with an unchanged plan file that is a pure
+  re-stamp, so the cost is one command, not a re-plan.
+
+An approval of text that has since changed approves nothing, and neither
+does an approval whose foundations changed underneath it.
 
 - `wddctl intake spec --approved-by NAME` — refuses unless `.wdd/spec.md`
   exists with the four agreed sections and **numbered acceptance criteria**
@@ -88,9 +107,12 @@ pointing at the owning skill stage.
   2. **Interfaces** — per component, Consumes / Produces (exact names and
      types where known).
   3. **Integration surfaces** — every file/registry multiple tasks feed,
-     and **which task owns each**. A shared surface with producers and no
-     owning integration task is a design error, caught here, not at
-     review.
+     listed one per line as ``- `path/glob` — owned by: <responsibility>``
+     (a named responsibility, since task IDs do not exist yet). At plan
+     time, lint closes the loop: `unowned_surface` warns for any listed
+     surface whose path is not covered by some task's `conflictDomains` —
+     a surface with producers and no owning task is a design error caught
+     mechanically, not at review.
   4. **Epic deliverable** — what observably runs when the scope is done,
      and the command that proves it. That command is recorded **on the
      scope** at design approval (`intake design --deliverable-command
@@ -141,6 +163,19 @@ Brief template gains two required sections, both linted:
 - **Interfaces** — Consumes / Produces for this task, consistent with
   design.md.
 
+Plan approval joins the approved-bytes doctrine: `plan apply
+--approved-by` records a composite SHA-256 over the normalized plan, every
+task's brief file, and every file named in `context` refs. A nonempty diff
+(tasks or scope changed) **requires** `--approved-by` — re-applying a
+changed plan silently is refused; an unchanged re-apply preserves the
+recorded approval. Post-approval edits to briefs or context files are plan
+drift, caught by the same execution gate as intake drift; the remedy is a
+fresh `plan apply --approved-by` (empty diff, re-stamp) after the user has
+seen the change — which makes reconciliation's brief updates an explicit,
+signed-off step rather than a silent mutation. `start`/`dispatch`
+revalidate the hashes of the specific brief and context refs they are
+about to hand over.
+
 Optional, minimal instrumentation (cuttable if the implementation plan
 finds it dead weight): `submit --tokens N` records the worker's reported
 token usage on the task (`task.cost`), surfaced by `status --json` and
@@ -180,7 +215,13 @@ The lever is judgment content, not size. Normative rules in `wdd-plan`:
 - **`wdd-review`** — reviews against the declared Deliverable first, the
   inventory for contract surfaces, criteria by number.
 - **Finalize tie-in** — `final_review`'s judgment references the numbered
-  criteria and design.md's epic deliverable statement (prose change only).
+  criteria and design.md's epic deliverable statement. `final_verification`
+  evidence grows a shape for multiple commands: an ordered list
+  `[{command, status}]` covering the global `verification.commands` then
+  the scope's deliverable command, plus an overall `status` that is
+  `passed` only when every entry passed (any failure or skip → the overall
+  is that failure; nothing partial is recorded as passed). The existing
+  single-command evidence remains readable (a one-entry list).
 - **New `wdd-runners`** — sets up and maintains the runner registry:
   probe what's on the box (`doctor`'s CLI report), help the user author
   each command template (headless flags, cwd handling, model selection),
@@ -211,9 +252,16 @@ resolvable to an external agent CLI:
 - `wddctl dispatch --task ID --role worker|reviewer` owns the mechanical
   part: assemble the dispatch packet (§5's contract) into the prompt, exec
   the runner in the task's worktree, capture output to
-  `.wdd/dispatch/<task>-<role>-<attempt>.log`, report exit code and the
-  trailing status token. The controller reads the log as it would read any
-  worker report; all evidence still flows through git and `wddctl` verbs.
+  `.wdd/dispatch/<task>-<role>-<attempt>.log`, and report per role:
+  **worker** dispatches end in the standard status token, read from the
+  log tail; **reviewer** dispatches must end with the repository's
+  existing SHA-bound `wddctl_review_result` JSON — `dispatch` validates
+  it, writes it to a result file beside the log, and the controller
+  records it with the existing `review collect` verb. No new evidence
+  format is invented; external reviewers speak the same contract internal
+  ones already do. The controller reads logs as it would read any
+  subagent report; all evidence still flows through git and `wddctl`
+  verbs.
   Log policy: `.wdd/dispatch/` is **transient scratch, never committed** —
   `init` (and `migrate`) write a `.wdd/.gitignore` entry for it; the
   directory is `0700`, logs `0600`; filenames use attempt numbering (no
@@ -231,10 +279,12 @@ resolvable to an external agent CLI:
   trivial prompt ("Reply with exactly: DONE"), report exit code, wall
   time, and whether the token came back. Registration order is probe →
   `config set runners ...` → ratify/amend. `dispatch --probe <name>`
-  re-verifies an already-ratified runner. Task dispatch (`dispatch
-  --task`) is a **governed verb**: it refuses under governance drift like
-  every other execution verb, so an unratified runner can never run a
-  task. The `wdd-runners` skill ends every registration with a passing
+  re-verifies an already-ratified runner and is **governed** — it executes
+  config-loaded commands, so it refuses under drift like any execution
+  verb; the deliberately ungoverned path is only ever `--probe-command`,
+  where the command is explicit in the invocation. Task dispatch
+  (`dispatch --task`) is likewise governed, so an unratified runner can
+  never run a task. The `wdd-runners` skill ends every registration with a passing
   probe — a runner that was never probed is configuration fiction.
 
 Documentation ships with the feature: a "Runners" section in
@@ -267,7 +317,9 @@ its runner command's business, authored per machine by the operator.
   one-page design.md. Research is conditional and skippable-with-reason.
 - No cost-analysis tooling; recording only (and only if it survives plan
   review).
-- No changes to execution or finalize mechanics beyond payload decoration
-  precedence and prose tie-ins.
+- No changes to execution or finalize mechanics beyond: payload
+  decoration precedence, the intake/plan drift extension of the existing
+  execution gate, and the multi-command `final_verification` evidence
+  shape defined in §5.
 - Jira provider and enterprise overlay remain the separate consolidation
   phase.
