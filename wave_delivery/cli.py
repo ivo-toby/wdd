@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,7 @@ from .config import (
     set_value,
 )
 from .constitution import probe_repository, ratification_status, read_proposal, write_proposal
-from .setup import init_repository, migrate_governance, setup_next_actions
+from .setup import _intake_ladder_action, init_repository, migrate_governance, setup_next_actions
 from .doctor import inspect_capabilities
 from .engine import (
     admission_schedule,
@@ -37,7 +38,7 @@ from .engine import (
     status_summary,
 )
 from .errors import IllegalTransition, ValidationError, WaveDeliveryError
-from .schema import derived_phase
+from .schema import derived_phase, intake_complete
 from .finalize import (
     archive_scope,
     finalize_next_actions,
@@ -618,7 +619,7 @@ def _simple_event(store: StateStore, args: argparse.Namespace, event: str, data:
 
 
 def _apply_execution_drift(
-    result: dict[str, Any], state: dict[str, Any], wdd_dir: Path
+    result: dict[str, Any], state: dict[str, Any], wdd_dir: Path, *, state_path: str | None = None
 ) -> dict[str, Any]:
     """Empty a `next` result's actions and surface a drift blocker when
     config/constitution, an intake rung, or the plan-approval composite
@@ -632,6 +633,21 @@ def _apply_execution_drift(
     too (rather than only execute/finalize) so a caller polling `next` after
     delivery still sees *why* nothing is happening if governance drifted.
 
+    One `plan_drift` case is not a dead end to surface as a blocker: a rung
+    re-approval mid-execution (the remedy for `intake_drift`) cascades and
+    clears every downstream rung, including `scope.approval` -- the ladder
+    itself is then incomplete, so `intake_gate_status` reports `plan_drift`
+    ("never composite-approved") even though the real next step is to walk
+    the ladder back to complete, not to run `plan apply --approved-by`
+    (which would itself refuse: apply_plan requires an intact ladder on a
+    non-legacy scope). When that's the situation -- non-legacy, a scope
+    exists, and the ladder isn't complete -- this emits the next ladder rung
+    action instead (reusing setup.py's `_intake_ladder_action`, which reads
+    `state["intake"]` the same way regardless of scope), so `next` stays
+    runnable through the whole remedy walk. Once the ladder is complete
+    again and the composite genuinely mismatches, the ordinary plan_drift
+    blocker below still applies.
+
     The chokepoint in `main()` (`require_fresh_governance` then
     `require_fresh_intake`) raises governance drift first when both are
     present, so this must surface the same blocker at position 0: the
@@ -643,21 +659,47 @@ def _apply_execution_drift(
     gate = intake_gate_status(state, wdd_dir)
     if gate is not None:
         code, detail = gate
-        result["actions"] = []
-        if code == "intake_drift":
-            message = (
-                f"intake {detail['rung']} drifted since approval (recorded "
-                f"{detail['recorded']}, actual {detail['actual']}); re-run "
-                f"'wddctl intake {detail['rung']} ...' to re-approve, then "
-                "'wddctl plan apply --approved-by NAME' to re-stamp"
-            )
+        if code == "plan_drift" and not intake_complete(state):
+            prefix = "wddctl" + (f" --state {shlex.quote(state_path)}" if state_path else "")
+            ladder_action = _intake_ladder_action(state, wdd_dir, prefix)
+            if ladder_action is not None:
+                result["actions"] = [ladder_action]
+            else:
+                # Defensive: intake_gate_status said the ladder isn't
+                # complete, but _intake_ladder_action found no next rung.
+                # Should not happen (both read the same state), but an
+                # empty-actions blocker is a safer fallback than a stale
+                # action list.
+                result["actions"] = []
+                result["blockers"].insert(
+                    0,
+                    {
+                        "code": code,
+                        "message": (
+                            "the intake ladder is incomplete and no next rung could be "
+                            "determined; run 'wddctl intake status' to inspect"
+                        ),
+                        **detail,
+                    },
+                )
         else:
-            message = (
-                "the applied plan's composite approval no longer matches its current "
-                "bytes (a brief or context file changed, or it was never composite-"
-                "approved); run 'wddctl plan apply --approved-by NAME' to re-stamp"
-            )
-        result["blockers"].insert(0, {"code": code, "message": message, **detail})
+            result["actions"] = []
+            if code == "intake_drift":
+                message = (
+                    f"intake {detail['rung']} drifted since approval (recorded "
+                    f"{detail['recorded']}, actual {detail['actual']}); re-run "
+                    f"'wddctl intake {detail['rung']} ...' to re-approve -- re-approving a "
+                    "rung this upstream cascades, clearing every rung recorded after it, so "
+                    "walk those again in order too -- then 'wddctl plan apply --approved-by "
+                    "NAME' to re-stamp"
+                )
+            else:
+                message = (
+                    "the applied plan's composite approval no longer matches its current "
+                    "bytes (a brief or context file changed, or it was never composite-"
+                    "approved); run 'wddctl plan apply --approved-by NAME' to re-stamp"
+                )
+            result["blockers"].insert(0, {"code": code, "message": message, **detail})
 
     drift = governance_drift(state, wdd_dir)
     if drift is not None:
@@ -788,7 +830,9 @@ def main(argv: list[str] | None = None) -> int:
                 result = finalize_next_actions(
                     state, store.path.parent, str(args.repo), state_path=_state_option(args)
                 )
-                _apply_execution_drift(result, state, store.path.parent)
+                _apply_execution_drift(
+                    result, state, store.path.parent, state_path=_state_option(args)
+                )
                 _print_json(result)
                 return 0
             config = (
@@ -806,7 +850,9 @@ def main(argv: list[str] | None = None) -> int:
                 models=models,
                 mode=mode,
             )
-            _apply_execution_drift(result, state, store.path.parent)
+            _apply_execution_drift(
+                result, state, store.path.parent, state_path=_state_option(args)
+            )
             _print_json(result)
             return 0
 
@@ -1065,6 +1111,28 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "intake" and args.intake_command == "research":
+            # Named, explicit validation instead of letting the ambiguous
+            # combinations reach record_research's own generic "exactly one
+            # of --done/--skip" check: that check only looks at whether
+            # done_artifacts/skip_reason ended up non-None below, which is
+            # not the same question as which flags the caller actually
+            # passed. In particular "--done --skip --reason r" (no
+            # --artifacts) computes done_artifacts=None (no --artifacts) and
+            # skip_reason="r" (--skip present) -- exactly one is non-None, so
+            # the generic check would pass and silently record a skip despite
+            # --done also being requested.
+            if args.done and args.skip:
+                raise ValidationError(
+                    "intake research: --done and --skip are mutually exclusive; pass exactly one"
+                )
+            if not args.done and not args.skip:
+                raise ValidationError(
+                    "intake research requires exactly one of --done or --skip"
+                )
+            if args.done and not args.artifacts:
+                raise ValidationError("intake research --done requires --artifacts PATH...")
+            if args.skip and not args.reason:
+                raise ValidationError("intake research --skip requires --reason '...'")
             state, duplicate = record_research(
                 store,
                 store.path.parent,

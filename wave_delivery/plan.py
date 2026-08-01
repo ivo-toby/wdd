@@ -407,7 +407,7 @@ def _validate_context_refs(tasks: list[dict[str, Any]], wdd_dir: Path) -> None:
     for entry in tasks:
         for ref in entry.get("context") or []:
             path_part = ref.split("#", 1)[0]
-            resolved = resolve_within_wdd(wdd_dir, path_part)
+            resolved = resolve_within_wdd(wdd_dir, path_part, label="context ref")
             if not resolved.exists() or not resolved.is_file():
                 raise ValidationError(
                     f"task {entry['id']} context ref does not resolve to a file "
@@ -570,9 +570,10 @@ def require_fresh_intake(state: dict[str, Any], wdd_dir: Path | str) -> None:
         raise IllegalTransition(
             f"intake drift: intake {detail['rung']} has drifted since approval "
             f"(recorded {detail['recorded']}, actual {detail['actual']}); re-run "
-            f"'wddctl intake {detail['rung']} ...' to re-approve, then "
-            "'wddctl plan apply --approved-by NAME' to re-stamp the plan before "
-            "resuming execution"
+            f"'wddctl intake {detail['rung']} ...' to re-approve -- re-approving a rung "
+            "this upstream cascades, clearing every rung recorded after it, so walk "
+            "those again in order too -- then 'wddctl plan apply --approved-by NAME' "
+            "to re-stamp the plan before resuming execution"
         )
     if detail.get("recorded") is None:
         raise IllegalTransition(

@@ -162,7 +162,8 @@ wddctl plan apply --plan plan.json --repo . [--from-ref REF] [--dry-run] [--appr
 ```sh
 wddctl plan apply --plan plan.json --repo . --dry-run
 # {"scope": "SCOPE-auth-refresh", "created": false, "diff": {"added": [...], ...}}
-wddctl plan apply --plan plan.json --repo .
+wddctl plan apply --plan plan.json --repo . --approved-by NAME
+# a nonempty diff on a non-legacy scope refuses without --approved-by
 ```
 
 ### `plan preview`
@@ -698,8 +699,8 @@ $ wddctl next --repo .
   "actions": [
     {
       "action": "plan",
-      "command": "wddctl plan apply --plan plan.json --repo .",
-      "judgment": "decompose the work per the wdd-plan skill, write task briefs, then apply",
+      "command": "wddctl plan apply --plan plan.json --repo . --approved-by NAME",
+      "judgment": "decompose the work per the wdd-plan skill, write task briefs, show the user the diff for explicit approval, then apply with the approving human's name",
       "task": "-"
     }
   ],

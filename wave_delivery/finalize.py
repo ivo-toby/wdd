@@ -26,6 +26,7 @@ supplies the revisioned/idempotent/locked envelope" pattern
 from __future__ import annotations
 
 import json
+import re
 import shlex
 from collections import Counter
 from pathlib import Path
@@ -43,6 +44,24 @@ from .store import StateStore, atomic_write_text
 
 
 FINALIZE_PHASES = {"finalize", "delivered"}
+
+# validate_plan places no character restriction on scope.id (only non-empty
+# str), so it lands in archive_scope's filename unsanitized -- the one write
+# in this module without a StateStore lock guarding it, and the one place a
+# scope id doubles as a filesystem path component. Same character class as
+# the dispatch-log filename idiom (docs/superpowers/specs's dispatch design):
+# keep [A-Za-z0-9._-], replace everything else (including path separators
+# and "..") with "_", so no scope id can escape .wdd/archive/.
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _sanitize_scope_id_for_filename(scope_id: str) -> str:
+    sanitized = _UNSAFE_FILENAME_CHARS.sub("_", scope_id)
+    if not sanitized:
+        raise ValidationError(
+            f"scope id sanitizes to an empty archive filename: {scope_id!r}"
+        )
+    return sanitized
 
 
 def _require_finalize_phase(state: dict[str, Any]) -> None:
@@ -432,8 +451,18 @@ def _require_current_finalize_evidence(state: dict[str, Any], base_sha: str) -> 
     """Handoff's precondition: clean review + passed verification, both fresh.
 
     Named after what to redo, not just that evidence is missing or stale --
-    the plan requires stale-evidence refusals to name the fix.
+    the plan requires stale-evidence refusals to name the fix. The verify
+    hint is branched on the scope's own legacy-ness: a v5 non-legacy scope's
+    `finalize verify record` refuses the legacy `--status/--command`
+    invocation outright (it wants `--results`), so naming the wrong contract
+    here would send the operator down a dead end.
     """
+    legacy = _is_legacy_intake(state)
+    verify_hint = (
+        "wddctl finalize verify record --status passed --command CMD --repo ."
+        if legacy
+        else "wddctl finalize verify record --results '[{\"command\":...,\"status\":...}, ...]' --repo ."
+    )
     finalize = state.get("finalize") or {}
     review = finalize.get("review")
     if not isinstance(review, dict) or review.get("outcome") != "passed":
@@ -449,15 +478,11 @@ def _require_current_finalize_evidence(state: dict[str, Any], base_sha: str) -> 
         )
     verification = finalize.get("verification")
     if not isinstance(verification, dict) or verification.get("status") != "passed":
-        raise IllegalTransition(
-            "handoff requires passed final verification; run 'wddctl finalize verify record "
-            "--status passed --command CMD --repo .'"
-        )
+        raise IllegalTransition(f"handoff requires passed final verification; run '{verify_hint}'")
     if verification.get("headSha") != base_sha:
         raise IllegalTransition(
             f"final verification evidence is stale (pinned to {verification.get('headSha')}, "
-            f"base is now at {base_sha}); re-run 'wddctl finalize verify record --status "
-            "passed --command CMD --repo .'"
+            f"base is now at {base_sha}); re-run '{verify_hint}'"
         )
 
 
@@ -788,7 +813,8 @@ def finalize_next_actions(
                 [{"command": cmd, "status": "passed"} for cmd in required]
             )
             record_with = (
-                f"{prefix} finalize verify record --results '{results_hint}' --repo {repo_arg}"
+                f"{prefix} finalize verify record --results {shlex.quote(results_hint)} "
+                f"--repo {repo_arg}"
             )
         action = {
             "task": "-",
@@ -878,7 +904,7 @@ def archive_scope(
         )
     scope_id = state["scope"]["id"]
 
-    archive_path = wdd_dir / "archive" / f"{scope_id}.json"
+    archive_path = wdd_dir / "archive" / f"{_sanitize_scope_id_for_filename(scope_id)}.json"
     payload = {
         "scope": state.get("scope"),
         "tasks": state.get("tasks"),

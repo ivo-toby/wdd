@@ -299,8 +299,20 @@ def setup_next_actions(
                 {
                     "task": "-",
                     "action": "plan",
-                    "command": f"{prefix} plan apply --plan plan.json --repo .",
-                    "judgment": "decompose the work per the wdd-plan skill, write task briefs, then apply",
+                    # --approved-by is not optional in practice: the first
+                    # apply onto a null scope is always a nonempty diff (every
+                    # task is newly "added"), and apply_plan refuses a
+                    # nonempty diff on a non-legacy scope without it. Naming
+                    # it here (NAME is a placeholder for the approving
+                    # human, same convention as ratify's --by NAME) keeps
+                    # this command runnable as emitted instead of failing on
+                    # first use.
+                    "command": f"{prefix} plan apply --plan plan.json --repo . --approved-by NAME",
+                    "judgment": (
+                        "decompose the work per the wdd-plan skill, write task briefs, show the "
+                        "user the diff for explicit approval, then apply with the approving "
+                        "human's name"
+                    ),
                 }
             )
     return {

@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -169,7 +170,9 @@ def _design_text(
     return "\n".join(parts) + "\n"
 
 
-def _walk_intake(state: str, wdd: Path, approver: str = "t") -> None:
+def _walk_intake(
+    state: str, wdd: Path, approver: str = "t", *, deliverable_command: str = "true"
+) -> None:
     """Canonical ladder walk (plan Task 2): spec -> research skip -> design.
 
     Added once per test file per the plan's convention; later phase-6a tasks
@@ -185,7 +188,7 @@ def _walk_intake(state: str, wdd: Path, approver: str = "t") -> None:
     (wdd / "design.md").write_text(_design_text(), encoding="utf-8")
     assert _cli(
         state, "intake", "design", "--approved-by", approver,
-        "--deliverable-command", "true",
+        "--deliverable-command", deliverable_command,
     )[0] == 0
 
 
@@ -210,7 +213,13 @@ def _inject_scope_with_approval(state_path: str, *, sha256: str = "sha256:preexi
 
 
 def _apply_ladder_and_plan(
-    state: str, wdd: Path, root: Path, *, review_policy: str = "risk_based", approver: str = "t"
+    state: str,
+    wdd: Path,
+    root: Path,
+    *,
+    review_policy: str = "risk_based",
+    approver: str = "t",
+    deliverable_command: str = "true",
 ) -> None:
     """`_walk_intake` + a one-task, composite-approved `plan apply` (Task 4).
 
@@ -219,7 +228,7 @@ def _apply_ladder_and_plan(
     unlike test_finalize.py's `_mark_legacy` shortcut, which deliberately
     exempts fixtures that aren't exercising the ladder.
     """
-    _walk_intake(state, wdd, approver)
+    _walk_intake(state, wdd, approver, deliverable_command=deliverable_command)
     (wdd / "tasks").mkdir(exist_ok=True)
     (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
     plan_file = root / "plan.json"
@@ -246,7 +255,7 @@ def _start_and_commit(state: str, root: Path, task_id: str = "T1", message: str 
     )
 
 
-def _run_to_finalize(tmp: str) -> tuple[Path, str]:
+def _run_to_finalize(tmp: str, *, deliverable_command: str = "true") -> tuple[Path, str]:
     """Drive a non-legacy, composite-approved scope through one local task
     to the finalize phase, for Task 4's finalize-governed-verb drift pin."""
     root, state = _ratified_repo(tmp)
@@ -254,7 +263,9 @@ def _run_to_finalize(tmp: str) -> tuple[Path, str]:
     subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
     subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True)
     wdd = root / ".wdd"
-    _apply_ladder_and_plan(state, wdd, root, review_policy="always")
+    _apply_ladder_and_plan(
+        state, wdd, root, review_policy="always", deliverable_command=deliverable_command
+    )
     _start_and_commit(state, root)
     assert _cli(state, "submit", "--task", "T1", "--repo", str(root))[0] == 0
     assert _cli(
@@ -292,7 +303,7 @@ def _valid_research_done(**overrides) -> dict:
         "by": "t",
         "at": "2026-08-01T00:00:00Z",
         "done": True,
-        "artifacts": [{"path": ".wdd/shared-context/contract-inventory.md", "sha256": "sha256:bbb"}],
+        "artifacts": [{"path": "shared-context/contract-inventory.md", "sha256": "sha256:bbb"}],
     }
     record.update(overrides)
     return record
@@ -776,6 +787,45 @@ class IntakeResearchVerbTest(unittest.TestCase):
             )
             self.assertNotEqual(code, 0)
 
+    def test_both_flags_with_only_skip_args_is_refused_not_silently_recorded(self) -> None:
+        """M3 regression: `--done --skip --reason r` (no --artifacts) used to
+        compute done_artifacts=None (no --artifacts) and skip_reason="r"
+        (--skip present) -- exactly one non-None, so the old "exactly one of
+        done_artifacts/skip_reason" check on the *computed* values passed,
+        and a skip was silently recorded despite --done also being
+        requested. Mutual exclusivity must be checked on the FLAGS the
+        caller passed, not on what they happened to compute to."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
+            code, _out, err = _cli_full(
+                state, "intake", "research", "--done", "--skip", "--by", "t",
+                "--reason", "y",
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("mutually exclusive", err)
+            recorded = StateStore(Path(state)).read()["intake"].get("research")
+            self.assertIsNone(recorded)
+
+    def test_done_without_artifacts_is_refused_by_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
+            code, _out, err = _cli_full(state, "intake", "research", "--done", "--by", "t")
+            self.assertNotEqual(code, 0)
+            self.assertIn("--artifacts", err)
+
+    def test_skip_without_reason_is_refused_by_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
+            code, _out, err = _cli_full(state, "intake", "research", "--skip", "--by", "t")
+            self.assertNotEqual(code, 0)
+            self.assertIn("--reason", err)
+
     def test_refuses_before_spec(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _root, state = _ratified_repo(tmp)
@@ -790,11 +840,14 @@ class IntakeResearchVerbTest(unittest.TestCase):
             (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             (root / "outside.md").write_text("x\n", encoding="utf-8")
-            code, _out = _cli(
+            code, _out, err = _cli_full(
                 state, "intake", "research", "--done", "--by", "t",
                 "--artifacts", "../outside.md",
             )
             self.assertNotEqual(code, 0)
+            # M2 pin: the default label stays "research artifact" for this
+            # (genuine research-artifact) call site.
+            self.assertIn("research artifact", err)
 
     def test_refuses_artifact_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1158,7 +1211,6 @@ class IntakeFunctionLevelRefusalTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
-            _cli(state, "intake", "spec", "--approved-by", "t")
             (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             assert _cli(
@@ -1207,7 +1259,13 @@ class SetupLadderNextTest(unittest.TestCase):
             )[0] == 0
 
             code, out = _cli(state, "next")
-            self.assertEqual(json.loads(out)["actions"][0]["action"], "plan")
+            plan_action = json.loads(out)["actions"][0]
+            self.assertEqual(plan_action["action"], "plan")
+            # I1 regression: the first apply onto a null scope is always a
+            # nonempty diff, so a non-legacy apply always requires
+            # --approved-by -- the emitted command must be runnable as-is,
+            # not fail on first use for lack of the flag.
+            self.assertIn("--approved-by", plan_action["command"])
 
             (wdd / "tasks").mkdir(exist_ok=True)
             (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
@@ -1385,11 +1443,16 @@ class PlanApprovalCompositeTest(unittest.TestCase):
             plan["tasks"][0]["context"] = ["../outside.md"]
             plan_file = root / "plan.json"
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
-            code, _out, _err = _cli_full(
+            code, _out, err = _cli_full(
                 state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
                 "--approved-by", "t",
             )
             self.assertNotEqual(code, 0)
+            # M2 regression: this is a plan `context` ref, not a research
+            # artifact -- the shared containment check must name the ref
+            # kind that actually escaped, not intake.py's research wording.
+            self.assertIn("context ref", err)
+            self.assertNotIn("research artifact", err)
 
     def test_context_ref_to_a_missing_file_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1663,6 +1726,69 @@ class ExecutionGateIntakeDriftTest(unittest.TestCase):
             code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
             self.assertEqual(code, 0, out)
 
+    def test_next_after_upstream_reapproval_resumes_ladder_not_plan_drift(self) -> None:
+        """I2 regression: the reviewer's exact repro. Re-approving an
+        upstream rung mid-execution cascades and clears every downstream
+        rung including scope.approval, so `next` -- read right after the
+        spec re-approval, before research/design are re-recorded -- used to
+        see an incomplete ladder with no composite approval and misreport it
+        as `plan_drift` with an empty action list: a dead end, since
+        `plan apply --approved-by` would itself refuse (the ladder is
+        incomplete). `next` must instead emit the next ladder rung
+        (`research`) so the whole remedy walk stays runnable end to end."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_ladder_and_plan(state, wdd, root)
+
+            (wdd / "spec.md").write_text(
+                _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
+            )
+            self.assertNotEqual(
+                _cli(state, "start", "--task", "T1", "--repo", str(root))[0], 0
+            )
+
+            assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
+
+            # This is the dead end the finding described: before the fix,
+            # `next` here reported an empty-actions plan_drift blocker
+            # instead of resuming the ladder.
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(
+                [b["code"] for b in result["blockers"]], [],
+                f"expected no blockers, a runnable ladder action instead: {result}",
+            )
+            self.assertEqual(len(result["actions"]), 1)
+            action = result["actions"][0]
+            self.assertEqual(action["action"], "research")
+            self.assertIn("recordWith", action)
+
+            assert _cli(
+                state, "intake", "research", "--skip", "--by", "t",
+                "--reason", "no external contracts",
+            )[0] == 0
+
+            code, out = _cli(state, "next")
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_design")
+
+            assert _cli(
+                state, "intake", "design", "--approved-by", "t",
+                "--deliverable-command", "true",
+            )[0] == 0
+
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
 
 class ExecutionGatePlanDriftTest(unittest.TestCase):
     """Task 4: a brief edit after composite approval is plan drift -- caught
@@ -1824,6 +1950,74 @@ class ExecutionGateFinalizeDriftTest(unittest.TestCase):
                 "--results", _passed_results("true", "true"), "--repo", str(root),
             )
             self.assertEqual(code, 0, out + err)
+
+    def test_finalize_phase_next_after_upstream_reapproval_resumes_ladder(self) -> None:
+        """I2 regression, finalize-phase counterpart: re-approving `spec`
+        (not just `design`) during finalize cascades the same way it does
+        mid-execute -- clearing research and design too -- so `next` here
+        must also resume the ladder (`research`) instead of misreporting an
+        empty-actions plan_drift dead end."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize(tmp)
+
+            assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
+
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["blockers"], [])
+            self.assertEqual(len(result["actions"]), 1)
+            self.assertEqual(result["actions"][0]["action"], "research")
+
+
+class FinalizeHandoffEvidenceMessageTest(unittest.TestCase):
+    """M1 regression: `_require_current_finalize_evidence`'s missing/stale
+    verification messages used to name the legacy `--status/--command`
+    invocation unconditionally, even for v5 non-legacy scopes where that
+    exact invocation is refused (v5 wants `--results`)."""
+
+    def test_v5_scope_missing_verification_names_results_not_legacy_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize(tmp)
+            assert _cli(
+                state, "finalize", "review", "record", "--reviewer", "t",
+                "--findings", "[]", "--repo", str(root),
+            )[0] == 0
+
+            code, _out, err = _cli_full(state, "finalize", "handoff", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("--results", err)
+            self.assertNotIn("--status", err)
+            self.assertNotIn("--command", err)
+
+
+class FinalizeVerifyResultsHintQuotingTest(unittest.TestCase):
+    """I3 regression: `finalize_next_actions`' `--results` hint used to
+    interpolate the JSON payload inside manual single quotes -- if any
+    required command (in practice, the design-recorded deliverable command)
+    contains an apostrophe, that manual quoting is corrupted, unlike the
+    `prefix`/`repo_arg` two lines up which already go through shlex.quote."""
+
+    def test_apostrophe_in_deliverable_command_round_trips_through_shlex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            deliverable = "echo it's fine"
+            root, state = _run_to_finalize(tmp, deliverable_command=deliverable)
+            assert _cli(
+                state, "finalize", "review", "record", "--reviewer", "t",
+                "--findings", "[]", "--repo", str(root),
+            )[0] == 0
+
+            from wave_delivery.finalize import finalize_next_actions
+
+            scope_state = StateStore(Path(state)).read()
+            result = finalize_next_actions(scope_state, Path(state).parent, str(root))
+            action = result["actions"][0]
+            self.assertEqual(action["action"], "final_verification")
+
+            argv = shlex.split(action["recordWith"])
+            payload = json.loads(argv[argv.index("--results") + 1])
+            commands = [entry["command"] for entry in payload]
+            self.assertIn(deliverable, commands)
 
 
 class IntakeGateStatusUnitTest(unittest.TestCase):
@@ -2418,6 +2612,29 @@ class ScopeArchiveTest(unittest.TestCase):
             after = StateStore(Path(state)).read()
             self.assertEqual(after["intake"], {})
             self.assertNotIn("design", after["intake"])
+
+    def test_traversal_scope_id_cannot_escape_the_archive_directory(self) -> None:
+        """M4 regression: validate_plan places no character restriction on
+        scope.id (only non-empty str), and archive_scope used to interpolate
+        it directly into a filename with no containment check -- the one
+        unrecoverable write in this module. Scope ids come from plan.json in
+        practice, so this hand-edits state.json directly (the plan-apply
+        path isn't the thing under test) to simulate one that would
+        traverse out of .wdd/archive/ if used unsanitized."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_delivered(tmp)
+            store = StateStore(Path(state))
+            current = store.read()
+            current["scope"]["id"] = "../../evil"
+            store.write(current)
+
+            code, out = _cli(state, "scope", "archive", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            archive_path = Path(result["archived"]).resolve()
+            archive_dir = (root / ".wdd" / "archive").resolve()
+            self.assertEqual(archive_path.parent, archive_dir)
+            self.assertTrue(archive_path.exists())
 
 
 class FullLifecycleE2ETest(unittest.TestCase):

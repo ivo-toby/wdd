@@ -142,14 +142,16 @@ def _validate_design_text(text: str) -> None:
     _require_sections(text, _REQUIRED_DESIGN_SECTIONS, label="design.md")
 
 
-def resolve_within_wdd(wdd_dir: Path, raw_path: str) -> Path:
-    """Resolve a research-artifact path, refusing anything outside `.wdd/`.
+def resolve_within_wdd(wdd_dir: Path, raw_path: str, *, label: str = "research artifact") -> Path:
+    """Resolve a `.wdd`-relative path, refusing anything outside `.wdd/`.
 
-    Paths are `.wdd`-relative (the same doctrine plan.json's future `context`
-    refs use, spec Sec3) unless already absolute; either way the RESOLVED
-    path must sit inside the resolved `.wdd/` directory -- a plain prefix
-    check on resolved paths, so `../..` traversal and symlink escapes are
-    both caught the same way.
+    Paths are `.wdd`-relative (the same doctrine plan.json's `context` refs
+    use, spec Sec3) unless already absolute; either way the RESOLVED path
+    must sit inside the resolved `.wdd/` directory -- a plain prefix check
+    on resolved paths, so `../..` traversal and symlink escapes are both
+    caught the same way. `label` names what kind of path this is in the
+    refusal message (research artifact, context ref, ...) so a shared
+    containment check doesn't mislabel the caller's own reference kind.
     """
     wdd_resolved = wdd_dir.resolve()
     candidate = Path(raw_path)
@@ -157,7 +159,7 @@ def resolve_within_wdd(wdd_dir: Path, raw_path: str) -> Path:
     resolved = candidate.resolve()
     if resolved != wdd_resolved and wdd_resolved not in resolved.parents:
         raise ValidationError(
-            f"research artifact path escapes .wdd/: {raw_path!r} (resolved to {resolved})"
+            f"{label} path escapes .wdd/: {raw_path!r} (resolved to {resolved})"
         )
     return resolved
 

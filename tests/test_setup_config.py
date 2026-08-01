@@ -831,6 +831,7 @@ class EndToEndSetupTest(unittest.TestCase):
 
             payload = self._cli(state, "next")
             self.assertEqual(payload["actions"][0]["action"], "plan")
+            self.assertIn("--approved-by", payload["actions"][0]["command"])
 
             plan_file = root / "plan.json"
             plan = _minimal_plan()
