@@ -49,6 +49,12 @@ from .finalize import (
 from .freshness import check_freshness, record_freshness
 from .git import require_repository, resolve_ref
 from .github import comment_pr, create_pr, push_branch
+from .intake import (
+    intake_status,
+    record_design,
+    record_research,
+    record_spec,
+)
 from .leases import release_task, start_task, submit_task
 from .lint import lint_plan
 from .merge import merge_task, observe_merge, refresh_task
@@ -296,6 +302,52 @@ def build_parser() -> argparse.ArgumentParser:
     _add_concurrency_flags(finalize_delivered)
 
     finalize_subparsers.add_parser("status", help="show the finalize section and phase")
+
+    intake = subparsers.add_parser(
+        "intake", help="the spec/research/design ladder before plan apply"
+    )
+    intake_subparsers = intake.add_subparsers(dest="intake_command", required=True)
+
+    intake_spec = intake_subparsers.add_parser(
+        "spec", help="record .wdd/spec.md approval (numbered acceptance criteria required)"
+    )
+    intake_spec.add_argument("--approved-by", dest="approved_by", required=True)
+    _add_concurrency_flags(intake_spec)
+
+    intake_research = intake_subparsers.add_parser(
+        "research", help="record research done (with hashed artifacts) or an attributed skip"
+    )
+    # Mode exclusivity (exactly one of --done/--skip) is enforced by
+    # record_research itself, not argparse: a semantic ValidationError with a
+    # clear message is more useful here than argparse's SystemExit(2).
+    intake_research.add_argument("--done", action="store_true")
+    intake_research.add_argument("--skip", action="store_true")
+    intake_research.add_argument("--by", required=True)
+    intake_research.add_argument(
+        "--artifacts",
+        nargs="+",
+        default=None,
+        help="one or more .wdd-relative paths, required with --done",
+    )
+    intake_research.add_argument("--reason", help="required with --skip")
+    _add_concurrency_flags(intake_research)
+
+    intake_design = intake_subparsers.add_parser(
+        "design", help="record .wdd/design.md approval and the epic deliverable command"
+    )
+    intake_design.add_argument("--approved-by", dest="approved_by", required=True)
+    # Not argparse-required: omission must refuse with record_design's own
+    # named message ("the epic deliverable's proof is not optional"), not
+    # argparse's generic SystemExit(2).
+    intake_design.add_argument(
+        "--deliverable-command",
+        dest="deliverable_command",
+        default=None,
+        help="the command that proves the epic deliverable; recorded and fingerprinted with design",
+    )
+    _add_concurrency_flags(intake_design)
+
+    intake_subparsers.add_parser("status", help="show the intake section and the next rung")
 
     freshness = subparsers.add_parser("freshness", help="classify a task branch against the base")
     freshness_subparsers = freshness.add_subparsers(dest="freshness_command", required=True)
@@ -921,6 +973,46 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "finalize" and args.finalize_command == "status":
             _print_json(finalize_status(store.read()))
+            return 0
+
+        if args.command == "intake" and args.intake_command == "spec":
+            state, duplicate = record_spec(
+                store, store.path.parent, approved_by=args.approved_by, **_concurrency(args)
+            )
+            _print_json(
+                {
+                    "revision": state["revision"],
+                    "duplicate": duplicate,
+                    "criteria": state["intake"]["spec"]["criteria"],
+                }
+            )
+            return 0
+
+        if args.command == "intake" and args.intake_command == "research":
+            state, duplicate = record_research(
+                store,
+                store.path.parent,
+                by=args.by,
+                done_artifacts=args.artifacts if args.done else None,
+                skip_reason=args.reason if args.skip else None,
+                **_concurrency(args),
+            )
+            _print_json({"revision": state["revision"], "duplicate": duplicate})
+            return 0
+
+        if args.command == "intake" and args.intake_command == "design":
+            state, duplicate = record_design(
+                store,
+                store.path.parent,
+                approved_by=args.approved_by,
+                deliverable_command=args.deliverable_command,
+                **_concurrency(args),
+            )
+            _print_json({"revision": state["revision"], "duplicate": duplicate})
+            return 0
+
+        if args.command == "intake" and args.intake_command == "status":
+            _print_json(intake_status(store.read()))
             return 0
 
         if args.command == "freshness" and args.freshness_command == "check":
