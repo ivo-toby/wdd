@@ -35,23 +35,40 @@ agree_spec -> research -> agree_design -> plan
 Evidence lives in a new optional `state["intake"]` section (finalize's
 twin), written through new verbs:
 
+Every approval is **bound to the approved bytes** — the same doctrine as
+the governance fingerprint. Each record carries a SHA-256 of the artifact
+at approval time; `next` and `plan apply` re-hash and treat a mismatch as
+intake drift: the affected rung is re-emitted for re-approval, and
+`plan apply` refuses until it happens. An approval of text that has since
+changed approves nothing.
+
 - `wddctl intake spec --approved-by NAME` — refuses unless `.wdd/spec.md`
   exists with the four agreed sections and **numbered acceptance criteria**
-  (`AC-1`, `AC-2`, …). Records `{by, at, criteria: N}`.
-- `wddctl intake research --done --artifacts <path>...` records completed
-  research and its artifact paths (under `.wdd/shared-context/`);
-  `--skip --reason "..."` records an explicit skip. One of the two is
-  required — silence is not an option. The canonical artifact is a
+  (`AC-1`, `AC-2`, …). Records `{by, at, criteria: N, sha256}`.
+- `wddctl intake research --done --by NAME --artifacts <path>...` records
+  completed research: approver, and per artifact its path and `sha256`.
+  Artifacts must exist, be regular files under `.wdd/`, and be non-empty —
+  validated at record time. `--skip --by NAME --reason "..."` records an
+  explicit, attributed skip. One of the two is required — silence is not
+  an option, and neither form is anonymous. The canonical artifact is a
   **contract inventory**: operation → method/path/shape → reference
   citation, built by actually reading the named reference.
 - `wddctl intake design --approved-by NAME` — refuses unless
-  `.wdd/design.md` exists. Records `{by, at}`.
-- `plan apply` refuses while the ladder is incomplete — for states whose
-  `init` created the intake scaffold. Pre-existing states (no `intake`
-  key) are grandfathered: legacy scopes keep working unchanged.
+  `.wdd/design.md` exists. Records `{by, at, sha256}` plus the scope's
+  **deliverable command** (see §2, Epic deliverable).
+- `plan apply` refuses while the ladder is incomplete or any recorded
+  fingerprint no longer matches its file.
+
+There is no path around the ladder. The legacy `plan apply` bootstrap
+(creating state when none exists) is **removed**: with no `state.json`,
+`plan apply` refuses and names `wddctl init`. State schema bumps to v5, in
+which the `intake` section always exists; `migrate` converts v4 states by
+adding `intake: {"legacy": true}`, which exempts them from the ladder.
+Exemption is therefore an explicit migration artifact, never an inference
+from absence — a post-release scope cannot masquerade as grandfathered.
 
 Clarification is not a rung; it is what happens at each approval. Every
-rung ends in explicit user sign-off.
+rung ends in explicit, attributed user sign-off.
 
 Phase derivation: `setup` extends through the intake rungs (scope is still
 null); `derived_phase` itself is unchanged. `setup_next_actions` gains the
@@ -75,8 +92,13 @@ pointing at the owning skill stage.
      owning integration task is a design error, caught here, not at
      review.
   4. **Epic deliverable** — what observably runs when the scope is done,
-     and the command that proves it. That command belongs in
-     `verification.commands` (propose the amendment at design approval).
+     and the command that proves it. That command is recorded **on the
+     scope** at design approval (`intake design --deliverable-command
+     "..."`), fingerprinted with the design: finalize's
+     `final_verification` runs the ratified global `verification.commands`
+     **plus** this scope command. Global config is never mutated
+     mid-intake — no governance drift, and an epic-specific smoke check
+     never leaks into unrelated future scopes.
   Size discipline is normative: a page of load-bearing structure. If it
   reads like a narrative, it is wrong.
 
@@ -85,8 +107,16 @@ pointing at the owning skill stage.
 `plan.json` task entries gain optional fields:
 
 - `"context": ["shared-context/contract-inventory.md#orders", "spec.md#AC-3", ...]`
-  — machine-carried handover. `next`/`start` payloads include it; the
-  dispatch contract (below) forwards it verbatim. Lint warns
+  — machine-carried handover. Ref syntax is `<path>[#<anchor>]`: the path
+  is `.wdd`-relative and is **validated at plan apply** (must resolve to a
+  regular file inside `.wdd/`, no traversal escapes); the anchor is
+  advisory reading guidance, not resolved mechanically. At dispatch time
+  refs are resolved to **absolute paths in the controller checkout** —
+  the same rule the worker contract already uses for briefs, because task
+  branches are cut from a base that may predate the intake artifacts and
+  external runners execute in the worktree. Payloads and dispatch packets
+  carry the resolved absolute paths; artifact integrity is already
+  guaranteed by the fingerprint-bound approvals (§1). Lint warns
   (`missing_context`) when a scope has intake artifacts and a task carries
   no refs.
 - `"model": "..."` — per-task override of the risk-tiered implementation
@@ -94,6 +124,14 @@ pointing at the owning skill stage.
   risk-tiered config → absent. This enables heterogeneous routing: the
   mechanical majority on cheap models, the judgment minority on strong
   ones, inside one scope.
+- `"reviewModel": "..."` — the same, for the reviewer of this task.
+- `config.models.review` becomes tierable like implementation:
+  `{"default": ..., "highRisk": ...}` (a plain string stays valid and
+  means both). `run_review` decoration resolves task `reviewModel` →
+  risk-tiered `models.review` → absent. Task risk — already derived from
+  riskRules, and raised for contract-transcription tasks by §4's rules —
+  is the persisted classification that carries "mechanical vs judgment"
+  into reviewer routing; no separate nature field is stored.
 
 Brief template gains two required sections, both linted:
 
@@ -173,17 +211,31 @@ resolvable to an external agent CLI:
 - `wddctl dispatch --task ID --role worker|reviewer` owns the mechanical
   part: assemble the dispatch packet (§5's contract) into the prompt, exec
   the runner in the task's worktree, capture output to
-  `.wdd/dispatch/<task>-<role>.log`, report exit code and the trailing
-  status token. The controller reads the log as it would read any worker
-  report; all evidence still flows through git and `wddctl` verbs.
+  `.wdd/dispatch/<task>-<role>-<attempt>.log`, report exit code and the
+  trailing status token. The controller reads the log as it would read any
+  worker report; all evidence still flows through git and `wddctl` verbs.
+  Log policy: `.wdd/dispatch/` is **transient scratch, never committed** —
+  `init` (and `migrate`) write a `.wdd/.gitignore` entry for it; the
+  directory is `0700`, logs `0600`; filenames use attempt numbering (no
+  overwrites) and task IDs sanitized to `[A-Za-z0-9._-]`; the result
+  payload carries only a bounded tail of the log (the file on disk holds
+  the rest). Raw agent output can contain anything — it gets file
+  permissions and a gitignore, not a place in durable state.
 - `doctor`'s existing CLI probes (`codex`, `claude`, …) report which
   runners' commands are actually present.
-- `wddctl dispatch --probe <runner>` proves a runner end-to-end before any
-  scope depends on it: exec the command template in a temp directory with a
-  canned trivial prompt ("Reply with exactly: DONE"), and report exit code,
-  wall time, and whether the expected token came back. The `wdd-runners`
-  skill ends every registration with a passing probe — a runner that was
-  never probed is configuration fiction.
+- Probing must not require the runner to already be ratified config
+  (that would be a governance cycle), and must not silently execute
+  unapproved commands either. So: `wddctl dispatch --probe-command
+  '["pi", ...]'` tests an **explicit candidate** the user just typed or
+  approved in conversation — exec in a temp directory with a canned
+  trivial prompt ("Reply with exactly: DONE"), report exit code, wall
+  time, and whether the token came back. Registration order is probe →
+  `config set runners ...` → ratify/amend. `dispatch --probe <name>`
+  re-verifies an already-ratified runner. Task dispatch (`dispatch
+  --task`) is a **governed verb**: it refuses under governance drift like
+  every other execution verb, so an unratified runner can never run a
+  task. The `wdd-runners` skill ends every registration with a passing
+  probe — a runner that was never probed is configuration fiction.
 
 Documentation ships with the feature: a "Runners" section in
 `docs/wddctl.md` (config shape, resolution order, `dispatch`/`--probe`
@@ -199,9 +251,11 @@ its runner command's business, authored per machine by the operator.
 
 ## 7. Compatibility and migration
 
-- Legacy states (no `intake` key): everything keeps working; the ladder is
-  init-created-state-only. No state migration needed (the section is
-  optional, like `finalize`).
+- Schema v5: `intake` always present. `migrate` converts v4 by adding
+  `intake: {"legacy": true}` (ladder-exempt); the exemption is explicit
+  migration metadata, never inferred from absence. The no-state
+  `plan apply` bootstrap is removed — `init` is the only way to create
+  state.
 - Existing plans without `context`/`model`/Deliverable: valid; lint warns
   where it applies. `--strict` makes warnings fatal, as today.
 - Test helpers that walk init→ratify→apply gain the three intake verbs
