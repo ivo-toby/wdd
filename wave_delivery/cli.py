@@ -39,6 +39,7 @@ from .engine import (
 from .errors import IllegalTransition, ValidationError, WaveDeliveryError
 from .schema import derived_phase
 from .finalize import (
+    archive_scope,
     finalize_next_actions,
     finalize_status,
     prepare_handoff,
@@ -280,17 +281,35 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_verify_record = finalize_verify_subparsers.add_parser(
         "record", help="record a final verification outcome"
     )
+    # Legacy scopes use --status/--command(/--justification); v5 non-legacy
+    # scopes use --results (a JSON array covering every required command in
+    # one atomic call). Neither trio nor --results is argparse-required:
+    # record_final_verification itself refuses the wrong contract for the
+    # scope's own legacy-ness with a named message, not argparse's generic
+    # SystemExit(2).
     finalize_verify_record.add_argument(
-        "--status", required=True, choices=("passed", "failed", "unavailable")
+        "--status",
+        choices=("passed", "failed", "unavailable"),
+        help="legacy scopes only: the single verification outcome",
     )
     # dest must not be "command": that is the top-level subparser destination.
     finalize_verify_record.add_argument(
-        "--command", dest="finalize_verify_command_text", help="the command that produced this result"
+        "--command",
+        dest="finalize_verify_command_text",
+        help="legacy scopes only: the command that produced this result",
     )
     finalize_verify_record.add_argument(
         "--justification",
-        help="required when --status unavailable and no config "
+        help="legacy scopes only: required when --status unavailable and no config "
         "verification.unavailableJustification exists",
+    )
+    finalize_verify_record.add_argument(
+        "--results",
+        type=_json_argument,
+        default=None,
+        help="v5 non-legacy scopes only: JSON array '[{\"command\":..., \"status\":...}, ...]' "
+        "naming, in order, every entry of the ratified global verification.commands then the "
+        "scope's deliverable command",
     )
     finalize_verify_record.add_argument("--repo", type=Path, default=Path("."))
     _add_concurrency_flags(finalize_verify_record)
@@ -356,6 +375,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_concurrency_flags(intake_design)
 
     intake_subparsers.add_parser("status", help="show the intake section and the next rung")
+
+    scope = subparsers.add_parser(
+        "scope", help="scope-level lifecycle verbs beyond the finalize ladder"
+    )
+    scope_subparsers = scope.add_subparsers(dest="scope_command", required=True)
+    scope_archive = scope_subparsers.add_parser(
+        "archive",
+        help="delivered-only: archive the scope's records and reset state for the next one",
+    )
+    scope_archive.add_argument("--repo", type=Path, default=Path("."))
+    _add_concurrency_flags(scope_archive)
 
     freshness = subparsers.add_parser("freshness", help="classify a task branch against the base")
     freshness_subparsers = freshness.add_subparsers(dest="freshness_command", required=True)
@@ -985,6 +1015,7 @@ def main(argv: list[str] | None = None) -> int:
                 status=args.status,
                 command=args.finalize_verify_command_text,
                 justification=args.justification,
+                results=args.results,
                 repo=args.repo,
                 **_concurrency(args),
             )
@@ -1051,6 +1082,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "intake" and args.intake_command == "status":
             _print_json(intake_status(store.read()))
+            return 0
+
+        if args.command == "scope" and args.scope_command == "archive":
+            _print_json(archive_scope(store, repo=args.repo, **_concurrency(args)))
             return 0
 
         if args.command == "freshness" and args.freshness_command == "check":

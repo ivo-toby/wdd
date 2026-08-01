@@ -282,11 +282,13 @@ def validate_state(state: dict[str, Any]) -> None:
     finalize = state.get("finalize")
     if finalize is not None:
         finalize = _require_mapping(finalize, "finalize")
-        # Optional keys: review, verification, handoff (each must be dict or absent).
-        for field in ("review", "verification", "handoff"):
+        # Optional keys: review, handoff (each must be dict or absent). verification
+        # gets its own deeper check below (Task 5: multi-command evidence shape).
+        for field in ("review", "handoff"):
             value = finalize.get(field)
             if value is not None and not isinstance(value, dict):
                 raise ValidationError(f"finalize.{field} must be an object or null")
+        _validate_finalize_verification(finalize.get("verification"))
         # Optional key: delivered (dict with non-empty-string at, by, headSha when present).
         delivered = finalize.get("delivered")
         if delivered is not None:
@@ -295,6 +297,54 @@ def validate_state(state: dict[str, Any]) -> None:
                 _require_string(delivered.get(field), f"finalize.delivered.{field}")
 
     _validate_intake(_require_mapping(state.get("intake"), "intake"))
+
+
+_VERIFICATION_STATUSES = {"passed", "failed", "unavailable"}
+
+
+def _validate_finalize_verification(verification: Any) -> None:
+    """Validate `finalize.verification` (Task 5: spec Sec5's multi-command evidence).
+
+    Two shapes are both legal, distinguished by the presence of `commands`:
+
+    - v5 non-legacy: `{headSha, commands: [{command, status}, ...], status, at}` --
+      an ordered, non-empty list of per-command outcomes plus the overall
+      `status` (`passed` iff every entry passed).
+    - legacy (pre-phase-6a, unchanged): `{headSha, status, command, justification, at}`
+      -- a single command/status pair. Read sites treat this as the one-entry
+      list it always was (`finalize.verification_commands`); this validator
+      does not itself normalize the shape, only accepts both.
+    """
+    if verification is None:
+        return
+    verification = _require_mapping(verification, "finalize.verification")
+    # headSha/at/status are not required here (mirrors review/handoff's own
+    # dict-or-null looseness above -- pre-phase-6a fixtures build partial
+    # verification stubs); `status`, when present, must still be one of the
+    # recognized values, and the `commands` list shape (when present) is
+    # validated in full since it's the new Task 5 doctrine.
+    status = verification.get("status")
+    if status is not None and status not in _VERIFICATION_STATUSES:
+        raise ValidationError(
+            f"finalize.verification.status must be one of {sorted(_VERIFICATION_STATUSES)}"
+        )
+    if "commands" in verification:
+        commands = verification["commands"]
+        if not isinstance(commands, list) or not commands:
+            raise ValidationError("finalize.verification.commands must be a non-empty list")
+        for entry in commands:
+            entry = _require_mapping(entry, "finalize.verification.commands[]")
+            _require_string(entry.get("command"), "finalize.verification.commands[].command")
+            if entry.get("status") not in _VERIFICATION_STATUSES:
+                raise ValidationError(
+                    "finalize.verification.commands[].status must be one of "
+                    f"{sorted(_VERIFICATION_STATUSES)}"
+                )
+    else:
+        _require_string(verification.get("command"), "finalize.verification.command", nullable=True)
+        _require_string(
+            verification.get("justification"), "finalize.verification.justification", nullable=True
+        )
 
 
 _INTAKE_RECORD_KEYS = {"spec", "research", "design"}

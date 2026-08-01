@@ -25,7 +25,9 @@ supplies the revisioned/idempotent/locked envelope" pattern
 
 from __future__ import annotations
 
+import json
 import shlex
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -36,8 +38,8 @@ from .git import is_ancestor, require_repository, resolve_ref, run_git
 from .github import create_pr, push_branch
 from .merge import _fetched_base_refs
 from .review import validate_findings
-from .schema import copied_state, derived_phase
-from .store import StateStore
+from .schema import copied_state, derived_phase, new_setup_state
+from .store import StateStore, atomic_write_text
 
 
 FINALIZE_PHASES = {"finalize", "delivered"}
@@ -198,40 +200,176 @@ def record_final_review(
     )
 
 
+def _is_legacy_intake(state: dict[str, Any]) -> bool:
+    return (state.get("intake") or {}).get("legacy") is True
+
+
+def _required_verification_commands(state: dict[str, Any], wdd_dir: Path) -> list[str]:
+    """The v5 non-legacy required command list, in order (spec Sec2/Sec5):
+    the ratified global ``verification.commands`` then the scope's epic
+    deliverable command (``intake.design.deliverableCommand`` -- always
+    present on a v5 non-legacy scope that reached finalize, since the intake
+    ladder must be complete before `plan apply` and the ladder never clears
+    without re-recording design)."""
+    commands = list(load_config(wdd_dir)["verification"]["commands"]) if config_path(wdd_dir).exists() else []
+    design = (state.get("intake") or {}).get("design") or {}
+    deliverable = design.get("deliverableCommand")
+    if deliverable:
+        commands.append(deliverable)
+    return commands
+
+
+def _validate_verification_results(
+    results: Any, required_commands: list[str]
+) -> list[dict[str, str]]:
+    """Validate `--results` against the exact, ordered required command list.
+
+    Missing, extra, or reordered entries all refuse, naming the mismatch --
+    there is no partial-evidence state (spec Sec5: "append semantics are
+    forbidden") and no room for the caller to skip or reorder a required
+    command.
+    """
+    if not isinstance(results, list) or not results:
+        raise ValidationError(
+            "--results must be a non-empty JSON array of {command, status} objects"
+        )
+    entries: list[dict[str, str]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            raise ValidationError("each --results entry must be an object with command/status")
+        command = item.get("command")
+        status = item.get("status")
+        if not isinstance(command, str) or not command:
+            raise ValidationError("each --results entry requires a non-empty 'command'")
+        if status not in {"passed", "failed", "unavailable"}:
+            raise ValidationError(
+                "each --results entry's status must be passed, failed, or unavailable"
+            )
+        entries.append({"command": command, "status": status})
+    actual_commands = [entry["command"] for entry in entries]
+    if actual_commands != required_commands:
+        # Multiset diff (not plain membership): the required/deliverable
+        # commands can repeat verbatim (e.g. the same smoke command used
+        # globally and as the deliverable), so a plain `in` check would miss
+        # a missing/extra *count* of an otherwise-present command.
+        required_counts = Counter(required_commands)
+        actual_counts = Counter(actual_commands)
+        missing = list((required_counts - actual_counts).elements())
+        extra = list((actual_counts - required_counts).elements())
+        detail_parts = []
+        if missing:
+            detail_parts.append(f"missing: {missing}")
+        if extra:
+            detail_parts.append(f"extra: {extra}")
+        if not missing and not extra:
+            detail_parts.append(f"expected order {required_commands}, got {actual_commands}")
+        raise ValidationError(
+            "finalize verify record --results must name exactly the required commands, in "
+            "order (the ratified global verification.commands then the scope's deliverable "
+            "command): " + "; ".join(detail_parts)
+        )
+    return entries
+
+
+def _overall_verification_status(entries: list[dict[str, str]]) -> str:
+    """Overall status is `passed` only when every entry passed (spec Sec5);
+    a failure outranks an unavailable entry when both are present, since
+    "failed" is the stronger, more actionable signal for `next` to surface."""
+    statuses = {entry["status"] for entry in entries}
+    if statuses == {"passed"}:
+        return "passed"
+    if "failed" in statuses:
+        return "failed"
+    return "unavailable"
+
+
+def verification_commands(verification: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Normalize `finalize.verification` evidence to its command list.
+
+    v5 non-legacy records already carry ``commands``: ``[{command, status}, ...]``.
+    Legacy (pre-phase-6a) records carry a single ``command``/``status`` pair at
+    the top level; read sites see that as the one-entry list it always was,
+    rather than special-casing the older shape at every call site.
+    """
+    if not verification:
+        return []
+    if "commands" in verification:
+        return list(verification["commands"])
+    command = verification.get("command")
+    if command is None:
+        return []
+    return [{"command": command, "status": verification.get("status")}]
+
+
 def record_final_verification(
     store: StateStore,
     *,
-    status: str,
+    status: str | None = None,
     command: str | None = None,
     justification: str | None = None,
+    results: list[dict[str, Any]] | None = None,
     repo: Path | str,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Record the full verification run against the current epic branch head.
 
-    Mirrors ``review.record_verification``'s status vocabulary. "unavailable"
-    additionally requires a justification -- either passed explicitly or
-    falling back to the configured ``verification.unavailableJustification``
-    -- since there is no task worker left to explain why the command could
-    not run once the scope has reached finalize.
+    Two contracts, chosen by the scope's own legacy-ness (never by which
+    arguments happen to be passed):
+
+    - Legacy scopes (``intake.legacy``): the original single-command shape,
+      unchanged bit-for-bit. Mirrors ``review.record_verification``'s status
+      vocabulary; "unavailable" requires a justification (explicit or the
+      configured ``verification.unavailableJustification`` fallback).
+    - v5 non-legacy scopes: the spec Sec5 multi-command shape, recorded in
+      ONE atomic ``--results`` invocation (append semantics are forbidden --
+      partial evidence must never exist in state). Completeness is validated
+      at record time: the entries must equal, exactly and in order, the
+      required list (global ``verification.commands`` then the scope's
+      deliverable command). Overall ``status`` is `passed` iff every entry
+      passed.
     """
-    if status not in {"passed", "failed", "unavailable"}:
-        raise ValidationError("verification status must be passed, failed, or unavailable")
     wdd_dir = store.path.parent
-    if status == "unavailable":
-        if not justification and config_path(wdd_dir).exists():
-            justification = load_config(wdd_dir)["verification"].get("unavailableJustification")
-        if not justification:
+    state = store.read()
+    legacy = _is_legacy_intake(state)
+
+    if legacy:
+        if results is not None:
             raise ValidationError(
-                "verification status 'unavailable' requires --justification (or a "
-                "configured verification.unavailableJustification)"
+                "this is a legacy scope; record evidence with --status/--command "
+                "(--results is the v5 multi-command contract)"
             )
+        if status not in {"passed", "failed", "unavailable"}:
+            raise ValidationError("verification status must be passed, failed, or unavailable")
+        if status == "unavailable":
+            if not justification and config_path(wdd_dir).exists():
+                justification = load_config(wdd_dir)["verification"].get("unavailableJustification")
+            if not justification:
+                raise ValidationError(
+                    "verification status 'unavailable' requires --justification (or a "
+                    "configured verification.unavailableJustification)"
+                )
+    else:
+        if status is not None or command is not None:
+            raise ValidationError(
+                "this is a v5 scope; record multi-command evidence with --results "
+                "'[{\"command\":..., \"status\":...}, ...]' (--status/--command is the "
+                "legacy contract)"
+            )
+        if results is None:
+            raise ValidationError(
+                "finalize verify record requires --results for this scope: the ratified "
+                "global verification.commands plus the scope's deliverable command"
+            )
+        # Validated pre-lock so a bad --results refuses before any side effects;
+        # re-validated inside the mutator below against the locked state, same
+        # two-stage pattern as every other finalize verb in this module.
+        _validate_verification_results(results, _required_verification_commands(state, wdd_dir))
+
     repo_path = require_repository(repo)
 
     # Fail fast, before any side effects run -- same two-stage pattern as
     # record_final_review/prepare_handoff/record_delivered.
-    state = store.read()
     _require_finalize_phase(state)
     _require_not_delivered(state, what="verify")
 
@@ -241,13 +379,24 @@ def record_final_verification(
         base_sha = resolve_ref(repo_path, _base_ref(state))
         updated = copied_state(state)
         updated.setdefault("finalize", {})
-        updated["finalize"]["verification"] = {
-            "headSha": base_sha,
-            "status": status,
-            "command": command,
-            "justification": justification,
-            "at": utc_now(),
-        }
+        if legacy:
+            updated["finalize"]["verification"] = {
+                "headSha": base_sha,
+                "status": status,
+                "command": command,
+                "justification": justification,
+                "at": utc_now(),
+            }
+        else:
+            entries = _validate_verification_results(
+                results, _required_verification_commands(state, wdd_dir)
+            )
+            updated["finalize"]["verification"] = {
+                "headSha": base_sha,
+                "commands": entries,
+                "status": _overall_verification_status(entries),
+                "at": utc_now(),
+            }
         return updated
 
     return apply_mutation(
@@ -266,13 +415,15 @@ def _handoff_summary(state: dict[str, Any]) -> str:
     finalize = state.get("finalize") or {}
     review = finalize.get("review") or {}
     verification = finalize.get("verification") or {}
+    commands = verification_commands(verification)
+    commands_desc = ", ".join(c["command"] for c in commands if c.get("command")) or "n/a"
     lines = [f"wdd scope {scope['id']}", "", "Tasks:"]
     for task_id, task in sorted(state["tasks"].items()):
         lines.append(f"- {task_id}: {task.get('title', task_id)} ({task['status']})")
     lines += [
         "",
         f"Final review: {review.get('outcome')} by {review.get('reviewer')}",
-        f"Final verification: {verification.get('status')} ({verification.get('command') or 'n/a'})",
+        f"Final verification: {verification.get('status')} ({commands_desc})",
     ]
     return "\n".join(lines)
 
@@ -490,6 +641,30 @@ def record_delivered(
     return {**outcome, "revision": state["revision"], "duplicate": duplicate}
 
 
+def _final_review_judgment(state: dict[str, Any]) -> str:
+    """The `final_review` action's judgment text (spec Sec5's finalize tie-in).
+
+    Legacy scopes keep the original prose verbatim (a regression pin -- they
+    have no numbered criteria or design.md deliverable to name). Non-legacy
+    v5 scopes additionally name the acceptance criteria to walk by number
+    (AC-1..AC-N, from ``intake.spec.criteria``) and design.md's epic
+    deliverable statement, alongside the existing spec.md instruction.
+    """
+    base = (
+        "dispatch a reviewer against the whole epic branch diff, per wdd-review's "
+        "final-review contract, checked against .wdd/spec.md"
+    )
+    if _is_legacy_intake(state):
+        return base
+    criteria = ((state.get("intake") or {}).get("spec") or {}).get("criteria")
+    if not criteria:
+        return base
+    return (
+        f"{base}; walk .wdd/spec.md's acceptance criteria AC-1..AC-{criteria} in order and "
+        "confirm design.md's epic deliverable statement is observably true"
+    )
+
+
 def finalize_next_actions(
     state: dict[str, Any],
     wdd_dir: Path | str,
@@ -577,10 +752,7 @@ def finalize_next_actions(
                 f"{prefix} finalize review record --reviewer NAME --findings '[]' "
                 f"--repo {repo_arg}"
             ),
-            "judgment": (
-                "dispatch a reviewer against the whole epic branch diff, per wdd-review's "
-                "final-review contract, checked against .wdd/spec.md"
-            ),
+            "judgment": _final_review_judgment(state),
         }
         config = load_config(wdd_dir) if config_path(wdd_dir).exists() else None
         model = (config["models"].get("review") if config else None)
@@ -605,13 +777,23 @@ def finalize_next_actions(
         or not verification_fresh
         or verification.get("status") != "passed"
     ):
+        if _is_legacy_intake(state):
+            record_with = (
+                f"{prefix} finalize verify record --status passed "
+                f"--command '<verification command>' --repo {repo_arg}"
+            )
+        else:
+            required = _required_verification_commands(state, wdd_dir)
+            results_hint = json.dumps(
+                [{"command": cmd, "status": "passed"} for cmd in required]
+            )
+            record_with = (
+                f"{prefix} finalize verify record --results '{results_hint}' --repo {repo_arg}"
+            )
         action = {
             "task": "-",
             "action": "final_verification",
-            "recordWith": (
-                f"{prefix} finalize verify record --status passed "
-                f"--command '<verification command>' --repo {repo_arg}"
-            ),
+            "recordWith": record_with,
             "judgment": "run full verification against the current epic branch head and record the result",
         }
     elif handoff is None or not handoff_fresh:
@@ -651,4 +833,91 @@ def finalize_next_actions(
         "phase": "finalize",
         "actions": [action],
         "blockers": [],
+    }
+
+
+def archive_scope(
+    store: StateStore,
+    *,
+    repo: Path | str,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """`wddctl scope archive`: the ladder's final transition (spec Sec1's rollover).
+
+    Delivered-phase only: moves the completed scope's records (scope, tasks,
+    intake, finalize, reconcile incl. pendingNotes, an event count, and an
+    archived-at timestamp) to ``.wdd/archive/<scope-id>.json`` via
+    ``atomic_write_text``, then resets every scope-carrying section of state
+    to ``new_setup_state()``'s fresh shape in ONE ``apply_mutation``: scope
+    null, tasks empty, ``finalize`` removed entirely, intake reset to ``{}``
+    (a fresh ladder -- NOT re-marked legacy; the next scope walks the ladder
+    for real), reconcile fully fresh (counters and pendingNotes both), and
+    monitoring observations cleared. Governance (constitution/ratification)
+    and the audit trail (events, appliedIdempotencyKeys, telemetry) are
+    deliberately left untouched -- archiving retires a scope's data, not the
+    repository's own history or its ratified process.
+
+    The no-leak guarantee is total, not counters-only: nothing scope-specific
+    (the deliverable command included, since it lives only in ``intake.design``
+    and ``finalize``, both wiped) survives into the next scope. `next` emits
+    `agree_spec` immediately afterward, same as any other ratified-but-scope-
+    null state -- no bespoke rollover logic is needed in setup.py.
+    """
+    wdd_dir = store.path.parent
+    require_repository(repo)
+    state = store.read()
+    phase = derived_phase(state)
+    if phase != "delivered":
+        raise IllegalTransition(
+            f"scope archive requires the scope to be delivered (it is {phase}); finish the "
+            "finalize ladder through 'wddctl finalize delivered --by NAME --repo .' first"
+        )
+    scope_id = state["scope"]["id"]
+
+    archive_path = wdd_dir / "archive" / f"{scope_id}.json"
+    payload = {
+        "scope": state.get("scope"),
+        "tasks": state.get("tasks"),
+        "intake": state.get("intake"),
+        "finalize": state.get("finalize"),
+        "reconcile": state.get("reconcile"),
+        "eventCount": len(state.get("events") or []),
+        "archivedAt": utc_now(),
+    }
+    atomic_write_text(archive_path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+    def mutator(current: dict[str, Any]) -> dict[str, Any]:
+        current_phase = derived_phase(current)
+        if current_phase != "delivered":
+            raise IllegalTransition(
+                f"scope archive requires the scope to be delivered (it is {current_phase}); "
+                "finish the finalize ladder through 'wddctl finalize delivered --by NAME "
+                "--repo .' first"
+            )
+        fresh = new_setup_state()
+        # Governance and the audit trail survive the reset -- only the
+        # scope-carrying sections new_setup_state() already produces fresh
+        # (scope, tasks, intake, reconcile, monitoring; finalize absent) are
+        # actually new here.
+        fresh["constitution"] = current["constitution"]
+        fresh["events"] = current["events"]
+        fresh["appliedIdempotencyKeys"] = current["appliedIdempotencyKeys"]
+        fresh["telemetry"] = current["telemetry"]
+        return fresh
+
+    state, duplicate = apply_mutation(
+        store,
+        event_type="scope.archived",
+        task_id=None,
+        data={"scopeId": scope_id},
+        idempotency_key=idempotency_key,
+        expected_revision=expected_revision,
+        mutator=mutator,
+    )
+    return {
+        "archived": str(archive_path),
+        "scope": scope_id,
+        "revision": state["revision"],
+        "duplicate": duplicate,
     }

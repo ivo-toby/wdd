@@ -102,6 +102,12 @@ def _plan_document(
     }
 
 
+def _passed_results(*commands: str) -> str:
+    """JSON --results payload marking every given command passed, in order --
+    the v5 multi-command `finalize verify record` contract (Task 5)."""
+    return json.dumps([{"command": command, "status": "passed"} for command in commands])
+
+
 def _ratified_repo(tmp: str) -> tuple[Path, str]:
     """A fresh git repo with .wdd/ initialized and the constitution ratified.
 
@@ -1756,8 +1762,8 @@ class ExecutionGateFinalizeDriftTest(unittest.TestCase):
                 _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
             )
             code, _out, err = _cli_full(
-                state, "finalize", "verify", "record", "--status", "passed",
-                "--command", "true", "--repo", str(root),
+                state, "finalize", "verify", "record",
+                "--results", _passed_results("true", "true"), "--repo", str(root),
             )
             self.assertNotEqual(code, 0)
             self.assertIn("intake drift", err)
@@ -1797,8 +1803,8 @@ class ExecutionGateFinalizeDriftTest(unittest.TestCase):
                 "--deliverable-command", "true",
             )[0] == 0
             code, _out, err = _cli_full(
-                state, "finalize", "verify", "record", "--status", "passed",
-                "--command", "true", "--repo", str(root),
+                state, "finalize", "verify", "record",
+                "--results", _passed_results("true", "true"), "--repo", str(root),
             )
             self.assertNotEqual(code, 0)
             self.assertIn("plan drift", err)
@@ -1814,8 +1820,8 @@ class ExecutionGateFinalizeDriftTest(unittest.TestCase):
             self.assertEqual(code, 0, out)
 
             code, out, err = _cli_full(
-                state, "finalize", "verify", "record", "--status", "passed",
-                "--command", "true", "--repo", str(root),
+                state, "finalize", "verify", "record",
+                "--results", _passed_results("true", "true"), "--repo", str(root),
             )
             self.assertEqual(code, 0, out + err)
 
@@ -2032,6 +2038,360 @@ class BothDriftBlockerOrderTest(unittest.TestCase):
             self.assertIn("governance_drift", codes)
             self.assertIn("intake_drift", codes)
             self.assertEqual(result["blockers"][0]["code"], "governance_drift")
+
+
+def _run_to_finalize_legacy(tmp: str) -> tuple[Path, str]:
+    """Drive a legacy (`intake.legacy`) scope through one local task to the
+    finalize phase -- Task 5's backward-compat fixture for the single-command
+    `finalize verify record` contract, which legacy scopes keep untouched.
+    Mirrors test_finalize.py's own legacy-marking pattern (mark legacy right
+    after ratify, apply the plan without walking the ladder)."""
+    root, state = _ratified_repo(tmp)
+    bare = Path(tmp) / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True)
+    wdd = root / ".wdd"
+    store = StateStore(Path(state))
+    current = deepcopy(store.read())
+    current["intake"] = {"legacy": True}
+    store.write(current)
+    (wdd / "tasks").mkdir(exist_ok=True)
+    (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+    plan_file = root / "plan.json"
+    plan_file.write_text(
+        json.dumps(_plan_document(["T1"], review_policy="always")), encoding="utf-8"
+    )
+    code, out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+    assert code == 0, out
+    _start_and_commit(state, root)
+    assert _cli(state, "submit", "--task", "T1", "--repo", str(root))[0] == 0
+    assert _cli(
+        state, "review", "record", "--task", "T1", "--reviewer", "t", "--findings", "[]"
+    )[0] == 0
+    assert _cli(state, "verify", "record", "--task", "T1", "--status", "passed")[0] == 0
+    assert _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0] == 0
+    assert _cli(state, "merge", "--task", "T1", "--repo", str(root))[0] == 0
+
+    from wave_delivery.schema import derived_phase
+
+    scope_state = StateStore(Path(state)).read()
+    assert derived_phase(scope_state) == "finalize", scope_state
+    return root, state
+
+
+class FinalVerificationMultiCommandTest(unittest.TestCase):
+    """Task 5, spec Sec5: v5 non-legacy scopes record final verification as
+    an ordered `[{command, status}]` list, in ONE atomic `--results` call,
+    validated for exact completeness against the required list (global
+    verification.commands then the scope's deliverable command)."""
+
+    def test_all_passed_results_in_overall_passed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize(tmp)
+            assert _cli(
+                state, "finalize", "review", "record", "--reviewer", "t", "--findings", "[]",
+                "--repo", str(root),
+            )[0] == 0
+            code, out = _cli(
+                state, "finalize", "verify", "record",
+                "--results", _passed_results("true", "true"), "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            verification = StateStore(Path(state)).read()["finalize"]["verification"]
+            self.assertEqual(verification["status"], "passed")
+            self.assertEqual(
+                verification["commands"],
+                [{"command": "true", "status": "passed"}, {"command": "true", "status": "passed"}],
+            )
+
+    def test_any_failed_entry_makes_overall_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize(tmp)
+            results = json.dumps(
+                [{"command": "true", "status": "passed"}, {"command": "true", "status": "failed"}]
+            )
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--results", results, "--repo", str(root)
+            )
+            self.assertEqual(code, 0, out)
+            verification = StateStore(Path(state)).read()["finalize"]["verification"]
+            self.assertEqual(verification["status"], "failed")
+
+    def test_missing_entry_is_refused_and_named(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize(tmp)
+            results = json.dumps([{"command": "true", "status": "passed"}])
+            code, _out, err = _cli_full(
+                state, "finalize", "verify", "record", "--results", results, "--repo", str(root)
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("missing", err)
+
+    def test_extra_entry_is_refused_and_named(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize(tmp)
+            results = json.dumps(
+                [
+                    {"command": "true", "status": "passed"},
+                    {"command": "true", "status": "passed"},
+                    {"command": "echo extra", "status": "passed"},
+                ]
+            )
+            code, _out, err = _cli_full(
+                state, "finalize", "verify", "record", "--results", results, "--repo", str(root)
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("extra", err)
+
+    def test_reordered_entries_are_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize(tmp)
+            # A required list of two distinct commands so reordering is
+            # observable: override the deliverable command via a fresh
+            # design re-approval (only clears scope.approval), then re-stamp.
+            (root / ".wdd" / "design.md").write_text(_design_text(), encoding="utf-8")
+            assert _cli(
+                state, "intake", "design", "--approved-by", "t",
+                "--deliverable-command", "echo deliverable",
+            )[0] == 0
+            plan_file = root / "plan.json"
+            plan_file.write_text(
+                json.dumps(_plan_document(["T1"], review_policy="always")), encoding="utf-8"
+            )
+            assert _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )[0] == 0
+            results = json.dumps(
+                [
+                    {"command": "echo deliverable", "status": "passed"},
+                    {"command": "true", "status": "passed"},
+                ]
+            )
+            code, _out, err = _cli_full(
+                state, "finalize", "verify", "record", "--results", results, "--repo", str(root)
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("expected order", err)
+
+    def test_legacy_status_command_args_refused_on_v5_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize(tmp)
+            code, _out, err = _cli_full(
+                state, "finalize", "verify", "record", "--status", "passed",
+                "--command", "true", "--repo", str(root),
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("v5 scope", err)
+
+    def test_v5_scope_without_results_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize(tmp)
+            code, _out, err = _cli_full(
+                state, "finalize", "verify", "record", "--repo", str(root)
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("requires --results", err)
+
+
+class FinalVerificationLegacyContractTest(unittest.TestCase):
+    """Task 5: legacy scopes keep the pre-existing single-command
+    `--status`/`--command` contract untouched -- a regression pin -- and
+    `--results` is refused there."""
+
+    def test_legacy_single_command_contract_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize_legacy(tmp)
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--status", "passed",
+                "--command", "pytest -q", "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            verification = StateStore(Path(state)).read()["finalize"]["verification"]
+            self.assertEqual(verification["status"], "passed")
+            self.assertEqual(verification["command"], "pytest -q")
+            self.assertNotIn("commands", verification)
+
+    def test_results_arg_refused_on_legacy_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize_legacy(tmp)
+            code, _out, err = _cli_full(
+                state, "finalize", "verify", "record",
+                "--results", _passed_results("pytest -q"), "--repo", str(root),
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("legacy scope", err)
+
+
+class VerificationCommandsReadSiteTest(unittest.TestCase):
+    """Task 5: `verification_commands` normalizes both evidence shapes to the
+    one-entry-list-or-more view every read site (handoff summary, `finalize
+    status`) shares, so legacy records read as the one-entry list they
+    always were."""
+
+    def test_legacy_shape_normalizes_to_one_entry(self) -> None:
+        from wave_delivery.finalize import verification_commands
+
+        legacy = {"headSha": "abc", "status": "passed", "command": "pytest -q", "at": "t"}
+        self.assertEqual(
+            verification_commands(legacy), [{"command": "pytest -q", "status": "passed"}]
+        )
+
+    def test_v5_shape_passes_through(self) -> None:
+        from wave_delivery.finalize import verification_commands
+
+        v5 = {
+            "headSha": "abc",
+            "status": "passed",
+            "commands": [{"command": "true", "status": "passed"}],
+            "at": "t",
+        }
+        self.assertEqual(verification_commands(v5), v5["commands"])
+
+    def test_empty_or_none_normalizes_to_empty_list(self) -> None:
+        from wave_delivery.finalize import verification_commands
+
+        self.assertEqual(verification_commands(None), [])
+        self.assertEqual(verification_commands({}), [])
+
+
+class FinalReviewJudgmentTest(unittest.TestCase):
+    """Task 5, spec Sec5's finalize tie-in: the `final_review` judgment names
+    AC-1..AC-N (from `intake.spec.criteria`) and design.md's epic deliverable
+    for non-legacy scopes; legacy scopes keep the original prose (pin)."""
+
+    def test_non_legacy_judgment_names_criteria_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize(tmp)
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            action = result["actions"][0]
+            self.assertEqual(action["action"], "final_review")
+            criteria = StateStore(Path(state)).read()["intake"]["spec"]["criteria"]
+            self.assertEqual(criteria, 1)
+            self.assertIn("AC-1", action["judgment"])
+            self.assertIn("design.md", action["judgment"])
+            self.assertIn("epic deliverable", action["judgment"])
+
+    def test_legacy_judgment_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize_legacy(tmp)
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            action = json.loads(out)["actions"][0]
+            self.assertEqual(action["action"], "final_review")
+            self.assertNotIn("AC-1", action["judgment"])
+            self.assertEqual(
+                action["judgment"],
+                "dispatch a reviewer against the whole epic branch diff, per wdd-review's "
+                "final-review contract, checked against .wdd/spec.md",
+            )
+
+
+def _run_to_delivered(tmp: str) -> tuple[Path, str]:
+    """`_run_to_finalize` walked the rest of the way to `delivered`, via the
+    v5 multi-command `--results` contract -- the scope-archive tests' shared
+    fixture."""
+    root, state = _run_to_finalize(tmp)
+    assert _cli(
+        state, "finalize", "review", "record", "--reviewer", "t", "--findings", "[]",
+        "--repo", str(root),
+    )[0] == 0
+    code, out = _cli(
+        state, "finalize", "verify", "record",
+        "--results", _passed_results("true", "true"), "--repo", str(root),
+    )
+    assert code == 0, out
+    code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+    assert code == 0, out
+    base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+         "merge", "--no-ff", "-m", "final merge", base_ref],
+        cwd=root, check=True,
+    )
+    code, out = _cli(state, "finalize", "delivered", "--by", "bob", "--repo", str(root))
+    assert code == 0, out
+
+    from wave_delivery.schema import derived_phase
+
+    assert derived_phase(StateStore(Path(state)).read()) == "delivered"
+    return root, state
+
+
+class ScopeArchiveTest(unittest.TestCase):
+    """Task 5, spec Sec1's rollover: `wddctl scope archive` is delivered-only,
+    writes `.wdd/archive/<scope-id>.json`, and resets every scope-carrying
+    section of state to a fresh setup-phase shape -- total no-leak, governance
+    untouched -- so `next` walks a brand-new intake ladder for the next
+    scope."""
+
+    def test_refuses_pre_delivered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize(tmp)
+            code, _out, err = _cli_full(state, "scope", "archive", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("delivered", err)
+
+    def test_archive_writes_file_and_resets_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_delivered(tmp)
+            # Seed a pending reconcile note before archiving so the no-leak
+            # assertion below has something concrete to prove gone.
+            assert _cli(state, "note", "--note", "a durable discovery")[0] == 0
+            before = StateStore(Path(state)).read()
+            self.assertEqual(len(before["reconcile"]["pendingNotes"]), 1)
+            scope_id = before["scope"]["id"]
+
+            code, out = _cli(state, "scope", "archive", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+
+            archive_path = Path(result["archived"])
+            self.assertTrue(archive_path.exists())
+            self.assertEqual(archive_path, root / ".wdd" / "archive" / f"{scope_id}.json")
+            payload = json.loads(archive_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["scope"]["id"], scope_id)
+            self.assertIn("T1", payload["tasks"])
+            self.assertIn("spec", payload["intake"])
+            self.assertIn("verification", payload["finalize"])
+            self.assertEqual(payload["reconcile"]["pendingNotes"][0]["note"], "a durable discovery")
+            self.assertIsInstance(payload["eventCount"], int)
+            self.assertGreater(payload["eventCount"], 0)
+            self.assertIn("archivedAt", payload)
+
+            after = StateStore(Path(state)).read()
+            self.assertIsNone(after["scope"])
+            self.assertEqual(after["tasks"], {})
+            self.assertNotIn("finalize", after)
+            self.assertEqual(after["intake"], {})
+            self.assertEqual(after["reconcile"]["pendingNotes"], [])
+            self.assertEqual(after["reconcile"]["mergesSinceCheckpoint"], 0)
+            self.assertEqual(after["monitoring"]["observations"], {})
+            # Governance survives the reset.
+            self.assertEqual(after["constitution"]["status"], "ratified")
+
+    def test_next_says_agree_spec_after_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_delivered(tmp)
+            assert _cli(state, "scope", "archive", "--repo", str(root))[0] == 0
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["actions"][0]["action"], "agree_spec")
+
+    def test_archived_deliverable_command_absent_from_next_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_delivered(tmp)
+            before = StateStore(Path(state)).read()
+            self.assertEqual(before["intake"]["design"]["deliverableCommand"], "true")
+
+            assert _cli(state, "scope", "archive", "--repo", str(root))[0] == 0
+            after = StateStore(Path(state)).read()
+            self.assertEqual(after["intake"], {})
+            self.assertNotIn("design", after["intake"])
 
 
 if __name__ == "__main__":
