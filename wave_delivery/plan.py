@@ -429,7 +429,13 @@ def plan_composite(plan_dict: dict[str, Any], wdd_dir: Path | str) -> str:
     into task state.
     """
     wdd_dir = Path(wdd_dir)
-    canonical = json.dumps(plan_dict, sort_keys=True, separators=(",", ":"))
+    # sort_keys=True only orders each dict's keys, not the tasks list itself;
+    # _apply_plan_to_state inserts tasks id-sorted regardless of plan-file
+    # order, so the composite must normalize task order the same way or two
+    # byte-identical plans (tasks merely listed differently) would hash
+    # differently -- a false-positive "changed plan" forever.
+    normalized = {**plan_dict, "tasks": sorted(plan_dict["tasks"], key=lambda entry: entry["id"])}
+    canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
     paths: set[str] = set()
     for entry in plan_dict["tasks"]:
         paths.add(entry["specPath"])

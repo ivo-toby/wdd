@@ -42,6 +42,7 @@ from wave_delivery.migration import (
     plan_migration,
     read_source,
 )
+from wave_delivery.plan import plan_composite
 from wave_delivery.schema import (
     SCHEMA_VERSION,
     intake_complete,
@@ -1344,6 +1345,23 @@ class PlanApprovalCompositeTest(unittest.TestCase):
             after = StateStore(Path(state)).read()["scope"]["approval"]
             self.assertEqual(before, after)
 
+    def test_composite_is_task_order_invariant(self) -> None:
+        """Finding 1 (review of 34c8eed): json.dumps(sort_keys=True) only
+        orders each dict's keys, not the `tasks` array -- the same plan with
+        tasks listed in a different order must still hash identically,
+        since _apply_plan_to_state inserts tasks id-sorted regardless of
+        plan-file order (a mismatched sort here would cause permanent
+        false-positive plan drift once Task 4 recomputes the composite from
+        state)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd, _state = self._ready(tmp)
+            (wdd / "tasks" / "T2.md").write_text("# T2\n\nBrief.\n", encoding="utf-8")
+            plan_forward = _plan_document(["T1", "T2"])
+            plan_reversed = _plan_document(["T2", "T1"])
+            composite_forward = plan_composite(plan_forward, wdd)
+            composite_reversed = plan_composite(plan_reversed, wdd)
+            self.assertEqual(composite_forward, composite_reversed)
+
 
 class PlanTaskHandoverFieldsTest(unittest.TestCase):
     """Task 3: context/model/reviewModel are validated at apply and
@@ -1439,6 +1457,58 @@ class LegacyPlanApplyRegressionTest(unittest.TestCase):
             code, out = _cli(state, "next")
             self.assertEqual(code, 0, out)
             self.assertEqual(json.loads(out)["actions"][0]["action"], "plan")
+
+    def test_legacy_changed_plan_without_approved_by_carries_prior_approval_forward(
+        self,
+    ) -> None:
+        """Finding 2 (review of 34c8eed): the exact pre-doctrine contract on a
+        legacy scope -- a prior scope.approval recorded (the v4 migrated
+        shape, which predates the sha256 composite field and so never has
+        one), then a CHANGED plan re-applied WITHOUT --approved-by must still
+        succeed and must leave the old approval dict untouched (silent
+        carry-forward is the documented legacy behavior, not a regression).
+        This also pins that `validate_state` tolerates `scope.approval`
+        lacking `sha256` -- required for a migrated v4 state, whose approval
+        shape predates this task's composite field, to remain valid."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+
+            # Mark legacy before the first apply -- a non-legacy scope would
+            # refuse this apply outright (ladder incomplete). This is the
+            # architecture-note-sanctioned way to hand-build a "migrated"
+            # scope in a test: set state["intake"] explicitly, never mint it
+            # via a constructor.
+            store = StateStore(Path(state))
+            legacy_state = deepcopy(store.read())
+            legacy_state["intake"] = {"legacy": True}
+            store.write(legacy_state)
+
+            (wdd / "tasks").mkdir(exist_ok=True)
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            # A legacy apply's composite is always None (apply_plan), so
+            # --approved-by on a legacy scope stamps {by, at} with NO
+            # sha256 -- exactly the v4-migrated approval shape that predates
+            # this task's composite field. This also exercises
+            # validate_state's tolerance for a sha256-less scope.approval.
+            assert _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "old",
+            )[0] == 0
+            legacy_approval = StateStore(Path(state)).read()["scope"]["approval"]
+            self.assertNotIn("sha256", legacy_approval)
+
+            (wdd / "tasks" / "T2.md").write_text("# T2\n\nBrief.\n", encoding="utf-8")
+            changed_plan = _plan_document(["T1", "T2"])
+            plan_file.write_text(json.dumps(changed_plan), encoding="utf-8")
+            code, out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            after = StateStore(Path(state)).read()
+            self.assertIn("T2", after["tasks"])
+            self.assertEqual(after["scope"]["approval"], legacy_approval)
 
 
 if __name__ == "__main__":
