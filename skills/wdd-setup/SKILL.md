@@ -29,7 +29,11 @@ Initialize from scratch.
      (values are JSON when structured, `'["npm test"]'`; bare strings
      otherwise, `local`). "We have no tests yet" is an answer too: set
      `verification.commands` to `[]` and put the user's reason in
-     `verification.unavailableJustification`. The model question maps the
+     `verification.unavailableJustification`. When relaying the
+     verification question, steer toward a compound answer: the strongest
+     gate covers the build, the tests, AND a startup smoke check (does the
+     binary run at all) — a unit-test-only gate passes packages that never
+     start. The model question maps the
      user's answer onto three roles in one set — for example
      `wddctl config set models '{"planning": null, "implementation":
      {"default": "haiku", "highRisk": "sonnet"}, "review": "sonnet"}'` —

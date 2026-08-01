@@ -17,7 +17,18 @@ job is to find problems and classify them — not to fix them.
   flag scope creep the same as a missing requirement.
 - Correctness against the task's brief and any adjacent contracts it must
   honor.
-- Test coverage for the behavior the task claims to add or change.
+- Test coverage for the behavior the task claims to add or change — and
+  whether the tests could fail. A suite that round-trips schemas, tests a
+  helper the production path never calls, re-implements the logic inline,
+  or never exercises the real entrypoint is green by construction; treat
+  it as missing coverage (P2), not as evidence. For anything that talks to
+  an external system, look for assertions on the actual boundary — method,
+  path, body — not just on the parsed result.
+- When the brief or constitution names a reference implementation or
+  external contract, spot-check the implemented surface against it. The
+  worker's report should cite the reference per endpoint; uncited or
+  mismatched shapes are P1 — fabricated contracts fail at runtime, not in
+  review.
 - Security and data-handling issues, proportional to what the task touches
   (weight this heavily on high-risk tasks — auth, persistence, migrations,
   public APIs).

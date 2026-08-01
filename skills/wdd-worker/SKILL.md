@@ -31,6 +31,12 @@ controller already created for you.
   here. Dependencies exist because someone judged the ordering matters.
 - Follow the task's verification command exactly; don't invent a different
   check.
+- When the brief or constitution names a reference implementation or an
+  external contract, read it BEFORE writing the surface that mirrors it,
+  and cite the reference (file and line, or endpoint doc) in your report
+  for every endpoint, query, and field shape you implement. An API shape
+  you cannot cite is a guess, and a guess that type-checks is still a
+  guess — say so instead of shipping it silently.
 
 ## TDD
 

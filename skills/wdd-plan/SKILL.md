@@ -67,6 +67,16 @@ rather than by line count. A task that can't be described with a single
 clear objective and a bounded file set is too big — split it. A task that
 only makes sense alongside another is too small — merge them.
 
+When several tasks produce components that a shared entrypoint, registry,
+or wiring file must consume (a server registering tools, a router mounting
+handlers, an index exporting modules), add an explicit **integration task**
+that `dependsOn` all of the producers and owns that file's conflict domain.
+Without it, the isolation that prevents merge conflicts also guarantees the
+wiring never happens: an early task writes the registry once, later tasks
+can't touch it, and the scope ships components that exist but are never
+reachable. A plan whose graph has no such sink for its shared surfaces is
+structurally incomplete, whatever lint says.
+
 ### Conflict domains — the single most important judgment
 
 `conflictDomains` are the paths/globs a task touches. Two tasks sharing a
@@ -110,6 +120,19 @@ directly when it touches auth, security, data persistence, migrations, a
 public API/contract, or generated code — anything where a bad merge is
 expensive to unwind — and consider proposing a `riskRules` entry for the
 scope's config so future plans don't have to repeat the judgment per task.
+
+Destructiveness is not the only risk axis. A task that transcribes an
+external contract — an API client against a named reference implementation,
+a protocol encoder, a schema mirroring someone else's — is high-risk even
+though it destroys nothing: fabricated endpoints and invented field names
+look exactly like real ones, pass type-checking, and sail through unit
+tests that only exercise the fabrication. Mark contract-transcription tasks
+`"risk": "high"` (or add a riskRules pattern for the client/adapter paths)
+so a reviewer compares the code against the reference. And when the
+implementation model is small or cheap, say so at approval time and
+recommend `reviewPolicy: always` for the scope — risk-based review assumes
+the worker's unreviewed output is usually right, which is precisely what a
+small model does not guarantee.
 
 Under `reviewPolicy: risk_based` (the default), only high-risk tasks — plan-
 declared or rule-derived — get a separate reviewer pass; `always` reviews
@@ -166,6 +189,14 @@ On explicit user approval, apply and record it:
 ```sh
 wddctl plan apply --plan plan.json --repo . --approved-by <name>
 ```
+
+While presenting, reconcile the spec's acceptance criteria with the scope's
+`verification.commands` (`wddctl config get verification.commands`): any
+criterion a command can check — the build passes, the binary starts, a
+smoke invocation answers — belongs in the verification gate, not just in
+prose. A gate that only runs unit tests will happily pass a package that
+does not start. Propose the amendment to the user before applying; config
+changes after ratification go through `wddctl constitution amend`.
 
 Never apply an unapproved plan. `<name>` is the human who approved the plan,
 not the agent.
