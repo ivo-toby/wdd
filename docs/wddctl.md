@@ -569,6 +569,417 @@ there is nothing left for a drift check to protect. `event apply` is
 governed, not exempt: it is a raw state transition, and the escape hatch
 bypasses transitions, not governance.
 
+## The intake ladder
+
+Between `constitution ratify` and `plan apply`, `wddctl next` walks three
+more rungs, one at a time: **spec → research → design**. Each rung is
+recorded by its own verb (`wddctl intake spec` / `research` / `design`),
+and each record is bound to the exact bytes it approved — a SHA-256 of the
+artifact, the same `governance_fingerprint` idiom the constitution uses.
+Editing an already-approved artifact is drift, not a free edit, exactly
+like editing `config.json`/`constitution.md` after ratification is. The
+ladder is also **ordered and cascading**: re-approving a rung clears every
+record after it (a spec re-approval clears research, design, and the
+plan's composite approval; a research re-approval clears design and the
+composite; a design re-approval clears only the composite) — because a
+later record's approval implicitly rests on the upstream bytes that just
+changed underneath it.
+
+A migrated (legacy, `intake.legacy`) scope is wholesale exempt from the
+entire ladder — `wddctl next` never emits a rung action for one, and the
+rung verbs themselves refuse outright. Every rung verb also refuses before
+ratification, and once the scope reaches `delivered` (`wddctl scope
+archive` is the only way back to a fresh ladder — see below).
+
+Real, unedited output from one continuous scratch repository — `wddctl
+init` through ratify, then the whole ladder — merge surface `local`:
+
+```sh
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "agree_spec",
+      "judgment": "agree .wdd/spec.md with the user (goal, in/out of scope, numbered acceptance criteria) per the wdd-intake skill's spec stage, then record it",
+      "recordWith": "wddctl intake spec --approved-by NAME",
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "setup",
+  "revision": 1,
+  "scope": null
+}
+```
+
+### `wddctl intake spec`
+
+Records `.wdd/spec.md`'s approval. Refuses unless the file exists,
+non-empty, has all four required `## ` sections (Goal, In scope, Out of
+scope, Acceptance criteria), and its Acceptance criteria section is
+**wholly numbered**: every checklist line matches `- [ ] AC-<n>: ...`, the
+numbers unique and contiguous from 1 — final review has to be able to walk
+`1..N` with nothing outside the numbering.
+
+```sh
+$ wddctl intake spec --approved-by ivo
+{
+  "criteria": 2,
+  "duplicate": false,
+  "revision": 2
+}
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "research",
+      "judgment": "read the named reference implementation and build the contract inventory per the wdd-intake skill's research stage, or record an explicit, attributed skip when no external contract applies",
+      "recordWith": "wddctl intake research --done --by NAME --artifacts PATH... (or --skip --by NAME --reason '...')",
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "setup",
+  "revision": 2,
+  "scope": null
+}
+```
+
+### `wddctl intake research`
+
+Exactly one of `--done` (with one or more `--artifacts PATH...`, each
+`.wdd`-relative, existing, non-empty, and fingerprinted) or `--skip` (with
+a non-empty `--reason`) — silence about research is not an option, and
+neither form is anonymous. Refuses before a spec is recorded.
+
+```sh
+$ wddctl intake research --done --by ivo --artifacts shared-context/contract-inventory.md
+{
+  "duplicate": false,
+  "revision": 3
+}
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "agree_design",
+      "judgment": "agree .wdd/design.md (components, interfaces, integration surfaces, epic deliverable) with the user per the wdd-intake skill's design stage, then record it with the command that proves the epic deliverable",
+      "recordWith": "wddctl intake design --approved-by NAME --deliverable-command '...'",
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "setup",
+  "revision": 3,
+  "scope": null
+}
+```
+
+(`wddctl intake research --skip --by NAME --reason "..."` is the other
+mode — used in the E2E test and the drift/cascade examples below; both
+modes record `by`/`at`, differing only in `done`+`artifacts` vs.
+`skipped`+`reason`.)
+
+### `wddctl intake design`
+
+`--deliverable-command` is **required and non-empty** — the epic
+deliverable's proof is not optional. Refuses unless `.wdd/design.md`
+exists, non-empty, has all four required sections (Components, Interfaces,
+Integration surfaces, Epic deliverable), and research is already recorded.
+
+```sh
+$ wddctl intake design --approved-by ivo --deliverable-command 'python3 -c "from src.greeting import greet; assert (\"Ivo\" in greet(\"Ivo\"))"'
+{
+  "duplicate": false,
+  "revision": 4
+}
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "plan",
+      "command": "wddctl plan apply --plan plan.json --repo .",
+      "judgment": "decompose the work per the wdd-plan skill, write task briefs, then apply",
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "setup",
+  "revision": 4,
+  "scope": null
+}
+$ wddctl intake status
+{
+  "intake": {
+    "design": {
+      "at": "2026-08-01T19:57:01Z",
+      "by": "ivo",
+      "deliverableCommand": "python3 -c \"from src.greeting import greet; assert (\\\"Ivo\\\" in greet(\\\"Ivo\\\"))\"",
+      "sha256": "sha256:391abee7b5efcd4de0fe2f113db79784e9b0f295946f41b63649bafbaed86bfc"
+    },
+    "research": {
+      "artifacts": [
+        {
+          "path": "shared-context/contract-inventory.md",
+          "sha256": "sha256:b997dfe72a5e5e130a08c2c1d31de0fb0466ad972bcfebdb926cb87b7020034a"
+        }
+      ],
+      "at": "2026-08-01T19:56:54Z",
+      "by": "ivo",
+      "done": true
+    },
+    "spec": {
+      "at": "2026-08-01T19:56:46Z",
+      "by": "ivo",
+      "criteria": 2,
+      "sha256": "sha256:d35ccd4e7c804285de3ecc65872ac654874efbb1fedfd4b8599d4f53133589ae"
+    }
+  },
+  "nextRung": null
+}
+```
+
+### Drift: an edit after approval
+
+Editing an approved artifact's bytes without re-recording the rung is
+drift — `next` re-emits the same rung action with `"stale": true` instead
+of advancing, and the rung verb itself is exactly the remedy:
+
+```sh
+$ echo "unrelated edit after approval" >> .wdd/spec.md
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "agree_spec",
+      "judgment": "agree .wdd/spec.md with the user (goal, in/out of scope, numbered acceptance criteria) per the wdd-intake skill's spec stage, then record it",
+      "recordWith": "wddctl intake spec --approved-by NAME",
+      "stale": true,
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "setup",
+  "revision": 4,
+  "scope": null
+}
+```
+
+### Cascade: a re-approval clears downstream rungs
+
+Re-recording `spec` above (the remedy for the drift, or simply a genuine
+scope change) clears `research` and `design` — both approved research and
+design implicitly rested on the spec bytes that just moved:
+
+```sh
+$ wddctl intake spec --approved-by ivo
+{
+  "criteria": 2,
+  "duplicate": false,
+  "revision": 5
+}
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "research",
+      "judgment": "read the named reference implementation and build the contract inventory per the wdd-intake skill's research stage, or record an explicit, attributed skip when no external contract applies",
+      "recordWith": "wddctl intake research --done --by NAME --artifacts PATH... (or --skip --by NAME --reason '...')",
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "setup",
+  "revision": 5,
+  "scope": null
+}
+```
+
+(Research and design have to be walked again from here before `plan apply`
+is reachable — omitted from this transcript since it's identical to the
+happy walk above.)
+
+### The plan-approval composite
+
+Once the ladder is complete, `wddctl plan apply --approved-by NAME`
+records `scope.approval = {by, at, sha256}`, where the SHA-256 is a
+**composite** over the canonically normalized plan document plus every
+task's brief file and every `context` file it references, sorted by path.
+Any nonempty diff against the currently-applied plan without
+`--approved-by` is refused; a byte-identical re-apply (no diff at all)
+silently preserves the existing approval, and a plan-file-unchanged
+re-apply *with* `--approved-by` is how you re-stamp the composite after
+editing a brief or context file that `_diff_plan` itself can't see (their
+bytes are covered by the composite even though they aren't plan-file
+fields):
+
+```sh
+$ wddctl plan apply --plan plan.json --repo . --approved-by ivo
+{
+  "approvedBy": "ivo",
+  "base": {"action": "created", "baseRef": "wdd/greeting-demo", "baseSha": "b1fe1255b9092ab6075c172b2cd31ffe1cb6ce43", "from": "HEAD"},
+  "created": true,
+  "diff": {"added": ["TASK-001-greeting"], "removed": [], "scope": {"...": "..."}, "updated": []},
+  "dryRun": false,
+  "duplicate": false,
+  "lint": [],
+  "revision": 6,
+  "scope": "SCOPE-greeting-demo"
+}
+```
+
+`scope.approval` afterward:
+
+```json
+{
+  "at": "2026-08-01T19:57:34Z",
+  "by": "ivo",
+  "sha256": "sha256:4446e7a9ccf9fca7b888e238be03a06833b5ab7172a2410c8af48605effb6abf"
+}
+```
+
+Applying against no state at all (`wddctl init` never run, or `state.json`
+missing) is refused outright, naming `wddctl init` — the old
+store-missing-means-bootstrap-a-legacy-scope path is gone:
+
+```
+wddctl: cannot apply plan.json: no state at .wdd/state.json; run 'wddctl init --repo .' first
+```
+
+Applying with an incomplete or drifted ladder is refused too, before any
+scope is created or touched:
+
+```
+wddctl: cannot apply plan.json: intake ladder is incomplete; walk it with 'wddctl intake spec/research/design' and 'wddctl next'
+```
+
+### Plan drift: editing a brief or context file after approval
+
+A brief or `context` file edited after the composite was recorded is
+**plan drift** — caught by the same execution gate that guards intake
+drift, so it blocks every governed verb (`start` included), not only
+`plan apply`:
+
+```sh
+$ echo "Edited after composite approval." >> .wdd/tasks/TASK-001-greeting.md
+$ wddctl start --task TASK-001-greeting --repo .
+wddctl: plan drift: recorded plan approval sha256:4446e7a9ccf9fca7b888e238be03a06833b5ab7172a2410c8af48605effb6abf no longer matches the applied plan's current bytes (sha256:2468e4d7da37d4a34309a4ed26a1e34d7c8273d9c09ade0776f8112be63541b7); a brief or context file changed since approval. Run 'wddctl plan apply --approved-by NAME' (an unchanged plan file is a pure re-stamp) to re-approve before resuming execution
+$ wddctl next --repo .
+{
+  "actions": [],
+  "blockers": [
+    {
+      "actual": "sha256:2468e4d7da37d4a34309a4ed26a1e34d7c8273d9c09ade0776f8112be63541b7",
+      "code": "plan_drift",
+      "message": "the applied plan's composite approval no longer matches its current bytes (a brief or context file changed, or it was never composite-approved); run 'wddctl plan apply --approved-by NAME' to re-stamp",
+      "recorded": "sha256:4446e7a9ccf9fca7b888e238be03a06833b5ab7172a2410c8af48605effb6abf"
+    }
+  ],
+  "revision": 6,
+  "scope": "SCOPE-greeting-demo",
+  "truncated": false
+}
+```
+
+The remedy is a re-stamp — the plan file itself is unchanged, so the diff
+is empty, but `--approved-by` moves the composite to cover the edited
+brief:
+
+```sh
+$ wddctl plan apply --plan plan.json --repo . --approved-by ivo
+{"approvedBy": "ivo", "created": false, "diff": {"added": [], "removed": [], "scope": {}, "updated": []}, "dryRun": false, "lint": [], "revision": 7, "scope": "SCOPE-greeting-demo", "unchanged": true}
+$ wddctl start --task TASK-001-greeting --repo .
+{
+  "action": "create_branch_and_worktree",
+  "baseRef": "wdd/greeting-demo",
+  "branch": "task/TASK-001-greeting",
+  "duplicate": false,
+  "headSha": "b1fe1255b9092ab6075c172b2cd31ffe1cb6ce43",
+  "revision": 8,
+  "specPath": "tasks/TASK-001-greeting.md",
+  "task": "TASK-001-greeting",
+  "worktree": "/path/to/repo.wdd/worktrees/SCOPE-greeting-demo/TASK-001-greeting"
+}
+```
+
+Intake drift (an edited `spec.md`/`design.md`, or a changed/missing
+research artifact, after the ladder was walked) is caught by the same
+gate, named `intake_drift` instead of `plan_drift`, and is remedied by
+re-walking the drifted rung (and everything the cascade re-clears) then
+re-stamping `plan apply --approved-by` — see `ExecutionGateIntakeDriftTest`
+in `tests/test_intake.py` for the full remedy walk.
+
+### `wddctl scope archive`
+
+`delivered`-phase only: the ladder's final transition, and the only path
+back to a fresh ladder. Writes `.wdd/archive/<scope-id>.json` — the
+scope, tasks, intake, finalize, reconcile (including `pendingNotes`),
+leases, an event count, and an archive timestamp — then resets every
+scope-carrying section of `state.json` in one mutation: `scope: null`,
+`tasks: {}`, `finalize` removed entirely, `intake: {}` (a genuinely fresh
+ladder, never re-marked `legacy`), `reconcile` fully reset (counters and
+pending notes both), `monitoring.observations` cleared, and `leases`
+dropped. Governance (`constitution`) and the audit trail (`events`,
+`telemetry`) are untouched — archiving retires a scope's data, not the
+repository's own history or its ratified process. Refuses outright before
+`delivered`.
+
+```sh
+$ wddctl note --note "greeting helper has no i18n; revisit if we add locales"
+{"duplicate": false, "revision": 17}
+$ wddctl scope archive --repo .
+{
+  "archived": ".wdd/archive/SCOPE-greeting-demo.json",
+  "duplicate": false,
+  "revision": 18,
+  "scope": "SCOPE-greeting-demo"
+}
+```
+
+`.wdd/archive/SCOPE-greeting-demo.json` (trimmed to the sections that
+prove the no-leak guarantee — see [`artifact-schema.md`](artifact-schema.md)
+for the full shape):
+
+```json
+{
+  "archivedAt": "2026-08-01T19:58:49Z",
+  "eventCount": 17,
+  "scope": {"id": "SCOPE-greeting-demo", "...": "..."},
+  "intake": {"spec": {"...": "..."}, "research": {"...": "..."}, "design": {"...": "..."}},
+  "finalize": {"review": {"...": "..."}, "verification": {"...": "..."}, "handoff": {"...": "..."}, "delivered": {"...": "..."}},
+  "tasks": {"TASK-001-greeting": {"...": "..."}},
+  "leases": {"TASK-001-greeting": {"status": "released", "...": "..."}},
+  "reconcile": {
+    "everyNMerges": 3,
+    "mergesSinceCheckpoint": 1,
+    "pendingNotes": [
+      {"at": "2026-08-01T19:58:49Z", "note": "greeting helper has no i18n; revisit if we add locales", "task": null}
+    ]
+  }
+}
+```
+
+`state.json` afterward — a genuinely fresh setup phase, exactly as if
+`wddctl init` had just been run against an already-ratified repository:
+
+```sh
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "agree_spec",
+      "judgment": "agree .wdd/spec.md with the user (goal, in/out of scope, numbered acceptance criteria) per the wdd-intake skill's spec stage, then record it",
+      "recordWith": "wddctl intake spec --approved-by NAME",
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "setup",
+  "revision": 18,
+  "scope": null
+}
+```
+
 ### `next`
 
 The action queue — read-only, and the thing to run every iteration of the
@@ -1368,16 +1779,82 @@ when no finding's severity is in `review.blockingSeverities`, else
 
 ### `finalize verify record`
 
-Mirrors the task-level contract, at scope granularity:
+Two contracts, chosen by the scope's own legacy-ness — never by which
+flags happen to be passed:
+
+**v5 non-legacy scopes** (the ladder was walked) record multi-command
+evidence in **one atomic `--results` call**: a JSON array naming, in
+order, every entry of the ratified global `verification.commands` then the
+scope's `intake.design.deliverableCommand`. Append semantics are
+forbidden — there is no partial-evidence state. Completeness is validated
+exactly: missing, extra, or reordered entries are all refused and named.
+Overall `status` is `passed` iff every entry passed.
 
 ```sh
-wddctl finalize verify record --status passed|failed|unavailable --command CMD --repo .
+wddctl finalize verify record --results '[{"command":"true","status":"passed"}, {"command":"...deliverable command...","status":"passed"}]' --repo .
+```
+
+```sh
+$ wddctl finalize verify record --results '[{"command": "true", "status": "passed"}, {"command": "python3 -c \"from src.greeting import greet; assert (\\\"Ivo\\\" in greet(\\\"Ivo\\\"))\"", "status": "passed"}]' --repo .
+{
+  "duplicate": false,
+  "headSha": "8886d8e1fd48df63a47e588dfa1561f42eb8e9f0",
+  "revision": 14,
+  "status": "passed"
+}
+```
+
+`wddctl next` names the exact required command list for you (with
+placeholder `"passed"` statuses to fill in), so a caller never has to
+reconstruct it by hand:
+
+```sh
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "final_verification",
+      "judgment": "run full verification against the current epic branch head and record the result",
+      "recordWith": "wddctl finalize verify record --results '[{\"command\": \"true\", \"status\": \"passed\"}, {\"command\": \"python3 -c \\\"from src.greeting import greet; assert (\\\\\\\"Ivo\\\\\\\" in greet(\\\\\\\"Ivo\\\\\\\"))\\\"\", \"status\": \"passed\"}]' --repo .",
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "finalize",
+  "revision": 13,
+  "scope": "SCOPE-greeting-demo"
+}
+```
+
+A missing entry (here, the deliverable command omitted) is refused and
+named:
+
+```sh
+$ wddctl finalize verify record --results '[{"command": "true", "status": "passed"}]' --repo .
+wddctl: finalize verify record --results must name exactly the required commands, in order (the ratified global verification.commands then the scope's deliverable command): missing: ['python3 -c "from src.greeting import greet; assert (\\"Ivo\\" in greet(\\"Ivo\\"))"']
+```
+
+Legacy-shaped arguments are refused on a v5 scope, and vice versa:
+
+```sh
+$ wddctl finalize verify record --status passed --command "true" --repo .
+wddctl: this is a v5 scope; record multi-command evidence with --results '[{"command":..., "status":...}, ...]' (--status/--command is the legacy contract)
+```
+
+**Legacy scopes** (`intake.legacy`) keep the original single-command
+contract, unchanged bit-for-bit — `--results` is refused there:
+
+```sh
+wddctl finalize verify record --status passed|failed|unavailable --command CMD [--justification "..."] --repo .
 ```
 
 `--status unavailable` requires `--justification` (or falls back to a
 configured `verification.unavailableJustification`) — skipping
 verification silently is no more acceptable at scope granularity than it
-is per task.
+is per task. Every read site (`finalize status`, the handoff summary)
+normalizes both shapes to the same `[{command, status}, ...]` view via
+`verification_commands()`, so a legacy record reads as the one-entry list
+it always was.
 
 ### `finalize handoff`
 
@@ -1457,10 +1934,16 @@ task-level `run_review`.
 
 ### Transcript: the finalize ladder, local surface, start to `delivered`
 
-Real, unedited output from one continuous scratch repository —
-`wddctl init` through a single task (`reviewPolicy: none`, so no
-task-level review gate) — merged, then the finalize ladder driven straight
-through to `delivered`. No network, no `gh`: `merge.surface local`.
+Real, unedited output from the same continuous scratch repository as "The
+intake ladder" above — `wddctl init` through the ladder, through a single
+task (default `reviewPolicy: risk_based`, `risk: normal`, so no
+task-level review gate either), merged, then the finalize ladder driven
+straight through to `delivered`. No network, no `gh`: `merge.surface
+local`. This is a genuine v5 (non-legacy) scope, so final verification
+uses the `--results` contract described above — note `final_review`'s
+judgment naming the exact acceptance-criteria count (`AC-1..AC-2`) and
+`design.md`'s epic deliverable, both sourced from the recorded intake
+ladder.
 
 ```sh
 $ wddctl status --json
@@ -1470,22 +1953,22 @@ $ wddctl next --repo .
   "actions": [
     {
       "action": "final_review",
-      "judgment": "dispatch a reviewer against the whole epic branch diff, per wdd-review's final-review contract, checked against .wdd/spec.md",
+      "judgment": "dispatch a reviewer against the whole epic branch diff, per wdd-review's final-review contract, checked against .wdd/spec.md; walk .wdd/spec.md's acceptance criteria AC-1..AC-2 in order and confirm design.md's epic deliverable statement is observably true",
       "recordWith": "wddctl finalize review record --reviewer NAME --findings '[]' --repo .",
       "task": "-"
     }
   ],
   "blockers": [],
   "phase": "finalize",
-  "revision": 8,
-  "scope": "SCOPE-finalize-demo"
+  "revision": 12,
+  "scope": "SCOPE-greeting-demo"
 }
-$ wddctl finalize review record --reviewer "codex-review" --findings '[]' --repo .
+$ wddctl finalize review record --reviewer ivo --findings '[]' --repo .
 {
   "duplicate": false,
-  "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d",
+  "headSha": "8886d8e1fd48df63a47e588dfa1561f42eb8e9f0",
   "outcome": "passed",
-  "revision": 9
+  "revision": 13
 }
 $ wddctl next --repo .
 {
@@ -1493,20 +1976,20 @@ $ wddctl next --repo .
     {
       "action": "final_verification",
       "judgment": "run full verification against the current epic branch head and record the result",
-      "recordWith": "wddctl finalize verify record --status passed --command '<verification command>' --repo .",
+      "recordWith": "wddctl finalize verify record --results '[{\"command\": \"true\", \"status\": \"passed\"}, {\"command\": \"python3 -c \\\"from src.greeting import greet; assert (\\\\\\\"Ivo\\\\\\\" in greet(\\\\\\\"Ivo\\\\\\\"))\\\"\", \"status\": \"passed\"}]' --repo .",
       "task": "-"
     }
   ],
   "blockers": [],
   "phase": "finalize",
-  "revision": 9,
-  "scope": "SCOPE-finalize-demo"
+  "revision": 13,
+  "scope": "SCOPE-greeting-demo"
 }
-$ wddctl finalize verify record --status passed --command "python3 -m unittest" --repo .
+$ wddctl finalize verify record --results '[{"command": "true", "status": "passed"}, {"command": "python3 -c \"from src.greeting import greet; assert (\\\"Ivo\\\" in greet(\\\"Ivo\\\"))\"", "status": "passed"}]' --repo .
 {
   "duplicate": false,
-  "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d",
-  "revision": 10,
+  "headSha": "8886d8e1fd48df63a47e588dfa1561f42eb8e9f0",
+  "revision": 14,
   "status": "passed"
 }
 $ wddctl next --repo .
@@ -1521,32 +2004,17 @@ $ wddctl next --repo .
   ],
   "blockers": [],
   "phase": "finalize",
-  "revision": 10,
-  "scope": "SCOPE-finalize-demo"
+  "revision": 14,
+  "scope": "SCOPE-greeting-demo"
 }
 $ wddctl finalize handoff --repo .
 {
   "duplicate": false,
-  "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d",
-  "instructions": "push wdd/finalize-demo to your remote (e.g. 'git push origin wdd/finalize-demo') and open a pull request into main yourself; wddctl does not perform this on the local surface. Once the human merge lands, run 'wddctl finalize delivered --by NAME --repo .' to record it.",
+  "headSha": "8886d8e1fd48df63a47e588dfa1561f42eb8e9f0",
+  "instructions": "push wdd/greeting-demo to your remote (e.g. 'git push origin wdd/greeting-demo') and open a pull request into main yourself; wddctl does not perform this on the local surface. Once the human merge lands, run 'wddctl finalize delivered --by NAME --repo .' to record it.",
   "pr": null,
-  "revision": 11,
+  "revision": 15,
   "targetBranch": "main"
-}
-$ wddctl next --repo .
-{
-  "actions": [
-    {
-      "action": "await_delivery",
-      "judgment": "wait for the human-owned final merge via the local handoff: push wdd/finalize-demo to your remote and open a pull request into main yourself; wddctl does not perform this on the local surface; once it lands, record it with recordWith so live Git can prove it happened",
-      "recordWith": "wddctl finalize delivered --by NAME --repo .",
-      "task": "-"
-    }
-  ],
-  "blockers": [],
-  "phase": "finalize",
-  "revision": 11,
-  "scope": "SCOPE-finalize-demo"
 }
 ```
 
@@ -1556,49 +2024,56 @@ click "Merge" on a PR or run it from their own terminal, entirely outside
 `wddctl`:
 
 ```sh
-$ git merge --no-ff -q wdd/finalize-demo -m "merge scope SCOPE-finalize-demo into main"
+$ git checkout -q main
+$ git merge --no-ff -q wdd/greeting-demo -m "merge scope SCOPE-greeting-demo into main"
 $ wddctl finalize delivered --by ivo --repo .
 {
   "by": "ivo",
   "duplicate": false,
-  "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d",
-  "revision": 12,
+  "headSha": "8886d8e1fd48df63a47e588dfa1561f42eb8e9f0",
+  "revision": 16,
   "targetBranch": "main"
 }
 $ wddctl next --repo .
-{"actions": [], "blockers": [], "phase": "delivered", "revision": 12, "scope": "SCOPE-finalize-demo"}
-$ wddctl status --json
+{"actions": [], "blockers": [], "phase": "delivered", "revision": 16, "scope": "SCOPE-greeting-demo"}
+```
+
+`finalize status`'s verification carries the v5 `commands` list instead of
+the legacy singular `command`/`status` pair:
+
+```sh
+$ wddctl finalize status
 {
   "finalize": {
-    "delivered": {
-      "at": "2026-07-28T23:05:04Z",
-      "by": "ivo",
-      "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d"
-    },
-    "handoff": {
-      "at": "2026-07-28T23:05:03Z",
-      "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d",
-      "pr": null,
-      "targetBranch": "main"
-    },
     "review": {
-      "at": "2026-07-28T23:05:03Z",
+      "at": "2026-08-01T19:58:16Z",
       "findings": [],
-      "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d",
+      "headSha": "8886d8e1fd48df63a47e588dfa1561f42eb8e9f0",
       "outcome": "passed",
-      "reviewer": "codex-review"
+      "reviewer": "ivo"
     },
     "verification": {
-      "at": "2026-07-28T23:05:03Z",
-      "command": "python3 -m unittest",
-      "headSha": "3ff80c2d843bbb7b580f26f5caa00ffb3ac4d27d",
-      "justification": null,
+      "at": "2026-08-01T19:58:27Z",
+      "commands": [
+        {"command": "true", "status": "passed"},
+        {"command": "python3 -c \"from src.greeting import greet; assert (\\\"Ivo\\\" in greet(\\\"Ivo\\\"))\"", "status": "passed"}
+      ],
+      "headSha": "8886d8e1fd48df63a47e588dfa1561f42eb8e9f0",
       "status": "passed"
     }
   },
-  "phase": "delivered"
+  "phase": "finalize"
 }
 ```
+
+(`finalize status` above still reports `"phase": "finalize"` because it
+was captured just before `finalize delivered`; re-running it after the
+merge above adds a `delivered: {at, by, headSha}` block and the phase
+flips to `"delivered"`, exactly as `next` shows.)
+
+From here, `wddctl scope archive --repo .` is the ladder's rollover — see
+"The intake ladder" above for its captured output, which continues this
+exact scratch session through to a fresh `agree_spec`.
 
 ### Transcript: a blocked final review
 

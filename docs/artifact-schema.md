@@ -5,11 +5,14 @@ WDD's durable state lives under `.wdd/` in the target repository:
 ```text
 .wdd/
   constitution.md          # human-authored governance; ratified via wddctl
+  spec.md                  # human-authored; ratified via wddctl intake spec
+  design.md                # human-authored; ratified via wddctl intake design
   plan.json                # the only planning input
   state.json               # wddctl-owned; never hand-edit
   state.md                 # generated projection (wddctl render)
   tasks/<TASK-ID>.md       # worker briefs, referenced by each task's specPath
-  shared-context/          # durable discoveries
+  shared-context/          # durable discoveries, and research-rung artifacts
+  archive/<SCOPE-ID>.json  # wddctl-owned; written by `wddctl scope archive`
 ```
 
 Everything here is either human-authored Markdown/JSON that `wddctl` reads,
@@ -48,6 +51,87 @@ Conventional body sections:
 proposal JSON file to speed up filling these sections in — it never ratifies
 anything itself. See [`docs/wddctl.md`](wddctl.md) for the probe/ratify/status
 commands.
+
+## The intake ladder: `spec.md` and `design.md`
+
+Between ratification and `plan apply`, two more human-authored Markdown
+files are agreed and recorded via `wddctl intake spec`/`design` (see
+"The intake ladder" in [`docs/wddctl.md`](wddctl.md)). Both are fingerprinted
+at approval time (SHA-256 over the exact bytes), so an edit afterward is
+drift, not a free edit.
+
+### `spec.md`
+
+Four required `## ` sections: **Goal**, **In scope**, **Out of scope**,
+**Acceptance criteria**. The Acceptance criteria section must be **wholly
+numbered**: every checklist line matches `- [ ] AC-<n>: <text>`, the
+numbers unique and contiguous from 1, with no unnumbered checklist line
+anywhere in the section — final review walks `AC-1..AC-<N>` and nothing
+else. `wddctl intake spec` records the exact count `N` as
+`intake.spec.criteria`.
+
+```markdown
+# Spec
+
+## Goal
+
+Ship a greeting helper that says hello to the caller by name.
+
+## In scope
+
+- `greet(name)` function returning a friendly greeting string.
+
+## Out of scope
+
+- Internationalization / localization.
+
+## Acceptance criteria
+
+- [ ] AC-1: `greet("Ivo")` returns a string containing "Ivo".
+- [ ] AC-2: `greet("")` raises a clear error instead of returning a blank greeting.
+```
+
+A plan task's `context` ref of the form `spec.md#AC-<n>` (see `tasks[]`
+below) is how a task declares which acceptance criterion it discharges;
+`plan lint`'s `missing_criteria` check looks for a full match against this
+exact pattern.
+
+### `design.md`
+
+Four required `## ` sections: **Components**, **Interfaces**,
+**Integration surfaces**, **Epic deliverable**. `wddctl intake design`
+requires research to be recorded first, and requires
+`--deliverable-command` — a non-empty command that proves the epic
+deliverable, recorded alongside the design fingerprint as
+`intake.design.deliverableCommand` and folded into `finalize verify
+record`'s required command list (see "The finalize phase" in
+[`docs/wddctl.md`](wddctl.md)).
+
+**Integration surfaces** lists the paths the scope's tasks are expected to
+own, one per bulleted line in the convention `` - `path` — owned by: ... ``
+— `plan lint`'s `unowned_surface` check parses exactly this shape and warns
+when a listed path isn't covered by any task's `conflictDomains`.
+
+```markdown
+# Design
+
+## Components
+
+- `greeting`: the `greet(name)` helper and its error path.
+
+## Interfaces
+
+- `greeting`: consumes nothing external, produces `greet(name) -> str`.
+
+## Integration surfaces
+
+- `src/greeting.py` — owned by: TASK-001-greeting
+
+## Epic deliverable
+
+`python3 -c "from src.greeting import greet; assert 'Ivo' in greet('Ivo')"`
+succeeds against the merged epic branch.
+```
 
 ## `plan.json`
 
@@ -102,9 +186,27 @@ against the current state.
 | `risk` | `normal` \| `high` | `normal` | Drives review requirement under `risk_based`. |
 | `dependsOn` | string list | `[]` | Task IDs that must reach `done` before this task is admissible. Cycles are rejected at plan time. |
 | `conflictDomains` | string list | `[]` | Paths/globs this task writes to. Two tasks sharing a domain are never concurrently active. A domain ending in `/**` is a path-prefix match; anything else uses `fnmatch`. |
+| `context` | string list | `[]` | Handover refs of the form `<path>[#anchor]`, `.wdd`-relative; each path must resolve to a regular file inside `.wdd/` (containment enforced, no traversal). A ref of `spec.md#AC-<n>` is how a task declares the acceptance criterion it discharges. Persisted into task state (`MUTABLE_TASK_FIELDS`) and covered, byte-for-byte, by the plan-approval composite (see below) — editing a referenced file is plan drift even though the ref string itself didn't change. |
+| `model` | string or null | `null` | Model alias for this task's implementation (decoration only in phase 6a; dispatch/routing lands in phase 6b). Persisted and composite-covered like `context`. |
+| `reviewModel` | string or null | `null` | Model alias for this task's reviewer, same persistence/composite treatment as `model`. |
 
 Editing or removing a task that has already started (left `todo`) is
 refused — decompose further work into new task IDs instead.
+
+### The plan-approval composite
+
+`wddctl plan apply --approved-by NAME` records `scope.approval =
+{by, at, sha256}`: the SHA-256 is a composite over the canonically
+normalized plan document (task order and dict-key order both neutralized)
+plus every task's brief file (`specPath`) and every `context`-ref file,
+combined as sorted `(path, sha256)` pairs. Because `context`/`model`/
+`reviewModel` are persisted into task state, the composite can be
+recomputed later purely from `state.json` — the same reconstruction the
+execution gate uses to detect **plan drift** (a brief or context file
+edited after approval) without needing the original `plan.json` on disk.
+See "The intake ladder" → "The plan-approval composite" in
+[`docs/wddctl.md`](wddctl.md) for captured transcripts of both the
+approval and the drift it catches.
 
 ## `state.json`
 
@@ -118,11 +220,13 @@ Top-level shape:
 
 ```json
 {
-  "schemaVersion": 3,
+  "schemaVersion": 5,
   "revision": 7,
-  "scope": { "...": "as in plan.json, plus maxConcurrent/reviewPolicy resolved" },
+  "scope": { "...": "as in plan.json, plus maxConcurrent/reviewPolicy resolved, plus approval" },
   "constitution": { "status": "ratified", "ratification": { "by": "...", "decisionFingerprint": "...", "at": "..." } },
+  "intake": { "spec": { "...": "..." }, "research": { "...": "..." }, "design": { "...": "..." } },
   "tasks": { "TASK-001-token-types": { "...": "..." } },
+  "finalize": { "review": { "...": "..." }, "verification": { "...": "..." }, "handoff": { "...": "..." }, "delivered": { "...": "..." } },
   "leases": { "TASK-001-token-types": { "...": "worktree bookkeeping" } },
   "reconcile": { "everyNMerges": 3, "mergesSinceCheckpoint": 1, "lastCheckpointAt": null, "pendingNotes": [] },
   "monitoring": { "mode": "manual", "status": "inactive", "observations": {} },
@@ -132,13 +236,74 @@ Top-level shape:
 }
 ```
 
+`finalize` is absent entirely before the scope reaches the `finalize`
+phase, and removed again by `wddctl scope archive` (see below) — it is
+never present as an empty object the way `intake`/`reconcile` are.
+
+### `intake` (schema v5, required)
+
+Either `{"legacy": true}` — the sole key, minted **only** by `wddctl
+migrate` for a pre-v5 scope, never by `wddctl init`/`plan apply` — or any
+subset of three records, one per ladder rung, each fingerprint-bound to
+the artifact bytes it approved:
+
+```json
+{
+  "spec": { "by": "ivo", "at": "2026-08-01T19:56:46Z", "criteria": 2, "sha256": "sha256:d35cc..." },
+  "research": {
+    "by": "ivo", "at": "2026-08-01T19:56:54Z", "done": true,
+    "artifacts": [{"path": "shared-context/contract-inventory.md", "sha256": "sha256:b997d..."}]
+  },
+  "design": {
+    "by": "ivo", "at": "2026-08-01T19:57:01Z",
+    "sha256": "sha256:391ab...",
+    "deliverableCommand": "python3 -c \"from src.greeting import greet; assert ('Ivo' in greet('Ivo'))\""
+  }
+}
+```
+
+`research`'s `done: true` shape carries `artifacts` (as above); its
+alternative is an attributed skip: `{"by", "at", "skipped": true,
+"reason": "..."}`. `intake_complete(state)` is `True` wholesale for
+`legacy`, else only once all three records are present. A fresh `wddctl
+init` or `wddctl plan apply`'s internal state construction always produces
+`intake: {}` — never `{"legacy": true}` — so a legacy scope only exists
+because `wddctl migrate` produced it from a genuine pre-v5 state.
+
+### `finalize.verification` (v5 vs. legacy shape)
+
+```json
+{
+  "headSha": "8886d8e...",
+  "commands": [
+    {"command": "true", "status": "passed"},
+    {"command": "python3 -c \"...\"", "status": "passed"}
+  ],
+  "status": "passed",
+  "at": "2026-08-01T19:58:27Z"
+}
+```
+
+`commands` is present only for v5 non-legacy scopes: the ratified global
+`verification.commands` (from `config.json`) followed by the scope's
+`intake.design.deliverableCommand`, in that exact order, recorded in one
+atomic `finalize verify record --results '[...]'` call. Legacy scopes
+instead carry the original singular pair, `{"headSha", "status",
+"command", "justification", "at"}` — no `commands` key. Every read site
+normalizes both shapes via `verification_commands()` to the same
+`[{command, status}, ...]` view.
+
 Each entry under `tasks` carries: `id`, `title`, `specPath`, `status`
 (`todo` / `in_progress` / `review` / `merge_ready` / `done` / `blocked` /
-`cancelled`), `risk`, `dependsOn`, `conflictDomains`, `branch`, `worktree`,
-`headSha`, `pr`, `review`, `verification`, `freshness`, `merge`, and
-`blocker`. The `review`/`verification`/`freshness`/`merge` objects each carry
-the `baseSha`/`headSha` (or `baseRef`) the evidence was pinned to, so a stale
-or mismatched entry is directly visible.
+`cancelled`), `risk`, `dependsOn`, `conflictDomains`, `context`, `model`,
+`reviewModel`, `branch`, `worktree`, `headSha`, `pr`, `review`,
+`verification`, `freshness`, `merge`, and `blocker`. `context`/`model`/
+`reviewModel` mirror `plan.json`'s `tasks[]` fields of the same name (see
+above) — populated at `plan apply`, re-diffed on every re-apply, and
+covered by the plan-approval composite. The `review`/`verification`/
+`freshness`/`merge` objects each carry the `baseSha`/`headSha` (or
+`baseRef`) the evidence was pinned to, so a stale or mismatched entry is
+directly visible.
 
 `worktree` is normally `null`, and that is deliberate. A task's worktree lives
 at `<repo>.wdd/worktrees/<scope>/<task>` — a pure function of the checkout it
@@ -163,17 +328,63 @@ it from Git history.
 they're computed live by `wddctl next` and `wddctl status` from the fields
 above. See the gates table in [`docs/wddctl.md`](wddctl.md).
 
+## `.wdd/archive/<SCOPE-ID>.json`
+
+Written once, by `wddctl scope archive` (delivered-phase only — see "The
+intake ladder" in [`docs/wddctl.md`](wddctl.md)). `wddctl` never reads this
+file back; it exists purely as the durable record of a completed scope,
+since `state.json` itself is reset to a fresh setup shape immediately
+after archiving.
+
+```json
+{
+  "scope": { "id": "SCOPE-greeting-demo", "baseRef": "wdd/greeting-demo", "...": "the delivered scope object, approval included" },
+  "tasks": { "TASK-001-greeting": { "...": "every task's final state" } },
+  "intake": { "spec": { "...": "..." }, "research": { "...": "..." }, "design": { "...": "..." } },
+  "finalize": { "review": { "...": "..." }, "verification": { "...": "..." }, "handoff": { "...": "..." }, "delivered": { "...": "..." } },
+  "reconcile": { "everyNMerges": 3, "mergesSinceCheckpoint": 1, "lastCheckpointAt": null, "pendingNotes": [ { "at": "...", "note": "...", "task": null } ] },
+  "leases": { "TASK-001-greeting": { "status": "released", "...": "worktree/branch/timestamps history" } },
+  "eventCount": 17,
+  "archivedAt": "2026-08-01T19:58:49Z"
+}
+```
+
+Every field is a snapshot at archive time — `scope`, `tasks`, `intake`,
+`finalize`, `reconcile` (including any still-pending `pendingNotes`), and
+`leases` (a task's full lease history, not just its final released state).
+`eventCount` and `archivedAt` exist only in the archive file, not in
+`state.json` itself. The no-leak guarantee this file's existence enables
+is total: after archiving, `state.json`'s `scope`, `tasks`, `finalize`,
+`intake`, `reconcile`, `monitoring.observations`, and `leases` are all
+reset to the same fresh shape `wddctl init` produces (`intake: {}`, a
+genuine new ladder — never re-marked `legacy`), while `constitution` and
+the audit trail (`events`, `appliedIdempotencyKeys`, `telemetry`) survive
+untouched.
+
 ## Task briefs (`.wdd/tasks/<TASK-ID>.md`)
 
 The worker implementation brief for one task, referenced by that task's
 `specPath` in `plan.json`. There is no required frontmatter schema — `wddctl`
 never reads these files, only the plan's `specPath` string that points at
-them. A useful brief still tends to cover:
+them. Two `## ` sections are checked by `plan lint`'s `missing_deliverable`
+and `missing_interfaces` codes (advisory, not enforced at `plan apply`) and
+should be treated as required in practice:
+
+- **Deliverable** — what this task's diff produces, observably; the
+  reviewer's first question.
+- **Interfaces** — what it consumes and produces, kept consistent with
+  `design.md`'s own Interfaces section.
+
+A useful brief still tends to cover everything else `plan lint` doesn't
+check for:
 
 - **Objective** — what this task delivers.
 - **Scope / Non-scope** — what's in and explicitly out.
 - **Relevant context** — pointers into `shared-context/`, prior task
-  findings, or repo docs the worker shouldn't have to rediscover.
+  findings, or repo docs the worker shouldn't have to rediscover. Prefer a
+  plan-level `context` ref (see `tasks[]` above) over prose for anything
+  machine-verifiable — it's fingerprint-bound and drift-checked; prose
+  here is not.
 - **Dependencies and conflict domains** — restated from `plan.json` so the
   worker sees why it can or can't run yet.
 - **Verification** — the command(s) that should pass before `submit`.

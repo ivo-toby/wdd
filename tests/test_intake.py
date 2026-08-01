@@ -2420,5 +2420,179 @@ class ScopeArchiveTest(unittest.TestCase):
             self.assertNotIn("design", after["intake"])
 
 
+class FullLifecycleE2ETest(unittest.TestCase):
+    """Task 7: the new canonical lifecycle, start to finish, in one journey --
+
+    init -> questions -> ratify -> the intake ladder (spec approve, research
+    skip, design approve with a deliverable command) -> plan apply
+    --approved-by (composite approval) -> one local-surface task through the
+    full execute loop (start/commit/submit/verify/freshness/merge/release --
+    the plan's default reviewPolicy risk_based + risk normal skips the
+    task-level review gate, per test_execution_surfaces.py's identical
+    fixture) -> the finalize ladder (a clean `finalize review record`, then
+    verification via the NEW v5 atomic `--results` contract naming both the
+    ratified global verification command and the epic deliverable command)
+    -> `finalize handoff` on the local surface -> a real (non-simulated)
+    `git merge` of the epic branch into the target, proved by `finalize
+    delivered` -> `scope archive` -> `next` says `agree_spec` again, proving
+    full rollover to a fresh ladder for the next scope.
+
+    Deliberately sequenced through the CLI directly with a checkpoint
+    assertion after every stage (rather than delegating to the composed
+    `_run_to_finalize`/`_run_to_delivered` fixtures those other classes use)
+    so this test reads as the lifecycle's own narrative and each named stage
+    is independently provable, while still reusing every granular helper in
+    this file (`_ratified_repo`, `_spec_text`, `_design_text`,
+    `_plan_document`, `_start_and_commit`, `_passed_results`). Individual
+    mechanisms already have dedicated unit/integration coverage above, and
+    in test_setup_config/test_plan_quality/test_execution_surfaces/
+    test_finalize -- this is the single end-to-end regression pin for the
+    whole ladder+governance lifecycle wired together.
+    """
+
+    def test_full_lifecycle_init_through_archive_to_fresh_ladder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # --- init -> questions -> ratify ---------------------------------
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            bare = Path(tmp) / "origin.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+            subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True)
+
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_spec")
+
+            # --- ladder rung 1: spec approve ---------------------------------
+            (wdd / "spec.md").write_text(
+                _spec_text(ac_lines=("- [ ] AC-1: greets the caller by name",)),
+                encoding="utf-8",
+            )
+            code, out = _cli(state, "intake", "spec", "--approved-by", "t")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["criteria"], 1)
+            code, out = _cli(state, "next")
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "research")
+
+            # --- ladder rung 2: research skip (attributed reason) ------------
+            code, out = _cli(
+                state, "intake", "research", "--skip", "--by", "t",
+                "--reason", "no external contracts to survey",
+            )
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "next")
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_design")
+
+            # --- ladder rung 3: design approve with deliverable command ------
+            (wdd / "design.md").write_text(_design_text(), encoding="utf-8")
+            code, out = _cli(
+                state, "intake", "design", "--approved-by", "t",
+                "--deliverable-command", "true",
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(
+                StateStore(Path(state)).read()["intake"]["design"]["deliverableCommand"], "true"
+            )
+            code, out = _cli(state, "next")
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "plan")
+
+            # --- plan apply --approved-by: the composite approval ------------
+            (wdd / "tasks").mkdir(exist_ok=True)
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+            approval = StateStore(Path(state)).read()["scope"]["approval"]
+            self.assertEqual(approval["by"], "t")
+            self.assertTrue(approval["sha256"].startswith("sha256:"))
+
+            # --- one local-surface task through the full execute loop --------
+            # Default reviewPolicy (risk_based) + default risk (normal) skips
+            # task-level review, so the loop is exactly start/commit/submit/
+            # verify/freshness/merge/release -- no `review record` call.
+            _start_and_commit(state, root)
+            code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "verify", "record", "--task", "T1", "--status", "passed")
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "merge", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "release", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            from wave_delivery.schema import derived_phase
+
+            after_execute = StateStore(Path(state)).read()
+            self.assertEqual(after_execute["tasks"]["T1"]["status"], "done")
+            self.assertEqual(derived_phase(after_execute), "finalize")
+
+            # --- finalize ladder: clean review, v5 multi-command verify ------
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "t", "--findings", "[]",
+                "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["outcome"], "passed")
+
+            code, out = _cli(
+                state, "finalize", "verify", "record",
+                "--results", _passed_results("true", "true"), "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            verification = StateStore(Path(state)).read()["finalize"]["verification"]
+            self.assertEqual(verification["status"], "passed")
+            self.assertEqual(
+                verification["commands"],
+                [{"command": "true", "status": "passed"}, {"command": "true", "status": "passed"}],
+            )
+
+            # --- handoff (local surface) then a real git merge into target ---
+            code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertIsNone(json.loads(out)["pr"])
+
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+            subprocess.run(["git", "checkout", "-q", "main"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                 "-c", "commit.gpgsign=false", "merge", "--no-ff", "-m", "final merge", base_ref],
+                cwd=root, check=True,
+            )
+            code, out = _cli(state, "finalize", "delivered", "--by", "t", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            delivered_state = StateStore(Path(state)).read()
+            self.assertEqual(derived_phase(delivered_state), "delivered")
+            self.assertEqual(delivered_state["finalize"]["delivered"]["by"], "t")
+
+            # --- scope archive: the ladder's rollover -------------------------
+            code, out = _cli(state, "scope", "archive", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            archive_path = Path(json.loads(out)["archived"])
+            self.assertTrue(archive_path.exists())
+            payload = json.loads(archive_path.read_text(encoding="utf-8"))
+            self.assertIn("spec", payload["intake"])
+            self.assertIn("T1", payload["tasks"])
+            self.assertEqual(payload["finalize"]["verification"]["status"], "passed")
+
+            after_archive = StateStore(Path(state)).read()
+            self.assertIsNone(after_archive["scope"])
+            self.assertEqual(after_archive["intake"], {})
+            self.assertEqual(after_archive["tasks"], {})
+            self.assertNotIn("finalize", after_archive)
+            # Governance survives the reset.
+            self.assertEqual(after_archive["constitution"]["status"], "ratified")
+
+            # --- next says agree_spec again: a fresh ladder for scope #2 -----
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_spec")
+
+
 if __name__ == "__main__":
     unittest.main()
