@@ -60,7 +60,15 @@ from .lint import lint_plan
 from .merge import merge_task, observe_merge, refresh_task
 from .migration import apply_migration, plan_migration
 from .monitor import monitor_once
-from .plan import apply_config_defaults, apply_plan, apply_risk_rules, read_plan, state_from_plan
+from .plan import (
+    apply_config_defaults,
+    apply_plan,
+    apply_risk_rules,
+    intake_gate_status,
+    read_plan,
+    require_fresh_intake,
+    state_from_plan,
+)
 from .review import record_review, record_verification, validate_findings
 from .store import StateStore
 
@@ -572,11 +580,12 @@ def _simple_event(store: StateStore, args: argparse.Namespace, event: str, data:
     return 0
 
 
-def _apply_governance_drift(
+def _apply_execution_drift(
     result: dict[str, Any], state: dict[str, Any], wdd_dir: Path
 ) -> dict[str, Any]:
-    """Empty a `next` result's actions and surface a governance_drift blocker
-    when config/constitution changed since ratification.
+    """Empty a `next` result's actions and surface a drift blocker when
+    config/constitution, an intake rung, or the plan-approval composite
+    changed since it was last signed off.
 
     Shared by every `next` branch (execute, finalize, delivered) so none of
     them can emit an action whose recordWith/command then fails the drift
@@ -584,7 +593,14 @@ def _apply_governance_drift(
     otherwise be misled into believing the action is still runnable.
     Delivered-phase actions are already empty, but drift is surfaced there
     too (rather than only execute/finalize) so a caller polling `next` after
-    delivery still sees *why* nothing is happening if config drifted.
+    delivery still sees *why* nothing is happening if governance drifted.
+
+    Governance drift is checked first (unchanged from before Task 4), then
+    the intake/plan gate (`plan.intake_gate_status`, `require_fresh_intake`'s
+    non-raising twin): each match inserts its own blocker at position 0, so
+    whichever fires last leads -- in practice the two are independent axes
+    (config/constitution vs spec/design/plan bytes) and rarely coexist, but
+    nothing here assumes exclusivity.
     """
     drift = governance_drift(state, wdd_dir)
     if drift is not None:
@@ -597,6 +613,25 @@ def _apply_governance_drift(
                 **drift,
             },
         )
+
+    gate = intake_gate_status(state, wdd_dir)
+    if gate is not None:
+        code, detail = gate
+        result["actions"] = []
+        if code == "intake_drift":
+            message = (
+                f"intake {detail['rung']} drifted since approval (recorded "
+                f"{detail['recorded']}, actual {detail['actual']}); re-run "
+                f"'wddctl intake {detail['rung']} ...' to re-approve, then "
+                "'wddctl plan apply --approved-by NAME' to re-stamp"
+            )
+        else:
+            message = (
+                "the applied plan's composite approval no longer matches its current "
+                "bytes (a brief or context file changed, or it was never composite-"
+                "approved); run 'wddctl plan apply --approved-by NAME' to re-stamp"
+            )
+        result["blockers"].insert(0, {"code": code, "message": message, **detail})
     return result
 
 
@@ -606,7 +641,9 @@ def main(argv: list[str] | None = None) -> int:
     store = StateStore(args.state)
     try:
         if (args.command, _subcommand(args)) in GOVERNED_VERBS and store.exists():
-            require_fresh_governance(store.read(), store.path.parent)
+            gated_state = store.read()
+            require_fresh_governance(gated_state, store.path.parent)
+            require_fresh_intake(gated_state, store.path.parent)
 
         if args.command == "doctor":
             state = store.read() if store.exists() else None
@@ -713,7 +750,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = finalize_next_actions(
                     state, store.path.parent, str(args.repo), state_path=_state_option(args)
                 )
-                _apply_governance_drift(result, state, store.path.parent)
+                _apply_execution_drift(result, state, store.path.parent)
                 _print_json(result)
                 return 0
             config = (
@@ -731,7 +768,7 @@ def main(argv: list[str] | None = None) -> int:
                 models=models,
                 mode=mode,
             )
-            _apply_governance_drift(result, state, store.path.parent)
+            _apply_execution_drift(result, state, store.path.parent)
             _print_json(result)
             return 0
 

@@ -42,7 +42,7 @@ from wave_delivery.migration import (
     plan_migration,
     read_source,
 )
-from wave_delivery.plan import plan_composite
+from wave_delivery.plan import intake_gate_status, plan_composite, require_fresh_intake
 from wave_delivery.schema import (
     SCHEMA_VERSION,
     intake_complete,
@@ -85,12 +85,19 @@ def _cli_full(state: str, *argv: str) -> tuple[int, str, str]:
 
 
 def _plan_document(
-    task_ids: tuple[str, ...] | list[str], *, scope_id: str = "SCOPE-x", base_ref: str = "wdd/scope-x"
+    task_ids: tuple[str, ...] | list[str],
+    *,
+    scope_id: str = "SCOPE-x",
+    base_ref: str = "wdd/scope-x",
+    review_policy: str | None = None,
 ) -> dict:
+    scope: dict = {"id": scope_id, "baseRef": base_ref}
+    if review_policy is not None:
+        scope["reviewPolicy"] = review_policy
     return {
         "schemaVersion": 1,
         "kind": "wdd_plan",
-        "scope": {"id": scope_id, "baseRef": base_ref},
+        "scope": scope,
         "tasks": [{"id": task_id, "specPath": f"tasks/{task_id}.md"} for task_id in task_ids],
     }
 
@@ -194,6 +201,68 @@ def _inject_scope_with_approval(state_path: str, *, sha256: str = "sha256:preexi
         "approval": {"by": "t", "at": "2026-08-01T00:00:00Z", "sha256": sha256},
     }
     store.write(state)
+
+
+def _apply_ladder_and_plan(
+    state: str, wdd: Path, root: Path, *, review_policy: str = "risk_based", approver: str = "t"
+) -> None:
+    """`_walk_intake` + a one-task, composite-approved `plan apply` (Task 4).
+
+    The execute/finalize-phase drift tests below need a REAL (non-legacy)
+    applied-and-approved scope to exercise `require_fresh_intake` against --
+    unlike test_finalize.py's `_mark_legacy` shortcut, which deliberately
+    exempts fixtures that aren't exercising the ladder.
+    """
+    _walk_intake(state, wdd, approver)
+    (wdd / "tasks").mkdir(exist_ok=True)
+    (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+    plan_file = root / "plan.json"
+    plan_file.write_text(
+        json.dumps(_plan_document(["T1"], review_policy=review_policy)), encoding="utf-8"
+    )
+    code, out = _cli(
+        state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+        "--approved-by", approver,
+    )
+    assert code == 0, out
+
+
+def _start_and_commit(state: str, root: Path, task_id: str = "T1", message: str = "do work") -> None:
+    code, out = _cli(state, "start", "--task", task_id, "--repo", str(root))
+    assert code == 0, out
+    worktree = Path(json.loads(out)["worktree"])
+    (worktree / "change.txt").write_text(f"{message}\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+         "-c", "commit.gpgsign=false", "commit", "-qm", message],
+        cwd=worktree, check=True,
+    )
+
+
+def _run_to_finalize(tmp: str) -> tuple[Path, str]:
+    """Drive a non-legacy, composite-approved scope through one local task
+    to the finalize phase, for Task 4's finalize-governed-verb drift pin."""
+    root, state = _ratified_repo(tmp)
+    bare = Path(tmp) / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True)
+    wdd = root / ".wdd"
+    _apply_ladder_and_plan(state, wdd, root, review_policy="always")
+    _start_and_commit(state, root)
+    assert _cli(state, "submit", "--task", "T1", "--repo", str(root))[0] == 0
+    assert _cli(
+        state, "review", "record", "--task", "T1", "--reviewer", "t", "--findings", "[]"
+    )[0] == 0
+    assert _cli(state, "verify", "record", "--task", "T1", "--status", "passed")[0] == 0
+    assert _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0] == 0
+    assert _cli(state, "merge", "--task", "T1", "--repo", str(root))[0] == 0
+
+    from wave_delivery.schema import derived_phase
+
+    scope_state = StateStore(Path(state)).read()
+    assert derived_phase(scope_state) == "finalize", scope_state
+    return root, state
 
 
 def _v4_state() -> dict:
@@ -1509,6 +1578,301 @@ class LegacyPlanApplyRegressionTest(unittest.TestCase):
             after = StateStore(Path(state)).read()
             self.assertIn("T2", after["tasks"])
             self.assertEqual(after["scope"]["approval"], legacy_approval)
+
+
+class ExecutionGateIntakeDriftTest(unittest.TestCase):
+    """Task 4: `require_fresh_intake` extends the execution gate -- a spec.md
+    edit after `plan apply` refuses every governed verb, not just planning,
+    until the full remedy walk (re-approve the drifted rung, then re-stamp
+    `plan apply --approved-by`) restores it."""
+
+    def test_post_apply_spec_edit_blocks_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_ladder_and_plan(state, wdd, root)
+
+            (wdd / "spec.md").write_text(
+                _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
+            )
+            code, _out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("intake drift", err)
+            self.assertIn("spec", err)
+
+    def test_execute_phase_next_shows_intake_drift_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_ladder_and_plan(state, wdd, root)
+
+            (wdd / "spec.md").write_text(
+                _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
+            )
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["actions"], [])
+            blocker = result["blockers"][0]
+            self.assertEqual(blocker["code"], "intake_drift")
+            self.assertEqual(blocker["rung"], "spec")
+
+    def test_full_remedy_walk_restores_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_ladder_and_plan(state, wdd, root)
+
+            (wdd / "spec.md").write_text(
+                _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
+            )
+            self.assertNotEqual(
+                _cli(state, "start", "--task", "T1", "--repo", str(root))[0], 0
+            )
+
+            # Cascade: re-approving spec clears research + design (recorded
+            # by _apply_ladder_and_plan's _walk_intake), so both must be
+            # re-recorded before the ladder is complete again.
+            assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
+            assert _cli(
+                state, "intake", "research", "--skip", "--by", "t",
+                "--reason", "no external contracts",
+            )[0] == 0
+            assert _cli(
+                state, "intake", "design", "--approved-by", "t",
+                "--deliverable-command", "true",
+            )[0] == 0
+
+            # The re-approval cascade also cleared scope.approval; an
+            # unchanged plan file re-stamps it (empty-diff --approved-by,
+            # Task 3's behavior) without needing a re-plan.
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+
+class ExecutionGatePlanDriftTest(unittest.TestCase):
+    """Task 4: a brief edit after composite approval is plan drift -- caught
+    by the same gate, remedied by a flagged, otherwise-empty-diff re-apply
+    (the brief edit is invisible to `_diff_plan`, so `--approved-by` on the
+    unchanged plan file is what moves the composite, per Task 3)."""
+
+    def test_brief_edit_blocks_start_with_plan_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_ladder_and_plan(state, wdd, root)
+
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief, edited.\n", encoding="utf-8")
+            code, _out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("plan drift", err)
+
+    def test_execute_phase_next_shows_plan_drift_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_ladder_and_plan(state, wdd, root)
+
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief, edited.\n", encoding="utf-8")
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["actions"], [])
+            self.assertEqual(result["blockers"][0]["code"], "plan_drift")
+
+    def test_reapply_approved_by_with_empty_diff_restores_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_ladder_and_plan(state, wdd, root)
+
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief, edited.\n", encoding="utf-8")
+            self.assertNotEqual(
+                _cli(state, "start", "--task", "T1", "--repo", str(root))[0], 0
+            )
+
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+            self.assertTrue(json.loads(out)["unchanged"])
+
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+
+class ExecutionGateLegacyPinTest(unittest.TestCase):
+    """Task 4 pin: a migrated legacy scope is wholesale exempt from the new
+    gate, exactly like it is from the ladder and the composite (spec Sec7)."""
+
+    def test_legacy_scope_start_unaffected_by_spec_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            store = StateStore(Path(state))
+            legacy_state = deepcopy(store.read())
+            legacy_state["intake"] = {"legacy": True}
+            store.write(legacy_state)
+
+            (wdd / "tasks").mkdir(exist_ok=True)
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            assert _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root)
+            )[0] == 0
+
+            # No spec.md ever existed for this legacy scope, and its
+            # scope.approval carries no sha256 (the v4-migrated shape) --
+            # both would be "drift" for a non-legacy scope, but the gate
+            # must no-op wholesale for legacy ones.
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+
+class ExecutionGateFinalizeDriftTest(unittest.TestCase):
+    """Task 4: the finalize-phase drift gate isn't limited to execute-phase
+    verbs -- a rung re-approval or a spec edit during finalize clears/drifts
+    scope.approval, and finalize verbs (already governed) refuse until the
+    plan is re-stamped."""
+
+    def test_spec_edit_during_finalize_blocks_finalize_verify(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize(tmp)
+            wdd = root / ".wdd"
+
+            (wdd / "spec.md").write_text(
+                _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
+            )
+            code, _out, err = _cli_full(
+                state, "finalize", "verify", "record", "--status", "passed",
+                "--command", "true", "--repo", str(root),
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("intake drift", err)
+
+    def test_finalize_phase_next_shows_intake_drift_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize(tmp)
+            wdd = root / ".wdd"
+
+            (wdd / "spec.md").write_text(
+                _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
+            )
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["actions"], [])
+            self.assertEqual(result["blockers"][0]["code"], "intake_drift")
+
+    def test_rung_reapproval_during_finalize_blocks_finalize_until_replan(self) -> None:
+        """Task-2 review's design note: a rung re-approval during finalize
+        clears scope.approval via the intake cascade, so finalize verbs
+        refuse (plan_drift, no composite approval) until a fresh `plan apply
+        --approved-by` re-stamps -- even though nothing about the rung's own
+        bytes drifted (a legitimate re-approval, not an edit-behind-its-back).
+
+        Re-approves `design` (the ladder's last rung) specifically: its
+        cascade only clears `scope.approval` (nothing downstream to clear),
+        so the ladder stays complete and only the plan-composite gate fires
+        -- isolating this case from the incomplete-ladder refusal a spec/
+        research re-approval's wider cascade would also trigger.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize(tmp)
+
+            assert _cli(
+                state, "intake", "design", "--approved-by", "t",
+                "--deliverable-command", "true",
+            )[0] == 0
+            code, _out, err = _cli_full(
+                state, "finalize", "verify", "record", "--status", "passed",
+                "--command", "true", "--repo", str(root),
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("plan drift", err)
+
+            plan_file = root / "plan.json"
+            plan_file.write_text(
+                json.dumps(_plan_document(["T1"], review_policy="always")), encoding="utf-8"
+            )
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+
+            code, out, err = _cli_full(
+                state, "finalize", "verify", "record", "--status", "passed",
+                "--command", "true", "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out + err)
+
+
+class IntakeGateStatusUnitTest(unittest.TestCase):
+    """Task 4: `intake_gate_status`/`require_fresh_intake` unit-level, for
+    the shape that can't arise through the CLI's own apply path -- a
+    non-legacy scope whose approval was never composite-stamped at all
+    (missing, or present without a sha256). A non-legacy `plan apply`
+    always requires `--approved-by` on a nonempty diff (Task 3), so this
+    state could only be produced by direct state surgery -- exactly what it
+    is here -- never by the CLI itself; the gate still must not treat it as
+    a legitimate steady state."""
+
+    def _ready_applied_state(self, tmp: str) -> tuple[dict, Path]:
+        root, state = _ratified_repo(tmp)
+        wdd = root / ".wdd"
+        _apply_ladder_and_plan(state, wdd, root)
+        current = StateStore(Path(state)).read()
+        return current, wdd
+
+    def test_missing_approval_is_plan_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            current, wdd = self._ready_applied_state(tmp)
+            current = deepcopy(current)
+            del current["scope"]["approval"]
+            gate = intake_gate_status(current, wdd)
+            self.assertIsNotNone(gate)
+            code, _detail = gate
+            self.assertEqual(code, "plan_drift")
+            with self.assertRaises(IllegalTransition) as ctx:
+                require_fresh_intake(current, wdd)
+            self.assertIn("plan drift", str(ctx.exception))
+            self.assertIn("never composite-approved", str(ctx.exception))
+
+    def test_approval_without_sha256_is_plan_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            current, wdd = self._ready_applied_state(tmp)
+            current = deepcopy(current)
+            current["scope"]["approval"] = {"by": "t", "at": "2026-08-01T00:00:00Z"}
+            gate = intake_gate_status(current, wdd)
+            self.assertEqual(gate[0], "plan_drift")
+
+    def test_matching_composite_is_no_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            current, wdd = self._ready_applied_state(tmp)
+            self.assertIsNone(intake_gate_status(current, wdd))
+            require_fresh_intake(current, wdd)  # must not raise
+
+    def test_legacy_state_is_never_gated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            current, wdd = self._ready_applied_state(tmp)
+            current = deepcopy(current)
+            current["intake"] = {"legacy": True}
+            del current["scope"]["approval"]
+            self.assertIsNone(intake_gate_status(current, wdd))
+            require_fresh_intake(current, wdd)  # must not raise
 
 
 if __name__ == "__main__":

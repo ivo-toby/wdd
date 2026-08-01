@@ -465,6 +465,129 @@ def _is_legacy_intake(state: dict[str, Any]) -> bool:
     return (state.get("intake") or {}).get("legacy") is True
 
 
+def _reconstruct_plan_from_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild a normalized plan dict from applied state alone (Task 4).
+
+    `require_fresh_intake` has no plan file to re-read at execute time -- the
+    only source of truth post-apply is the state a prior `plan apply` wrote.
+    This mirrors `_diff_plan`'s own reconstruction of "what the plan looked
+    like" from state: scope fields `_apply_plan_to_state` persists
+    (`mergeSurface`/`mergeMode` included only when the key is present in
+    `state["scope"]`, the same "omission means keep, not clear" convention
+    `_diff_plan`/`_apply_plan_to_state` use elsewhere), and per task exactly
+    `MUTABLE_TASK_FIELDS` -- `_apply_plan_to_state`'s own mutable-field list,
+    also what `_diff_plan` diffs and what `plan_composite` folds into its
+    digest, so nothing this composite must see can go stale by omission here.
+    Task iteration/list order doesn't matter: `plan_composite` re-sorts tasks
+    by id internally before hashing (matching `_apply_plan_to_state`'s
+    id-sorted insertion), so a byte-identical scope produces a byte-identical
+    composite regardless of dict order below.
+    """
+    scope = state["scope"]
+    normalized_scope: dict[str, Any] = {
+        "id": scope["id"],
+        "baseRef": scope.get("baseRef"),
+        "maxConcurrent": scope.get("maxConcurrent"),
+        "reviewPolicy": scope.get("reviewPolicy"),
+        "reconcileEveryNMerges": state["reconcile"].get("everyNMerges"),
+    }
+    for field in ("mergeSurface", "mergeMode"):
+        if field in scope:
+            normalized_scope[field] = scope[field]
+    tasks = []
+    for task_id, task in state["tasks"].items():
+        entry: dict[str, Any] = {"id": task_id}
+        for field in MUTABLE_TASK_FIELDS:
+            entry[field] = task.get(field)
+        tasks.append(entry)
+    return {
+        "schemaVersion": 1,
+        "kind": PLAN_KIND,
+        "scope": normalized_scope,
+        "tasks": tasks,
+    }
+
+
+def intake_gate_status(
+    state: dict[str, Any], wdd_dir: Path | str
+) -> tuple[str, dict[str, Any]] | None:
+    """(code, detail) for the first drift `require_fresh_intake` would refuse
+    on, or None -- the non-raising counterpart `next` uses to build a
+    blocker, mirroring `config.governance_drift`'s relationship to
+    `require_fresh_governance`.
+
+    None covers the no-op cases: legacy scopes (wholesale exempt, spec Sec7)
+    and no scope yet (nothing applied to gate). Checked in ladder order: an
+    intake rung drift (spec Sec1's three-gate doctrine, re-hashed here via
+    `intake_drift`) is reported before a plan-composite drift, since a stale
+    intake rung is the more upstream problem and re-approving it will also
+    require the plan re-stamp that would otherwise show up here separately.
+    A non-legacy scope with no composite approval at all (missing, or present
+    without a `sha256`) is treated as plan drift too: a non-legacy `plan
+    apply` always requires `--approved-by` on a nonempty diff (Task 3), so a
+    non-legacy applied scope with no composite approval could only mean the
+    approval was never stamped -- there is no legitimate "never approved"
+    steady state to exempt. A brief/context file deleted since approval
+    makes `plan_composite` refuse (`_hash_or_refuse`); that refusal is caught
+    here and reported as drift too, rather than propagating as an unrelated
+    ValidationError out of a read path like `next`.
+    """
+    if _is_legacy_intake(state) or state.get("scope") is None:
+        return None
+    wdd_dir = Path(wdd_dir)
+    drift = intake_drift(state, wdd_dir)
+    if drift is not None:
+        return "intake_drift", drift
+    approval = state["scope"].get("approval")
+    if not isinstance(approval, dict) or not approval.get("sha256"):
+        return "plan_drift", {"recorded": None, "actual": "never composite-approved"}
+    try:
+        recomputed = plan_composite(_reconstruct_plan_from_state(state), wdd_dir)
+    except ValidationError as error:
+        return "plan_drift", {"recorded": approval["sha256"], "actual": f"missing file: {error}"}
+    if approval["sha256"] != recomputed:
+        return "plan_drift", {"recorded": approval["sha256"], "actual": recomputed}
+    return None
+
+
+def require_fresh_intake(state: dict[str, Any], wdd_dir: Path | str) -> None:
+    """Extend the execution gate (`config.require_fresh_governance`'s
+    sibling, spec Sec1 "after apply" enforcement) with intake/plan drift.
+
+    Wired at the same CLI chokepoint, for every governed verb: a non-legacy
+    scope whose recorded intake fingerprints or plan-approval composite no
+    longer match the current bytes refuses admission, merges, and every
+    other governed verb -- not just planning. Intake verbs and `plan apply
+    --approved-by` are deliberately NOT governed verbs (cli.py's
+    GOVERNED_VERBS): they are the remedy this gate demands, and must stay
+    legal precisely when this raises.
+    """
+    gate = intake_gate_status(state, wdd_dir)
+    if gate is None:
+        return
+    code, detail = gate
+    if code == "intake_drift":
+        raise IllegalTransition(
+            f"intake drift: intake {detail['rung']} has drifted since approval "
+            f"(recorded {detail['recorded']}, actual {detail['actual']}); re-run "
+            f"'wddctl intake {detail['rung']} ...' to re-approve, then "
+            "'wddctl plan apply --approved-by NAME' to re-stamp the plan before "
+            "resuming execution"
+        )
+    if detail.get("recorded") is None:
+        raise IllegalTransition(
+            "plan drift: this scope's plan was never composite-approved; run "
+            "'wddctl plan apply --approved-by NAME' to stamp the currently applied plan"
+        )
+    raise IllegalTransition(
+        f"plan drift: recorded plan approval {detail['recorded']} no longer matches "
+        f"the applied plan's current bytes ({detail['actual']}); a brief or context "
+        "file changed since approval. Run 'wddctl plan apply --approved-by NAME' "
+        "(an unchanged plan file is a pure re-stamp) to re-approve before resuming "
+        "execution"
+    )
+
+
 def _stamp_approval(
     state: dict[str, Any], approved_by: str | None, composite: str | None = None
 ) -> dict[str, Any]:
