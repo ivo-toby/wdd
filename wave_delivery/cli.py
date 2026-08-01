@@ -563,21 +563,28 @@ def _concurrency(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _overlaid_plan(args: argparse.Namespace, store: StateStore) -> tuple[dict[str, Any], Path]:
+def _overlaid_plan(
+    args: argparse.Namespace, store: StateStore
+) -> tuple[dict[str, Any], Path, dict[str, Any] | None]:
     """Read a plan file and apply the same config overlays 'plan apply' does.
 
     Shared by 'plan lint' and 'plan apply' so lint always sees exactly what
-    apply would see: raw scope defaults, then risk-rule overrides.
+    apply would see: raw scope defaults, then risk-rule overrides. Also
+    returns the current state (or None when no state.json exists yet) --
+    lint's `missing_context` check (Task 6) needs to know whether intake
+    artifacts are recorded, and this is the one place both callers already
+    touch the store, so the state ride-alongs rather than each caller
+    re-reading it.
     """
     plan = read_plan(args.plan)
     wdd_dir = store.path.parent
+    state = store.read() if store.exists() else None
     if config_path(wdd_dir).exists():
         raw_plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
         config = load_config(wdd_dir)
         plan = apply_config_defaults(plan, raw_plan["scope"], config)
-        state = store.read() if store.exists() else None
         plan = apply_risk_rules(plan, config, state)
-    return plan, wdd_dir
+    return plan, wdd_dir, state
 
 
 def _base_equals_target_branch(plan: dict[str, Any], wdd_dir: Path) -> str | None:
@@ -688,14 +695,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "plan" and args.plan_command == "apply":
             if args.approved_by is not None and not args.approved_by.strip():
                 raise ValidationError("--approved-by requires a non-empty name")
-            plan, wdd_dir = _overlaid_plan(args, store)
+            plan, wdd_dir, lint_state = _overlaid_plan(args, store)
             target_branch = _base_equals_target_branch(plan, wdd_dir)
             if target_branch is not None:
                 raise ValidationError(
                     f"scope.baseRef must differ from branching.targetBranch ({target_branch}): "
                     "the epic branch cannot be the branch it delivers into"
                 )
-            findings = lint_plan(plan, wdd_dir if wdd_dir.exists() else None)
+            findings = lint_plan(plan, wdd_dir if wdd_dir.exists() else None, lint_state)
             if args.strict and findings:
                 raise ValidationError(
                     "plan apply --strict: " + ", ".join(sorted({f["code"] for f in findings}))
@@ -713,8 +720,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "plan" and args.plan_command == "lint":
-            plan_dict, wdd_dir = _overlaid_plan(args, store)
-            findings = lint_plan(plan_dict, wdd_dir if wdd_dir.exists() else None)
+            plan_dict, wdd_dir, lint_state = _overlaid_plan(args, store)
+            findings = lint_plan(plan_dict, wdd_dir if wdd_dir.exists() else None, lint_state)
             target_branch = _base_equals_target_branch(plan_dict, wdd_dir)
             if target_branch is not None:
                 findings.append(

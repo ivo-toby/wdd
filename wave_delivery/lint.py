@@ -8,10 +8,11 @@ ceremony. Lint warns; it never blocks unless the caller passes --strict.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
-from .domains import WILDCARDS, domains_overlap
+from .domains import WILDCARDS, domains_overlap, matches_domain
 from .engine import admission_schedule
 from .plan import state_from_plan
 
@@ -179,15 +180,217 @@ def _check_spec(wdd_dir: Path | str) -> list[dict[str, Any]]:
     ]
 
 
+_HEADING_RE = re.compile(r"^##\s+(.+?)\s*$")
+# The spec's Integration surfaces convention: `- `path/glob` — owned by: ...`.
+# Only the backtick-quoted path is load-bearing; the "owned by" prose is a
+# named responsibility for humans, not something lint resolves.
+_SURFACE_LINE_RE = re.compile(r"^-\s+`([^`]+)`")
+# A context ref counts as an acceptance-criteria mapping only when it is
+# EXACTLY `spec.md#AC-<digits>` -- prefix junk like `spec.md#AC-garbage`
+# does not match `\d+$` and so does not count (spec Sec3).
+_AC_REF_RE = re.compile(r"^spec\.md#AC-\d+$")
+
+
+def _sections(text: str) -> dict[str, list[str]]:
+    """Map lowercased `## ` heading name -> its body lines (to the next heading).
+
+    Tolerant by construction: a file with no headings at all yields `{}`,
+    never an error -- callers treat an absent section the same as an empty
+    one. Shared by the brief (Deliverable/Interfaces) and design.md
+    (Integration surfaces) parsers below.
+    """
+    lines = text.splitlines()
+    headings = [
+        (match.group(1).strip().lower(), index)
+        for index, line in enumerate(lines)
+        if (match := _HEADING_RE.match(line))
+    ]
+    sections: dict[str, list[str]] = {}
+    for position, (name, start) in enumerate(headings):
+        end = headings[position + 1][1] if position + 1 < len(headings) else len(lines)
+        sections.setdefault(name, []).extend(lines[start + 1 : end])
+    return sections
+
+
+def _section_nonempty(sections: dict[str, list[str]], name: str) -> bool:
+    return any(line.strip() for line in sections.get(name, []))
+
+
+def _check_deliverable_and_interfaces(
+    plan_dict: dict[str, Any], wdd_dir: Path | str
+) -> list[dict[str, Any]]:
+    """Brief template's two required, linted sections (spec Sec3).
+
+    A brief that `_check_briefs` already flagged as missing/empty is skipped
+    here -- one finding (`missing_brief`) for a nonexistent file, not three.
+    """
+    findings: list[dict[str, Any]] = []
+    for entry in plan_dict["tasks"]:
+        brief = Path(wdd_dir) / entry["specPath"]
+        if not brief.is_file():
+            continue
+        sections = _sections(brief.read_text(encoding="utf-8"))
+        if not _section_nonempty(sections, "deliverable"):
+            findings.append(
+                {
+                    "code": "missing_deliverable",
+                    "severity": "warning",
+                    "task": entry["id"],
+                    "message": (
+                        f"{entry['id']}: brief {entry['specPath']} has no non-empty "
+                        "'## Deliverable' section — the reviewer's first question is "
+                        "whether the diff produces it."
+                    ),
+                }
+            )
+        if not _section_nonempty(sections, "interfaces"):
+            findings.append(
+                {
+                    "code": "missing_interfaces",
+                    "severity": "warning",
+                    "task": entry["id"],
+                    "message": (
+                        f"{entry['id']}: brief {entry['specPath']} has no non-empty "
+                        "'## Interfaces' section — Consumes/Produces should be consistent "
+                        "with design.md."
+                    ),
+                }
+            )
+    return findings
+
+
+def _check_missing_criteria(plan_dict: dict[str, Any]) -> list[dict[str, Any]]:
+    """Advisory: a task with no `spec.md#AC-<n>` ref discharges no acceptance
+    criterion (spec Sec3) -- genuinely internal tasks exist, so this never
+    blocks, only surfaces for a human to confirm."""
+    findings: list[dict[str, Any]] = []
+    for entry in plan_dict["tasks"]:
+        refs = entry.get("context") or []
+        if any(_AC_REF_RE.match(ref) for ref in refs):
+            continue
+        findings.append(
+            {
+                "code": "missing_criteria",
+                "severity": "warning",
+                "task": entry["id"],
+                "message": (
+                    f"{entry['id']}: no context ref maps to a numbered acceptance "
+                    "criterion (spec.md#AC-<n>) — confirm this task is genuinely internal."
+                ),
+            }
+        )
+    return findings
+
+
+def _intake_recorded(state: dict[str, Any] | None) -> bool:
+    """True once at least one intake rung (spec/research/design) is recorded.
+
+    Legacy scopes are wholesale-exempt from the ladder (schema Sec7) and
+    never carry these keys, so they fall out of this check for free.
+    """
+    if not state:
+        return False
+    intake = state.get("intake") or {}
+    if intake.get("legacy") is True:
+        return False
+    return any(intake.get(key) is not None for key in ("spec", "research", "design"))
+
+
+def _check_missing_context(
+    plan_dict: dict[str, Any], state: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """A scope with recorded intake artifacts but a task carrying no
+    `context` refs is losing the machine-carried handover those artifacts
+    exist to provide (spec Sec3)."""
+    if not _intake_recorded(state):
+        return []
+    findings: list[dict[str, Any]] = []
+    for entry in plan_dict["tasks"]:
+        if entry.get("context"):
+            continue
+        findings.append(
+            {
+                "code": "missing_context",
+                "severity": "warning",
+                "task": entry["id"],
+                "message": (
+                    f"{entry['id']}: intake artifacts are recorded but this task carries "
+                    "no 'context' refs — handover will rely on memory, not machine-carried "
+                    "evidence."
+                ),
+            }
+        )
+    return findings
+
+
+def _integration_surfaces(wdd_dir: Path | str) -> list[str]:
+    """Paths listed under design.md's '## Integration surfaces' section.
+
+    Tolerant of an absent file or absent/empty section (both return `[]`,
+    never raise) -- design.md is optional at lint time, unlike at intake
+    `design` approval where its presence is enforced.
+    """
+    design = Path(wdd_dir) / "design.md"
+    if not design.is_file():
+        return []
+    sections = _sections(design.read_text(encoding="utf-8"))
+    lines = sections.get("integration surfaces", [])
+    surfaces = []
+    for line in lines:
+        match = _SURFACE_LINE_RE.match(line.strip())
+        if match:
+            surfaces.append(match.group(1))
+    return surfaces
+
+
+def _check_unowned_surfaces(
+    plan_dict: dict[str, Any], wdd_dir: Path | str
+) -> list[dict[str, Any]]:
+    """design.md's Integration surfaces vs. the plan's conflictDomains (spec Sec2).
+
+    A surface with producers and no task's conflictDomains covering it is a
+    design error caught mechanically: nobody owns writing to it, so multiple
+    tasks (or none) will improvise there.
+    """
+    surfaces = _integration_surfaces(wdd_dir)
+    if not surfaces:
+        return []
+    all_domains = [
+        domain for entry in plan_dict["tasks"] for domain in entry.get("conflictDomains", [])
+    ]
+    findings: list[dict[str, Any]] = []
+    for path in surfaces:
+        if any(matches_domain(path, domain) for domain in all_domains):
+            continue
+        findings.append(
+            {
+                "code": "unowned_surface",
+                "severity": "warning",
+                "message": (
+                    f"design.md lists integration surface `{path}` but no task's "
+                    "conflictDomains cover it — a surface with producers and no owning "
+                    "task is a design error."
+                ),
+            }
+        )
+    return findings
+
+
 def lint_plan(
-    plan_dict: dict[str, Any], wdd_dir: Path | str | None = None
+    plan_dict: dict[str, Any],
+    wdd_dir: Path | str | None = None,
+    state: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     findings.extend(_check_serialization(plan_dict))
     findings.extend(_check_risk_distribution(plan_dict))
     findings.extend(_check_enumerated_domains(plan_dict))
     findings.extend(_check_coarse_domains(plan_dict))
+    findings.extend(_check_missing_criteria(plan_dict))
+    findings.extend(_check_missing_context(plan_dict, state))
     if wdd_dir is not None:
         findings.extend(_check_spec(wdd_dir))
         findings.extend(_check_briefs(plan_dict, wdd_dir))
+        findings.extend(_check_deliverable_and_interfaces(plan_dict, wdd_dir))
+        findings.extend(_check_unowned_surfaces(plan_dict, wdd_dir))
     return findings

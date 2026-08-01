@@ -10,6 +10,7 @@ from pathlib import Path
 
 from wave_delivery.cli import main
 from wave_delivery.config import default_config, governance_fingerprint, load_config, save_config, set_value
+from wave_delivery.engine import utc_now
 from wave_delivery.lint import lint_plan
 from wave_delivery.plan import apply_risk_rules
 from wave_delivery.schema import new_setup_state, new_state
@@ -794,6 +795,200 @@ class PlanApprovalTest(unittest.TestCase):
             # composite, still pinned to the one-task plan) is untouched.
             after = StateStore(wdd / "state.json").read()["scope"]["approval"]
             self.assertEqual(before, after)
+
+
+def _state_with_spec_recorded() -> dict:
+    """Cheapest legal state carrying a recorded intake.spec (Task 6 fixture).
+
+    Schema v5 requires `intake` (schema.py's `_validate_intake`); a single
+    hand-written `spec` record is enough to make `_intake_recorded` true --
+    the walk-the-whole-ladder helper (`_walk_intake`) is unnecessary when the
+    test is only about lint reading state, not about the ladder itself.
+    """
+    state = new_setup_state()
+    state["intake"]["spec"] = {
+        "by": "t",
+        "at": utc_now(),
+        "criteria": 1,
+        "sha256": "sha256:" + "a" * 64,
+    }
+    return state
+
+
+class LintDeliverableInterfacesTest(unittest.TestCase):
+    """Task 6 / spec Sec3: the brief template's two required, linted sections."""
+
+    def test_brief_missing_both_sections_warns_both_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            (wdd / "tasks").mkdir(parents=True)
+            (wdd / "tasks" / "T1.md").write_text(
+                "# T1\n\nJust an objective, no required sections.\n", encoding="utf-8"
+            )
+            plan = _plan([_task("T1")])
+            findings = lint_plan(plan, wdd)
+            codes = {(f["code"], f.get("task")) for f in findings}
+            self.assertIn(("missing_deliverable", "T1"), codes)
+            self.assertIn(("missing_interfaces", "T1"), codes)
+
+    def test_brief_with_empty_deliverable_section_warns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            (wdd / "tasks").mkdir(parents=True)
+            (wdd / "tasks" / "T1.md").write_text(
+                "# T1\n\n## Deliverable\n\n## Interfaces\n\nConsumes nothing, produces lib.\n",
+                encoding="utf-8",
+            )
+            plan = _plan([_task("T1")])
+            findings = lint_plan(plan, wdd)
+            self.assertIn("missing_deliverable", _codes(findings))
+            self.assertNotIn("missing_interfaces", _codes(findings))
+
+    def test_brief_with_both_sections_populated_is_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            (wdd / "tasks").mkdir(parents=True)
+            (wdd / "tasks" / "T1.md").write_text(
+                "# T1\n\n## Deliverable\n\nThe lib imports and exports `foo()`.\n\n"
+                "## Interfaces\n\nConsumes nothing, produces lib.\n",
+                encoding="utf-8",
+            )
+            plan = _plan([_task("T1")])
+            codes = _codes(lint_plan(plan, wdd))
+            self.assertNotIn("missing_deliverable", codes)
+            self.assertNotIn("missing_interfaces", codes)
+
+    def test_missing_brief_file_does_not_also_report_section_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            (wdd / "tasks").mkdir(parents=True)
+            plan = _plan([_task("T1")])
+            findings = lint_plan(plan, wdd)
+            self.assertIn("missing_brief", _codes(findings))
+            self.assertNotIn("missing_deliverable", _codes(findings))
+            self.assertNotIn("missing_interfaces", _codes(findings))
+
+
+class LintMissingCriteriaTest(unittest.TestCase):
+    """Task 6 / spec Sec3: `spec.md#AC-<n>` context refs are the authoritative
+    task -> acceptance-criteria mapping; advisory when a task discharges none."""
+
+    def test_task_with_no_context_warns(self) -> None:
+        plan = _plan([_task("T1")])
+        self.assertIn("missing_criteria", _codes(lint_plan(plan)))
+
+    def test_task_with_full_ac_ref_is_clean(self) -> None:
+        plan = _plan([_task("T1")])
+        plan["tasks"][0]["context"] = ["spec.md#AC-3"]
+        self.assertNotIn("missing_criteria", _codes(lint_plan(plan)))
+
+    def test_prefix_junk_ac_ref_still_warns(self) -> None:
+        # spec.md#AC-garbage is not a full match of `spec.md#AC-<digits>` --
+        # prefix junk does not count as discharging a criterion.
+        plan = _plan([_task("T1")])
+        plan["tasks"][0]["context"] = ["spec.md#AC-garbage"]
+        self.assertIn("missing_criteria", _codes(lint_plan(plan)))
+
+    def test_non_ac_context_ref_still_warns(self) -> None:
+        plan = _plan([_task("T1")])
+        plan["tasks"][0]["context"] = ["shared-context/contract-inventory.md#orders"]
+        self.assertIn("missing_criteria", _codes(lint_plan(plan)))
+
+
+class LintMissingContextTest(unittest.TestCase):
+    """Task 6 / spec Sec3: `missing_context` only fires once intake artifacts
+    are recorded in state -- a scope that hasn't run the ladder yet has no
+    handover artifacts to reference, so silence there is correct, not a gap."""
+
+    def test_no_state_is_quiet_even_without_context_refs(self) -> None:
+        plan = _plan([_task("T1")])
+        self.assertNotIn("missing_context", _codes(lint_plan(plan, state=None)))
+
+    def test_legacy_state_is_quiet(self) -> None:
+        state = new_setup_state()
+        state["intake"] = {"legacy": True}
+        plan = _plan([_task("T1")])
+        self.assertNotIn("missing_context", _codes(lint_plan(plan, state=state)))
+
+    def test_recorded_spec_and_task_without_context_warns(self) -> None:
+        state = _state_with_spec_recorded()
+        plan = _plan([_task("T1")])
+        findings = [f for f in lint_plan(plan, state=state) if f["code"] == "missing_context"]
+        self.assertEqual([f["task"] for f in findings], ["T1"])
+
+    def test_recorded_spec_and_task_with_context_is_clean(self) -> None:
+        state = _state_with_spec_recorded()
+        plan = _plan([_task("T1")])
+        plan["tasks"][0]["context"] = ["spec.md#AC-1"]
+        self.assertNotIn("missing_context", _codes(lint_plan(plan, state=state)))
+
+    def test_recorded_intake_via_cli_plan_lint_surfaces_missing_context(self) -> None:
+        # End-to-end plumbing check: `_overlaid_plan` threads state.json's
+        # intake records into `lint_plan` for the real `plan lint` CLI path,
+        # not just direct calls into the lint module. No `init`/config.json
+        # here on purpose (mirrors this file's no-config lint fixtures) --
+        # the point is state.json alone, hand-written, reaching lint_plan.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            state_path = wdd / "state.json"
+            StateStore(state_path).write(_state_with_spec_recorded())
+            plan = _plan([_task("T1")])
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+
+            code, out = _cli(str(state_path), "plan", "lint", "--plan", str(plan_file))
+            self.assertEqual(code, 0, out)
+            self.assertIn("missing_context", out)
+
+
+class LintUnownedSurfaceTest(unittest.TestCase):
+    """Task 6 / spec Sec2: design.md's Integration surfaces vs. conflictDomains."""
+
+    def test_no_design_file_is_quiet_and_does_not_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            wdd.mkdir()
+            plan = _plan([_task("T1")])
+            self.assertNotIn("unowned_surface", _codes(lint_plan(plan, wdd)))
+
+    def test_design_file_without_surfaces_section_is_quiet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            wdd.mkdir()
+            (wdd / "design.md").write_text(
+                "# Design\n\n## Components\n\n- core\n\n## Interfaces\n\n"
+                "- core: consumes nothing, produces lib\n\n## Epic deliverable\n\nIt runs.\n",
+                encoding="utf-8",
+            )
+            plan = _plan([_task("T1")])
+            self.assertNotIn("unowned_surface", _codes(lint_plan(plan, wdd)))
+
+    def test_uncovered_surface_warns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            wdd.mkdir()
+            (wdd / "design.md").write_text(
+                "# Design\n\n## Integration surfaces\n\n"
+                "- `src/shared/registry.py` — owned by: registry\n",
+                encoding="utf-8",
+            )
+            plan = _plan([_task("T1", domains=["src/unrelated/**"])])
+            findings = [f for f in lint_plan(plan, wdd) if f["code"] == "unowned_surface"]
+            self.assertEqual(len(findings), 1)
+            self.assertIn("src/shared/registry.py", findings[0]["message"])
+
+    def test_covered_surface_is_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            wdd.mkdir()
+            (wdd / "design.md").write_text(
+                "# Design\n\n## Integration surfaces\n\n"
+                "- `src/shared/registry.py` — owned by: registry\n",
+                encoding="utf-8",
+            )
+            plan = _plan([_task("T1", domains=["src/shared/**"])])
+            self.assertNotIn("unowned_surface", _codes(lint_plan(plan, wdd)))
 
 
 if __name__ == "__main__":

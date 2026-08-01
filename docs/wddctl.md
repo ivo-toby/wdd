@@ -231,6 +231,11 @@ Codes:
 | `missing_brief` | a task's `specPath` file doesn't exist, or has fewer than 2 non-blank lines — a worker dispatched on it will improvise. |
 | `missing_spec` | `.wdd/spec.md` is missing or effectively empty — the finalize phase reviews the epic branch against it; run the intake first. |
 | `nonprose_brief` | a task's brief starts with `{` or `[` — it reads as JSON/data, not the Markdown prose (objective, scope, verification) a worker needs. |
+| `missing_deliverable` | a task's brief has no non-empty `## Deliverable` section — the reviewer's first question is whether the diff produces it. |
+| `missing_interfaces` | a task's brief has no non-empty `## Interfaces` section — Consumes/Produces should be consistent with design.md. |
+| `missing_context` | intake artifacts are recorded in state (spec/research/design) but a task carries no `context` refs — handover will rely on memory, not machine-carried evidence. |
+| `missing_criteria` | a task has no `context` ref that fully matches `spec.md#AC-<n>` — advisory, since genuinely internal tasks discharge no criterion. |
+| `unowned_surface` | design.md's `## Integration surfaces` lists a path that no task's `conflictDomains` cover — a surface with producers and no owning task is a design error caught mechanically. |
 
 Every finding is `"severity": "warning"` — lint never blocks by default. Pass
 `--strict` to turn any finding into a refusal (exit 2), naming the offending
