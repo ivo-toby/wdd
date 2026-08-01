@@ -64,6 +64,7 @@ from .lint import lint_plan
 from .merge import merge_task, observe_merge, refresh_task
 from .migration import apply_migration, plan_migration
 from .monitor import monitor_once
+from .runner import dispatch_task, probe_command, record_probe, runner_command_digest
 from .plan import (
     apply_config_defaults,
     apply_plan,
@@ -104,6 +105,13 @@ GOVERNED_VERBS = {
     # the remedy input-version binding demands, and must stay legal exactly
     # when a task's own inputs_status is non-None.
     ("rebind", None),
+    # Governed by default -- both `--probe NAME` (re-verifying an already-
+    # ratified runner) and `--task ID --role ...` execute config-loaded
+    # commands. The one exception, `--probe-command` (an explicit candidate
+    # the user just typed, never yet config), is special-cased to skip this
+    # set entirely in main()'s chokepoint -- spec Sec6's "deliberately
+    # ungoverned" path, never a second entry in this set.
+    ("dispatch", None),
     # The escape hatch bypasses transitions, not governance.
     ("event", "apply"),
 }
@@ -125,6 +133,11 @@ TASK_INPUT_GATED_VERBS = {
     ("verify", "collect"),
     ("refresh", None),
     ("merge", None),
+    # `--task ID --role ...` is task-targeted the same way; `--probe-command`/
+    # `--probe NAME` pass no --task, so the chokepoint's own gated_task_id
+    # lookup (getattr(args, "task", None)) is None for them and this is a
+    # no-op there -- only the --task dispatch path is actually gated.
+    ("dispatch", None),
 }
 
 
@@ -452,6 +465,26 @@ def build_parser() -> argparse.ArgumentParser:
     rebind.add_argument("--by", required=True)
     rebind.add_argument("--repo", type=Path, default=Path("."))
     _add_concurrency_flags(rebind)
+
+    dispatch = subparsers.add_parser(
+        "dispatch",
+        help="probe a runner command, or dispatch a task through a configured runner",
+    )
+    dispatch.add_argument(
+        "--probe-command",
+        dest="probe_command",
+        type=_json_list,
+        default=None,
+        help="ungoverned: probe an explicit candidate runner argv (JSON string array)",
+    )
+    dispatch.add_argument(
+        "--probe", default=None, help="governed: re-verify an already-configured runner by name"
+    )
+    dispatch.add_argument("--task", help="governed + input-binding-gated: dispatch this task")
+    dispatch.add_argument("--role", choices=("worker", "reviewer"))
+    dispatch.add_argument("--repo", type=Path, default=Path("."))
+    dispatch.add_argument("--timeout", type=int, default=None)
+    _add_concurrency_flags(dispatch)
 
     release = subparsers.add_parser("release", help="remove a finished task's worktree")
     release.add_argument("--task", required=True)
@@ -822,11 +855,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     store = StateStore(args.state)
     try:
-        if (args.command, _subcommand(args)) in GOVERNED_VERBS and store.exists():
+        verb = (args.command, _subcommand(args))
+        governed = verb in GOVERNED_VERBS
+        if args.command == "dispatch" and getattr(args, "probe_command", None) is not None:
+            # spec Sec6's deliberately UNGOVERNED path: an explicit candidate
+            # command the user just typed or approved in conversation, never
+            # yet config -- `--probe NAME` and `--task ...` stay governed.
+            governed = False
+        if governed and store.exists():
             gated_state = store.read()
             require_fresh_governance(gated_state, store.path.parent)
             require_fresh_intake(gated_state, store.path.parent)
-            if (args.command, _subcommand(args)) in TASK_INPUT_GATED_VERBS:
+            if verb in TASK_INPUT_GATED_VERBS:
                 gated_task_id = getattr(args, "task", None)
                 gated_task = (gated_state.get("tasks") or {}).get(gated_task_id) if gated_task_id else None
                 # Merged evidence is history (spec Sec3): a done/cancelled
@@ -1434,6 +1474,76 @@ def main(argv: list[str] | None = None) -> int:
                     "inputsRecorded": len(task.get("inputs") or []),
                 }
             )
+            return 0
+
+        if args.command == "dispatch":
+            selected = [
+                flag
+                for flag, value in (
+                    ("--probe-command", args.probe_command),
+                    ("--probe", args.probe),
+                    ("--task", args.task),
+                )
+                if value
+            ]
+            if len(selected) != 1:
+                raise ValidationError(
+                    "dispatch requires exactly one of --probe-command, --probe, or --task"
+                )
+            timeout_kwargs: dict[str, Any] = {} if args.timeout is None else {"timeout": args.timeout}
+
+            if args.probe_command is not None:
+                command = args.probe_command
+                result = probe_command(command, **timeout_kwargs)
+                result["digest"] = runner_command_digest(command)
+                if result["ok"] and store.exists():
+                    record_probe(store, command=command, **_concurrency(args))
+                    result["recorded"] = True
+                else:
+                    result["recorded"] = False
+                    if result["ok"]:
+                        result["note"] = (
+                            "no state.json yet; this probe will be re-verified once the "
+                            "runner is registered and state exists"
+                        )
+                _print_json(result)
+                return 0
+
+            if args.probe is not None:
+                config = load_config(store.path.parent)
+                runners = config.get("runners") or {}
+                if args.probe not in runners:
+                    raise ValidationError(f"unknown runner: {args.probe}")
+                command = runners[args.probe]["command"]
+                result = probe_command(command, **timeout_kwargs)
+                result["digest"] = runner_command_digest(command)
+                result["runner"] = args.probe
+                if result["ok"] and store.exists():
+                    record_probe(store, command=command, **_concurrency(args))
+                    result["recorded"] = True
+                else:
+                    result["recorded"] = False
+                _print_json(result)
+                return 0
+
+            if not args.role:
+                raise ValidationError("dispatch --task requires --role worker|reviewer")
+            state = store.read()
+            config = (
+                load_config(store.path.parent)
+                if config_path(store.path.parent).exists()
+                else None
+            )
+            result = dispatch_task(
+                state,
+                config,
+                repo=args.repo,
+                wdd_dir=store.path.parent,
+                task_id=args.task,
+                role=args.role,
+                **timeout_kwargs,
+            )
+            _print_json(result)
             return 0
 
         if args.command == "release":

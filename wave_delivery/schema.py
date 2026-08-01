@@ -314,6 +314,22 @@ def validate_state(state: dict[str, Any]) -> None:
 
     _validate_intake(_require_mapping(state.get("intake"), "intake"))
 
+    # Optional (spec Sec6): absent on any state that predates the runner
+    # registry, or that has never recorded a passing probe. digest ->
+    # {"at", "ok"}, the "monitor precedent" ungoverned observation write --
+    # runner.py's record_probe is the only writer.
+    probes = state.get("probes")
+    if probes is not None:
+        if not isinstance(probes, dict):
+            raise ValidationError("probes must be an object")
+        for digest, entry in probes.items():
+            if not isinstance(digest, str) or not digest:
+                raise ValidationError("probes keys must be non-empty strings")
+            entry = _require_mapping(entry, f"probes.{digest}")
+            _require_string(entry.get("at"), f"probes.{digest}.at")
+            if not isinstance(entry.get("ok"), bool):
+                raise ValidationError(f"probes.{digest}.ok must be a boolean")
+
 
 _VERIFICATION_STATUSES = {"passed", "failed", "unavailable"}
 

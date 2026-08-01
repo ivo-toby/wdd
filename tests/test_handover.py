@@ -19,7 +19,7 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from wave_delivery.config import default_config, load_config, validate_config
+from wave_delivery.config import default_config, load_config, save_config, set_value, validate_config
 from wave_delivery.engine import bounded_next_actions
 from wave_delivery.errors import IllegalTransition, ValidationError
 from wave_delivery.handover import (
@@ -30,6 +30,7 @@ from wave_delivery.handover import (
     rebind_attempt,
 )
 from wave_delivery.intake import artifact_sha256
+from wave_delivery.runner import probe_command, runner_command_digest
 from wave_delivery.schema import new_state, task_state
 from wave_delivery.setup import init_repository, migrate_governance
 from wave_delivery.store import StateStore
@@ -400,26 +401,33 @@ def _apply_v5_scope(
     *,
     task_id: str = "T1",
     context: list[str] | None = None,
+    model: str | None = None,
+    review_model: str | None = None,
 ) -> None:
     """Walk the intake ladder and composite-approve a one-task plan for
-    task_id, with a real brief on disk (and optional context refs)."""
+    task_id, with a real brief on disk (and optional context refs / routing
+    overrides -- model/review_model feed Task 4's dispatch tests)."""
     _walk_intake(state, wdd)
     (wdd / "tasks").mkdir(exist_ok=True)
     (wdd / "tasks" / f"{task_id}.md").write_text(
-        f"# {task_id}\n\nBrief body for {task_id}.\n", encoding="utf-8"
+        f"# {task_id}\n\nBrief body for {task_id}.\n\n## Deliverable\n\n"
+        f"{task_id} works end to end.\n", encoding="utf-8"
     )
+    task_entry: dict = {
+        "id": task_id,
+        "specPath": f"tasks/{task_id}.md",
+        "risk": "normal",
+        "context": context or [],
+    }
+    if model is not None:
+        task_entry["model"] = model
+    if review_model is not None:
+        task_entry["reviewModel"] = review_model
     plan = {
         "schemaVersion": 1,
         "kind": "wdd_plan",
         "scope": {"id": "SCOPE-x", "baseRef": "wdd/scope-x"},
-        "tasks": [
-            {
-                "id": task_id,
-                "specPath": f"tasks/{task_id}.md",
-                "risk": "normal",
-                "context": context or [],
-            }
-        ],
+        "tasks": [task_entry],
     }
     plan_file = root / "plan.json"
     plan_file.write_text(json.dumps(plan), encoding="utf-8")
@@ -1193,6 +1201,368 @@ class InputVersionBindingTest(unittest.TestCase):
             self.assertEqual(code, 0, out)
             code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
             self.assertEqual(code, 0, out)
+
+
+# --- Task 4: runner registry, probes, dispatch ------------------------------
+
+
+FAKE_RUNNER = str(Path(__file__).resolve().parent / "fixtures" / "fake-runner" / "fake-runner")
+
+
+def _runner_command() -> list[str]:
+    return [FAKE_RUNNER, "--prompt", "{prompt}", "--worktree", "{worktree}", "--logfile", "{logfile}"]
+
+
+def _register_runner(state: str, name: str, command: list[str]) -> None:
+    payload = json.dumps({name: {"command": command}})
+    assert _cli(state, "config", "set", "runners", payload)[0] == 0
+
+
+class RunnerConfigValidationTest(unittest.TestCase):
+    """Spec Sec6: config.json's optional `runners` map."""
+
+    def test_good_shape_validates(self) -> None:
+        config = default_config()
+        config["runners"] = {
+            "local": {"command": ["pi", "--headless", "--cd", "{worktree}", "-p", "{prompt}"]}
+        }
+        validate_config(config)  # must not raise
+
+    def test_absent_runners_key_still_validates(self) -> None:
+        config = default_config()
+        del config["runners"]
+        validate_config(config)  # optional: backward compatible with pre-6b configs
+
+    def test_bad_shapes_rejected(self) -> None:
+        base = default_config()
+        bad_runner_maps = [
+            "not-a-dict",
+            {"local": "not-a-dict"},
+            {"local": {}},
+            {"local": {"command": []}},
+            {"local": {"command": "not-a-list"}},
+            {"local": {"command": [1, 2]}},
+            {"local": {"command": [""]}},
+        ]
+        for bad in bad_runner_maps:
+            config = default_config()
+            config["runners"] = bad
+            with self.assertRaises(ValidationError):
+                validate_config(config)
+
+
+class ProbeCommandUnitTest(unittest.TestCase):
+    """`probe_command`/`runner_command_digest` as pure functions."""
+
+    def test_probe_succeeds_against_fake_runner(self) -> None:
+        result = probe_command(_runner_command())
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["exitCode"], 0)
+        self.assertTrue(result["tokenSeen"])
+        self.assertIsInstance(result["wallMs"], int)
+
+    def test_probe_fails_when_token_is_wrong(self) -> None:
+        with unittest.mock.patch.dict(os.environ, {"FAKE_RUNNER_TOKEN": "NOPE"}):
+            result = probe_command(_runner_command())
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["tokenSeen"])
+        self.assertEqual(result["exitCode"], 0)
+
+    def test_probe_fails_on_nonzero_exit(self) -> None:
+        with unittest.mock.patch.dict(os.environ, {"FAKE_RUNNER_FAIL": "1"}):
+            result = probe_command(_runner_command())
+        self.assertFalse(result["ok"])
+        self.assertNotEqual(result["exitCode"], 0)
+
+    def test_digest_is_stable_and_order_sensitive(self) -> None:
+        command = _runner_command()
+        self.assertEqual(runner_command_digest(command), runner_command_digest(list(command)))
+        reordered = [command[1], command[0], *command[2:]]
+        self.assertNotEqual(runner_command_digest(command), runner_command_digest(reordered))
+
+    def test_digest_rejects_empty_or_malformed_command(self) -> None:
+        for bad in ([], [""], ["ok", 1], "not-a-list"):
+            with self.assertRaises(ValidationError):
+                runner_command_digest(bad)  # type: ignore[arg-type]
+
+
+class ProbeCliTest(unittest.TestCase):
+    """`dispatch --probe-command` (ungoverned) and `dispatch --probe NAME` (governed)."""
+
+    def test_probe_command_without_state_reports_and_does_not_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "nonexistent" / "state.json")
+            code, out = _cli(
+                state, "dispatch", "--probe-command", json.dumps(_runner_command())
+            )
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertTrue(result["ok"])
+            self.assertFalse(result["recorded"])
+            self.assertIn("re-verified", result["note"])
+
+    def test_probe_command_with_state_records_probes_at_matching_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            command = _runner_command()
+            code, out = _cli(state, "dispatch", "--probe-command", json.dumps(command))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["recorded"])
+            digest = result["digest"]
+            self.assertEqual(digest, runner_command_digest(command))
+            recorded = StateStore(Path(state)).read()["probes"]
+            self.assertIn(digest, recorded)
+            self.assertTrue(recorded[digest]["ok"])
+            self.assertIsInstance(recorded[digest]["at"], str)
+
+    def test_probe_command_failure_is_not_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            with unittest.mock.patch.dict(os.environ, {"FAKE_RUNNER_FAIL": "1"}):
+                code, out = _cli(
+                    state, "dispatch", "--probe-command", json.dumps(_runner_command())
+                )
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["recorded"])
+            self.assertEqual(StateStore(Path(state)).read().get("probes"), None)
+
+    def test_probe_name_governed_refuses_under_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            state = str(wdd / "state.json")
+            self.assertEqual(_cli(state, "init", "--repo", str(root))[0], 0)
+            self.assertEqual(_cli(state, "config", "set", "merge.surface", "local")[0], 0)
+            self.assertEqual(
+                _cli(
+                    state, "config", "set", "models",
+                    '{"planning": null, "implementation": {"default": null, "highRisk": null}, '
+                    '"review": null}',
+                )[0], 0,
+            )
+            config = load_config(wdd)
+            if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
+                self.assertEqual(
+                    _cli(state, "config", "set", "verification.commands", '["true"]')[0], 0
+                )
+            _register_runner(state, "test-runner", _runner_command())
+            self.assertEqual(_cli(state, "constitution", "ratify", "--by", "t")[0], 0)
+
+            # Drift: edit config.json after ratification without amending
+            # (the test_setup_config.py precedent for provoking drift).
+            save_config(wdd, set_value(load_config(wdd), "concurrency.maxConcurrent", 5))
+
+            code, out, err = _cli_full(state, "dispatch", "--probe", "test-runner", "--repo", str(root))
+            self.assertEqual(code, 5, err)
+            self.assertIn("drift", err.lower())
+
+    def test_probe_name_unknown_runner_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            code, out, err = _cli_full(state, "dispatch", "--probe", "nope", "--repo", str(root))
+            self.assertEqual(code, 2, err)
+            self.assertIn("unknown runner", err.lower())
+
+    def test_probe_name_success_records_and_matches_command_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            command = _runner_command()
+            _register_runner(state, "test-runner", command)
+            # Registering a runner edits config.json; re-sign so this isn't
+            # governance drift -- that path is covered by its own test above.
+            self.assertEqual(_cli(state, "constitution", "amend", "--by", "t2")[0], 0)
+            code, out = _cli(state, "dispatch", "--probe", "test-runner", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["recorded"])
+            self.assertEqual(result["digest"], runner_command_digest(command))
+
+
+def _dispatch_ready_scope(
+    tmp: str, *, model: str | None = "test-runner", review_model: str | None = None
+) -> tuple[Path, str, Path]:
+    """A ratified v5 scope with a probed `test-runner` registered and a
+    started T1 (worktree + attempt snapshot on disk) -- the common setup
+    every dispatch test builds on."""
+    root, state = _ratified_repo(tmp)
+    wdd = root / ".wdd"
+    command = _runner_command()
+    _register_runner(state, "test-runner", command)
+    # Registering a runner edits config.json; re-sign so probing/dispatch
+    # below aren't blocked by governance drift.
+    assert _cli(state, "constitution", "amend", "--by", "t2")[0] == 0
+    assert _cli(state, "dispatch", "--probe", "test-runner", "--repo", str(root))[0] == 0
+    _apply_v5_scope(root, wdd, state, model=model, review_model=review_model)
+    code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+    assert code == 0, out
+    return root, state, wdd
+
+
+class DispatchTaskTest(unittest.TestCase):
+    """`dispatch --task ID --role worker|reviewer`: governed, digest-gated,
+    input-binding-gated one-shot exec against the fake-runner fixture."""
+
+    def test_refuses_unprobed_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _register_runner(state, "test-runner", _runner_command())  # never probed
+            self.assertEqual(_cli(state, "constitution", "amend", "--by", "t2")[0], 0)
+            _apply_v5_scope(root, wdd, state, model="test-runner")
+            self.assertEqual(_cli(state, "start", "--task", "T1", "--repo", str(root))[0], 0)
+
+            code, out, err = _cli_full(
+                state, "dispatch", "--task", "T1", "--role", "worker", "--repo", str(root)
+            )
+            self.assertEqual(code, 5, err)
+            self.assertIn("no passing probe record", err.lower())
+
+    def test_refuses_non_runner_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _dispatch_ready_scope(tmp, model="claude-opus-not-a-runner")
+            code, out, err = _cli_full(
+                state, "dispatch", "--task", "T1", "--role", "worker", "--repo", str(root)
+            )
+            self.assertEqual(code, 5, err)
+            self.assertIn("not a configured runner", err.lower())
+            self.assertIn("harness-native", err.lower())
+
+    def test_worker_dispatch_runs_fake_runner_and_extracts_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _dispatch_ready_scope(tmp)
+            code, out = _cli(
+                state, "dispatch", "--task", "T1", "--role", "worker", "--repo", str(root)
+            )
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["exitCode"], 0)
+            self.assertEqual(result["statusToken"], "DONE")
+            self.assertIn("DONE", result["tail"])
+
+            log_path = Path(result["log"])
+            self.assertTrue(log_path.is_file())
+            self.assertEqual(log_path.name, "T1-worker-1.log")
+            self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+            dispatch_dir = wdd / "dispatch"
+            self.assertEqual(stat.S_IMODE(dispatch_dir.stat().st_mode), 0o700)
+
+    def test_worker_dispatch_reports_non_done_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _dispatch_ready_scope(tmp)
+            with unittest.mock.patch.dict(os.environ, {"FAKE_RUNNER_TOKEN": "NEEDS_CONTEXT"}):
+                code, out = _cli(
+                    state, "dispatch", "--task", "T1", "--role", "worker", "--repo", str(root)
+                )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["statusToken"], "NEEDS_CONTEXT")
+
+    def test_second_worker_dispatch_gets_attempt_two_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _dispatch_ready_scope(tmp)
+            first = _cli(state, "dispatch", "--task", "T1", "--role", "worker", "--repo", str(root))
+            self.assertEqual(first[0], 0, first[1])
+            second = _cli(state, "dispatch", "--task", "T1", "--role", "worker", "--repo", str(root))
+            self.assertEqual(second[0], 0, second[1])
+            self.assertEqual(Path(json.loads(second[1])["log"]).name, "T1-worker-2.log")
+
+    def test_reviewer_dispatch_validates_result_and_review_collect_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _dispatch_ready_scope(tmp, model="test-runner", review_model="test-runner")
+            _start_and_commit(state, root, "T1")
+            self.assertEqual(_cli(state, "submit", "--task", "T1", "--repo", str(root))[0], 0)
+
+            with unittest.mock.patch.dict(os.environ, {"FAKE_RUNNER_REVIEW_RESULT": "1"}):
+                code, out = _cli(
+                    state, "dispatch", "--task", "T1", "--role", "reviewer", "--repo", str(root)
+                )
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["exitCode"], 0)
+            self.assertIsNotNone(result["resultPath"])
+            self.assertEqual(result["findings"], 0)
+
+            result_path = Path(result["resultPath"])
+            self.assertTrue(result_path.is_file())
+            self.assertEqual(stat.S_IMODE(result_path.stat().st_mode), 0o600)
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["kind"], "wddctl_review_result")
+            self.assertEqual(payload["task"], "T1")
+
+            code, out = _cli(
+                state, "review", "collect", "--task", "T1",
+                "--result", str(result_path), "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            task = StateStore(Path(state)).read()["tasks"]["T1"]
+            self.assertEqual(task["review"]["outcome"], "passed")
+
+    def test_reviewer_dispatch_with_findings_is_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _dispatch_ready_scope(tmp, model="test-runner", review_model="test-runner")
+            _start_and_commit(state, root, "T1")
+            self.assertEqual(_cli(state, "submit", "--task", "T1", "--repo", str(root))[0], 0)
+
+            findings = json.dumps(
+                [{"severity": "P1", "summary": "bug", "file": "a.py", "line": 1}]
+            )
+            with unittest.mock.patch.dict(
+                os.environ,
+                {"FAKE_RUNNER_REVIEW_RESULT": "1", "FAKE_RUNNER_FINDINGS": findings},
+            ):
+                code, out = _cli(
+                    state, "dispatch", "--task", "T1", "--role", "reviewer", "--repo", str(root)
+                )
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["findings"], 1)
+
+            code, out = _cli(
+                state, "review", "collect", "--task", "T1",
+                "--result", result["resultPath"], "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            task = StateStore(Path(state)).read()["tasks"]["T1"]
+            self.assertEqual(task["review"]["outcome"], "blocking")
+
+    def test_edited_command_after_probe_refuses_on_digest_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _dispatch_ready_scope(tmp)
+
+            # Edit the registered runner's command bytes (still named
+            # "test-runner"), then re-ratify so this isn't just governance
+            # drift -- isolating the digest-mismatch refusal specifically.
+            edited_command = _runner_command() + ["--extra-flag"]
+            _register_runner(state, "test-runner", edited_command)
+            self.assertEqual(_cli(state, "constitution", "amend", "--by", "t2")[0], 0)
+
+            code, out, err = _cli_full(
+                state, "dispatch", "--task", "T1", "--role", "worker", "--repo", str(root)
+            )
+            self.assertEqual(code, 5, err)
+            self.assertIn("no passing probe record", err.lower())
+            self.assertNotEqual(
+                runner_command_digest(edited_command), runner_command_digest(_runner_command())
+            )
+
+    def test_dispatch_gated_by_input_binding_like_other_task_verbs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _dispatch_ready_scope(tmp)
+            (wdd / "tasks" / "T1.md").write_text(
+                "# T1\n\nBrief body for T1 -- edited.\n\n## Deliverable\n\nT1 works.\n",
+                encoding="utf-8",
+            )
+            _restamp_plan(root, state)
+
+            code, out, err = _cli_full(
+                state, "dispatch", "--task", "T1", "--role", "worker", "--repo", str(root)
+            )
+            self.assertEqual(code, 5, err)
+            self.assertIn("inputs changed", err.lower())
 
 
 if __name__ == "__main__":
