@@ -48,7 +48,7 @@ Spec §1 ("no path around the ladder"), §7 (wholesale legacy exemption).
 **Files:** `wave_delivery/schema.py`, `wave_delivery/migration.py`; tests in `tests/test_intake.py` (create file with local `_git_repo`/`_cli` helpers copied per convention).
 
 **Interfaces:**
-- `SCHEMA_VERSION = 5`. `validate_state`: top-level `intake` REQUIRED (object). Valid shapes: `{"legacy": True}` or any subset of `{spec, research, design}` records — `spec`: `{by, at, criteria:int, sha256}`; `research`: `{by, at, done:bool, artifacts:[{path, sha256}]}` or `{by, at, skipped:True, reason}`; `design`: `{by, at, sha256, deliverableCommand:str|None}`. All strings non-empty where present.
+- `SCHEMA_VERSION = 5`. `validate_state`: top-level `intake` REQUIRED (object). Valid shapes: `{"legacy": True}` or any subset of `{spec, research, design}` records — `spec`: `{by, at, criteria:int, sha256}`; `research`: `{by, at, done:bool, artifacts:[{path, sha256}]}` or `{by, at, skipped:True, reason}`; `design`: `{by, at, sha256, deliverableCommand}` with `deliverableCommand` a **required non-empty string** (spec §2 — the epic deliverable's proof is not optional). All strings non-empty where present.
 - `new_setup_state()` → v5, `intake: {}`. `new_state()` → v5, `intake: {}` as well — constructors never mint `legacy`; only `migrate` writes it. Hand-built test scopes set it explicitly per the architecture note above.
 - `migrate`: `SUPPORTED_SOURCE_VERSIONS = {2, 3, 4}`; v4→v5 = version bump + `intake: {"legacy": True}`; chain the earlier conversions. Version-hint message covers 2, 3, 4.
 - `intake_complete(state) -> bool`: legacy → True; else spec+research+design records all present.
