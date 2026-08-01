@@ -874,17 +874,26 @@ def main(argv: list[str] | None = None) -> int:
                 worktree=args.worktree,
                 **_concurrency(args),
             )
-            # Materialize + record a fresh attempt snapshot only on a genuine
-            # new dispatch. A duplicate (idempotency-key replay) did no new
-            # work; a reattach (leases._reattach's action is prefixed
-            # "reattach:") reconnects an in-progress task's worktree without
-            # re-approving anything -- re-materializing there would silently
-            # re-bind input digests to whatever the source files currently
-            # are, defeating Task 3's rebind gate. Either way, surface the
-            # already-recorded snapshot if the task has one.
+            # Materialize + record a fresh attempt snapshot on a genuine new
+            # dispatch, OR whenever the task has no recorded snapshot yet --
+            # self-healing for the crash window between task.started
+            # committing and materialize_attempt/record_attempt succeeding.
+            # Without the second condition, an idempotency-keyed retry after
+            # that crash hits duplicate=True and would skip materialization
+            # forever, leaving the task stuck in_progress with snapshot None.
+            # A duplicate/reattach that already HAS a snapshot keeps the
+            # original no-new-attempt behavior: a reattach (leases._reattach's
+            # action is prefixed "reattach:") reconnects an in-progress task's
+            # worktree without re-approving anything, and re-materializing
+            # there would silently re-bind input digests to whatever the
+            # source files currently are, defeating Task 3's rebind gate.
             is_reattach = str(result.get("action", "")).startswith("reattach:")
-            if not duplicate and not is_reattach:
-                pre_state = store.read()
+            pre_state = store.read()
+            existing_task = pre_state["tasks"].get(args.task) or {}
+            needs_attempt = (not duplicate and not is_reattach) or not existing_task.get(
+                "snapshot"
+            )
+            if needs_attempt:
                 materialized = materialize_attempt(pre_state, store.path.parent, args.task)
                 state_after, _ = record_attempt(
                     store,
@@ -899,13 +908,11 @@ def main(argv: list[str] | None = None) -> int:
                     "inputsRecorded": len(recorded.get("inputs") or []),
                 }
             else:
-                task = store.read()["tasks"].get(args.task) or {}
-                if task.get("snapshot"):
-                    result = {
-                        **result,
-                        "snapshot": task["snapshot"],
-                        "inputsRecorded": len(task.get("inputs") or []),
-                    }
+                result = {
+                    **result,
+                    "snapshot": existing_task["snapshot"],
+                    "inputsRecorded": len(existing_task.get("inputs") or []),
+                }
             _print_json({**result, "duplicate": duplicate})
             return 0
 

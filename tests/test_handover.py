@@ -16,6 +16,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from wave_delivery.config import default_config, load_config, validate_config
@@ -578,6 +579,47 @@ class AttemptSnapshotTest(unittest.TestCase):
             self.assertEqual(result["snapshot"], first_snapshot)
             self.assertFalse((wdd / "dispatch" / "T1-2").exists())
 
+    def test_stuck_started_task_self_heals_on_retry_with_same_idempotency_key(self) -> None:
+        """Simulates the crash window between task.started committing and
+        materialize_attempt/record_attempt succeeding: a task left in_progress
+        with snapshot/inputs cleared (StateStore hand-edit stands in for the
+        real failure, cheaper and more deterministic than fault injection). A
+        retry of 'start' with the SAME idempotency key used to hit
+        duplicate=True and skip materialization forever (stuck permanently);
+        it must now self-heal by materializing on that retry."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_v5_scope(root, wdd, state)
+
+            code, out = _cli(
+                state, "start", "--task", "T1", "--repo", str(root),
+                "--idempotency-key", "retry-key",
+            )
+            self.assertEqual(code, 0, out)
+            first_snapshot = json.loads(out)["snapshot"]
+            self.assertEqual(first_snapshot, "dispatch/T1-1")
+
+            store = StateStore(Path(state))
+            stuck = store.read()
+            stuck["tasks"]["T1"]["snapshot"] = None
+            stuck["tasks"]["T1"]["inputs"] = []
+            store.write(stuck)
+
+            code, out = _cli(
+                state, "start", "--task", "T1", "--repo", str(root),
+                "--idempotency-key", "retry-key",
+            )
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertTrue(result["duplicate"])
+            self.assertIsNotNone(result.get("snapshot"))
+            self.assertGreater(result.get("inputsRecorded", 0), 0)
+
+            recorded = StateStore(Path(state)).read()["tasks"]["T1"]
+            self.assertIsNotNone(recorded["snapshot"])
+            self.assertTrue((wdd / recorded["snapshot"]).is_dir())
+
     def test_legacy_start_records_snapshot_but_no_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _git_repo(tmp)
@@ -668,6 +710,61 @@ class MaterializeAttemptUnitTest(unittest.TestCase):
             state["tasks"]["T1"] = task_state("T1", conflict_domains=["src/t1/**"])
             with self.assertRaises(ValidationError):
                 materialize_attempt(state, wdd, "T1")
+
+    def test_materialize_attempt_retries_past_a_precreated_colliding_dir(self) -> None:
+        """The glob-count-then-mkdir(exist_ok=False) allocation in
+        _next_attempt_number/materialize_attempt is not atomic: something can
+        create the candidate dir between the count and the mkdir (a stray
+        leftover from a previous partial run, a concurrent racer). Faking a
+        pre-created 'T1-1' by forcing the computed attempt number to 1 (via
+        mock, per the fix-round's own suggestion -- deterministic, no fault
+        injection needed) reproduces exactly that collision: materialize_attempt
+        must retry the next number rather than propagate a raw FileExistsError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            wdd.mkdir()
+            (wdd / "tasks").mkdir()
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            state = _ratified(new_state("SCOPE-x", base_ref="wdd/x"))
+            state["tasks"]["T1"] = task_state(
+                "T1", conflict_domains=["src/t1/**"], spec_path="tasks/T1.md"
+            )
+
+            (wdd / "dispatch").mkdir()
+            (wdd / "dispatch" / "T1-1").mkdir()
+
+            with unittest.mock.patch(
+                "wave_delivery.handover._next_attempt_number", return_value=1
+            ):
+                result = materialize_attempt(state, wdd, "T1")
+            self.assertEqual(result["snapshot"], "dispatch/T1-2")
+            self.assertTrue((wdd / "dispatch" / "T1-2").is_dir())
+
+    def test_materialize_attempt_gives_up_after_bounded_collision_retries(self) -> None:
+        """Every candidate number from the computed attempt onward is already
+        taken (pathological, but the retry loop must still terminate cleanly
+        with a ValidationError rather than looping forever or leaking a raw
+        FileExistsError)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            wdd.mkdir()
+            (wdd / "tasks").mkdir()
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            state = _ratified(new_state("SCOPE-x", base_ref="wdd/x"))
+            state["tasks"]["T1"] = task_state(
+                "T1", conflict_domains=["src/t1/**"], spec_path="tasks/T1.md"
+            )
+
+            dispatch_dir = wdd / "dispatch"
+            dispatch_dir.mkdir()
+            for n in range(1, 101):
+                (dispatch_dir / f"T1-{n}").mkdir()
+
+            with unittest.mock.patch(
+                "wave_delivery.handover._next_attempt_number", return_value=1
+            ):
+                with self.assertRaises(ValidationError):
+                    materialize_attempt(state, wdd, "T1")
 
 
 if __name__ == "__main__":

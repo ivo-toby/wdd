@@ -35,6 +35,12 @@ _DISPATCH_GITIGNORE_ENTRY = "dispatch/"
 _ATTEMPT_DIR_MODE = 0o700
 _ATTEMPT_FILE_MODE = 0o400
 
+# Bound on attempt-number collision retries (see materialize_attempt): a
+# generous ceiling for a scenario that should be rare (a stray leftover dir,
+# a concurrent racer), just large enough that it never bites a legitimate
+# caller while still guaranteeing termination.
+_MAX_ATTEMPT_DIR_RETRIES = 100
+
 
 def _sanitize_task_id_for_filename(task_id: str) -> str:
     sanitized = _UNSAFE_FILENAME_CHARS.sub("_", task_id)
@@ -119,8 +125,26 @@ def materialize_attempt(
 
     sanitized = _sanitize_task_id_for_filename(task_id)
     attempt = _next_attempt_number(dispatch_dir, sanitized)
-    attempt_dir = dispatch_dir / f"{sanitized}-{attempt}"
-    attempt_dir.mkdir(parents=False, exist_ok=False)
+    # mkdir(exist_ok=False) is the collision check, but the glob count above
+    # is not atomic with it -- a stray leftover dir or a concurrent racer can
+    # already occupy the counted number. Retry the next number on collision
+    # (bounded, so a pathological all-taken run fails cleanly instead of
+    # looping forever) rather than let a raw FileExistsError escape.
+    attempt_dir: Path | None = None
+    for _ in range(_MAX_ATTEMPT_DIR_RETRIES):
+        candidate = dispatch_dir / f"{sanitized}-{attempt}"
+        try:
+            candidate.mkdir(parents=False, exist_ok=False)
+        except FileExistsError:
+            attempt += 1
+            continue
+        attempt_dir = candidate
+        break
+    if attempt_dir is None:
+        raise ValidationError(
+            f"could not allocate an attempt dir for task {task_id!r} after "
+            f"{_MAX_ATTEMPT_DIR_RETRIES} collision retries"
+        )
     os.chmod(attempt_dir, _ATTEMPT_DIR_MODE)
 
     inputs: list[dict[str, str]] = []
