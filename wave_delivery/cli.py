@@ -30,6 +30,7 @@ from .constitution import probe_repository, ratification_status, read_proposal, 
 from .setup import _intake_ladder_action, init_repository, migrate_governance, setup_next_actions
 from .doctor import inspect_capabilities
 from .engine import (
+    ACTIVE_STATUSES,
     admission_schedule,
     apply_event,
     bounded_next_actions,
@@ -51,7 +52,7 @@ from .finalize import (
 from .freshness import check_freshness, record_freshness
 from .git import require_repository, resolve_ref
 from .github import comment_pr, create_pr, push_branch
-from .handover import materialize_attempt, record_attempt
+from .handover import inputs_status, materialize_attempt, record_attempt, rebind_attempt
 from .intake import (
     intake_status,
     record_design,
@@ -98,8 +99,32 @@ GOVERNED_VERBS = {
     ("finalize", "verify"),
     ("finalize", "handoff"),
     ("finalize", "delivered"),
+    # rebind is governed (config/constitution + intake/plan drift must still
+    # be fresh) but deliberately NOT in TASK_INPUT_GATED_VERBS below: it is
+    # the remedy input-version binding demands, and must stay legal exactly
+    # when a task's own inputs_status is non-None.
+    ("rebind", None),
     # The escape hatch bypasses transitions, not governance.
     ("event", "apply"),
+}
+
+# Task-targeted governed verbs additionally gated by input-version binding
+# (spec Sec3, Task 3): refuse via IllegalTransition when the TARGETED task's
+# own `inputs_status` is non-None -- its recorded attempt's brief/context
+# digests no longer match the current bytes, so review/verification/merge
+# evidence for it is no longer trustworthy. `start` is deliberately absent:
+# a fresh `start` re-materializes and re-records, which IS the re-dispatch
+# remedy, not something the gate should block. Scope-level verbs (finalize,
+# reconcile) and other tasks are unaffected -- this is a per-task gate, not
+# a scope-wide one (that's `require_fresh_intake`'s plan_drift, above).
+TASK_INPUT_GATED_VERBS = {
+    ("submit", None),
+    ("review", "record"),
+    ("review", "collect"),
+    ("verify", "record"),
+    ("verify", "collect"),
+    ("refresh", None),
+    ("merge", None),
 }
 
 
@@ -419,6 +444,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_concurrency_flags(merge)
 
+    rebind = subparsers.add_parser(
+        "rebind",
+        help="record that a task's changed inputs are accepted; re-records digests vs current bytes",
+    )
+    rebind.add_argument("--task", required=True)
+    rebind.add_argument("--by", required=True)
+    rebind.add_argument("--repo", type=Path, default=Path("."))
+    _add_concurrency_flags(rebind)
+
     release = subparsers.add_parser("release", help="remove a finished task's worktree")
     release.add_argument("--task", required=True)
     release.add_argument("--repo", type=Path, default=Path("."))
@@ -716,6 +750,73 @@ def _apply_execution_drift(
     return result
 
 
+def _apply_input_binding(
+    result: dict[str, Any],
+    state: dict[str, Any],
+    wdd_dir: Path,
+    *,
+    state_path: str | None = None,
+    repo: str = ".",
+) -> dict[str, Any]:
+    """Layer per-task `inputs_changed` actions onto a `next` result (spec Sec3
+    input-version binding, Task 3).
+
+    Mirrors `_apply_execution_drift`'s CLI-injection pattern for the same
+    reason: `inputs_status` needs `.wdd`-relative file reads, so it cannot
+    live in the file-free engine, and is computed and injected here instead.
+    Runs AFTER `_apply_execution_drift` and unconditionally adds to whatever
+    it left behind (including an already-emptied `actions` list from a
+    scope-wide drift blocker): the two gates are orthogonal -- the composite
+    gates the plan, per-task digests gate the task -- so a controller mid-
+    remedy for one still needs to see the other. This is exactly the "a
+    started task's context edit fires BOTH plan_drift and inputs_changed"
+    interplay the plan calls out; the judgment below names re-stamping the
+    plan first when both are present.
+
+    Only ACTIVE_STATUSES tasks (in_progress/review/merge_ready) are checked:
+    a `todo` task was never started, so it has no recorded `inputs` to have
+    gone stale (`inputs_status` returns None for it regardless), and
+    done/cancelled tasks are merged-evidence-is-history -- never gated,
+    never surfaced, so they are skipped outright rather than relying on
+    `inputs_status` to say None. For a mismatched task, its own gate action
+    (if any) is removed from `result["actions"]` -- don't emit `run_review`
+    for a task whose inputs are stale -- and replaced with one
+    `inputs_changed` action; other tasks' actions are untouched.
+    """
+    prefix = "wddctl" + (f" --state {shlex.quote(state_path)}" if state_path else "")
+    for task_id, task in sorted(state["tasks"].items()):
+        if task["status"] not in ACTIVE_STATUSES:
+            continue
+        mismatch = inputs_status(state, wdd_dir, task_id)
+        if mismatch is None:
+            continue
+        result["actions"] = [a for a in result["actions"] if a.get("task") != task_id]
+        rebind_command = (
+            f"{prefix} rebind --task {shlex.quote(task_id)} --by NAME "
+            f"--repo {shlex.quote(repo)}"
+        )
+        result["actions"].append(
+            {
+                "task": task_id,
+                "action": "inputs_changed",
+                "path": mismatch["path"],
+                "recorded": mismatch["recorded"],
+                "actual": mismatch["actual"],
+                "judgment": (
+                    f"{mismatch['path']} changed since task {task_id}'s attempt was "
+                    "dispatched: its recorded input digest no longer matches the current "
+                    "bytes, so unmerged review/verification evidence for it is no longer "
+                    "trustworthy. If a plan_drift blocker is also present above, re-stamp "
+                    "the plan first ('wddctl plan apply --approved-by NAME'); either way, "
+                    "then decide: rebind to accept the existing work as still valid, or "
+                    "discard it and re-dispatch a fresh attempt (block, unblock, then start)."
+                ),
+                "recordWith": rebind_command,
+            }
+        )
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -725,6 +826,27 @@ def main(argv: list[str] | None = None) -> int:
             gated_state = store.read()
             require_fresh_governance(gated_state, store.path.parent)
             require_fresh_intake(gated_state, store.path.parent)
+            if (args.command, _subcommand(args)) in TASK_INPUT_GATED_VERBS:
+                gated_task_id = getattr(args, "task", None)
+                gated_task = (gated_state.get("tasks") or {}).get(gated_task_id) if gated_task_id else None
+                # Merged evidence is history (spec Sec3): a done/cancelled
+                # task is never gated here, matching `_apply_input_binding`'s
+                # identical ACTIVE_STATUSES-only check for `next`'s
+                # surfacing. Without this, a governed verb aimed at an
+                # already-terminal task (a stale digest left over from
+                # before it merged) would refuse with the wrong reason --
+                # "inputs changed" instead of the transition's own "not
+                # legal from done".
+                if gated_task is not None and gated_task.get("status") in ACTIVE_STATUSES:
+                    mismatch = inputs_status(gated_state, store.path.parent, gated_task_id)
+                    if mismatch is not None:
+                        raise IllegalTransition(
+                            f"inputs changed for task {gated_task_id}: {mismatch['path']} "
+                            f"recorded {mismatch['recorded']}, now {mismatch['actual']}; run "
+                            f"'wddctl rebind --task {gated_task_id} --by NAME --repo .' to "
+                            "accept the existing work as still valid, or re-dispatch a fresh "
+                            "attempt (block, unblock, then start)"
+                        )
 
         if args.command == "doctor":
             state = store.read() if store.exists() else None
@@ -853,6 +975,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             _apply_execution_drift(
                 result, state, store.path.parent, state_path=_state_option(args)
+            )
+            _apply_input_binding(
+                result, state, store.path.parent,
+                state_path=_state_option(args), repo=str(args.repo),
             )
             _print_json(result)
             return 0
@@ -1290,6 +1416,24 @@ def main(argv: list[str] | None = None) -> int:
                         # to a warning instead of losing the merge.
                         result["warning"] = f"push of {base_ref} to origin failed: {error}"
             _print_json(result)
+            return 0
+
+        if args.command == "rebind":
+            state, duplicate = rebind_attempt(
+                store,
+                task_id=args.task,
+                wdd_dir=store.path.parent,
+                by=args.by,
+                **_concurrency(args),
+            )
+            task = state["tasks"][args.task]
+            _print_json(
+                {
+                    "revision": state["revision"],
+                    "duplicate": duplicate,
+                    "inputsRecorded": len(task.get("inputs") or []),
+                }
+            )
             return 0
 
         if args.command == "release":

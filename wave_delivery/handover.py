@@ -17,8 +17,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .engine import apply_mutation
-from .errors import ValidationError
+from .engine import apply_mutation, utc_now
+from .errors import IllegalTransition, ValidationError
 from .intake import artifact_sha256, resolve_within_wdd
 from .schema import copied_state
 from .store import StateStore, atomic_write_text
@@ -84,20 +84,19 @@ def _next_attempt_number(dispatch_dir: Path, sanitized_task_id: str) -> int:
     return 1 + len(existing)
 
 
-def materialize_attempt(
-    state: dict[str, Any], wdd_dir: Path | str, task_id: str
-) -> dict[str, Any]:
-    """Copy a task's brief + context-ref files into a fresh, read-only attempt dir.
+def _task_input_sources(
+    state: dict[str, Any], wdd_dir: Path, task_id: str
+) -> list[Path]:
+    """Resolve a task's brief + context-ref files to absolute paths, deduped.
 
-    Returns ``{"snapshot": <.wdd-relative dir path>, "inputs": [{"path", "sha256"}, ...]}``.
-    ``inputs`` digests are of the SOURCE files (the live `.wdd` copies), not
-    the snapshot copies, and paths are `.wdd`-relative -- the same doctrine
-    `plan_composite`/research artifacts already use. Anchors (`#...`) are
-    stripped for file resolution; a file referenced twice (brief == a context
-    ref, or a duplicate context ref) copies once and appears once in `inputs`.
+    Shared by `materialize_attempt` (copies them into a snapshot) and
+    `rebind_attempt` (Task 3: re-hashes them in place against current bytes)
+    -- both need the identical source-file resolution, so a re-approval that
+    adds or removes a context ref is picked up the same way by either path.
+    Anchors (`#...`) are stripped for file resolution; a file referenced
+    twice (brief == a context ref, or a duplicate context ref) appears once,
+    in first-seen order (brief first, then context refs in plan order).
     """
-    wdd_dir = Path(wdd_dir)
-    wdd_resolved = wdd_dir.resolve()
     try:
         task = state["tasks"][task_id]
     except KeyError as error:
@@ -118,6 +117,24 @@ def materialize_attempt(
     for ref in task.get("context") or []:
         path_part = ref.split("#", 1)[0]
         _add(path_part, label="context ref")
+    return sources
+
+
+def materialize_attempt(
+    state: dict[str, Any], wdd_dir: Path | str, task_id: str
+) -> dict[str, Any]:
+    """Copy a task's brief + context-ref files into a fresh, read-only attempt dir.
+
+    Returns ``{"snapshot": <.wdd-relative dir path>, "inputs": [{"path", "sha256"}, ...]}``.
+    ``inputs`` digests are of the SOURCE files (the live `.wdd` copies), not
+    the snapshot copies, and paths are `.wdd`-relative -- the same doctrine
+    `plan_composite`/research artifacts already use. Anchors (`#...`) are
+    stripped for file resolution; a file referenced twice (brief == a context
+    ref, or a duplicate context ref) copies once and appears once in `inputs`.
+    """
+    wdd_dir = Path(wdd_dir)
+    wdd_resolved = wdd_dir.resolve()
+    sources = _task_input_sources(state, wdd_dir, task_id)
 
     dispatch_dir = wdd_dir / "dispatch"
     dispatch_dir.mkdir(parents=True, exist_ok=True)
@@ -198,6 +215,107 @@ def record_attempt(
         event_type="task.dispatched",
         task_id=task_id,
         data={"snapshot": snapshot},
+        idempotency_key=idempotency_key,
+        expected_revision=expected_revision,
+        mutator=mutator,
+    )
+
+
+def inputs_status(
+    state: dict[str, Any], wdd_dir: Path | str, task_id: str
+) -> dict[str, str] | None:
+    """The task's input-version-binding status (spec Sec3).
+
+    None when the task has no recorded ``inputs`` (a legacy scope, a pre-6b
+    task, or one that has never started -- `record_attempt` is what first
+    populates it) or when every recorded digest still matches the CURRENT
+    bytes at that path. Otherwise, the FIRST mismatch in recorded order, as
+    ``{"path", "recorded", "actual"}``; a since-deleted file reports
+    ``"actual": "missing:<path>"`` rather than raising.
+
+    Deliberately compares the RECORDED (path, sha256) pairs as-is, not a
+    freshly re-derived source set (`_task_input_sources`): a plan
+    re-approval that only touched some OTHER task's brief or context must
+    not perturb this task's own gate. The composite gates the plan; these
+    per-task digests gate the task -- keeping that boundary exact is the
+    point of testing against what was actually recorded, not what the task's
+    fields currently say to resolve.
+    """
+    wdd_dir = Path(wdd_dir)
+    try:
+        task = state["tasks"][task_id]
+    except KeyError as error:
+        raise ValidationError(f"unknown task: {task_id}") from error
+
+    recorded = task.get("inputs") or []
+    if not recorded:
+        return None
+
+    wdd_resolved = wdd_dir.resolve()
+    for entry in recorded:
+        path = entry["path"]
+        recorded_sha = entry["sha256"]
+        candidate = wdd_resolved / path
+        if not candidate.exists() or not candidate.is_file():
+            return {"path": path, "recorded": recorded_sha, "actual": f"missing:{path}"}
+        actual_sha = artifact_sha256(candidate)
+        if actual_sha != recorded_sha:
+            return {"path": path, "recorded": recorded_sha, "actual": actual_sha}
+    return None
+
+
+def rebind_attempt(
+    store: StateStore,
+    *,
+    task_id: str,
+    wdd_dir: Path | str,
+    by: str,
+    idempotency_key: str | None = None,
+    expected_revision: int | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Re-record a task's input digests against CURRENT bytes.
+
+    The recorded human decision (spec Sec3) that a task's in-flight attempt
+    and its unmerged evidence still stand, despite the recorded digests no
+    longer matching -- the escape hatch alongside re-dispatch (a fresh
+    `start`). Refuses ("nothing to rebind") when `inputs_status` is already
+    None: a legacy/pre-6b task, one that never started, and one whose
+    recorded digests already match current bytes all have nothing to
+    re-bind, and are refused the same way.
+
+    Re-resolves the task's CURRENT source set (`_task_input_sources`) rather
+    than only re-hashing the previously recorded paths, so a re-approval
+    that also added or removed a context ref is picked up too -- the same
+    resolution `materialize_attempt` uses, just re-hashing in place instead
+    of copying into a new snapshot (rebind does not mint a new attempt dir;
+    the existing snapshot and worktree are exactly what the human is
+    vouching still stands).
+    """
+    if not by:
+        raise ValidationError("rebind requires --by")
+    wdd_dir = Path(wdd_dir)
+
+    def mutator(state: dict[str, Any]) -> dict[str, Any]:
+        if inputs_status(state, wdd_dir, task_id) is None:
+            raise IllegalTransition(
+                f"nothing to rebind for task {task_id}: it has no recorded inputs, or its "
+                "recorded digests already match the current bytes"
+            )
+        sources = _task_input_sources(state, wdd_dir, task_id)
+        wdd_resolved = wdd_dir.resolve()
+        new_inputs = [
+            {"path": str(source.relative_to(wdd_resolved)), "sha256": artifact_sha256(source)}
+            for source in sources
+        ]
+        updated = copied_state(state)
+        updated["tasks"][task_id]["inputs"] = new_inputs
+        return updated
+
+    return apply_mutation(
+        store,
+        event_type="task.rebound",
+        task_id=task_id,
+        data={"by": by, "at": utc_now()},
         idempotency_key=idempotency_key,
         expected_revision=expected_revision,
         mutator=mutator,

@@ -21,16 +21,32 @@ from pathlib import Path
 
 from wave_delivery.config import default_config, load_config, validate_config
 from wave_delivery.engine import bounded_next_actions
-from wave_delivery.errors import ValidationError
+from wave_delivery.errors import IllegalTransition, ValidationError
 from wave_delivery.handover import (
     ensure_dispatch_gitignore,
+    inputs_status,
     materialize_attempt,
     record_attempt,
+    rebind_attempt,
 )
 from wave_delivery.intake import artifact_sha256
 from wave_delivery.schema import new_state, task_state
 from wave_delivery.setup import init_repository, migrate_governance
 from wave_delivery.store import StateStore
+
+
+def _cli_full(state: str, *argv: str) -> tuple[int, str, str]:
+    """Like _cli, but also captures stderr for asserting on refusal messages.
+
+    Copied from tests/test_intake.py's helper of the same name (no
+    cross-file imports between test modules)."""
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        from wave_delivery.cli import main
+
+        code = main(["--state", state, *argv])
+    return code, stdout.getvalue(), stderr.getvalue()
 
 
 def _git_repo(tmp: str) -> Path:
@@ -359,6 +375,21 @@ def _walk_intake(state: str, wdd: Path, approver: str = "t") -> None:
             "--deliverable-command", "true",
         )[0]
         == 0
+    )
+
+
+def _start_and_commit(state: str, root: Path, task_id: str = "T1", message: str = "do work") -> None:
+    """Copied from tests/test_intake.py's helper of the same name (no
+    cross-file imports between test modules)."""
+    code, out = _cli(state, "start", "--task", task_id, "--repo", str(root))
+    assert code == 0, out
+    worktree = Path(json.loads(out)["worktree"])
+    (worktree / "change.txt").write_text(f"{message}\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+         "-c", "commit.gpgsign=false", "commit", "-qm", message],
+        cwd=worktree, check=True,
     )
 
 
@@ -765,6 +796,403 @@ class MaterializeAttemptUnitTest(unittest.TestCase):
             ):
                 with self.assertRaises(ValidationError):
                     materialize_attempt(state, wdd, "T1")
+
+
+# --- Task 3: input-version binding ------------------------------------------
+
+
+def _apply_v5_scope_two_tasks(
+    root: Path, wdd: Path, state: str, *, contexts: dict[str, list[str]] | None = None
+) -> None:
+    """Walk the intake ladder and composite-approve a two-task plan (T1, T2)
+    with distinct conflict domains, real briefs on disk, and optional
+    per-task context refs -- for sibling-task-unaffected coverage that
+    `_apply_v5_scope`'s single task cannot exercise."""
+    _walk_intake(state, wdd)
+    (wdd / "tasks").mkdir(exist_ok=True)
+    contexts = contexts or {}
+    tasks = []
+    for task_id in ("T1", "T2"):
+        (wdd / "tasks" / f"{task_id}.md").write_text(
+            f"# {task_id}\n\nBrief body for {task_id}.\n", encoding="utf-8"
+        )
+        tasks.append(
+            {
+                "id": task_id,
+                "specPath": f"tasks/{task_id}.md",
+                "risk": "normal",
+                "conflictDomains": [f"src/{task_id.lower()}/**"],
+                "context": contexts.get(task_id, []),
+            }
+        )
+    plan = {
+        "schemaVersion": 1,
+        "kind": "wdd_plan",
+        "scope": {"id": "SCOPE-x", "baseRef": "wdd/scope-x"},
+        "tasks": tasks,
+    }
+    plan_file = root / "plan.json"
+    plan_file.write_text(json.dumps(plan), encoding="utf-8")
+    code, out = _cli(
+        state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+        "--approved-by", "t",
+    )
+    assert code == 0, out
+
+
+def _restamp_plan(root: Path, state: str, *, approved_by: str = "t2") -> None:
+    """Re-apply the currently-applied plan.json unchanged, with a fresh
+    --approved-by.
+
+    Spec Sec3's 'empty diff, re-stamp' remedy for plan_drift: apply_plan's
+    'unchanged' path (no task-field diff) still recomputes the composite
+    over the CURRENT file bytes and re-stamps when --approved-by is passed,
+    which is exactly what clears a composite mismatch caused by editing a
+    brief/context file's bytes without touching plan.json itself.
+    """
+    plan_file = root / "plan.json"
+    code, out = _cli(
+        state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+        "--approved-by", approved_by,
+    )
+    assert code == 0, out
+
+
+class InputVersionBindingTest(unittest.TestCase):
+    """Spec Sec3 input-version binding: `inputs_status`, the task-targeted
+    gate on submit/review/verify/refresh/merge, `rebind`, and `next`'s
+    per-task `inputs_changed` surfacing -- including the pinned interplay
+    with 6a's scope-wide `plan_drift`."""
+
+    def test_context_edit_after_start_gates_submit_not_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            (wdd / "shared-context").mkdir(exist_ok=True)
+            (wdd / "shared-context" / "contract.md").write_text(
+                "contract v1\n", encoding="utf-8"
+            )
+            _apply_v5_scope_two_tasks(
+                root, wdd, state, contexts={"T1": ["shared-context/contract.md"]}
+            )
+            _start_and_commit(state, root, "T1")
+            _start_and_commit(state, root, "T2")
+
+            # Drift T1's context file, then re-stamp the plan (spec Sec3's
+            # remedy for the scope-wide composite) so what's left is purely
+            # T1's own stale recorded digest -- isolating the per-task gate.
+            (wdd / "shared-context" / "contract.md").write_text(
+                "contract v2 -- edited\n", encoding="utf-8"
+            )
+            _restamp_plan(root, state)
+
+            code, out, err = _cli_full(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 5, err)
+            self.assertIn("inputs changed", err.lower())
+            self.assertIn("rebind", err.lower())
+
+            # T2 (no context ref, untouched) submits cleanly: the gate is
+            # per-task, not scope-wide.
+            code, out = _cli(state, "submit", "--task", "T2", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            changed = [a for a in result["actions"] if a["action"] == "inputs_changed"]
+            self.assertEqual([a["task"] for a in changed], ["T1"])
+            self.assertEqual(changed[0]["path"], "shared-context/contract.md")
+            self.assertIn("rebind", changed[0]["recordWith"])
+            self.assertIn("--task T1", changed[0]["recordWith"])
+            # T1's own gate action (await_worker, pre-drift) is suppressed --
+            # not emitted alongside inputs_changed for the same task.
+            self.assertNotIn(
+                "await_worker", {a["action"] for a in result["actions"] if a["task"] == "T1"}
+            )
+
+    def test_merge_also_refuses_when_inputs_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_v5_scope(root, wdd, state)
+            _start_and_commit(state, root, "T1")
+            self.assertEqual(_cli(state, "submit", "--task", "T1", "--repo", str(root))[0], 0)
+            self.assertEqual(
+                _cli(state, "verify", "record", "--task", "T1", "--status", "passed")[0], 0
+            )
+            self.assertEqual(
+                _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0], 0
+            )
+
+            (wdd / "tasks" / "T1.md").write_text(
+                "# T1\n\nBrief body for T1 -- edited.\n", encoding="utf-8"
+            )
+            _restamp_plan(root, state)
+
+            code, out, err = _cli_full(state, "merge", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 5, err)
+            self.assertIn("inputs changed", err.lower())
+
+    def test_rebind_clears_the_gate_and_re_records_current_digests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_v5_scope(root, wdd, state)
+            _start_and_commit(state, root, "T1")
+
+            new_brief = "# T1\n\nBrief body for T1 -- edited.\n"
+            (wdd / "tasks" / "T1.md").write_text(new_brief, encoding="utf-8")
+            _restamp_plan(root, state)
+
+            code, out, err = _cli_full(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 5, err)
+
+            code, out = _cli(state, "rebind", "--task", "T1", "--by", "reviewer-t", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["inputsRecorded"], 1)
+
+            task = StateStore(Path(state)).read()["tasks"]["T1"]
+            self.assertEqual(task["inputs"][0]["sha256"], artifact_sha256(wdd / "tasks" / "T1.md"))
+            events = StateStore(Path(state)).read()["events"]
+            rebound = [e for e in events if e["type"] == "task.rebound"]
+            self.assertEqual(len(rebound), 1)
+            self.assertEqual(rebound[0]["task"], "T1")
+
+            # Now clear: submit succeeds, and next has no inputs_changed for T1.
+            code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "next")
+            changed = [a for a in json.loads(out)["actions"] if a["action"] == "inputs_changed"]
+            self.assertEqual(changed, [])
+
+    def test_rebind_refuses_when_nothing_to_rebind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_v5_scope(root, wdd, state)
+            _start_and_commit(state, root, "T1")
+
+            code, out, err = _cli_full(
+                state, "rebind", "--task", "T1", "--by", "t", "--repo", str(root)
+            )
+            self.assertEqual(code, 5, err)
+            self.assertIn("nothing to rebind", err.lower())
+
+    def test_restart_after_block_unblock_rematerializes_and_clears(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_v5_scope(root, wdd, state)
+
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            (wdd / "tasks" / "T1.md").write_text(
+                "# T1\n\nBrief body for T1 -- edited.\n", encoding="utf-8"
+            )
+            _restamp_plan(root, state)
+
+            state_obj = StateStore(Path(state)).read()
+            self.assertIsNotNone(inputs_status(state_obj, wdd, "T1"))
+
+            self.assertEqual(
+                _cli(state, "block", "--task", "T1", "--reason", "resolving drift")[0], 0
+            )
+            self.assertEqual(_cli(state, "unblock", "--task", "T1")[0], 0)
+
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["snapshot"], "dispatch/T1-2")
+
+            state_obj = StateStore(Path(state)).read()
+            self.assertIsNone(inputs_status(state_obj, wdd, "T1"))
+
+    def test_done_task_brief_edit_not_gated_after_plan_restamp(self) -> None:
+        """Merged evidence is history (spec Sec3): once a task is done, its
+        recorded inputs are never re-checked, even after a later edit to its
+        own brief -- gated only by the scope-wide plan_drift blocker (6a)
+        until the plan is re-stamped, exactly like any other post-merge
+        drift. This is the interplay pin's other half: the FIRST sentence
+        ('editing a NOT-started -- here, a DONE -- task's brief fires
+        scope-wide plan_drift only') applies to a merged task the same way
+        it does to a not-yet-started one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_v5_scope(root, wdd, state)
+            _start_and_commit(state, root, "T1")
+            self.assertEqual(_cli(state, "submit", "--task", "T1", "--repo", str(root))[0], 0)
+            self.assertEqual(
+                _cli(state, "verify", "record", "--task", "T1", "--status", "passed")[0], 0
+            )
+            self.assertEqual(
+                _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0], 0
+            )
+            self.assertEqual(_cli(state, "merge", "--task", "T1", "--repo", str(root))[0], 0)
+            self.assertEqual(
+                StateStore(Path(state)).read()["tasks"]["T1"]["status"], "done"
+            )
+
+            (wdd / "tasks" / "T1.md").write_text(
+                "# T1\n\nBrief body for T1 -- edited post-merge.\n", encoding="utf-8"
+            )
+
+            # Before re-stamp: scope-wide plan_drift blocks next's actions,
+            # but T1 (done) contributes no inputs_changed action -- merged
+            # evidence is never gated or surfaced. All tasks are terminal, so
+            # this is finalize-phase `next`; --repo is required for its own
+            # git-backed checks the same way it is for any other verb.
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["actions"], [])
+            self.assertEqual(result["blockers"][0]["code"], "plan_drift")
+            # `inputs_status` itself is a pure digest comparison, unaware of
+            # task status -- it WOULD report this mismatch. The done/
+            # cancelled exemption ("never gated, never surfaced") is
+            # enforced at the call sites: `_apply_input_binding`'s
+            # ACTIVE_STATUSES-only loop (proven by `actions == []` above,
+            # not an inputs_changed entry for T1) and the CLI chokepoint's
+            # identical status check (no governed verb is legal against a
+            # done task's status anyway, but the chokepoint skips the
+            # inputs_status call entirely so a stale digest never produces
+            # the misleading "inputs changed" refusal in its place).
+            state_obj = StateStore(Path(state)).read()
+            self.assertIsNotNone(inputs_status(state_obj, wdd, "T1"))
+
+            _restamp_plan(root, state)
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(
+                [b for b in result["blockers"] if b.get("code") == "plan_drift"], []
+            )
+            self.assertEqual(
+                [a for a in result["actions"] if a["action"] == "inputs_changed"], []
+            )
+
+    def test_legacy_scope_exempt_from_gate_and_rebind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            state_path = str(wdd / "state.json")
+            self.assertEqual(_cli(state_path, "init", "--repo", str(root))[0], 0)
+            self.assertEqual(_cli(state_path, "config", "set", "merge.surface", "local")[0], 0)
+            self.assertEqual(
+                _cli(
+                    state_path, "config", "set", "models",
+                    '{"planning": null, "implementation": {"default": null, "highRisk": null}, '
+                    '"review": null}',
+                )[0],
+                0,
+            )
+            config = load_config(wdd)
+            if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
+                self.assertEqual(
+                    _cli(state_path, "config", "set", "verification.commands", '["true"]')[0], 0
+                )
+            self.assertEqual(_cli(state_path, "constitution", "ratify", "--by", "t")[0], 0)
+            _mark_legacy(state_path)
+            (wdd / "tasks").mkdir(exist_ok=True)
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nLegacy brief.\n", encoding="utf-8")
+            plan = _plan({"baseRef": "wdd/scope-x"})
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            self.assertEqual(
+                _cli(state_path, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))[0],
+                0,
+            )
+
+            _start_and_commit(state_path, root, "T1")
+            task = StateStore(Path(state_path)).read()["tasks"]["T1"]
+            self.assertEqual(task["inputs"], [])  # legacy: snapshot lands, inputs stay empty
+
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nLegacy brief -- edited.\n", encoding="utf-8")
+
+            # No composite doctrine to drift, and no recorded inputs to gate:
+            # submit proceeds untouched.
+            code, out = _cli(state_path, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            code, out, err = _cli_full(
+                state_path, "rebind", "--task", "T1", "--by", "t", "--repo", str(root)
+            )
+            self.assertEqual(code, 5, err)
+            self.assertIn("nothing to rebind", err.lower())
+
+            code, out = _cli(state_path, "next")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(
+                [a for a in json.loads(out)["actions"] if a["action"] == "inputs_changed"], []
+            )
+
+    def test_interplay_started_task_edit_fires_both_plan_drift_and_inputs_changed(self) -> None:
+        """The pinned interplay: editing a STARTED task's own context file
+        fires 6a's scope-wide plan_drift (the composite covers every brief
+        and context file together) AND this task's per-task inputs_changed
+        at the same time -- and, because `require_fresh_intake` raises
+        plan_drift before any task-targeted verb's own gate runs, the
+        governed-verb chokepoint enforces the documented remedy order: you
+        cannot even reach the task-level gate (let alone rebind) until the
+        plan is re-stamped first."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_v5_scope(root, wdd, state)
+            _start_and_commit(state, root, "T1")
+
+            (wdd / "tasks" / "T1.md").write_text(
+                "# T1\n\nBrief body for T1 -- edited.\n", encoding="utf-8"
+            )
+
+            # Both fire in `next`, simultaneously, before any remedy:
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["blockers"][0]["code"], "plan_drift")
+            # Exactly one action survives: plan_drift emptied the list, and
+            # inputs_changed for T1 is the only thing added back on top.
+            self.assertEqual(len(result["actions"]), 1)
+            self.assertEqual(result["actions"][0]["action"], "inputs_changed")
+            self.assertEqual(result["actions"][0]["task"], "T1")
+
+            # Remedy order: submit refuses on the SCOPE-wide drift first
+            # (require_fresh_intake fires at the chokepoint, before rebind
+            # or any task-targeted verb's own gate is even reached) --
+            # rebind is equally blocked for the same reason.
+            code, out, err = _cli_full(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 5, err)
+            self.assertIn("plan drift", err.lower())
+            self.assertNotIn("inputs changed", err.lower())
+
+            code, out, err = _cli_full(
+                state, "rebind", "--task", "T1", "--by", "t", "--repo", str(root)
+            )
+            self.assertEqual(code, 5, err)
+            self.assertIn("plan drift", err.lower())
+
+            # Re-stamp first (the documented remedy order) -- plan_drift
+            # clears, but T1's own inputs_changed remains: its recorded
+            # digest was taken before the edit, so it still mismatches the
+            # bytes the re-stamp just approved.
+            _restamp_plan(root, state)
+
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(
+                [b for b in result["blockers"] if b.get("code") == "plan_drift"], []
+            )
+            changed = [a for a in result["actions"] if a["action"] == "inputs_changed"]
+            self.assertEqual([a["task"] for a in changed], ["T1"])
+
+            # Now rebind (the second half of the remedy) clears it.
+            code, out = _cli(state, "rebind", "--task", "T1", "--by", "t", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
 
 
 if __name__ == "__main__":
