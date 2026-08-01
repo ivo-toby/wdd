@@ -17,6 +17,7 @@ from typing import Any
 from .config import config_path, constitution_path, default_config, load_config, save_config
 from .constitution import probe_repository
 from .engine import apply_mutation
+from .handover import ensure_dispatch_gitignore
 from .intake import intake_drift, intake_status
 from .schema import copied_state, new_setup_state
 from .store import StateStore, atomic_write_text
@@ -155,6 +156,12 @@ def init_repository(wdd_dir: Path | str, repo: Path | str) -> dict[str, Any]:
     for directory in ("tasks", "shared-context"):
         (wdd_dir / directory).mkdir(parents=True, exist_ok=True)
         created.append(str(wdd_dir / directory))
+
+    # .wdd/dispatch/ is transient scratch (Global Constraints, phase-6b Task
+    # 2): gitignored from the start so a fresh init never risks a worker's
+    # dispatch log or attempt snapshot getting committed.
+    if ensure_dispatch_gitignore(wdd_dir):
+        created.append(str(wdd_dir / ".gitignore"))
 
     # Wrap state write in lock with re-check for race condition safety
     with store.locked():
@@ -351,6 +358,9 @@ def migrate_governance(wdd_dir: Path | str) -> dict[str, Any]:
             config["models"]["implementation"]["default"] = implementation
     config["openQuestions"] = _open_questions(config["verification"]["commands"])
     save_config(wdd_dir, config)
+    # A pre-split .wdd predates the dispatch/ scratch dir too; ensure the
+    # gitignore entry the same way a fresh init would.
+    ensure_dispatch_gitignore(wdd_dir)
 
     if old_text:
         atomic_write_text(wdd_dir / "constitution.md.pre-config", old_text)

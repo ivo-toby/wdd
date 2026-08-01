@@ -69,6 +69,11 @@ def convert(state: dict[str, Any], *, review_policy: str = "always") -> dict[str
         task.setdefault("context", [])
         task.setdefault("model", None)
         task.setdefault("reviewModel", None)
+        # Handover fields (phase-6b Task 2, spec Sec3) postdate every
+        # migratable source version the same way context/model/reviewModel
+        # (phase-6a) did -- same setdefault treatment, same reasoning.
+        task.setdefault("snapshot", None)
+        task.setdefault("inputs", [])
     validate_state(migrated)
     return migrated
 

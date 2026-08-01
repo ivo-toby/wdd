@@ -51,6 +51,7 @@ from .finalize import (
 from .freshness import check_freshness, record_freshness
 from .git import require_repository, resolve_ref
 from .github import comment_pr, create_pr, push_branch
+from .handover import materialize_attempt, record_attempt
 from .intake import (
     intake_status,
     record_design,
@@ -873,6 +874,38 @@ def main(argv: list[str] | None = None) -> int:
                 worktree=args.worktree,
                 **_concurrency(args),
             )
+            # Materialize + record a fresh attempt snapshot only on a genuine
+            # new dispatch. A duplicate (idempotency-key replay) did no new
+            # work; a reattach (leases._reattach's action is prefixed
+            # "reattach:") reconnects an in-progress task's worktree without
+            # re-approving anything -- re-materializing there would silently
+            # re-bind input digests to whatever the source files currently
+            # are, defeating Task 3's rebind gate. Either way, surface the
+            # already-recorded snapshot if the task has one.
+            is_reattach = str(result.get("action", "")).startswith("reattach:")
+            if not duplicate and not is_reattach:
+                pre_state = store.read()
+                materialized = materialize_attempt(pre_state, store.path.parent, args.task)
+                state_after, _ = record_attempt(
+                    store,
+                    task_id=args.task,
+                    snapshot=materialized["snapshot"],
+                    inputs=materialized["inputs"],
+                )
+                recorded = state_after["tasks"][args.task]
+                result = {
+                    **result,
+                    "snapshot": recorded["snapshot"],
+                    "inputsRecorded": len(recorded.get("inputs") or []),
+                }
+            else:
+                task = store.read()["tasks"].get(args.task) or {}
+                if task.get("snapshot"):
+                    result = {
+                        **result,
+                        "snapshot": task["snapshot"],
+                        "inputsRecorded": len(task.get("inputs") or []),
+                    }
             _print_json({**result, "duplicate": duplicate})
             return 0
 

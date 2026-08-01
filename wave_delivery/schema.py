@@ -65,6 +65,14 @@ def task_state(
         "freshness": None,
         "merge": None,
         "blocker": None,
+        # Handover fields (front-half spec Sec3, phase-6b Task 2): populated by
+        # start's post-`start_task` materialize+record step, never by plan
+        # apply. "inputs" is the recorded digests of the SOURCE files behind
+        # the attempt snapshot named by "snapshot" (Task 3's input-version
+        # binding reads these); legacy scopes get a snapshot but leave
+        # "inputs" empty (no binding doctrine to bind to).
+        "snapshot": None,
+        "inputs": [],
     }
 
 
@@ -254,6 +262,14 @@ def validate_state(state: dict[str, Any]) -> None:
         freshness = task.get("freshness")
         if freshness is not None and not isinstance(freshness, dict):
             raise ValidationError(f"tasks.{task_id}.freshness must be an object or null")
+        _require_string(task.get("snapshot"), f"tasks.{task_id}.snapshot", nullable=True)
+        inputs = task.get("inputs", [])
+        if not isinstance(inputs, list):
+            raise ValidationError(f"tasks.{task_id}.inputs must be a list")
+        for entry in inputs:
+            entry = _require_mapping(entry, f"tasks.{task_id}.inputs[]")
+            _require_string(entry.get("path"), f"tasks.{task_id}.inputs[].path")
+            _require_string(entry.get("sha256"), f"tasks.{task_id}.inputs[].sha256")
 
     detect_dependency_cycle(tasks)
 
