@@ -143,6 +143,14 @@ The lever is judgment content, not size. Normative rules in `wdd-plan`:
   inventory for contract surfaces, criteria by number.
 - **Finalize tie-in** — `final_review`'s judgment references the numbered
   criteria and design.md's epic deliverable statement (prose change only).
+- **New `wdd-runners`** — sets up and maintains the runner registry:
+  probe what's on the box (`doctor`'s CLI report), help the user author
+  each command template (headless flags, cwd handling, model selection),
+  prove every runner with `wddctl dispatch --probe <name>` before it is
+  recorded, and route the config change through governance (`config set
+  runners ...` + ratify/amend — runners are fingerprinted config like
+  everything else). Triggers on "add a runner", "use qwen/codex as a
+  worker", "set up local workers".
 
 ## 6. Runners: generic dispatch beyond the harness
 
@@ -170,6 +178,17 @@ resolvable to an external agent CLI:
   report; all evidence still flows through git and `wddctl` verbs.
 - `doctor`'s existing CLI probes (`codex`, `claude`, …) report which
   runners' commands are actually present.
+- `wddctl dispatch --probe <runner>` proves a runner end-to-end before any
+  scope depends on it: exec the command template in a temp directory with a
+  canned trivial prompt ("Reply with exactly: DONE"), and report exit code,
+  wall time, and whether the expected token came back. The `wdd-runners`
+  skill ends every registration with a passing probe — a runner that was
+  never probed is configuration fiction.
+
+Documentation ships with the feature: a "Runners" section in
+`docs/wddctl.md` (config shape, resolution order, `dispatch`/`--probe`
+semantics, real transcripts against a stub runner) and a worked example in
+`docs/workflow.md`'s appendix territory for one local runner.
 
 **Hard non-goals, stated to stay out of harness territory:** no streaming,
 no interactive sessions, no tool-permission mediation, no supervision or
