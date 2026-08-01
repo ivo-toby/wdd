@@ -846,17 +846,20 @@ def archive_scope(
     """`wddctl scope archive`: the ladder's final transition (spec Sec1's rollover).
 
     Delivered-phase only: moves the completed scope's records (scope, tasks,
-    intake, finalize, reconcile incl. pendingNotes, an event count, and an
-    archived-at timestamp) to ``.wdd/archive/<scope-id>.json`` via
+    intake, finalize, reconcile incl. pendingNotes, leases -- every task's
+    lease history, worktree/branch/timestamps included -- an event count, and
+    an archived-at timestamp) to ``.wdd/archive/<scope-id>.json`` via
     ``atomic_write_text``, then resets every scope-carrying section of state
     to ``new_setup_state()``'s fresh shape in ONE ``apply_mutation``: scope
     null, tasks empty, ``finalize`` removed entirely, intake reset to ``{}``
     (a fresh ladder -- NOT re-marked legacy; the next scope walks the ladder
-    for real), reconcile fully fresh (counters and pendingNotes both), and
-    monitoring observations cleared. Governance (constitution/ratification)
-    and the audit trail (events, appliedIdempotencyKeys, telemetry) are
-    deliberately left untouched -- archiving retires a scope's data, not the
-    repository's own history or its ratified process.
+    for real), reconcile fully fresh (counters and pendingNotes both),
+    monitoring observations cleared, and ``leases`` absent (``new_setup_state``
+    produces no ``leases`` key at all -- it is archived above, then dropped,
+    not preserved and not zeroed to ``{}``). Governance (constitution/
+    ratification) and the audit trail (events, appliedIdempotencyKeys,
+    telemetry) are deliberately left untouched -- archiving retires a scope's
+    data, not the repository's own history or its ratified process.
 
     The no-leak guarantee is total, not counters-only: nothing scope-specific
     (the deliverable command included, since it lives only in ``intake.design``
@@ -882,6 +885,7 @@ def archive_scope(
         "intake": state.get("intake"),
         "finalize": state.get("finalize"),
         "reconcile": state.get("reconcile"),
+        "leases": state.get("leases") or {},
         "eventCount": len(state.get("events") or []),
         "archivedAt": utc_now(),
     }
@@ -899,7 +903,9 @@ def archive_scope(
         # Governance and the audit trail survive the reset -- only the
         # scope-carrying sections new_setup_state() already produces fresh
         # (scope, tasks, intake, reconcile, monitoring; finalize absent) are
-        # actually new here.
+        # actually new here. Leases are archived above (in `payload`) then
+        # dropped, not preserved: new_setup_state() produces no "leases" key
+        # at all, so the reset state has none, matching that fresh shape.
         fresh["constitution"] = current["constitution"]
         fresh["events"] = current["events"]
         fresh["appliedIdempotencyKeys"] = current["appliedIdempotencyKeys"]

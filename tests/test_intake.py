@@ -2373,6 +2373,32 @@ class ScopeArchiveTest(unittest.TestCase):
             # Governance survives the reset.
             self.assertEqual(after["constitution"]["status"], "ratified")
 
+    def test_archive_includes_and_disposes_leases(self) -> None:
+        """Finding: `state["leases"]` was silently dropped at archive -- not
+        archived, not explicitly cleared (`new_setup_state()` just has no
+        `leases` key, so it vanished undisclosed). `_run_to_delivered` drives
+        a real task through `start`/`submit`/`merge`, which populates and
+        then releases a T1 lease (worktree/branch/timestamps), so this fixture
+        already has per-task lease history to prove archived and disposed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_delivered(tmp)
+            before = StateStore(Path(state)).read()
+            self.assertIn("T1", before.get("leases") or {})
+            lease_before = before["leases"]["T1"]
+            self.assertIn("branch", lease_before)
+            self.assertIn("worktree", lease_before)
+
+            code, out = _cli(state, "scope", "archive", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+
+            payload = json.loads(Path(result["archived"]).read_text(encoding="utf-8"))
+            self.assertIn("T1", payload["leases"])
+            self.assertEqual(payload["leases"]["T1"], lease_before)
+
+            after = StateStore(Path(state)).read()
+            self.assertNotIn("leases", after)
+
     def test_next_says_agree_spec_after_archive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _run_to_delivered(tmp)
