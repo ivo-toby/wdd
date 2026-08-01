@@ -22,7 +22,8 @@ from .schema import SCHEMA_VERSION, validate_state
 from .store import StateStore, atomic_write_text
 
 
-SUPPORTED_SOURCE_VERSIONS = {2, 3}
+SUPPORTED_SOURCE_VERSIONS = {2, 3, 4}
+_V4_SCHEMA_VERSION = 4
 
 
 def read_source(path: Path | str) -> dict[str, Any]:
@@ -47,19 +48,38 @@ def read_source(path: Path | str) -> dict[str, Any]:
 
 
 def convert(state: dict[str, Any], *, review_policy: str = "always") -> dict[str, Any]:
-    """Return the current-schema equivalent of a v2 or v3 state."""
-    if state.get("schemaVersion") == 3:
+    """Return the current-schema (v5) equivalent of a v2, v3, or v4 state.
+
+    Conversion always lands on an intermediate v4-shaped dict first (the
+    v2/v3 field remap is untouched from before schema v5 existed), then the
+    v4 -> v5 step is a pure bump plus `intake: {"legacy": True}` — migration
+    is the only producer of that exemption (see schema.py's
+    `_validate_intake`); constructors never mint it.
+    """
+    v4 = _convert_to_v4(state, review_policy=review_policy)
+    migrated = deepcopy(v4)
+    migrated["schemaVersion"] = SCHEMA_VERSION
+    migrated["intake"] = {"legacy": True}
+    validate_state(migrated)
+    return migrated
+
+
+def _convert_to_v4(state: dict[str, Any], *, review_policy: str) -> dict[str, Any]:
+    version = state.get("schemaVersion")
+    if version == _V4_SCHEMA_VERSION:
+        return deepcopy(state)
+
+    if version == 3:
         # Every valid v3 state is already a valid v4 state (schema.py's
         # scope-optional relaxation only adds a case v3 never produced), so
         # the conversion is a pure version bump rather than a field remap.
         migrated = deepcopy(state)
-        migrated["schemaVersion"] = SCHEMA_VERSION
-        validate_state(migrated)
+        migrated["schemaVersion"] = _V4_SCHEMA_VERSION
         return migrated
 
     scope = dict(state.get("scope") or {})
     migrated: dict[str, Any] = {
-        "schemaVersion": SCHEMA_VERSION,
+        "schemaVersion": _V4_SCHEMA_VERSION,
         "revision": state.get("revision", 0),
         "scope": {
             "id": scope.get("id"),
@@ -98,7 +118,9 @@ def convert(state: dict[str, Any], *, review_policy: str = "always") -> dict[str
         converted["worktree"] = None
         migrated["tasks"][task_id] = converted
 
-    validate_state(migrated)
+    # Not validated here: this dict is v4-shaped and validate_state only
+    # accepts the current SCHEMA_VERSION (v5). The caller (convert) takes it
+    # through the v4 -> v5 step and validates the final result.
     return migrated
 
 

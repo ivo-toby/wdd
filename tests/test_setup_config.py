@@ -153,8 +153,8 @@ class ConfigCliTest(unittest.TestCase):
 
 
 class SetupStateTest(unittest.TestCase):
-    def test_schema_version_is_4(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 4)
+    def test_schema_version_is_5(self) -> None:
+        self.assertEqual(SCHEMA_VERSION, 5)
 
     def test_new_setup_state_validates_with_null_scope(self) -> None:
         state = new_setup_state()
@@ -183,8 +183,8 @@ class SetupStateTest(unittest.TestCase):
 
 
 class MigrationV3Test(unittest.TestCase):
-    def test_v3_state_migrates_to_v4(self) -> None:
-        from wave_delivery.migration import plan_migration
+    def test_v3_state_migrates_to_v5(self) -> None:
+        from wave_delivery.migration import convert, plan_migration
 
         with tempfile.TemporaryDirectory() as tmp:
             state = new_state("SCOPE-x", base_ref="wdd/x")
@@ -196,7 +196,11 @@ class MigrationV3Test(unittest.TestCase):
             # the converted state itself: {"state", "from", "to", "tasks",
             # "backup", "notes"}. "to" is always SCHEMA_VERSION.
             self.assertEqual(result["from"], 3)
-            self.assertEqual(result["to"], 4)
+            self.assertEqual(result["to"], 5)
+            # v3/v4 -> v5 is exempted wholesale via intake.legacy (spec §7);
+            # it never mints itself, only migration does.
+            migrated = convert(state)
+            self.assertEqual(migrated["intake"], {"legacy": True})
 
 
 def _write_governance(wdd: Path, *, questions: list | None = None) -> None:

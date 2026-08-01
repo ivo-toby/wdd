@@ -780,7 +780,8 @@ class MigrationTests(BaseTest):
         self.assertTrue(Path(result["backup"]).exists())
 
         migrated = StateStore(path).read()
-        self.assertEqual(migrated["schemaVersion"], 4)
+        self.assertEqual(migrated["schemaVersion"], 5)
+        self.assertEqual(migrated["intake"], {"legacy": True})
         self.assertEqual(migrated["tasks"]["T1"]["risk"], "normal")
         self.assertEqual(migrated["tasks"]["T1"]["title"], "T1")
         # v2 required review for every task; migrating must not drop that.
@@ -1621,7 +1622,12 @@ class SchemaTests(BaseTest):
 
     def test_store_round_trips_atomically(self) -> None:
         store = StateStore(self.root / "nested" / "state.json")
-        store.write(new_state("SCOPE-x"))
+        state = new_state("SCOPE-x")
+        # Hand-built active scope written directly (not via migrate): simulate
+        # a migrated scope explicitly, per the architecture note in the
+        # intake-ladder plan -- constructors never mint intake.legacy.
+        state["intake"] = {"legacy": True}
+        store.write(state)
         self.assertEqual(store.read()["scope"]["id"], "SCOPE-x")
 
 

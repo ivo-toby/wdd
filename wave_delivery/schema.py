@@ -8,7 +8,7 @@ from typing import Any
 from .errors import ValidationError
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 TASK_STATUSES = {
     "todo",
     "in_progress",
@@ -99,6 +99,7 @@ def new_state(
         "events": [],
         "appliedIdempotencyKeys": [],
         "telemetry": {"eventApplications": 0, "renderCount": 0},
+        "intake": {},
     }
 
 
@@ -157,7 +158,7 @@ def validate_state(state: dict[str, Any]) -> None:
         found = state.get("schemaVersion")
         hint = (
             " run 'wddctl --state <path> migrate --dry-run' to convert it"
-            if found in {2, 3}
+            if found in {2, 3, 4}
             else ""
         )
         raise ValidationError(
@@ -280,6 +281,77 @@ def validate_state(state: dict[str, Any]) -> None:
             delivered = _require_mapping(delivered, "finalize.delivered")
             for field in ("at", "by", "headSha"):
                 _require_string(delivered.get(field), f"finalize.delivered.{field}")
+
+    _validate_intake(_require_mapping(state.get("intake"), "intake"))
+
+
+_INTAKE_RECORD_KEYS = {"spec", "research", "design"}
+
+
+def _validate_intake(intake: dict[str, Any]) -> None:
+    """Validate the required `intake` section (schema v5).
+
+    Valid shapes: `{"legacy": True}` (migration-only exemption, see
+    migration.py) or any subset of `{spec, research, design}` records, each
+    bound to the artifact bytes that were approved (governance_fingerprint
+    idiom).
+    """
+    if "legacy" in intake:
+        if intake.get("legacy") is not True or intake.keys() != {"legacy"}:
+            raise ValidationError("intake.legacy must be the sole key, set to true")
+        return
+
+    unknown = set(intake) - _INTAKE_RECORD_KEYS
+    if unknown:
+        raise ValidationError(f"intake has unknown keys: {sorted(unknown)}")
+
+    spec = intake.get("spec")
+    if spec is not None:
+        spec = _require_mapping(spec, "intake.spec")
+        _require_string(spec.get("by"), "intake.spec.by")
+        _require_string(spec.get("at"), "intake.spec.at")
+        _require_string(spec.get("sha256"), "intake.spec.sha256")
+        criteria = spec.get("criteria")
+        if not isinstance(criteria, int) or isinstance(criteria, bool) or criteria < 1:
+            raise ValidationError("intake.spec.criteria must be a positive integer")
+
+    research = intake.get("research")
+    if research is not None:
+        research = _require_mapping(research, "intake.research")
+        _require_string(research.get("by"), "intake.research.by")
+        _require_string(research.get("at"), "intake.research.at")
+        done = research.get("done")
+        skipped = research.get("skipped")
+        if (done is True) == (skipped is True):
+            raise ValidationError(
+                "intake.research must be exactly one of done=true or skipped=true"
+            )
+        if done is True:
+            artifacts = research.get("artifacts")
+            if not isinstance(artifacts, list):
+                raise ValidationError("intake.research.artifacts must be a list")
+            for artifact in artifacts:
+                artifact = _require_mapping(artifact, "intake.research.artifacts[]")
+                _require_string(artifact.get("path"), "intake.research.artifacts[].path")
+                _require_string(artifact.get("sha256"), "intake.research.artifacts[].sha256")
+        else:
+            _require_string(research.get("reason"), "intake.research.reason")
+
+    design = intake.get("design")
+    if design is not None:
+        design = _require_mapping(design, "intake.design")
+        _require_string(design.get("by"), "intake.design.by")
+        _require_string(design.get("at"), "intake.design.at")
+        _require_string(design.get("sha256"), "intake.design.sha256")
+        _require_string(design.get("deliverableCommand"), "intake.design.deliverableCommand")
+
+
+def intake_complete(state: dict[str, Any]) -> bool:
+    """True once the ladder is done: legacy scopes are exempt wholesale."""
+    intake = state.get("intake") or {}
+    if intake.get("legacy") is True:
+        return True
+    return all(intake.get(key) is not None for key in ("spec", "research", "design"))
 
 
 def detect_dependency_cycle(tasks: dict[str, Any]) -> None:
