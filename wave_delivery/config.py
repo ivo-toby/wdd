@@ -111,16 +111,30 @@ def validate_config(config: dict[str, Any]) -> None:
 
     models = config.get("models")
     _require(isinstance(models, dict), "models must be an object")
-    for key in ("planning", "review"):
-        value = models.get(key)
-        _require(value is None or (isinstance(value, str) and value),
-                 f"models.{key} must be null or a non-empty string")
+    value = models.get("planning")
+    _require(value is None or (isinstance(value, str) and value),
+             "models.planning must be null or a non-empty string")
     implementation = models.get("implementation")
     _require(isinstance(implementation, dict), "models.implementation must be an object")
     for key in ("default", "highRisk"):
         value = implementation.get(key)
         _require(value is None or (isinstance(value, str) and value),
                  f"models.implementation.{key} must be null or a non-empty string")
+    # review stays tierable like implementation: a plain string means both
+    # tiers (regression-pinned -- spec Sec3), an object form tiers by task
+    # risk the same way implementation does. Object shape validation matches
+    # implementation's strictness: default/highRisk must each be null or a
+    # non-empty string; unknown extra keys are not rejected (implementation
+    # doesn't reject them either).
+    review = models.get("review")
+    if isinstance(review, dict):
+        for key in ("default", "highRisk"):
+            value = review.get(key)
+            _require(value is None or (isinstance(value, str) and value),
+                     f"models.review.{key} must be null or a non-empty string")
+    else:
+        _require(review is None or (isinstance(review, str) and review),
+                 "models.review must be null, a non-empty string, or an object")
 
     rules = config.get("riskRules")
     _require(isinstance(rules, list), "riskRules must be a list")
