@@ -142,7 +142,7 @@ def _validate_design_text(text: str) -> None:
     _require_sections(text, _REQUIRED_DESIGN_SECTIONS, label="design.md")
 
 
-def _resolve_within_wdd(wdd_dir: Path, raw_path: str) -> Path:
+def resolve_within_wdd(wdd_dir: Path, raw_path: str) -> Path:
     """Resolve a research-artifact path, refusing anything outside `.wdd/`.
 
     Paths are `.wdd`-relative (the same doctrine plan.json's future `context`
@@ -280,7 +280,7 @@ def record_research(
             raise ValidationError("--done requires at least one --artifacts path")
         records = []
         for raw_path in done_artifacts:
-            resolved = _resolve_within_wdd(wdd_dir, raw_path)
+            resolved = resolve_within_wdd(wdd_dir, raw_path)
             if not resolved.exists() or not resolved.is_file():
                 raise ValidationError(
                     f"research artifact does not exist or is not a regular file: {raw_path}"

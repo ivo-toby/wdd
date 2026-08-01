@@ -12,7 +12,7 @@ from wave_delivery.cli import main
 from wave_delivery.config import default_config, governance_fingerprint, load_config, save_config, set_value
 from wave_delivery.lint import lint_plan
 from wave_delivery.plan import apply_risk_rules
-from wave_delivery.schema import new_state
+from wave_delivery.schema import new_setup_state, new_state
 from wave_delivery.setup import init_repository, migrate_governance, setup_next_actions
 from wave_delivery.store import StateStore
 
@@ -201,6 +201,47 @@ def _cli(state: str, *argv: str) -> tuple[int, str]:
     return code, stdout.getvalue()
 
 
+def _mark_legacy(state: str) -> None:
+    """Exempt a hand-built fixture from the phase-6a intake ladder.
+
+    Most of this module's tests exercise plan/lint/governance mechanics, not
+    intake -- per the plan's architecture note, these mark `intake.legacy`
+    explicitly rather than fake-walk a ladder that isn't the point of the
+    test (and legacy also means no approved-bytes composite is required).
+    """
+    store = StateStore(Path(state))
+    current = store.read()
+    current["intake"] = {"legacy": True}
+    store.write(current)
+
+
+def _walk_intake(state: str, wdd: Path, approver: str = "t") -> None:
+    """Canonical ladder walk (plan Task 2/3): spec -> research skip -> design."""
+    (wdd / "spec.md").write_text(
+        "# Spec\n\n## Goal\n\nShip it.\n\n## In scope\n\n- x\n\n"
+        "## Out of scope\n\n- y\n\n## Acceptance criteria\n\n"
+        "- [ ] AC-1: the thing works\n", encoding="utf-8")
+    assert _cli(state, "intake", "spec", "--approved-by", approver)[0] == 0
+    assert _cli(state, "intake", "research", "--skip", "--by", approver,
+                "--reason", "no external contracts")[0] == 0
+    (wdd / "design.md").write_text(
+        "# Design\n\n## Components\n\n- core\n\n## Interfaces\n\n"
+        "- core: consumes nothing, produces lib\n\n"
+        "## Integration surfaces\n\n- `src/core.py` — owned by: core task\n\n"
+        "## Epic deliverable\n\nThe lib imports.\n", encoding="utf-8")
+    assert _cli(state, "intake", "design", "--approved-by", approver,
+                "--deliverable-command", "true")[0] == 0
+
+
+def _write_briefs(wdd: Path, plan: dict) -> None:
+    (wdd / "tasks").mkdir(parents=True, exist_ok=True)
+    for task in plan["tasks"]:
+        path = wdd / task["specPath"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(f"# {task['id']}\n\nBrief.\n", encoding="utf-8")
+
+
 class LintBriefTest(unittest.TestCase):
     def test_missing_and_empty_briefs_warn(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -301,16 +342,18 @@ class LintCliTest(unittest.TestCase):
     def test_apply_result_carries_lint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _git_repo(tmp)
+            state = str(root / ".wdd" / "state.json")
+            assert _cli(state, "init", "--repo", str(root))[0] == 0
+            _mark_legacy(state)
             plan = _plan([
                 _task("T1"), _task("T2", depends_on=["T1"]), _task("T3", depends_on=["T2"]),
             ])
             plan_file = root / "plan.json"
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
             code, out = _cli(
-                str(root / ".wdd" / "state.json"),
-                "plan", "apply", "--plan", str(plan_file), "--repo", str(root), "--dry-run",
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root), "--dry-run",
             )
-            self.assertEqual(code, 0)
+            self.assertEqual(code, 0, out)
             self.assertIn("serialized_plan", out)
 
 
@@ -344,6 +387,7 @@ class BaseEqualsTargetBranchTest(unittest.TestCase):
         if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
             assert _cli(state, "config", "set", "verification.commands", '["true"]')[0] == 0
         assert _cli(state, "constitution", "ratify", "--by", "t")[0] == 0
+        _mark_legacy(state)
         return root, wdd, state
 
     def test_plan_apply_refuses_when_base_ref_equals_target_branch(self) -> None:
@@ -375,12 +419,24 @@ class BaseEqualsTargetBranchTest(unittest.TestCase):
             self.assertEqual(code, 0, out)
 
     def test_plan_apply_skips_check_without_config(self) -> None:
-        # Bootstrap/no-config (legacy) path: nothing to compare baseRef
-        # against, so the check is a no-op rather than a crash.
+        # No-config (legacy, pre-config.json) path: nothing to compare
+        # baseRef against, so the check is a no-op rather than a crash.
+        # Task 3 removed apply_plan's no-state bootstrap, so state.json must
+        # already exist; a hand-written legacy state without ever creating
+        # config.json reproduces the "no config.json" scenario this test
+        # defends, without also walking (or being exempt from) the intake
+        # ladder via a real 'wddctl init'.
         with tempfile.TemporaryDirectory() as tmp:
             root = _git_repo(tmp)
             wdd = root / ".wdd"
             state = str(wdd / "state.json")
+            legacy_state = new_setup_state()
+            legacy_state["intake"] = {"legacy": True}
+            legacy_state["constitution"] = {
+                "status": "ratified",
+                "ratification": {"by": "t", "decisionFingerprint": "sha256:x"},
+            }
+            StateStore(Path(state)).write(legacy_state)
             plan = _plan([_task("T1")])
             plan["scope"]["baseRef"] = "main"
             plan_file = root / "plan.json"
@@ -499,6 +555,7 @@ class ConfigOverlayEndToEndTest(unittest.TestCase):
             self.assertEqual(_cli(state, "config", "set", "merge.reconcileEveryNMerges", "5")[0], 0)
             self.assertEqual(_cli(state, "config", "set", "concurrency.maxConcurrent", "2")[0], 0)
             self.assertEqual(_cli(state, "constitution", "ratify", "--by", "t")[0], 0)
+            _mark_legacy(state)
             plan = _plan([_task("T1")])
             del plan["scope"]["reconcileEveryNMerges"]
             del plan["scope"]["maxConcurrent"]
@@ -527,6 +584,7 @@ class MidScopeRiskRuleReapplyTest(unittest.TestCase):
                     _cli(state, "config", "set", "verification.commands", '["true"]')[0], 0
                 )
             self.assertEqual(_cli(state, "constitution", "ratify", "--by", "t")[0], 0)
+            _mark_legacy(state)
 
             plan = _plan([_task("T1", domains=["src/auth/**"])])
             plan["scope"]["baseRef"] = "wdd/scope-q"
@@ -568,6 +626,11 @@ class MidScopeRiskRuleReapplyTest(unittest.TestCase):
 
 
 class PlanApprovalTest(unittest.TestCase):
+    """These genuinely exercise the plan-approval composite (Task 3), so
+    unlike this module's other fixtures they walk the real intake ladder
+    (not `_mark_legacy`) and write real brief files -- both are now part of
+    what a recorded approval binds to."""
+
     def _ready_repo(self, tmp: str):
         root = _git_repo(tmp)
         wdd = root / ".wdd"
@@ -579,44 +642,59 @@ class PlanApprovalTest(unittest.TestCase):
         if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
             assert _cli(state, "config", "set", "verification.commands", '["true"]')[0] == 0
         assert _cli(state, "constitution", "ratify", "--by", "t")[0] == 0
+        _walk_intake(state, wdd)
         return root, wdd, state
 
     def test_approved_by_is_stamped_into_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, wdd, state = self._ready_repo(tmp)
+            plan = _plan([_task("T1")])
+            _write_briefs(wdd, plan)
             plan_file = root / "plan.json"
-            plan_file.write_text(json.dumps(_plan([_task("T1")])), encoding="utf-8")
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
             code, out = _cli(
                 state, "plan", "apply", "--plan", str(plan_file),
                 "--repo", str(root), "--approved-by", "ivo",
             )
-            self.assertEqual(code, 0)
+            self.assertEqual(code, 0, out)
             self.assertIn("ivo", out)
             approval = StateStore(wdd / "state.json").read()["scope"]["approval"]
             self.assertEqual(approval["by"], "ivo")
             self.assertTrue(approval["at"])
+            self.assertTrue(approval["sha256"].startswith("sha256:"))
 
-    def test_reapply_without_flag_preserves_approval(self) -> None:
+    def test_reapply_a_changed_plan_without_approved_by_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, wdd, state = self._ready_repo(tmp)
+            plan = _plan([_task("T1")])
+            _write_briefs(wdd, plan)
             plan_file = root / "plan.json"
-            plan_file.write_text(json.dumps(_plan([_task("T1")])), encoding="utf-8")
-            _cli(state, "plan", "apply", "--plan", str(plan_file),
-                 "--repo", str(root), "--approved-by", "ivo")
-            plan = _plan([_task("T1"), _task("T2")])
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
-            code, _ = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
-            self.assertEqual(code, 0)
-            approval = StateStore(wdd / "state.json").read()["scope"]["approval"]
-            self.assertEqual(approval["by"], "ivo")
+            assert _cli(state, "plan", "apply", "--plan", str(plan_file),
+                        "--repo", str(root), "--approved-by", "ivo")[0] == 0
+            before = StateStore(wdd / "state.json").read()["scope"]["approval"]
+
+            # Task 3: a nonempty diff (T2 added) without --approved-by now
+            # refuses outright -- silently carrying the old approval forward
+            # over changed scope, as the pre-ladder code did, is exactly
+            # what the composite doctrine forbids.
+            plan = _plan([_task("T1"), _task("T2")])
+            _write_briefs(wdd, plan)
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            code, _out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            after = StateStore(wdd / "state.json").read()["scope"]["approval"]
+            self.assertEqual(before, after)
 
     def test_reapply_identical_plan_with_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, wdd, state = self._ready_repo(tmp)
-            plan_file = root / "plan.json"
             plan = _plan([_task("T1")])
+            _write_briefs(wdd, plan)
+            plan_file = root / "plan.json"
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
-            code, _ = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            code, _ = _cli(state, "plan", "apply", "--plan", str(plan_file),
+                           "--repo", str(root), "--approved-by", "ivo")
             self.assertEqual(code, 0)
             # Re-apply identical plan with --approved-by
             code, out = _cli(state, "plan", "apply", "--plan", str(plan_file),
@@ -630,8 +708,10 @@ class PlanApprovalTest(unittest.TestCase):
     def test_empty_approved_by_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, wdd, state = self._ready_repo(tmp)
+            plan = _plan([_task("T1")])
+            _write_briefs(wdd, plan)
             plan_file = root / "plan.json"
-            plan_file.write_text(json.dumps(_plan([_task("T1")])), encoding="utf-8")
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
             code, out = _cli(
                 state, "plan", "apply", "--plan", str(plan_file),
                 "--repo", str(root), "--approved-by", "   ",
@@ -645,13 +725,17 @@ class PlanApprovalTest(unittest.TestCase):
     def test_changed_plan_reapply_with_approved_by_stamps_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, wdd, state = self._ready_repo(tmp)
+            plan = _plan([_task("T1")])
+            _write_briefs(wdd, plan)
             plan_file = root / "plan.json"
-            plan_file.write_text(json.dumps(_plan([_task("T1")])), encoding="utf-8")
-            code, _ = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            code, _ = _cli(state, "plan", "apply", "--plan", str(plan_file),
+                           "--repo", str(root), "--approved-by", "ivo")
             self.assertEqual(code, 0)
             # Re-apply a CHANGED plan (new task added) with --approved-by: goes
             # through the mutator path, not the unchanged/dry-run shortcuts.
             plan = _plan([_task("T1"), _task("T2")])
+            _write_briefs(wdd, plan)
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
             code, out = _cli(state, "plan", "apply", "--plan", str(plan_file),
                              "--repo", str(root), "--approved-by", "ivo")
@@ -664,8 +748,10 @@ class PlanApprovalTest(unittest.TestCase):
     def test_reapproval_with_different_name_overwrites_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, wdd, state = self._ready_repo(tmp)
+            plan = _plan([_task("T1")])
+            _write_briefs(wdd, plan)
             plan_file = root / "plan.json"
-            plan_file.write_text(json.dumps(_plan([_task("T1")])), encoding="utf-8")
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
             code, _ = _cli(
                 state, "plan", "apply", "--plan", str(plan_file),
                 "--repo", str(root), "--approved-by", "ivo",
@@ -687,22 +773,27 @@ class PlanApprovalTest(unittest.TestCase):
     def test_update_path_dry_run_echoes_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, wdd, state = self._ready_repo(tmp)
-            plan_file = root / "plan.json"
             plan = _plan([_task("T1")])
+            _write_briefs(wdd, plan)
+            plan_file = root / "plan.json"
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
-            # First apply without approval
-            code, _ = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            # First apply, approved (Task 3: a nonempty diff requires it now)
+            code, _ = _cli(state, "plan", "apply", "--plan", str(plan_file),
+                           "--repo", str(root), "--approved-by", "ivo")
             self.assertEqual(code, 0)
-            # Dry-run with --approved-by
+            before = StateStore(wdd / "state.json").read()["scope"]["approval"]
+            # Dry-run with --approved-by, against a CHANGED plan (T2 added)
             plan = _plan([_task("T1"), _task("T2")])
+            _write_briefs(wdd, plan)
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
             code, out = _cli(state, "plan", "apply", "--plan", str(plan_file),
                              "--repo", str(root), "--dry-run", "--approved-by", "ivo")
-            self.assertEqual(code, 0)
+            self.assertEqual(code, 0, out)
             self.assertIn("ivo", out)
-            # Approval should NOT be stamped in state
-            approval = StateStore(wdd / "state.json").read()["scope"].get("approval")
-            self.assertIsNone(approval)
+            # A dry run never writes: the recorded approval (and its
+            # composite, still pinned to the one-task plan) is untouched.
+            after = StateStore(wdd / "state.json").read()["scope"]["approval"]
+            self.assertEqual(before, after)
 
 
 if __name__ == "__main__":

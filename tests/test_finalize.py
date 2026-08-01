@@ -125,6 +125,19 @@ def _gh_log(log_path: str) -> list[list[str]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
+def _mark_legacy(state: str) -> None:
+    """Exempt a hand-built fixture from the phase-6a intake ladder.
+
+    This module exercises finalize-phase mechanics, not intake -- per the
+    plan's architecture note, these mark `intake.legacy` explicitly rather
+    than fake-walk a ladder that isn't the point of the test.
+    """
+    store = StateStore(Path(state))
+    current = store.read()
+    current["intake"] = {"legacy": True}
+    store.write(current)
+
+
 def _bootstrap_ready_scope(
     tmp: str, *, surface: str, mode: str = "controller", base_ref: str = "wdd/scope-x",
     review_policy: str = "always",
@@ -150,6 +163,7 @@ def _bootstrap_ready_scope(
     if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
         assert _cli(state, "config", "set", "verification.commands", '["true"]')[0] == 0
     assert _cli(state, "constitution", "ratify", "--by", "t")[0] == 0
+    _mark_legacy(state)
     plan_file = root / "plan.json"
     plan_file.write_text(
         json.dumps(_plan({"baseRef": base_ref, "reviewPolicy": review_policy})),

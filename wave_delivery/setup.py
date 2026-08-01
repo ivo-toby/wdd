@@ -17,6 +17,7 @@ from typing import Any
 from .config import config_path, constitution_path, default_config, load_config, save_config
 from .constitution import probe_repository
 from .engine import apply_mutation
+from .intake import intake_drift, intake_status
 from .schema import copied_state, new_setup_state
 from .store import StateStore, atomic_write_text
 
@@ -175,6 +176,70 @@ def init_repository(wdd_dir: Path | str, repo: Path | str) -> dict[str, Any]:
     }
 
 
+def _intake_ladder_action(
+    state: dict[str, Any], wdd_dir: Path, prefix: str
+) -> dict[str, Any] | None:
+    """The one intake rung to walk next, or None once the ladder is done.
+
+    Front-half spec Sec1: between ratify and plan apply, `next` walks
+    ``agree_spec -> research -> agree_design`` one rung at a time. Drift
+    takes priority over "what's unset": a rung that was already recorded but
+    whose artifact bytes no longer match is re-emitted with ``stale: true``
+    (spec's "before apply, next re-hashes" clause) even though every rung
+    technically has *a* record -- an approval of edited-since bytes approves
+    nothing. Legacy scopes are wholesale exempt (schema.py's migration-only
+    doctrine), so this returns None immediately for them.
+    """
+    intake = state.get("intake") or {}
+    if intake.get("legacy") is True:
+        return None
+    drift = intake_drift(state, wdd_dir)
+    rung = drift["rung"] if drift is not None else intake_status(state)["nextRung"]
+    if rung is None:
+        return None
+    action: dict[str, Any]
+    if rung == "spec":
+        action = {
+            "task": "-",
+            "action": "agree_spec",
+            "recordWith": f"{prefix} intake spec --approved-by NAME",
+            "judgment": (
+                "agree .wdd/spec.md with the user (goal, in/out of scope, numbered "
+                "acceptance criteria) per the wdd-intake skill's spec stage, then record it"
+            ),
+        }
+    elif rung == "research":
+        action = {
+            "task": "-",
+            "action": "research",
+            "recordWith": (
+                f"{prefix} intake research --done --by NAME --artifacts PATH... "
+                "(or --skip --by NAME --reason '...')"
+            ),
+            "judgment": (
+                "read the named reference implementation and build the contract "
+                "inventory per the wdd-intake skill's research stage, or record an "
+                "explicit, attributed skip when no external contract applies"
+            ),
+        }
+    else:  # rung == "design"
+        action = {
+            "task": "-",
+            "action": "agree_design",
+            "recordWith": (
+                f"{prefix} intake design --approved-by NAME --deliverable-command '...'"
+            ),
+            "judgment": (
+                "agree .wdd/design.md (components, interfaces, integration surfaces, "
+                "epic deliverable) with the user per the wdd-intake skill's design stage, "
+                "then record it with the command that proves the epic deliverable"
+            ),
+        }
+    if drift is not None:
+        action["stale"] = True
+    return action
+
+
 def setup_next_actions(
     state: dict[str, Any], wdd_dir: Path | str, *, state_path: str | None = None
 ) -> dict[str, Any]:
@@ -226,14 +291,18 @@ def setup_next_actions(
             }
         )
     elif state.get("scope") is None:
-        actions.append(
-            {
-                "task": "-",
-                "action": "plan",
-                "command": f"{prefix} plan apply --plan plan.json --repo .",
-                "judgment": "decompose the work per the wdd-plan skill, write task briefs, then apply",
-            }
-        )
+        ladder_action = _intake_ladder_action(state, wdd_dir, prefix)
+        if ladder_action is not None:
+            actions.append(ladder_action)
+        else:
+            actions.append(
+                {
+                    "task": "-",
+                    "action": "plan",
+                    "command": f"{prefix} plan apply --plan plan.json --repo .",
+                    "judgment": "decompose the work per the wdd-plan skill, write task briefs, then apply",
+                }
+            )
     return {
         "scope": (state.get("scope") or {}).get("id") if state.get("scope") else None,
         "revision": state["revision"],

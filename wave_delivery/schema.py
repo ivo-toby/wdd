@@ -35,6 +35,9 @@ def task_state(
     conflict_domains: list[str] | None = None,
     spec_path: str | None = None,
     risk: str = "normal",
+    context: list[str] | None = None,
+    model: str | None = None,
+    review_model: str | None = None,
 ) -> dict[str, Any]:
     if risk not in RISK_LEVELS:
         raise ValidationError(f"task risk must be one of {sorted(RISK_LEVELS)}")
@@ -46,6 +49,13 @@ def task_state(
         "risk": risk,
         "dependsOn": list(depends_on or []),
         "conflictDomains": list(conflict_domains or []),
+        # Handover fields (front-half spec Sec3): validated at plan apply
+        # (path/format for context, non-empty for model/reviewModel) and
+        # persisted here so the plan-approval composite and Task 4's drift
+        # gate can be reconstructed from state alone.
+        "context": list(context or []),
+        "model": model,
+        "reviewModel": review_model,
         "branch": None,
         "worktree": None,
         "headSha": None,
@@ -220,12 +230,14 @@ def validate_state(state: dict[str, Any]) -> None:
             raise ValidationError(f"tasks.{task_id}.status is invalid")
         if task.get("risk") not in RISK_LEVELS:
             raise ValidationError(f"tasks.{task_id}.risk must be 'normal' or 'high'")
-        for field in ("dependsOn", "conflictDomains"):
+        for field in ("dependsOn", "conflictDomains", "context"):
             value = task.get(field)
             if not isinstance(value, list) or not all(
                 isinstance(item, str) and item for item in value
             ):
                 raise ValidationError(f"tasks.{task_id}.{field} must be a string list")
+        for field in ("model", "reviewModel"):
+            _require_string(task.get(field), f"tasks.{task_id}.{field}", nullable=True)
         if task_id in task["dependsOn"]:
             raise ValidationError(f"tasks.{task_id} cannot depend on itself")
         for dependency in task["dependsOn"]:

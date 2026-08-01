@@ -74,6 +74,26 @@ def _cli(state: str, *argv: str) -> tuple[int, str]:
     return code, stdout.getvalue()
 
 
+def _cli_full(state: str, *argv: str) -> tuple[int, str, str]:
+    """Like _cli, but also captures stderr for asserting on refusal messages."""
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        code = main(["--state", state, *argv])
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+def _plan_document(
+    task_ids: tuple[str, ...] | list[str], *, scope_id: str = "SCOPE-x", base_ref: str = "wdd/scope-x"
+) -> dict:
+    return {
+        "schemaVersion": 1,
+        "kind": "wdd_plan",
+        "scope": {"id": scope_id, "baseRef": base_ref},
+        "tasks": [{"id": task_id, "specPath": f"tasks/{task_id}.md"} for task_id in task_ids],
+    }
+
+
 def _ratified_repo(tmp: str) -> tuple[Path, str]:
     """A fresh git repo with .wdd/ initialized and the constitution ratified.
 
@@ -614,6 +634,7 @@ class IntakeSpecVerbTest(unittest.TestCase):
                 "T1": {
                     "id": "T1", "title": "T1", "specPath": "tasks/T1.md", "status": "done",
                     "risk": "normal", "dependsOn": [], "conflictDomains": [], "branch": None,
+                    "context": [], "model": None, "reviewModel": None,
                     "worktree": None, "headSha": None, "pr": None, "review": None,
                     "verification": None, "freshness": None, "merge": None, "blocker": None,
                 }
@@ -1073,6 +1094,351 @@ class IntakeFunctionLevelRefusalTest(unittest.TestCase):
                 record_design(store, wdd, approved_by="t", deliverable_command="")
             with self.assertRaises(ValidationError):
                 record_design(store, wdd, approved_by="t", deliverable_command="   ")
+
+
+class SetupLadderNextTest(unittest.TestCase):
+    """Task 3: `next` walks agree_spec -> research -> agree_design -> plan,
+    one rung at a time, and a drifted rung is re-emitted with `stale: true`."""
+
+    def test_next_walks_the_ladder_then_plan_then_apply_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            action = json.loads(out)["actions"][0]
+            self.assertEqual(action["action"], "agree_spec")
+            self.assertIn("recordWith", action)
+            self.assertNotIn("stale", action)
+
+            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
+
+            code, out = _cli(state, "next")
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "research")
+
+            assert _cli(
+                state, "intake", "research", "--skip", "--by", "t", "--reason", "n/a"
+            )[0] == 0
+
+            code, out = _cli(state, "next")
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_design")
+
+            (wdd / "design.md").write_text(_design_text(), encoding="utf-8")
+            assert _cli(
+                state, "intake", "design", "--approved-by", "t", "--deliverable-command", "true"
+            )[0] == 0
+
+            code, out = _cli(state, "next")
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "plan")
+
+            (wdd / "tasks").mkdir(exist_ok=True)
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+
+    def test_drifted_rung_is_reemitted_with_stale_true(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _walk_intake(state, wdd)
+            (wdd / "spec.md").write_text(
+                _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
+            )
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            action = json.loads(out)["actions"][0]
+            self.assertEqual(action["action"], "agree_spec")
+            self.assertTrue(action["stale"])
+
+
+class PlanApplyGateTest(unittest.TestCase):
+    """Task 3: the store-missing bootstrap is gone; non-legacy apply refuses
+    on an incomplete or drifted ladder, and on an unapproved nonempty diff."""
+
+    def test_refuses_when_no_state_naming_init(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            state = str(root / ".wdd" / "state.json")
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            code, _out, err = _cli_full(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root)
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("wddctl init", err)
+
+    def test_refuses_while_intake_ladder_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            (wdd / "tasks").mkdir(exist_ok=True)
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            code, _out, err = _cli_full(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("intake ladder is incomplete", err)
+            self.assertIsNone(StateStore(Path(state)).read()["scope"])
+
+    def test_refuses_on_drifted_rung(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _walk_intake(state, wdd)
+            (wdd / "spec.md").write_text(
+                _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
+            )
+            (wdd / "tasks").mkdir(exist_ok=True)
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            code, _out, err = _cli_full(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("drifted", err)
+
+    def test_refuses_a_changed_plan_without_approved_by(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _walk_intake(state, wdd)
+            (wdd / "tasks").mkdir(exist_ok=True)
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            code, _out, err = _cli_full(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root)
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("--approved-by", err)
+            self.assertIsNone(StateStore(Path(state)).read()["scope"])
+
+
+class PlanApprovalCompositeTest(unittest.TestCase):
+    """Task 3: plan_composite covers the normalized plan + every brief +
+    every context file; the recorded composite changes when those bytes do."""
+
+    def _ready(self, tmp: str) -> tuple[Path, Path, str]:
+        root, state = _ratified_repo(tmp)
+        wdd = root / ".wdd"
+        _walk_intake(state, wdd)
+        (wdd / "tasks").mkdir(exist_ok=True)
+        (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief v1.\n", encoding="utf-8")
+        return root, wdd, state
+
+    def test_composite_is_recorded_on_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _wdd, state = self._ready(tmp)
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+            approval = StateStore(Path(state)).read()["scope"]["approval"]
+            self.assertEqual(approval["by"], "t")
+            self.assertTrue(approval["sha256"].startswith("sha256:"))
+
+    def test_editing_a_brief_changes_the_composite_on_restamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd, state = self._ready(tmp)
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            assert _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )[0] == 0
+            first = StateStore(Path(state)).read()["scope"]["approval"]["sha256"]
+
+            # The brief's bytes change but no MUTABLE_TASK_FIELD does, so
+            # _diff_plan alone would call this "unchanged" -- the re-stamp
+            # (same --approved-by, same plan file) is exactly how the
+            # operator signs off on the edit and moves the composite.
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief v2, edited.\n", encoding="utf-8")
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+            second = StateStore(Path(state)).read()["scope"]["approval"]["sha256"]
+            self.assertNotEqual(first, second)
+
+    def test_context_file_bytes_are_covered_by_the_composite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wdd, state = self._ready(tmp)
+            (wdd / "shared-context").mkdir(exist_ok=True)
+            context_file = wdd / "shared-context" / "notes.md"
+            context_file.write_text("v1\n", encoding="utf-8")
+            plan = _plan_document(["T1"])
+            plan["tasks"][0]["context"] = ["shared-context/notes.md#x"]
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            assert _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )[0] == 0
+            first = StateStore(Path(state)).read()["scope"]["approval"]["sha256"]
+
+            context_file.write_text("v2, edited\n", encoding="utf-8")
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+            second = StateStore(Path(state)).read()["scope"]["approval"]["sha256"]
+            self.assertNotEqual(first, second)
+
+    def test_context_ref_escaping_wdd_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _wdd, state = self._ready(tmp)
+            (root / "outside.md").write_text("x\n", encoding="utf-8")
+            plan = _plan_document(["T1"])
+            plan["tasks"][0]["context"] = ["../outside.md"]
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            code, _out, _err = _cli_full(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertNotEqual(code, 0)
+
+    def test_context_ref_to_a_missing_file_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _wdd, state = self._ready(tmp)
+            plan = _plan_document(["T1"])
+            plan["tasks"][0]["context"] = ["shared-context/does-not-exist.md"]
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            code, _out, _err = _cli_full(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertNotEqual(code, 0)
+
+    def test_unchanged_reapply_without_flag_preserves_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _wdd, state = self._ready(tmp)
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            assert _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )[0] == 0
+            before = StateStore(Path(state)).read()["scope"]["approval"]
+
+            code, out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            after = StateStore(Path(state)).read()["scope"]["approval"]
+            self.assertEqual(before, after)
+
+
+class PlanTaskHandoverFieldsTest(unittest.TestCase):
+    """Task 3: context/model/reviewModel are validated at apply and
+    persisted into task state (MUTABLE_TASK_FIELDS), so a later edit is a
+    detectable diff and the composite is reconstructable from state alone."""
+
+    def test_context_model_reviewmodel_are_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _walk_intake(state, wdd)
+            (wdd / "tasks").mkdir(exist_ok=True)
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            (wdd / "shared-context").mkdir(exist_ok=True)
+            (wdd / "shared-context" / "notes.md").write_text("row\n", encoding="utf-8")
+            plan = _plan_document(["T1"])
+            plan["tasks"][0]["context"] = ["shared-context/notes.md#x", "spec.md#AC-1"]
+            plan["tasks"][0]["model"] = "qwen-local"
+            plan["tasks"][0]["reviewModel"] = "opus"
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+            task = StateStore(Path(state)).read()["tasks"]["T1"]
+            self.assertEqual(task["context"], ["shared-context/notes.md#x", "spec.md#AC-1"])
+            self.assertEqual(task["model"], "qwen-local")
+            self.assertEqual(task["reviewModel"], "opus")
+
+    def test_changing_model_on_reapply_is_a_diff_requiring_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _walk_intake(state, wdd)
+            (wdd / "tasks").mkdir(exist_ok=True)
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            plan = _plan_document(["T1"])
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            assert _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )[0] == 0
+
+            plan["tasks"][0]["model"] = "qwen-local"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            code, _out, _err = _cli_full(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root)
+            )
+            self.assertNotEqual(code, 0)
+
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(StateStore(Path(state)).read()["tasks"]["T1"]["model"], "qwen-local")
+
+
+class LegacyPlanApplyRegressionTest(unittest.TestCase):
+    """Task 3 pin: a migrated (legacy) scope's plan apply is bit-for-bit
+    unaffected -- no ladder, no composite, no approval requirement."""
+
+    def test_legacy_scope_applies_without_ladder_brief_or_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            store = StateStore(Path(state))
+            legacy_state = deepcopy(store.read())
+            legacy_state["intake"] = {"legacy": True}
+            store.write(legacy_state)
+
+            # No spec.md/design.md, no ladder walked, no brief file on disk,
+            # no --approved-by: exactly the pre-v5 apply_plan contract.
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            code, out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            after = StateStore(Path(state)).read()
+            self.assertIsNotNone(after["scope"])
+            self.assertIn("T1", after["tasks"])
+            self.assertIsNone(after["scope"].get("approval"))
+
+    def test_legacy_next_never_shows_ladder_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            store = StateStore(Path(state))
+            legacy_state = deepcopy(store.read())
+            legacy_state["intake"] = {"legacy": True}
+            store.write(legacy_state)
+
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "plan")
 
 
 if __name__ == "__main__":

@@ -466,9 +466,19 @@ class PlanAdoptionTest(unittest.TestCase):
                 "status": "ratified",
                 "ratification": {"by": "ivo", "decisionFingerprint": "sha256:abc"},
             }
+            # This test exercises scope adoption, not the intake ladder; mark
+            # legacy per the plan's architecture note rather than fake-walk
+            # a ladder that isn't the point here.
+            state["intake"] = {"legacy": True}
             store.write(state)
             result = apply_plan(store, _minimal_plan())
-            self.assertFalse(result["created"])
+            # Bootstrap removal (Task 3) collapsed the old "no file at all"
+            # vs. "file exists with scope still null" distinction into one
+            # case: apply_plan always finds an existing store now, so
+            # "created" is redefined as "this apply just adopted a scope
+            # where there was none" -- true here, same as a genuine first
+            # apply after 'wddctl init'.
+            self.assertTrue(result["created"])
             adopted = store.read()
             self.assertEqual(adopted["scope"]["id"], "SCOPE-demo")
             self.assertIn("TASK-001-first", adopted["tasks"])
@@ -485,6 +495,12 @@ class PlanConfigDefaultsTest(unittest.TestCase):
         config = set_value(config, "verification.commands", ["true"])
         config = set_value(config, "review.policy", "always")
         save_config(wdd, config)
+        # Config-overlay tests, not intake ones: mark legacy so plan apply's
+        # new ladder gate doesn't block on an unwalked ladder.
+        store = StateStore(wdd / "state.json")
+        state = store.read()
+        state["intake"] = {"legacy": True}
+        store.write(state)
         return root, wdd
 
     def test_omitted_scope_field_defaults_from_config(self) -> None:
@@ -546,6 +562,10 @@ class GovernanceDriftTest(unittest.TestCase):
                 "decisionFingerprint": governance_fingerprint(wdd),
             },
         }
+        # Governance-drift tests, not intake ones: mark legacy so the
+        # (unrelated) apply_plan calls some of these tests make don't block
+        # on an unwalked ladder.
+        state["intake"] = {"legacy": True}
         store.write(state)
         return root, wdd
 
@@ -777,6 +797,39 @@ class EndToEndSetupTest(unittest.TestCase):
             self._cli(state, "constitution", "ratify", "--by", "test")
 
             payload = self._cli(state, "next")
+            self.assertEqual(payload["actions"][0]["action"], "agree_spec")
+
+            (wdd / "spec.md").write_text(
+                "# Spec\n\n## Goal\n\nShip it.\n\n## In scope\n\n- x\n\n"
+                "## Out of scope\n\n- y\n\n## Acceptance criteria\n\n"
+                "- [ ] AC-1: the thing works\n",
+                encoding="utf-8",
+            )
+            self._cli(state, "intake", "spec", "--approved-by", "test")
+
+            payload = self._cli(state, "next")
+            self.assertEqual(payload["actions"][0]["action"], "research")
+
+            self._cli(
+                state, "intake", "research", "--skip", "--by", "test",
+                "--reason", "no external contracts",
+            )
+
+            payload = self._cli(state, "next")
+            self.assertEqual(payload["actions"][0]["action"], "agree_design")
+
+            (wdd / "design.md").write_text(
+                "# Design\n\n## Components\n\n- core\n\n## Interfaces\n\n"
+                "- core: consumes nothing, produces lib\n\n"
+                "## Integration surfaces\n\n- `src/core.py` — owned by: core task\n\n"
+                "## Epic deliverable\n\nThe lib imports.\n",
+                encoding="utf-8",
+            )
+            self._cli(
+                state, "intake", "design", "--approved-by", "test", "--deliverable-command", "true"
+            )
+
+            payload = self._cli(state, "next")
             self.assertEqual(payload["actions"][0]["action"], "plan")
 
             plan_file = root / "plan.json"
@@ -785,7 +838,10 @@ class EndToEndSetupTest(unittest.TestCase):
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
             (wdd / "tasks").mkdir(exist_ok=True)
             (wdd / "tasks" / "TASK-001-first.md").write_text("# Brief\n", encoding="utf-8")
-            self._cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
+            self._cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "test",
+            )
 
             payload = self._cli(state, "next", "--repo", str(root))
             actions = [action["action"] for action in payload["actions"]]

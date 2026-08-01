@@ -60,6 +60,15 @@ def convert(state: dict[str, Any], *, review_policy: str = "always") -> dict[str
     migrated = deepcopy(v4)
     migrated["schemaVersion"] = SCHEMA_VERSION
     migrated["intake"] = {"legacy": True}
+    # Handover fields (phase-6a, spec Sec3) postdate every migratable source
+    # version, including a source that was ALREADY v4 (the passthrough
+    # branch of _convert_to_v4 above, which does not touch task fields at
+    # all) -- applied here so every path to v5 gets the same defaults
+    # task_state() gives a freshly planned task.
+    for task in migrated["tasks"].values():
+        task.setdefault("context", [])
+        task.setdefault("model", None)
+        task.setdefault("reviewModel", None)
     validate_state(migrated)
     return migrated
 

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from wave_delivery import leases
 from wave_delivery.cli import main
+from wave_delivery.config import load_config
 from wave_delivery.constitution import (
     probe_repository,
     ratification_status,
@@ -60,7 +61,7 @@ from wave_delivery.review import (
     record_verification,
     run_review,
 )
-from wave_delivery.schema import new_state, task_state, validate_state
+from wave_delivery.schema import new_setup_state, new_state, task_state, validate_state
 from wave_delivery.store import StateStore
 
 
@@ -100,6 +101,24 @@ class BaseTest(unittest.TestCase):
         self.git(repo, "commit", "-qm", "init")
         return repo
 
+    def _bootstrapped_store(self, repo: Path) -> StateStore:
+        """A store with schema-v5 legacy-intake state already on disk.
+
+        Phase-6a (intake ladder) removed apply_plan's no-state bootstrap:
+        `wddctl init` is now the only way state comes to exist, and a
+        non-legacy scope must walk the intake ladder before its first plan
+        apply. These execution/merge/reconciliation tests exercise none of
+        that -- they are pre-existing scope mechanics -- so per the plan's
+        architecture note, hand-built fixtures mark `intake: {"legacy":
+        True}` explicitly rather than fake-walking a ladder that isn't the
+        point of the test.
+        """
+        store = StateStore(repo / ".wdd" / "state.json")
+        state = new_setup_state()
+        state["intake"] = {"legacy": True}
+        store.write(state)
+        return store
+
     def plan_document(self, **overrides) -> dict:
         plan = {
             "schemaVersion": 1,
@@ -123,7 +142,7 @@ class BaseTest(unittest.TestCase):
 
     def scope(self, repo: Path, plan: dict | None = None) -> StateStore:
         plan = validate_plan(plan or self.plan_document())
-        store = StateStore(repo / ".wdd" / "state.json")
+        store = self._bootstrapped_store(repo)
         apply_plan(store, plan, repo=repo)
         apply_event(
             store,
@@ -538,7 +557,7 @@ class FourthRoundRegressionTests(BaseTest):
 
     def test_unratified_start_leaves_git_untouched(self) -> None:
         repo = self.repository()
-        store = StateStore(repo / ".wdd" / "state.json")
+        store = self._bootstrapped_store(repo)
         apply_plan(store, validate_plan(self.plan_document()), repo=repo)
         with self.assertRaises(IllegalTransition):
             start_task(store, repo=repo, task_id="TASK-A")
@@ -676,26 +695,13 @@ class ConcurrencyRegressionTests(BaseTest):
         self.assertTrue(store.lock_path.exists())
         store.lock_path.unlink()
 
-    def test_creating_a_scope_twice_concurrently_refuses_the_loser(self) -> None:
-        repo = self.repository()
-        rival = StateStore(repo / ".wdd" / "state.json")
-        apply_plan(rival, validate_plan(self.plan_document()), repo=repo)
-
-        loser = StateStore(repo / ".wdd" / "state.json")
-        real_exists = loser.exists
-        calls: list[bool] = []
-
-        def stale_first_check() -> bool:
-            # The pre-lock check ran before the rival's write landed; every
-            # later call, including the one inside the lock, sees the truth.
-            calls.append(True)
-            return False if len(calls) == 1 else real_exists()
-
-        loser.exists = stale_first_check
-        with self.assertRaises(IllegalTransition) as raised:
-            apply_plan(loser, validate_plan(self.plan_document()), repo=repo)
-        self.assertIn("created concurrently", str(raised.exception))
-        self.assertEqual(rival.read()["scope"]["id"], "SCOPE-demo")
+    # test_creating_a_scope_twice_concurrently_refuses_the_loser removed:
+    # phase-6a's intake ladder removed apply_plan's no-state bootstrap (the
+    # store.exists()==False branch this test raced two callers against), so
+    # the "two racers both see no state" scenario it pinned can no longer
+    # happen -- `wddctl init` now owns state creation, and any two apply_plan
+    # callers already contend on the ordinary store lock apply_mutation uses
+    # for every other write.
 
     def test_migration_is_serialized_against_a_second_migration(self) -> None:
         path = self.root / "v2.json"
@@ -855,7 +861,7 @@ class PlanTests(BaseTest):
 
     def test_apply_creates_the_base_branch(self) -> None:
         repo = self.repository()
-        store = StateStore(repo / ".wdd" / "state.json")
+        store = self._bootstrapped_store(repo)
         result = apply_plan(store, validate_plan(self.plan_document()), repo=repo)
         self.assertTrue(result["created"])
         self.assertEqual(result["base"]["action"], "created")
@@ -863,9 +869,9 @@ class PlanTests(BaseTest):
 
     def test_dry_run_writes_nothing(self) -> None:
         repo = self.repository()
-        store = StateStore(repo / ".wdd" / "state.json")
+        store = self._bootstrapped_store(repo)
         apply_plan(store, validate_plan(self.plan_document()), repo=repo, dry_run=True)
-        self.assertFalse(store.exists())
+        self.assertIsNone(store.read()["scope"])
 
     def test_reapply_is_a_no_op_and_can_add_tasks(self) -> None:
         repo = self.repository()
@@ -1456,7 +1462,7 @@ class ReconcileTests(BaseTest):
 class LifecycleTests(BaseTest):
     def test_execution_is_blocked_until_ratification(self) -> None:
         repo = self.repository()
-        store = StateStore(repo / ".wdd" / "state.json")
+        store = self._bootstrapped_store(repo)
         apply_plan(store, validate_plan(self.plan_document()), repo=repo)
         with self.assertRaises(IllegalTransition):
             start_task(store, repo=repo, task_id="TASK-A")
@@ -1682,7 +1688,7 @@ class ConstitutionTests(BaseTest):
 
     def test_amendment_requires_prior_ratification(self) -> None:
         repo = self.repository()
-        store = StateStore(repo / ".wdd" / "state.json")
+        store = self._bootstrapped_store(repo)
         apply_plan(store, validate_plan(self.plan_document()), repo=repo)
         with self.assertRaises(IllegalTransition):
             apply_event(
@@ -1732,18 +1738,73 @@ class CliTests(BaseTest):
             self.addCleanup(silence.__exit__, None, None, None)
 
     def test_cli_drives_a_task_end_to_end(self) -> None:
+        """The realism test for the phase-6a lifecycle: init -> resolve open
+        questions -> ratify -> walk the intake ladder -> plan apply
+        --approved-by -> the ordinary execution loop. This used to drive
+        `plan apply` straight onto a no-state repo (the bootstrap Task 3
+        removed); it now genuinely exercises `wddctl init` and the ladder,
+        which is the point of calling it the CLI end-to-end test."""
         repo = self.repository()
-        plan_path = repo / ".wdd" / "plan.json"
-        plan_path.parent.mkdir(parents=True, exist_ok=True)
-        plan_path.write_text(json.dumps(self.plan_document()), encoding="utf-8")
-        state_path = repo / ".wdd" / "state.json"
+        wdd = repo / ".wdd"
+        state_path = wdd / "state.json"
 
         def run(*arguments: str) -> int:
             return main(["--state", str(state_path), *arguments])
 
-        self.assertEqual(run("plan", "apply", "--plan", str(plan_path), "--repo", str(repo)), 0)
+        self.assertEqual(run("init", "--repo", str(repo)), 0)
+        self.assertEqual(run("config", "set", "merge.surface", "local"), 0)
         self.assertEqual(
-            run("constitution", "ratify", "--by", "tester", "--decision-fingerprint", "sha256:x"), 0
+            run(
+                "config", "set", "models",
+                '{"planning": null, "implementation": {"default": null, "highRisk": null}, "review": null}',
+            ),
+            0,
+        )
+        config = load_config(wdd)
+        if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
+            self.assertEqual(run("config", "set", "verification.commands", '["true"]'), 0)
+        self.assertEqual(run("constitution", "ratify", "--by", "tester"), 0)
+
+        (wdd / "spec.md").write_text(
+            "# Spec\n\n## Goal\n\nShip it.\n\n## In scope\n\n- x\n\n"
+            "## Out of scope\n\n- y\n\n## Acceptance criteria\n\n"
+            "- [ ] AC-1: the thing works\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(run("intake", "spec", "--approved-by", "tester"), 0)
+        self.assertEqual(
+            run(
+                "intake", "research", "--skip", "--by", "tester",
+                "--reason", "no external contracts",
+            ),
+            0,
+        )
+        (wdd / "design.md").write_text(
+            "# Design\n\n## Components\n\n- core\n\n## Interfaces\n\n"
+            "- core: consumes nothing, produces lib\n\n"
+            "## Integration surfaces\n\n- `src/core.py` — owned by: core task\n\n"
+            "## Epic deliverable\n\nThe lib imports.\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            run("intake", "design", "--approved-by", "tester", "--deliverable-command", "true"), 0
+        )
+
+        plan_path = wdd / "plan.json"
+        plan = self.plan_document()
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        (wdd / "tasks").mkdir(exist_ok=True)
+        for task in plan["tasks"]:
+            (wdd / task.get("specPath", f"tasks/{task['id']}.md")).write_text(
+                f"# {task['id']}\n\nBrief.\n", encoding="utf-8"
+            )
+
+        self.assertEqual(
+            run(
+                "plan", "apply", "--plan", str(plan_path), "--repo", str(repo),
+                "--approved-by", "tester",
+            ),
+            0,
         )
         self.assertEqual(run("start", "--task", "TASK-A", "--repo", str(repo)), 0)
         worktree = worktree_for(repo, "SCOPE-demo", "TASK-A")

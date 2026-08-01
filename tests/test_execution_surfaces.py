@@ -82,6 +82,20 @@ def _ratified(state: dict) -> dict:
     return state
 
 
+def _mark_legacy(state: str) -> None:
+    """Exempt a hand-built fixture from the phase-6a intake ladder.
+
+    This module exercises execution-surface mechanics (start/submit/merge,
+    PR vs local, human vs controller mode), not intake -- per the plan's
+    architecture note, these mark `intake.legacy` explicitly rather than
+    fake-walk a ladder that isn't the point of the test.
+    """
+    store = StateStore(Path(state))
+    current = store.read()
+    current["intake"] = {"legacy": True}
+    store.write(current)
+
+
 def _cli_full(state: str, *argv: str) -> tuple[int, str, str]:
     """Like _cli, but also captures stderr for asserting on refusal messages."""
     stdout = io.StringIO()
@@ -166,6 +180,7 @@ def _bootstrap_ready_scope(
     if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
         assert _cli(state, "config", "set", "verification.commands", '["true"]')[0] == 0
     assert _cli(state, "constitution", "ratify", "--by", "t")[0] == 0
+    _mark_legacy(state)
     plan_file = root / "plan.json"
     plan_file.write_text(json.dumps(_plan({"baseRef": base_ref})), encoding="utf-8")
     code, out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
@@ -213,6 +228,7 @@ class MergeSettingsTest(unittest.TestCase):
         if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
             assert _cli(state, "config", "set", "verification.commands", '["true"]')[0] == 0
         assert _cli(state, "constitution", "ratify", "--by", "t")[0] == 0
+        _mark_legacy(state)
         return root, wdd, state
 
     def test_defaults_from_config(self) -> None:
@@ -268,17 +284,20 @@ class MergeSettingsTest(unittest.TestCase):
 
 
 class BootstrapApplyMergeFieldsTest(unittest.TestCase):
-    # Regression coverage: apply_plan's store-missing branch builds state via
-    # state_from_plan() -> new_state(), neither of which knew about these
-    # fields, so a plan setting them on the very first apply (no prior
-    # init/state.json) silently lost them -- merge_settings() would then
-    # resolve to config defaults against the operator's stated override.
+    # Regression coverage: the first-ever plan apply that adopts a scope
+    # from a null-scope state (_apply_plan_to_state's null-scope branch --
+    # the only surviving scope-adoption path since Task 3 removed
+    # apply_plan's store-missing bootstrap) must still carry these fields,
+    # or merge_settings() would resolve to config defaults against the
+    # operator's stated override.
 
     def test_first_apply_carries_scope_override_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _git_repo(tmp)
             wdd = root / ".wdd"
             state_path = str(wdd / "state.json")
+            assert _cli(state_path, "init", "--repo", str(root))[0] == 0
+            _mark_legacy(state_path)
             plan_file = root / "plan.json"
             plan_file.write_text(
                 json.dumps(_plan({"mergeSurface": "local", "mergeMode": "human"})),
@@ -295,6 +314,8 @@ class BootstrapApplyMergeFieldsTest(unittest.TestCase):
             root = _git_repo(tmp)
             wdd = root / ".wdd"
             state_path = str(wdd / "state.json")
+            assert _cli(state_path, "init", "--repo", str(root))[0] == 0
+            _mark_legacy(state_path)
             plan_file = root / "plan.json"
             plan_file.write_text(json.dumps(_plan()), encoding="utf-8")
             code, out = _cli(state_path, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
@@ -387,6 +408,7 @@ class ModelRoutingTest(unittest.TestCase):
                     _cli(state_path, "config", "set", "verification.commands", '["true"]')[0], 0
                 )
             self.assertEqual(_cli(state_path, "constitution", "ratify", "--by", "t")[0], 0)
+            _mark_legacy(state_path)
             plan = _plan()
             plan["tasks"][0]["risk"] = "high"
             plan_file = root / "plan.json"
@@ -433,6 +455,7 @@ class PrSurfaceSubmitTest(unittest.TestCase):
                 _cli(state, "config", "set", "verification.commands", '["true"]')[0], 0
             )
         self.assertEqual(_cli(state, "constitution", "ratify", "--by", "t")[0], 0)
+        _mark_legacy(state)
         plan_file = root / "plan.json"
         # baseRef must differ from the default branching.targetBranch
         # ("main"): the epic branch cannot be the branch it delivers into

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -11,11 +12,13 @@ from .domains import domains_overlap
 from .engine import apply_mutation, utc_now
 from .errors import IllegalTransition, ValidationError
 from .git import branch_exists, require_repository, resolve_ref, run_git, validate_ref_name
+from .intake import artifact_sha256, intake_drift, resolve_within_wdd
 from .schema import (
     REVIEW_POLICIES,
     RISK_LEVELS,
     copied_state,
     detect_dependency_cycle,
+    intake_complete,
     new_state,
     task_state,
 )
@@ -23,7 +26,16 @@ from .store import StateStore
 
 
 PLAN_KIND = "wdd_plan"
-MUTABLE_TASK_FIELDS = ("title", "specPath", "risk", "dependsOn", "conflictDomains")
+MUTABLE_TASK_FIELDS = (
+    "title",
+    "specPath",
+    "risk",
+    "dependsOn",
+    "conflictDomains",
+    "context",
+    "model",
+    "reviewModel",
+)
 
 
 def read_plan(path: Path | str) -> dict[str, Any]:
@@ -99,6 +111,25 @@ def validate_plan(plan: Any) -> dict[str, Any]:
         spec_path = entry.get("specPath", f"tasks/{task_id}.md")
         if not isinstance(spec_path, str) or not spec_path:
             raise ValidationError(f"task {task_id} specPath must be a non-empty string")
+        context = entry.get("context", [])
+        if not isinstance(context, list) or not all(
+            isinstance(item, str) and item for item in context
+        ):
+            raise ValidationError(f"task {task_id} context must be a string list")
+        for ref in context:
+            path_part, _, _anchor = ref.partition("#")
+            if not path_part:
+                raise ValidationError(
+                    f"task {task_id} context ref has no path before '#': {ref!r}"
+                )
+        model = entry.get("model")
+        if model is not None and (not isinstance(model, str) or not model.strip()):
+            raise ValidationError(f"task {task_id} model must be a non-empty string")
+        review_model = entry.get("reviewModel")
+        if review_model is not None and (
+            not isinstance(review_model, str) or not review_model.strip()
+        ):
+            raise ValidationError(f"task {task_id} reviewModel must be a non-empty string")
         normalized.append(
             {
                 "id": task_id,
@@ -107,6 +138,9 @@ def validate_plan(plan: Any) -> dict[str, Any]:
                 "risk": risk,
                 "dependsOn": list(entry.get("dependsOn", [])),
                 "conflictDomains": list(entry.get("conflictDomains", [])),
+                "context": list(context),
+                "model": model,
+                "reviewModel": review_model,
             }
         )
 
@@ -231,6 +265,9 @@ def state_from_plan(plan: dict[str, Any]) -> dict[str, Any]:
             risk=entry["risk"],
             depends_on=entry["dependsOn"],
             conflict_domains=entry["conflictDomains"],
+            context=entry.get("context"),
+            model=entry.get("model"),
+            review_model=entry.get("reviewModel"),
         )
     return state
 
@@ -317,6 +354,9 @@ def _apply_plan_to_state(state: dict[str, Any], plan: dict[str, Any]) -> dict[st
                 risk=entry["risk"],
                 depends_on=entry["dependsOn"],
                 conflict_domains=entry["conflictDomains"],
+                context=entry.get("context"),
+                model=entry.get("model"),
+                review_model=entry.get("reviewModel"),
             )
             continue
         task = state["tasks"][task_id]
@@ -357,9 +397,76 @@ def _apply_plan_to_state(state: dict[str, Any], plan: dict[str, Any]) -> dict[st
     return state
 
 
-def _stamp_approval(state: dict[str, Any], approved_by: str | None) -> dict[str, Any]:
+def _validate_context_refs(tasks: list[dict[str, Any]], wdd_dir: Path) -> None:
+    """Every task `context` ref must resolve to a regular file inside `.wdd/`.
+
+    Ref syntax is `<path>[#anchor]` (spec Sec3); the anchor is advisory
+    reading guidance, never resolved mechanically. Mirrors intake.py's
+    research-artifact containment doctrine (`resolve_within_wdd`).
+    """
+    for entry in tasks:
+        for ref in entry.get("context") or []:
+            path_part = ref.split("#", 1)[0]
+            resolved = resolve_within_wdd(wdd_dir, path_part)
+            if not resolved.exists() or not resolved.is_file():
+                raise ValidationError(
+                    f"task {entry['id']} context ref does not resolve to a file "
+                    f"inside .wdd/: {ref!r}"
+                )
+
+
+def plan_composite(plan_dict: dict[str, Any], wdd_dir: Path | str) -> str:
+    """SHA-256 composite binding a plan approval to the bytes it was shown.
+
+    Covers the canonical normalized plan (key-sorted JSON, so task/field
+    order never changes the digest) plus every task's brief file and every
+    `context`-ref file, combined as sorted (path, sha256) pairs so duplicate
+    paths across tasks are hashed once and iteration order never matters.
+    Task 4 reconstructs a comparable plan dict from applied state (mirroring
+    `_diff_plan`'s reconstruction) and recomputes this same function to
+    detect post-apply drift -- the reason every field this composite must
+    see (context/model/reviewModel) is also a MUTABLE_TASK_FIELD persisted
+    into task state.
+    """
+    wdd_dir = Path(wdd_dir)
+    canonical = json.dumps(plan_dict, sort_keys=True, separators=(",", ":"))
+    paths: set[str] = set()
+    for entry in plan_dict["tasks"]:
+        paths.add(entry["specPath"])
+        for ref in entry.get("context") or []:
+            paths.add(ref.split("#", 1)[0])
+
+    def _hash_or_refuse(path: str) -> str:
+        resolved = wdd_dir / path
+        try:
+            return artifact_sha256(resolved)
+        except FileNotFoundError as error:
+            raise ValidationError(
+                f"plan apply --approved-by requires every brief and context file to exist: "
+                f"{path} does not exist at {resolved}"
+            ) from error
+
+    pairs = sorted((path, _hash_or_refuse(path)) for path in paths)
+    digest = hashlib.sha256()
+    digest.update(canonical.encode("utf-8"))
+    for path, file_hash in pairs:
+        digest.update(path.encode("utf-8"))
+        digest.update(file_hash.encode("utf-8"))
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _is_legacy_intake(state: dict[str, Any]) -> bool:
+    return (state.get("intake") or {}).get("legacy") is True
+
+
+def _stamp_approval(
+    state: dict[str, Any], approved_by: str | None, composite: str | None = None
+) -> dict[str, Any]:
     if approved_by:
-        state["scope"]["approval"] = {"by": approved_by, "at": utc_now()}
+        approval = {"by": approved_by, "at": utc_now()}
+        if composite is not None:
+            approval["sha256"] = composite
+        state["scope"]["approval"] = approval
     return state
 
 
@@ -392,46 +499,61 @@ def apply_plan(
     idempotency_key: str | None = None,
     approved_by: str | None = None,
 ) -> dict[str, Any]:
-    if not store.exists():
-        state = state_from_plan(plan)
-        _stamp_approval(state, approved_by)
-        diff = {
-            "added": sorted(state["tasks"]),
-            "removed": [],
-            "updated": [],
-            "scope": plan["scope"],
-        }
-        result: dict[str, Any] = {
-            "scope": plan["scope"]["id"],
-            "created": True,
-            "dryRun": dry_run,
-            "diff": diff,
-        }
-        if approved_by:
-            result["approvedBy"] = approved_by
-        if dry_run:
-            return result
-        base = None
-        # Creation is a check-then-act: without the lock two controllers both
-        # saw no state and the loser's plan was silently discarded. The
-        # existence check is repeated inside so the second one loses cleanly.
-        with store.locked():
-            if store.exists():
-                raise IllegalTransition(
-                    f"scope state already exists at {store.path}; it was created concurrently — "
-                    "re-run to apply this plan as a diff"
-                )
-            if repo is not None and plan["scope"]["baseRef"]:
-                base = ensure_base_branch(repo, plan["scope"]["baseRef"], from_ref=from_ref)
-            store.write(state)
-        return {**result, "revision": 0, "base": base}
+    """Apply a validated, overlaid plan dict to the scope's state.
 
+    The legacy no-state bootstrap (creating state.json out of thin air) is
+    gone -- Sec1/Sec7 of the front-half spec: `wddctl init` is the only way
+    state comes to exist. Every apply onto a non-legacy scope also refuses
+    while the intake ladder is incomplete or drifted, and a nonempty diff
+    requires `--approved-by` (the plan-approval composite doctrine, Sec3).
+    Legacy scopes (`intake.legacy`) are wholesale exempt from all three: they
+    have no approved-bytes baseline to gate against, so their apply behavior
+    stays bit-for-bit what it was before schema v5.
+    """
+    if not store.exists():
+        raise ValidationError(
+            f"no scope state at {store.path}; run 'wddctl init --repo .' first"
+        )
+
+    wdd_dir = store.path.parent
     current = store.read()
+    legacy = _is_legacy_intake(current)
+
+    _validate_context_refs(plan["tasks"], wdd_dir)
+
+    if not legacy:
+        if not intake_complete(current):
+            raise IllegalTransition(
+                "plan apply refuses: the intake ladder is incomplete; finish "
+                "'wddctl intake spec/research/design' before applying a plan"
+            )
+        drift = intake_drift(current, wdd_dir)
+        if drift is not None:
+            raise IllegalTransition(
+                f"plan apply refuses: intake {drift['rung']} has drifted "
+                f"(recorded {drift['recorded']}, actual {drift['actual']}); re-run "
+                f"'wddctl intake {drift['rung']} ...' to re-approve before applying"
+            )
+
     diff = _diff_plan(current, plan)
     unchanged = not (diff["added"] or diff["removed"] or diff["updated"] or diff["scope"])
+    created = current["scope"] is None
+
+    if not legacy and not unchanged and not approved_by:
+        raise ValidationError(
+            "plan apply refuses: this plan changes the scope; re-run with "
+            "--approved-by NAME once the user has reviewed the diff"
+        )
+
+    # The composite is recomputed every time an approval is (re-)stamped --
+    # including the unchanged-diff re-stamp path -- so an edit to a brief or
+    # context file (invisible to _diff_plan, which only compares task
+    # fields) is still captured in the bytes the next approval binds to.
+    composite = None if legacy or not approved_by else plan_composite(plan, wdd_dir)
+
     result = {
         "scope": plan["scope"]["id"],
-        "created": False,
+        "created": created,
         "dryRun": dry_run,
         "diff": diff,
         "revision": current["revision"],
@@ -451,7 +573,7 @@ def apply_plan(
     if unchanged and approved_by:
         def approval_mutator(state: dict[str, Any]) -> dict[str, Any]:
             state_copy = copied_state(state)
-            _stamp_approval(state_copy, approved_by)
+            _stamp_approval(state_copy, approved_by, composite)
             return state_copy
 
         state, duplicate = apply_mutation(
@@ -479,7 +601,7 @@ def apply_plan(
         # that a later corrected apply would silently adopt as its base.
         nonlocal base
         updated = _apply_plan_to_state(state, plan)
-        _stamp_approval(updated, approved_by)
+        _stamp_approval(updated, approved_by, composite)
         if repo is not None and plan["scope"]["baseRef"]:
             base = ensure_base_branch(repo, plan["scope"]["baseRef"], from_ref=from_ref)
         return updated
