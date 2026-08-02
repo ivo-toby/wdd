@@ -79,6 +79,26 @@ operation, built by actually READING the reference (source file, generated
 client, protocol doc) — never by recalling what an API "probably" looks
 like.
 
+The citation rule is hard: **cite only files you actually opened, at line
+numbers you actually read.** When the contract lives in a dependency that
+is not on disk — a library the reference merely calls into, a vendored
+API you can't see — you have exactly two honest moves:
+
+- **Fetch it first**, then read and cite it: `go mod download` and cite
+  the module-cache path, `npm pack` / clone the upstream repo, download
+  the protocol doc. The row then cites what is now on disk.
+- **Mark the row `NOT READ`** in the citation column, with where the
+  contract actually lives ("defined in appie-go v0.0.12 — not fetched"),
+  so the task brief and reviewer treat it as unverified and check it at
+  implementation time.
+
+What you must never do is let specifics recalled from memory wear a
+citation. A row that names an exact header or endpoint with a
+`file:line` pointing at code that doesn't contain it is worse than no
+row: it sends the reviewer to the wrong place with false confidence —
+the precise failure this artifact exists to kill. If a spot-check of
+your own rows finds one citation that doesn't hold, re-verify them all.
+
 ```markdown
 | Operation      | Method/Path or shape       | Citation                  |
 | -------------- | --------------------------- | -------------------------- |

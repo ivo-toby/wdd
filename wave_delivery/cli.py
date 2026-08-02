@@ -69,7 +69,9 @@ from .plan import (
     apply_config_defaults,
     apply_plan,
     apply_risk_rules,
+    brief_skeleton,
     intake_gate_status,
+    plan_skeleton,
     read_plan,
     require_fresh_intake,
     state_from_plan,
@@ -205,6 +207,14 @@ def build_parser() -> argparse.ArgumentParser:
     plan_lint = plan_subparsers.add_parser("lint", help="report plan-quality warnings")
     plan_lint.add_argument("--plan", type=Path, required=True)
     plan_lint.add_argument("--strict", action="store_true")
+    plan_template = plan_subparsers.add_parser(
+        "template",
+        help=(
+            "print a skeleton plan.json (or --brief for a task brief) to fill "
+            "in — the starting point for wdd-plan decomposition"
+        ),
+    )
+    plan_template.add_argument("--brief", action="store_true")
 
     subparsers.add_parser("doctor", help="report optional controller capabilities").add_argument(
         "--json", action="store_true"
@@ -946,6 +956,16 @@ def main(argv: list[str] | None = None) -> int:
                     "plan lint --strict: " + ", ".join(sorted({f["code"] for f in findings}))
                 )
             _print_json({"findings": findings, "strict": args.strict})
+            return 0
+
+        if args.command == "plan" and args.plan_command == "template":
+            # Pure emitter: no store.read()/write(), not in GOVERNED_VERBS,
+            # so it runs mid-setup with no .wdd/ at all -- exactly like
+            # --help. See wave_delivery.plan for the skeletons themselves.
+            if args.brief:
+                print(brief_skeleton(), end="")
+            else:
+                _print_json(plan_skeleton())
             return 0
 
         if args.command == "plan" and args.plan_command == "preview":
