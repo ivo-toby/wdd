@@ -136,7 +136,14 @@ def materialize_attempt(
     wdd_resolved = wdd_dir.resolve()
     sources = _task_input_sources(state, wdd_dir, task_id)
 
-    dispatch_dir = wdd_dir / "dispatch"
+    # Built from wdd_resolved (not the possibly-relative wdd_dir): every
+    # downstream path (attempt_dir, per-file destinations) must be absolute
+    # so the final `attempt_dir.relative_to(wdd_resolved)` below is a
+    # valid comparison regardless of whether the caller passed a relative
+    # or absolute wdd_dir -- the CLI's own default `--state` resolves to
+    # the relative `.wdd/state.json`, so this is the common case, not an
+    # edge case.
+    dispatch_dir = wdd_resolved / "dispatch"
     dispatch_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(dispatch_dir, _ATTEMPT_DIR_MODE)
 

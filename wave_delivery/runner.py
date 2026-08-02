@@ -419,7 +419,14 @@ def dispatch_task(
     except KeyError as error:
         raise ValidationError(f"unknown task: {task_id}") from error
 
-    wdd_dir = Path(wdd_dir)
+    # Resolved up front (not just where a snapshot path is read): dispatch_dir
+    # below, and the prompt/log paths built from it, are substituted into
+    # argv for a subprocess run with cwd=worktree -- a DIFFERENT directory --
+    # so a still-relative path there would resolve against the wrong cwd
+    # inside the runner process. The CLI's own default `--state` resolves to
+    # the relative `.wdd/state.json`, so this is the common case, not an
+    # edge case (same fix as materialize_attempt's, handover.py).
+    wdd_dir = Path(wdd_dir).resolve()
     repo = require_repository(repo)
 
     model = _resolve_dispatch_model(task, config, role=role)
@@ -445,7 +452,7 @@ def dispatch_task(
                 f"task {task_id} has no recorded attempt snapshot; run 'wddctl start' first"
             )
 
-    snapshot_root = wdd_dir.resolve() / snapshot
+    snapshot_root = wdd_dir / snapshot
     brief_path, context_paths = _snapshot_files(snapshot_root, Path(task["specPath"]))
     brief_text = brief_path.read_text(encoding="utf-8") if brief_path else ""
     deliverable = _extract_section(brief_text, "Deliverable")

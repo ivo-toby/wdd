@@ -403,10 +403,12 @@ def _apply_v5_scope(
     context: list[str] | None = None,
     model: str | None = None,
     review_model: str | None = None,
+    risk: str = "normal",
 ) -> None:
     """Walk the intake ladder and composite-approve a one-task plan for
     task_id, with a real brief on disk (and optional context refs / routing
-    overrides -- model/review_model feed Task 4's dispatch tests)."""
+    overrides -- model/review_model feed Task 4's dispatch tests; risk feeds
+    the e2e test's need for a task where review is actually required)."""
     _walk_intake(state, wdd)
     (wdd / "tasks").mkdir(exist_ok=True)
     (wdd / "tasks" / f"{task_id}.md").write_text(
@@ -416,7 +418,7 @@ def _apply_v5_scope(
     task_entry: dict = {
         "id": task_id,
         "specPath": f"tasks/{task_id}.md",
-        "risk": "normal",
+        "risk": risk,
         "context": context or [],
     }
     if model is not None:
@@ -732,6 +734,35 @@ class SchemaHandoverFieldsTest(unittest.TestCase):
 
 class MaterializeAttemptUnitTest(unittest.TestCase):
     """Direct (non-CLI) coverage of materialize_attempt/record_attempt."""
+
+    def test_materialize_attempt_with_relative_wdd_dir(self) -> None:
+        """Task 5 finding: the documented default invocation (`wddctl start
+        --repo .` with no `--state`, so `wdd_dir` is the CLI's relative
+        default `.wdd`) must not crash. Before the fix, the final
+        `attempt_dir.relative_to(wdd_resolved)` compared a still-relative
+        `attempt_dir` (built from the unresolved `wdd_dir` argument) against
+        the resolved/absolute `wdd_resolved`, raising ValueError on every
+        relative-path caller -- masked until now because every existing
+        test passes an absolute `wdd_dir`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            wdd.mkdir()
+            (wdd / "tasks").mkdir()
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            state = _ratified(new_state("SCOPE-x", base_ref="wdd/x"))
+            state["tasks"]["T1"] = task_state(
+                "T1", conflict_domains=["src/t1/**"], spec_path="tasks/T1.md"
+            )
+
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                result = materialize_attempt(state, Path(".wdd"), "T1")
+            finally:
+                os.chdir(cwd)
+
+            self.assertEqual(result["snapshot"], "dispatch/T1-1")
+            self.assertTrue((wdd / "dispatch" / "T1-1" / "tasks" / "T1.md").is_file())
 
     def test_materialize_attempt_unknown_task_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1549,6 +1580,49 @@ class DispatchTaskTest(unittest.TestCase):
                 runner_command_digest(edited_command), runner_command_digest(_runner_command())
             )
 
+    def test_start_and_dispatch_work_with_relative_state_path(self) -> None:
+        """Task 5 finding, dispatch's side: `dispatch_task`'s dispatch_dir/
+        prompt_path/log_path were built the same way materialize_attempt's
+        were (from the raw, possibly-relative `wdd_dir`), then substituted
+        into argv for a subprocess run with cwd=worktree -- a DIFFERENT
+        directory. A relative prompt/log path there resolves against the
+        WRONG cwd inside the runner process, not wddctl's own. Reproduces
+        the whole CLI stack with the documented default invocation (no
+        --state flag; relative default `.wdd/state.json`, cwd inside the
+        repo) rather than the absolute --state every other test in this
+        file passes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            command = _runner_command()
+            _register_runner(state, "test-runner", command)
+            self.assertEqual(_cli(state, "constitution", "amend", "--by", "t2")[0], 0)
+            self.assertEqual(
+                _cli(state, "dispatch", "--probe", "test-runner", "--repo", str(root))[0], 0
+            )
+            _apply_v5_scope(root, wdd, state, model="test-runner")
+
+            cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                code, out = _cli(".wdd/state.json", "start", "--task", "T1", "--repo", ".")
+                self.assertEqual(code, 0, out)
+                self.assertEqual(json.loads(out)["snapshot"], "dispatch/T1-1")
+
+                code, out = _cli(
+                    ".wdd/state.json", "dispatch", "--task", "T1", "--role", "worker",
+                    "--repo", ".",
+                )
+                self.assertEqual(code, 0, out)
+                dispatch_result = json.loads(out)
+            finally:
+                os.chdir(cwd)
+
+            self.assertEqual(dispatch_result["statusToken"], "DONE")
+            log_path = Path(dispatch_result["log"])
+            self.assertTrue(log_path.is_absolute(), dispatch_result["log"])
+            self.assertTrue(log_path.is_file())
+
     def test_dispatch_gated_by_input_binding_like_other_task_verbs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state, wdd = _dispatch_ready_scope(tmp)
@@ -1563,6 +1637,205 @@ class DispatchTaskTest(unittest.TestCase):
             )
             self.assertEqual(code, 5, err)
             self.assertIn("inputs changed", err.lower())
+
+
+# --- Task 5: end-to-end journey (6a + 6b compose) ---------------------------
+
+
+class RunnerDispatchEndToEndTest(unittest.TestCase):
+    """One continuous journey proving 6a (intake ladder, plan-approval
+    composite, plan_drift) and 6b (snapshots, input-version binding, rebind,
+    runner registry, dispatch) compose: a v5 scope with a runner registered
+    the real way (probe-command -> config set runners -> amend) walked
+    through start, worker dispatch, submit, reviewer dispatch, review
+    collect, an inputs_changed+rebind interlude, verify/freshness/merge, and
+    the finalize ladder to delivered."""
+
+    def test_runner_registration_through_delivered_with_rebind_interlude(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+
+            # --- runner registration: probe-command -> config set -> amend
+            # (spec Sec6's registration order: prove the candidate before it
+            # is ever config, then route it through governance like any
+            # other config change).
+            command = _runner_command()
+            code, out = _cli(state, "dispatch", "--probe-command", json.dumps(command))
+            self.assertEqual(code, 0, out)
+            probe_result = json.loads(out)
+            self.assertTrue(probe_result["ok"])
+            self.assertTrue(probe_result["recorded"])
+            _register_runner(state, "stub-runner", command)
+            code, out = _cli(state, "constitution", "amend", "--by", "ivo")
+            self.assertEqual(code, 0, out)
+
+            # --- v5 scope: one high-risk task (review actually required
+            # under the default risk_based policy -- the Task-3 coverage gap
+            # this closes needs real review evidence, not an incidental
+            # skip), routed to the registered runner for both roles, with a
+            # context ref to drift in the interlude below.
+            (wdd / "shared-context").mkdir(exist_ok=True)
+            (wdd / "shared-context" / "contract.md").write_text(
+                "contract v1\n", encoding="utf-8"
+            )
+            _apply_v5_scope(
+                root, wdd, state,
+                context=["shared-context/contract.md#orders"],
+                model="stub-runner", review_model="stub-runner", risk="high",
+            )
+
+            # --- start: snapshot recorded ---------------------------------
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            start_result = json.loads(out)
+            self.assertEqual(start_result["snapshot"], "dispatch/T1-1")
+            self.assertEqual(start_result["inputsRecorded"], 2)
+            worktree = Path(start_result["worktree"])
+
+            # --- dispatch worker via the fake runner: DONE token extracted
+            code, out = _cli(
+                state, "dispatch", "--task", "T1", "--role", "worker", "--repo", str(root)
+            )
+            self.assertEqual(code, 0, out)
+            worker_result = json.loads(out)
+            self.assertEqual(worker_result["statusToken"], "DONE")
+            self.assertIn("DONE", worker_result["tail"])
+
+            # The fake runner only proves the token contract (it never
+            # touches git); the worker's actual commit is driven directly in
+            # the worktree `start` already handed back, same as every other
+            # dispatch test in this file.
+            (worktree / "change.txt").write_text("work\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                 "-c", "commit.gpgsign=false", "commit", "-qm", "do work"],
+                cwd=worktree, check=True,
+            )
+
+            # --- submit ------------------------------------------------------
+            code, out = _cli(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            # --- dispatch reviewer via the fake runner: clean result JSON --
+            with unittest.mock.patch.dict(os.environ, {"FAKE_RUNNER_REVIEW_RESULT": "1"}):
+                code, out = _cli(
+                    state, "dispatch", "--task", "T1", "--role", "reviewer", "--repo", str(root)
+                )
+            self.assertEqual(code, 0, out)
+            reviewer_result = json.loads(out)
+            self.assertEqual(reviewer_result["findings"], 0)
+            self.assertIsNotNone(reviewer_result["resultPath"])
+
+            # --- review collect ---------------------------------------------
+            code, out = _cli(
+                state, "review", "collect", "--task", "T1",
+                "--result", reviewer_result["resultPath"], "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            pre_rebind_review = StateStore(Path(state)).read()["tasks"]["T1"]["review"]
+            self.assertEqual(pre_rebind_review["outcome"], "passed")
+
+            # --- interlude: inputs_changed + rebind mid-scope ----------------
+            # Drift T1's context ref, then re-stamp the plan (clears the
+            # scope-wide plan_drift so what's left is purely T1's own stale
+            # digest -- isolating the per-task gate, same pattern as
+            # InputVersionBindingTest above).
+            (wdd / "shared-context" / "contract.md").write_text(
+                "contract v2 -- edited\n", encoding="utf-8"
+            )
+            _restamp_plan(root, state)
+
+            state_obj = StateStore(Path(state)).read()
+            self.assertIsNotNone(inputs_status(state_obj, wdd, "T1"))
+
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            changed = [a for a in json.loads(out)["actions"] if a["action"] == "inputs_changed"]
+            self.assertEqual([a["task"] for a in changed], ["T1"])
+
+            # verify refuses for T1 while inputs_changed stands.
+            code, out, err = _cli_full(
+                state, "verify", "record", "--task", "T1", "--status", "passed"
+            )
+            self.assertEqual(code, 5, err)
+            self.assertIn("inputs changed", err.lower())
+
+            # Rebind: the recorded human decision that T1's already-collected
+            # review evidence still stands despite the context drift -- this
+            # is the named Task-3 gap: risk is high, so that review evidence
+            # was actually load-bearing (required by the gate), not
+            # incidental. Rebind re-records digests; it must NOT touch the
+            # review record (merged-evidence/human-decision semantics: the
+            # decision is that the existing work -- including its review --
+            # stands, not that it is re-judged).
+            code, out = _cli(
+                state, "rebind", "--task", "T1", "--by", "ivo", "--repo", str(root)
+            )
+            self.assertEqual(code, 0, out)
+            rebind_result = json.loads(out)
+            self.assertEqual(rebind_result["inputsRecorded"], 2)
+
+            state_obj = StateStore(Path(state)).read()
+            self.assertIsNone(inputs_status(state_obj, wdd, "T1"))
+            post_rebind_review = state_obj["tasks"]["T1"]["review"]
+            self.assertEqual(post_rebind_review, pre_rebind_review)
+
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(
+                [a for a in json.loads(out)["actions"] if a["action"] == "inputs_changed"], []
+            )
+
+            # --- resume: verify / freshness / merge --------------------------
+            code, out = _cli(state, "verify", "record", "--task", "T1", "--status", "passed")
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "merge", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertEqual(
+                StateStore(Path(state)).read()["tasks"]["T1"]["status"], "done"
+            )
+
+            # --- finalize ladder through delivered ----------------------------
+            code, out = _cli(
+                state, "finalize", "review", "record",
+                "--reviewer", "ivo", "--findings", "[]", "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            code, out = _cli(
+                state, "finalize", "verify", "record",
+                "--results", json.dumps(
+                    [{"command": "true", "status": "passed"},
+                     {"command": "true", "status": "passed"}]
+                ),
+                "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            # The human merge: a real git merge into the target branch,
+            # exactly as an operator would do outside wddctl (same idiom as
+            # the finalize-ladder transcript in docs/wddctl.md).
+            subprocess.run(["git", "checkout", "-q", "main"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                 "-c", "commit.gpgsign=false", "merge", "--no-ff", "-q", "wdd/scope-x",
+                 "-m", "merge scope SCOPE-x into main"],
+                cwd=root, check=True,
+            )
+            code, out = _cli(state, "finalize", "delivered", "--by", "ivo", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["phase"], "delivered")
+            self.assertEqual(result["actions"], [])
+            self.assertEqual(result["blockers"], [])
 
 
 if __name__ == "__main__":

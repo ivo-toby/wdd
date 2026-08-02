@@ -671,6 +671,100 @@ class DoctorGovernanceTest(unittest.TestCase):
             self.assertIsNotNone(governance["drift"])
 
 
+FAKE_RUNNER = str(
+    Path(__file__).resolve().parent / "fixtures" / "fake-runner" / "fake-runner"
+)
+
+
+class DoctorRunnersTest(unittest.TestCase):
+    """Task 5 addendum (spec Sec6, doctor stays read-only): when config has a
+    non-empty `runners` map, doctor reports per configured runner whether its
+    command's argv[0] is on PATH -- the same shutil.which idiom the existing
+    git/gh/acli/codex/claude probes use."""
+
+    def test_no_runners_key_when_config_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            wdd.mkdir()
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--state", str(wdd / "state.json"), "doctor"])
+            self.assertEqual(code, 0)
+            self.assertNotIn("runners", json.loads(stdout.getvalue()))
+
+    def test_no_runners_key_when_runners_map_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            init_repository(wdd, root)  # default config: runners == {}
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--state", str(wdd / "state.json"), "doctor"])
+            self.assertEqual(code, 0)
+            self.assertNotIn("runners", json.loads(stdout.getvalue()))
+
+    def test_reports_available_and_unavailable_runner_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            init_repository(wdd, root)
+            config = load_config(wdd)
+            config["runners"] = {
+                "stub-runner": {"command": [FAKE_RUNNER, "--prompt", "{prompt}"]},
+                "missing-runner": {"command": ["nope-not-a-real-binary-xyz", "run"]},
+            }
+            save_config(wdd, config)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--state", str(wdd / "state.json"), "doctor"])
+            self.assertEqual(code, 0)
+            runners = json.loads(stdout.getvalue())["runners"]
+            self.assertEqual(runners["stub-runner"]["argv0"], FAKE_RUNNER)
+            self.assertTrue(runners["stub-runner"]["available"])
+            self.assertEqual(runners["missing-runner"]["argv0"], "nope-not-a-real-binary-xyz")
+            self.assertFalse(runners["missing-runner"]["available"])
+
+    def test_placeholder_in_argv0_reported_unresolvable_not_crashed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            init_repository(wdd, root)
+            config = load_config(wdd)
+            # A malformed runner entry -- the placeholder belongs in an
+            # argument, never argv[0] -- must be reported, not crash doctor.
+            config["runners"] = {"malformed": {"command": ["{worktree}", "run"]}}
+            save_config(wdd, config)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--state", str(wdd / "state.json"), "doctor"])
+            self.assertEqual(code, 0)
+            runners = json.loads(stdout.getvalue())["runners"]
+            self.assertTrue(runners["malformed"]["unresolvable"])
+            self.assertFalse(runners["malformed"]["available"])
+
+    def test_no_runners_key_when_config_invalid(self) -> None:
+        """An invalid config already fails governance's own configValid check;
+        doctor must not additionally crash trying to probe runners out of it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            init_repository(wdd, root)
+            (wdd / "config.json").write_text("not json", encoding="utf-8")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--state", str(wdd / "state.json"), "doctor"])
+            self.assertEqual(code, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertFalse(payload["governance"]["configValid"])
+            self.assertNotIn("runners", payload)
+
+
 LEGACY_CONSTITUTION = """---
 id: WDD-CONSTITUTION
 kind: constitution
