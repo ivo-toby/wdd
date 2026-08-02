@@ -195,7 +195,13 @@ def _extra_commit(state: str, root: Path, task_id: str = "T1", message: str = "m
     """Add a second, genuinely new commit on top of an already-submitted task branch."""
     read_state = StateStore(Path(state)).read()
     task = read_state["tasks"][task_id]
-    worktree = worktree_for(root, read_state["scope"]["id"], task_id, task.get("worktree"))
+    # This fixture's scope was bootstrapped through a real 'wddctl init', so
+    # config.json carries the real worktrees.root default (".worktrees"),
+    # which 'start' already threaded through.
+    worktree = worktree_for(
+        root, read_state["scope"]["id"], task_id, task.get("worktree"),
+        worktrees_root=".worktrees",
+    )
     (worktree / "change2.txt").write_text(f"{message}\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=worktree, check=True)
     subprocess.run(
@@ -423,7 +429,13 @@ class SubmitIdempotencyRetryTest(unittest.TestCase):
             read_state = StateStore(Path(state)).read()
             task = read_state["tasks"]["T1"]
             branch = task["branch"]
-            worktree = worktree_for(root, read_state["scope"]["id"], "T1", task.get("worktree"))
+            # This scope was bootstrapped through a real 'wddctl init', so
+            # config.json's worktrees.root default (".worktrees") is what
+            # 'start' actually used.
+            worktree = worktree_for(
+                root, read_state["scope"]["id"], "T1", task.get("worktree"),
+                worktrees_root=".worktrees",
+            )
 
             # Simulate the branch vanishing out-of-band (deleted, or pruned
             # by GC) between the original submit and a client's retry of the

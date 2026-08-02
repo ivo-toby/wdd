@@ -20,12 +20,12 @@ from .errors import IllegalTransition, ValidationError
 from .git import (
     branch_exists,
     ensure_worktree,
+    ensure_worktrees_gitignore,
     worktree_override,
     require_repository,
     resolve_ref,
     worktree_for,
     run_git,
-    task_worktree_path,
     worktree_at,
     worktree_branch,
 )
@@ -52,13 +52,25 @@ def _is_pr_upgrade(current_pr: Any, new_pr: str | None) -> bool:
 
 
 def _reattach(
-    state: dict[str, Any], repo: Path, task_id: str, outcome: dict[str, Any]
+    state: dict[str, Any],
+    repo: Path,
+    task_id: str,
+    outcome: dict[str, Any],
+    *,
+    worktrees_root: str | None = None,
 ) -> dict[str, Any]:
     """Recreate the worktree for an already-started task.
 
     This is the local-agent-to-cloud-agent handoff: the committed state says a
     task is in progress, its branch exists, but the worktree that lived beside
     the old checkout was never part of the clone.
+
+    A task's recorded ``worktree`` override (when set) always wins over
+    ``worktrees_root`` here -- see ``git.worktree_for``'s docstring. When
+    nothing is recorded, this re-derives from ``worktrees_root``, which must
+    be the CURRENT config value: a config change made mid-scope, with no
+    recorded override to fall back on, is governance drift like any other
+    post-ratification config edit, not something re-derivation reconciles.
     """
     task = state["tasks"][task_id]
     branch = task.get("branch")
@@ -69,12 +81,19 @@ def _reattach(
             f"task {task_id} is {task['status']} but branch {branch} is missing from this "
             "repository; fetch it before re-attaching"
         )
-    target = worktree_for(repo, state["scope"]["id"], task_id, task.get("worktree"))
+    target = worktree_for(
+        repo, state["scope"]["id"], task_id, task.get("worktree"), worktrees_root=worktrees_root
+    )
+    # Before creating anything: an in-repo worktrees.root must be gitignored
+    # BEFORE `git worktree add` can ever make Git see an untracked directory
+    # there (a repo-root `git status` -- e.g. merge.py's `_integration_dir` --
+    # must never see it as dirty).
+    ensure_worktrees_gitignore(repo, worktrees_root)
     action = ensure_worktree(repo, target, branch, base_ref=state["scope"].get("baseRef"))
 
     updated = copied_state(state)
     updated["tasks"][task_id]["worktree"] = worktree_override(
-        repo, target, state["scope"]["id"], task_id
+        repo, target, state["scope"]["id"], task_id, worktrees_root=worktrees_root
     )
     lease = dict((updated.get("leases") or {}).get(task_id) or {})
     lease.update(
@@ -108,6 +127,7 @@ def start_task(
     task_id: str,
     branch: str | None = None,
     worktree: Path | str | None = None,
+    worktrees_root: str | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
@@ -116,6 +136,12 @@ def start_task(
     Admission is enforced here and again inside the ``task.started`` transition,
     so a caller that bypasses ``wddctl next`` still cannot start two tasks that
     share a conflict domain.
+
+    ``worktrees_root`` is the ``worktrees.root`` config value, read by the
+    caller (CLI layer) and threaded through here -- this module stays as
+    config-agnostic as the engine itself, just like ``worktree`` (an explicit
+    ``--worktree`` override) already is. ``None`` preserves the legacy
+    out-of-repo default for callers with no config to read.
     """
     repo = require_repository(repo)
     outcome: dict[str, Any] = {}
@@ -127,7 +153,7 @@ def start_task(
     def mutator(state: dict[str, Any]) -> dict[str, Any]:
         task = _task(state, task_id)
         if task["status"] in ACTIVE_STATUSES:
-            return _reattach(state, repo, task_id, outcome)
+            return _reattach(state, repo, task_id, outcome, worktrees_root=worktrees_root)
         if task["status"] != "todo":
             raise IllegalTransition(
                 f"task {task_id} is {task['status']}, not todo; nothing to start"
@@ -148,14 +174,23 @@ def start_task(
         task_branch = branch or task.get("branch") or f"task/{task_id}"
         task_worktree = Path(
             worktree
-            or worktree_for(repo, state["scope"]["id"], task_id, task.get("worktree"))
+            or worktree_for(
+                repo, state["scope"]["id"], task_id, task.get("worktree"),
+                worktrees_root=worktrees_root,
+            )
         ).resolve()
+        # Gitignore the in-repo worktrees.root BEFORE `git worktree add` can
+        # make Git see an untracked directory there (see _reattach's same
+        # ordering note).
+        ensure_worktrees_gitignore(repo, worktrees_root)
         action = ensure_worktree(repo, task_worktree, task_branch, base_ref=base_ref)
         head_sha = resolve_ref(repo, task_branch)
 
         updated = transition(state, "task.started", task_id, {})
         updated["tasks"][task_id]["branch"] = task_branch
-        override = worktree_override(repo, task_worktree, state["scope"]["id"], task_id)
+        override = worktree_override(
+            repo, task_worktree, state["scope"]["id"], task_id, worktrees_root=worktrees_root
+        )
         updated["tasks"][task_id]["worktree"] = override
         updated.setdefault("leases", {})[task_id] = {
             "status": "active",
@@ -206,10 +241,17 @@ def submit_task(
     repo: Path | str,
     task_id: str,
     pr: str | None = None,
+    worktrees_root: str | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
-    """Record a task's deliverable, reading the head SHA from its branch."""
+    """Record a task's deliverable, reading the head SHA from its branch.
+
+    ``worktrees_root`` must match whatever was in effect when this task's
+    worktree was created if it has no recorded ``worktree`` override (see
+    ``git.worktree_for``'s docstring) -- it is only ever consulted to locate
+    an EXISTING worktree here, never to create one.
+    """
     repo = require_repository(repo)
     outcome: dict[str, Any] = {}
 
@@ -266,7 +308,8 @@ def submit_task(
         if not branch:
             raise IllegalTransition(f"task {task_id} has no branch; run 'wddctl start' first")
         resolved_worktree = worktree_for(
-            repo, state["scope"]["id"], task_id, task.get("worktree")
+            repo, state["scope"]["id"], task_id, task.get("worktree"),
+            worktrees_root=worktrees_root,
         )
         if resolved_worktree.exists():
             # Clean is not enough: a worktree switched to another branch would let
@@ -395,10 +438,16 @@ def release_task(
     repo: Path | str,
     task_id: str,
     keep_worktree: bool = False,
+    worktrees_root: str | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
-    """Remove a finished task's worktree, refusing to discard unsaved work."""
+    """Remove a finished task's worktree, refusing to discard unsaved work.
+
+    ``worktrees_root`` must match whatever was in effect when this task's
+    worktree was created if it has no recorded ``worktree`` override -- only
+    ever consulted to locate the EXISTING worktree, never to create one.
+    """
     repo = require_repository(repo)
     outcome: dict[str, Any] = {}
 
@@ -412,7 +461,10 @@ def release_task(
         lease = (state.get("leases") or {}).get(task_id)
         if not isinstance(lease, dict) or lease.get("status") != "active":
             raise IllegalTransition(f"task {task_id} has no active worktree")
-        path = worktree_for(repo, state["scope"]["id"], task_id, task.get("worktree"))
+        path = worktree_for(
+            repo, state["scope"]["id"], task_id, task.get("worktree"),
+            worktrees_root=worktrees_root,
+        )
         cleanup = "retained"
         if not keep_worktree:
             entry = worktree_at(repo, path)

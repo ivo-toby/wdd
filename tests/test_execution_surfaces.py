@@ -287,6 +287,76 @@ class MergeSettingsTest(unittest.TestCase):
             validate_plan(_plan({"mergeMode": "carrier-pigeon"}))
 
 
+class WorktreesRootCliTest(unittest.TestCase):
+    """End-to-end coverage of the `worktrees.root` config key (CLI -> config -> leases/git)."""
+
+    def test_default_worktree_lives_inside_the_repo_and_is_gitignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, _bare = _bootstrap_ready_scope(tmp, surface="local", mode="controller")
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            worktree = Path(json.loads(out)["worktree"])
+            self.assertEqual(worktree, (root / ".worktrees" / "SCOPE-x" / "T1").resolve())
+            self.assertTrue(worktree.is_dir())
+            gitignore = (root / ".gitignore").read_text(encoding="utf-8")
+            self.assertIn(".worktrees/", gitignore.splitlines())
+
+    def test_custom_relative_root_is_honored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, _bare = _bootstrap_ready_scope(tmp, surface="local", mode="controller")
+            assert _cli(state, "config", "set", "worktrees.root", "build/wdd-trees")[0] == 0
+            assert _cli(state, "constitution", "amend", "--by", "t")[0] == 0
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            worktree = Path(json.loads(out)["worktree"])
+            self.assertEqual(worktree, (root / "build" / "wdd-trees" / "SCOPE-x" / "T1").resolve())
+            gitignore = (root / ".gitignore").read_text(encoding="utf-8")
+            self.assertIn("build/wdd-trees/", gitignore.splitlines())
+
+    def test_absolute_root_outside_repo_is_honored_without_a_gitignore_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, _bare = _bootstrap_ready_scope(tmp, surface="local", mode="controller")
+            # init already scaffolded the default ".worktrees/" entry; capture
+            # it as the baseline `start` below must leave untouched.
+            before = (root / ".gitignore").read_text(encoding="utf-8")
+            external = Path(tmp) / "external-worktrees"
+            assert _cli(state, "config", "set", "worktrees.root", str(external))[0] == 0
+            assert _cli(state, "constitution", "amend", "--by", "t")[0] == 0
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            worktree = Path(json.loads(out)["worktree"])
+            self.assertEqual(worktree, (external / "SCOPE-x" / "T1").resolve())
+            self.assertTrue(worktree.is_dir())
+            after = (root / ".gitignore").read_text(encoding="utf-8")
+            self.assertEqual(after, before)
+
+    def test_recorded_worktree_survives_a_worktrees_root_config_change(self) -> None:
+        """CRITICAL compat: an in-flight task's recorded path must keep winning.
+
+        An explicit `--worktree` override is the only way a still-default-eligible
+        location gets recorded at all (portability doctrine: the default itself
+        is never stored). Changing worktrees.root afterwards is governance
+        drift like any other post-ratification config edit -- remedied here
+        with `constitution amend`, same as the docstring notes in git.py/leases.py.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, _bare = _bootstrap_ready_scope(tmp, surface="local", mode="controller")
+            custom = root.parent / "custom-trees" / "T1"
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root), "--worktree", str(custom))
+            self.assertEqual(code, 0, out)
+            self.assertEqual(Path(json.loads(out)["worktree"]), custom.resolve())
+            recorded = StateStore(Path(state)).read()["tasks"]["T1"]["worktree"]
+            self.assertIsNotNone(recorded)
+
+            assert _cli(state, "config", "set", "worktrees.root", "somewhere-else")[0] == 0
+            assert _cli(state, "constitution", "amend", "--by", "t")[0] == 0
+
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertIn("reattach", json.loads(out)["action"])
+            self.assertEqual(Path(json.loads(out)["worktree"]), custom.resolve())
+
+
 class BootstrapApplyMergeFieldsTest(unittest.TestCase):
     # Regression coverage: the first-ever plan apply that adopts a scope
     # from a null-scope state (_apply_plan_to_state's null-scope branch --

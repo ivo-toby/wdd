@@ -43,6 +43,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "riskRules": [],
     "taskProvider": {"type": "local"},
     "runners": {},
+    "worktrees": {"root": ".worktrees"},
     "openQuestions": [],
 }
 
@@ -168,6 +169,16 @@ def validate_config(config: dict[str, Any]) -> None:
                 and all(isinstance(item, str) and item for item in command),
                 f"runners.{name}.command must be a non-empty list of non-empty strings",
             )
+
+    # Optional, like runners above: absent entirely on configs that predate
+    # this key -- backward compatible with a config.json written before
+    # worktrees.root existed. When present, root must be a non-empty string;
+    # git.py resolves it (relative against the repo root, absolute as-is).
+    worktrees = config.get("worktrees")
+    if worktrees is not None:
+        _require(isinstance(worktrees, dict), "worktrees must be an object")
+        _require(isinstance(worktrees.get("root"), str) and worktrees["root"],
+                 "worktrees.root must be a non-empty string")
 
     questions = config.get("openQuestions")
     _require(isinstance(questions, list), "openQuestions must be a list")

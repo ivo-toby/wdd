@@ -66,6 +66,27 @@ class ConfigValidationTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate_config(config)
 
+    def test_default_config_has_in_repo_worktrees_root(self) -> None:
+        self.assertEqual(default_config()["worktrees"], {"root": ".worktrees"})
+
+    def test_rejects_empty_worktrees_root(self) -> None:
+        config = default_config()
+        config["worktrees"]["root"] = ""
+        with self.assertRaises(ValidationError):
+            validate_config(config)
+
+    def test_rejects_non_string_worktrees_root(self) -> None:
+        config = default_config()
+        config["worktrees"]["root"] = 123
+        with self.assertRaises(ValidationError):
+            validate_config(config)
+
+    def test_missing_worktrees_key_is_backward_compatible(self) -> None:
+        """A config.json written before worktrees.root existed must still load."""
+        config = default_config()
+        del config["worktrees"]
+        validate_config(config)
+
 
 class ConfigStorageTest(unittest.TestCase):
     def test_save_and_load_round_trip(self) -> None:
@@ -298,6 +319,16 @@ class InitTest(unittest.TestCase):
     def test_template_has_no_placeholders_or_json(self) -> None:
         for banned in ("```json", "TBD", "TODO", "<", "state which"):
             self.assertNotIn(banned, CONSTITUTION_TEMPLATE)
+
+    def test_init_scaffolds_worktrees_gitignore_at_repo_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            result = init_repository(wdd, root)
+            gitignore = root / ".gitignore"
+            self.assertTrue(gitignore.is_file())
+            self.assertIn(".worktrees/", gitignore.read_text(encoding="utf-8").splitlines())
+            self.assertIn(str(gitignore), result["created"])
 
     def test_init_preserves_existing_config(self) -> None:
         """Existing config.json should not be overwritten; openQuestions should survive."""

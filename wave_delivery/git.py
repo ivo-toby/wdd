@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import ValidationError
+from .store import atomic_write_text
 
 
 _REF_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -109,17 +110,48 @@ def wdd_root(repo: Path) -> Path:
     return repo.parent / f"{repo.name}.wdd"
 
 
-def worktree_override(repo: Path, path: Path | str, scope_id: str, task_id: str) -> str | None:
+def resolve_worktrees_root(repo: Path, worktrees_root: str | Path | None) -> Path:
+    """Where task worktrees live, absent an explicit per-task override.
+
+    ``worktrees_root`` is the config value (``worktrees.root``), threaded in
+    by the CLI/leases layer -- never read from disk here (engine/git stay
+    config-agnostic). ``None`` preserves the historical, pre-config-key
+    location beside the repository (``wdd_root(repo)/"worktrees"``): callers
+    that have no config at all (a legacy repo predating this key, or a raw
+    call that hasn't threaded a value through) must keep deriving exactly
+    what they always have. Any other value is resolved against the repo root
+    when relative, or used as-is when absolute -- the same relative/absolute
+    split ``config.py`` documents for the key.
+    """
+    if worktrees_root is None:
+        return wdd_root(repo) / "worktrees"
+    root_path = Path(worktrees_root)
+    return root_path if root_path.is_absolute() else (repo / root_path)
+
+
+def worktree_override(
+    repo: Path,
+    path: Path | str,
+    scope_id: str,
+    task_id: str,
+    *,
+    worktrees_root: str | Path | None = None,
+) -> str | None:
     """Return a storable override, or None when the location is the default.
 
-    The default location is a pure function of (repo, scope, task), so storing
-    it would bake in the directory name of whichever checkout created it — a
-    clone into a differently-named directory would then resolve back to the
-    original machine's worktree. Only a caller-chosen path is worth recording,
-    and that is stored relative to the repository.
+    The default location is a pure function of (repo, scope, task,
+    worktrees_root), so storing it would bake in the directory name of
+    whichever checkout created it — a clone into a differently-named
+    directory would then resolve back to the original machine's worktree.
+    Only a caller-chosen path is worth recording, and that is stored relative
+    to the repository. ``worktrees_root`` must be the SAME value the caller
+    used to derive ``path`` (see ``task_worktree_path``), or a config-current
+    default would be misidentified as a caller override.
     """
     resolved = Path(path).resolve()
-    if resolved == task_worktree_path(repo, scope_id, task_id).resolve():
+    if resolved == task_worktree_path(
+        repo, scope_id, task_id, worktrees_root=worktrees_root
+    ).resolve():
         return None
     try:
         return os.path.relpath(resolved, repo.resolve())
@@ -129,26 +161,75 @@ def worktree_override(repo: Path, path: Path | str, scope_id: str, task_id: str)
 
 
 def worktree_for(
-    repo: Path | str, scope_id: str, task_id: str, override: str | Path | None = None
+    repo: Path | str,
+    scope_id: str,
+    task_id: str,
+    override: str | Path | None = None,
+    *,
+    worktrees_root: str | Path | None = None,
 ) -> Path:
     """Where this task's worktree lives, for this checkout.
 
     The repository path is canonicalized so callers that pass an alias (on
     macOS, /var vs /private/var) derive the same location as ``start``.
+
+    ``override`` -- the task's recorded ``worktree`` field, when set -- always
+    wins over ``worktrees_root``: an already-started task's worktree location
+    is frozen the moment it is first created (or first stored as an explicit
+    override), and must keep resolving there regardless of what config now
+    says. Only when a task has NO recorded override does ``worktrees_root``
+    ever apply, and it must then be the CURRENT config value -- a config
+    change mid-scope (with no recorded override to fall back on) is
+    governance drift the same as any other post-ratification config edit
+    (``config.require_fresh_governance``), not something this function
+    reconciles; it always derives from whatever it is handed.
     """
     repo = Path(repo).resolve()
     if override:
         path = Path(override)
         return path if path.is_absolute() else (repo / path).resolve()
-    return task_worktree_path(repo, scope_id, task_id)
+    return task_worktree_path(repo, scope_id, task_id, worktrees_root=worktrees_root)
 
 
-def task_worktree_path(repo: Path, scope_id: str, task_id: str) -> Path:
-    return wdd_root(repo) / "worktrees" / scope_id / task_id
+def task_worktree_path(
+    repo: Path, scope_id: str, task_id: str, *, worktrees_root: str | Path | None = None
+) -> Path:
+    return resolve_worktrees_root(repo, worktrees_root) / scope_id / task_id
 
 
 def integration_worktree_path(repo: Path, scope_id: str) -> Path:
     return wdd_root(repo) / "integration" / scope_id
+
+
+def ensure_worktrees_gitignore(repo: Path, worktrees_root: str | Path | None) -> bool:
+    """Ensure the REPO ROOT `.gitignore` ignores an in-repo `worktrees.root`.
+
+    A no-op when ``worktrees_root`` is ``None`` (no config; the legacy
+    out-of-repo default needs no gitignore entry) or resolves outside the
+    repository (an absolute path elsewhere on disk) -- there is nothing
+    inside the working tree to ignore in either case. Idempotent and
+    content-preserving, mirroring ``handover.ensure_dispatch_gitignore``'s
+    precedent for `.wdd/.gitignore`, but at the repository root and keyed off
+    the resolved root's path relative to the repo rather than a fixed string.
+    """
+    if worktrees_root is None:
+        return False
+    resolved_root = resolve_worktrees_root(repo, worktrees_root)
+    try:
+        relative = resolved_root.relative_to(repo.resolve())
+    except ValueError:
+        return False
+    entry = f"{relative.as_posix()}/"
+    gitignore = repo / ".gitignore"
+    existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    if entry in existing.splitlines():
+        return False
+    content = existing
+    if content and not content.endswith("\n"):
+        content += "\n"
+    content += entry + "\n"
+    atomic_write_text(gitignore, content)
+    return True
 
 
 def ensure_worktree(repo: Path, path: Path, branch: str, *, base_ref: str | None) -> str:

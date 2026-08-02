@@ -433,7 +433,14 @@ def dispatch_task(
     command = _runner_command_for_model(config, model)
     digest = _require_passing_probe(state, command)
 
-    worktree = worktree_for(repo, state["scope"]["id"], task_id, task.get("worktree"))
+    # worktrees.root is only ever consulted to locate this task's EXISTING
+    # worktree (never to create one -- 'start' already did): the task's own
+    # recorded `worktree` override, when set, wins regardless (git.worktree_for).
+    worktrees_root = ((config or {}).get("worktrees") or {}).get("root")
+    worktree = worktree_for(
+        repo, state["scope"]["id"], task_id, task.get("worktree"),
+        worktrees_root=worktrees_root,
+    )
     if not worktree.is_dir():
         raise IllegalTransition(
             f"task {task_id} has no worktree at {worktree}; run 'wddctl start' first"
