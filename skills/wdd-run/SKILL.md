@@ -236,6 +236,14 @@ recording. Tell the user this is the degraded single-session mode —
 self-review is weaker than an independent reviewer, and the review record
 should name you honestly rather than a phantom reviewer.
 
+A review record is evidence, and evidence you invent is fabrication: never
+record a review that did not happen, and never put a human's name in
+`--reviewer` unless that human actually reviewed the diff. An empty
+findings list from a review nobody ran is worse than no record — it
+converts "unreviewed" into "reviewed and clean", which is a lie the merge
+gate then trusts. If you cannot dispatch the configured reviewer, say so
+and stop; recording a pass is not a fallback.
+
 ## Keeping the loop alive
 
 The loop only runs if you keep running it. A controller that dispatches a

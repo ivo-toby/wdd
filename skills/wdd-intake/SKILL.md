@@ -92,6 +92,16 @@ API you can't see — you have exactly two honest moves:
   so the task brief and reviewer treat it as unverified and check it at
   implementation time.
 
+Response shapes get the same rigor as requests. A row that pins the
+method and path but not the response envelope and field names only moves
+fabrication downstream — the worker faithfully calls the right endpoint,
+then invents what comes back (`results` vs `products`, nested vs flat
+prices). For every operation a task will consume, record the response
+shape — envelope key, field names, nesting — read from the same source,
+cited the same way. GraphQL operations additionally need their full
+selection set pinned: requesting a field the schema doesn't have fails
+loudly against the real server.
+
 What you must never do is let specifics recalled from memory wear a
 citation. A row that names an exact header or endpoint with a
 `file:line` pointing at code that doesn't contain it is worse than no

@@ -83,6 +83,11 @@ Findings are a JSON array:
 [{"severity": "P1", "summary": "...", "file": "src/a.py", "line": 42}]
 ```
 
+`--reviewer` names who actually read the diff — the model or human that
+did the work, never a person who wasn't in the loop. Recording a review
+that did not happen is fabricated evidence, whatever the findings list
+says.
+
 `severity` must be `P1`, `P2`, or `P3`; `summary` is required. Pass `[]` or
 omit `--findings` entirely for a clean review — don't invent a placeholder
 finding to signal "reviewed."
