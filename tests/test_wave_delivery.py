@@ -41,7 +41,13 @@ from wave_delivery.errors import (
     ValidationError,
 )
 from wave_delivery.freshness import check_freshness, record_freshness
-from wave_delivery.git import worktree_for
+from wave_delivery.git import (
+    ensure_worktrees_gitignore,
+    resolve_worktrees_root,
+    task_worktree_path,
+    wdd_root,
+    worktree_for,
+)
 from wave_delivery.leases import release_task, start_task, submit_task
 from wave_delivery.merge import merge_task, refresh_task
 from wave_delivery import migration
@@ -1428,6 +1434,71 @@ class PortabilityTests(BaseTest):
         self.assertIn("fetch it", str(raised.exception))
 
 
+class WorktreesRootUnitTest(BaseTest):
+    """Unit coverage for the `worktrees.root` primitives in git.py.
+
+    See WorktreesRootCliTest (test_execution_surfaces.py) for the config ->
+    CLI -> leases/git end-to-end wiring; these exercise git.py's own
+    functions directly and in isolation.
+    """
+
+    def test_none_preserves_the_legacy_out_of_repo_default(self) -> None:
+        repo = self.repository()
+        self.assertEqual(
+            resolve_worktrees_root(repo, None), wdd_root(repo) / "worktrees"
+        )
+
+    def test_relative_root_resolves_under_the_repo(self) -> None:
+        repo = self.repository()
+        self.assertEqual(
+            resolve_worktrees_root(repo, ".worktrees"), repo / ".worktrees"
+        )
+        self.assertEqual(
+            resolve_worktrees_root(repo, "build/wdd-trees"), repo / "build" / "wdd-trees"
+        )
+
+    def test_absolute_root_is_used_as_is(self) -> None:
+        repo = self.repository()
+        external = self.root / "elsewhere"
+        self.assertEqual(resolve_worktrees_root(repo, str(external)), external)
+
+    def test_task_worktree_path_honors_worktrees_root(self) -> None:
+        repo = self.repository()
+        self.assertEqual(
+            task_worktree_path(repo, "SCOPE-demo", "TASK-A", worktrees_root=".worktrees"),
+            repo / ".worktrees" / "SCOPE-demo" / "TASK-A",
+        )
+
+    def test_ensure_worktrees_gitignore_creates_and_is_idempotent(self) -> None:
+        repo = self.repository()
+        self.assertTrue(ensure_worktrees_gitignore(repo, ".worktrees"))
+        content = (repo / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn(".worktrees/", content.splitlines())
+        # Second call: already present, no-op, and no duplicate line.
+        self.assertFalse(ensure_worktrees_gitignore(repo, ".worktrees"))
+        self.assertEqual(
+            (repo / ".gitignore").read_text(encoding="utf-8").splitlines().count(".worktrees/"), 1
+        )
+
+    def test_ensure_worktrees_gitignore_is_a_noop_for_none(self) -> None:
+        repo = self.repository()
+        self.assertFalse(ensure_worktrees_gitignore(repo, None))
+        self.assertFalse((repo / ".gitignore").exists())
+
+    def test_ensure_worktrees_gitignore_is_a_noop_outside_the_repo(self) -> None:
+        repo = self.repository()
+        external = self.root / "elsewhere-trees"
+        self.assertFalse(ensure_worktrees_gitignore(repo, str(external)))
+        self.assertFalse((repo / ".gitignore").exists())
+
+    def test_ensure_worktrees_gitignore_preserves_existing_content(self) -> None:
+        repo = self.repository()
+        (repo / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+        self.assertTrue(ensure_worktrees_gitignore(repo, ".worktrees"))
+        lines = (repo / ".gitignore").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines, ["node_modules/", ".worktrees/"])
+
+
 class ReconcileTests(BaseTest):
     def test_a_queued_note_makes_reconciliation_due(self) -> None:
         repo = self.repository()
@@ -1807,7 +1878,10 @@ class CliTests(BaseTest):
             0,
         )
         self.assertEqual(run("start", "--task", "TASK-A", "--repo", str(repo)), 0)
-        worktree = worktree_for(repo, "SCOPE-demo", "TASK-A")
+        # This test runs a real 'wddctl init', so config.json carries the
+        # real worktrees.root default (".worktrees") -- the CLI's 'start'
+        # threads it through, so the location here must match.
+        worktree = worktree_for(repo, "SCOPE-demo", "TASK-A", worktrees_root=".worktrees")
         self.commit_in(worktree, "src/schema.ts", "cli change\n")
         self.assertEqual(run("submit", "--task", "TASK-A", "--repo", str(repo)), 0)
         self.assertEqual(

@@ -642,6 +642,18 @@ def _concurrency(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _worktrees_root(config: dict[str, Any] | None) -> str | None:
+    """The `worktrees.root` config value, or None with no config (legacy repo).
+
+    None is also legal for a config that predates this key (config.py's
+    backward-compatible optional validation) -- either way, git.py's
+    `resolve_worktrees_root` falls back to the historical out-of-repo default.
+    """
+    if not config:
+        return None
+    return (config.get("worktrees") or {}).get("root")
+
+
 def _overlaid_plan(
     args: argparse.Namespace, store: StateStore
 ) -> tuple[dict[str, Any], Path, dict[str, Any] | None]:
@@ -1052,12 +1064,18 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "start":
+            config = (
+                load_config(store.path.parent)
+                if config_path(store.path.parent).exists()
+                else None
+            )
             result, duplicate = start_task(
                 store,
                 repo=args.repo,
                 task_id=args.task,
                 branch=args.branch,
                 worktree=args.worktree,
+                worktrees_root=_worktrees_root(config),
                 **_concurrency(args),
             )
             # Materialize + record a fresh attempt snapshot on a genuine new
@@ -1120,13 +1138,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "submit":
             warning = None
             pr = args.pr
+            config = (
+                load_config(store.path.parent)
+                if config_path(store.path.parent).exists()
+                else None
+            )
             if pr is None:
                 state = store.read()
-                config = (
-                    load_config(store.path.parent)
-                    if config_path(store.path.parent).exists()
-                    else None
-                )
                 if merge_settings(state, config)["surface"] == "pr":
                     try:
                         task = state["tasks"][args.task]
@@ -1175,7 +1193,8 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         pr = existing_pr
             result, duplicate = submit_task(
-                store, repo=args.repo, task_id=args.task, pr=pr, **_concurrency(args)
+                store, repo=args.repo, task_id=args.task, pr=pr,
+                worktrees_root=_worktrees_root(config), **_concurrency(args)
             )
             payload = {**result, "duplicate": duplicate}
             if warning:
@@ -1429,13 +1448,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "refresh":
-            result = refresh_task(store, repo=args.repo, task_id=args.task, **_concurrency(args))
-            state = store.read()
             config = (
                 load_config(store.path.parent)
                 if config_path(store.path.parent).exists()
                 else None
             )
+            result = refresh_task(
+                store, repo=args.repo, task_id=args.task,
+                worktrees_root=_worktrees_root(config), **_concurrency(args)
+            )
+            state = store.read()
             if merge_settings(state, config)["surface"] == "pr":
                 branch = (state["tasks"].get(args.task) or {}).get("branch")
                 if branch:
@@ -1587,11 +1609,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "release":
+            config = (
+                load_config(store.path.parent)
+                if config_path(store.path.parent).exists()
+                else None
+            )
             result, duplicate = release_task(
                 store,
                 repo=args.repo,
                 task_id=args.task,
                 keep_worktree=args.keep_worktree,
+                worktrees_root=_worktrees_root(config),
                 **_concurrency(args),
             )
             _print_json({**result, "duplicate": duplicate})
@@ -1656,9 +1684,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "monitor":
+            config = (
+                load_config(store.path.parent)
+                if config_path(store.path.parent).exists()
+                else None
+            )
             _print_json(
                 monitor_once(
-                    store, repo=args.repo, dry_run=args.dry_run, state_path=_state_option(args)
+                    store, repo=args.repo, dry_run=args.dry_run, state_path=_state_option(args),
+                    worktrees_root=_worktrees_root(config),
                 )
             )
             return 0

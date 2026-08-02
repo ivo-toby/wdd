@@ -359,12 +359,24 @@ does not durably store a mutation's `data` (see `events` below) — `rebind`'s
 rebind simply overwrites it with the newer attribution.
 
 `worktree` is normally `null`, and that is deliberate. A task's worktree lives
-at `<repo>.wdd/worktrees/<scope>/<task>` — a pure function of the checkout it
-belongs to. Recording it would bake this machine's directory name into
-committed state, so a clone into a differently named directory would resolve
-back to the original machine's worktree. The location is derived instead, and
-the field only holds a value when a caller passed an explicit `--worktree`,
-in which case it is stored relative to the repository root.
+at `<repo>/<worktrees.root>/<scope>/<task>` — a pure function of the checkout
+it belongs to and the current `config.json` (`worktrees.root`, default
+`.worktrees`, resolved against the repo root when relative; an absolute value
+is used as-is, anywhere on disk). Recording it would bake this machine's
+directory name (and today's config value) into committed state, so a clone
+into a differently named directory, or a later config change, would resolve
+back to the wrong place. The location is derived instead, and the field only
+holds a value when a caller passed an explicit `--worktree`, in which case it
+is stored relative to the repository root (or absolute, if it names a
+location outside it) and always wins over `worktrees.root` from then on — see
+`git.worktree_for`'s docstring. A relative `worktrees.root` is gitignored at
+the repository root automatically (idempotent, both at `init` and the moment
+a worktree is first created under it); an absolute root outside the
+repository needs no such entry and gets none. Changing `worktrees.root` for a
+task that has no recorded override is governance drift like any other
+`config.json` edit made after ratification — see "Governance drift" in
+[`docs/wddctl.md`](wddctl.md) — not something re-derivation reconciles on its
+own.
 
 This is what makes a scope portable. A cloud agent can clone a repository
 whose `state.json` says a task is `in_progress`, find no worktree (they are

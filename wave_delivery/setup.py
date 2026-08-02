@@ -17,6 +17,7 @@ from typing import Any
 from .config import config_path, constitution_path, default_config, load_config, save_config
 from .constitution import probe_repository
 from .engine import apply_mutation
+from .git import ensure_worktrees_gitignore
 from .handover import ensure_dispatch_gitignore
 from .intake import intake_drift, intake_status
 from .schema import copied_state, new_setup_state
@@ -122,6 +123,7 @@ def _open_questions(probed_commands: list[str]) -> list[dict[str, Any]]:
 
 def init_repository(wdd_dir: Path | str, repo: Path | str) -> dict[str, Any]:
     wdd_dir = Path(wdd_dir)
+    repo = Path(repo)
     store = StateStore(wdd_dir / "state.json")
     if store.exists():
         return {
@@ -162,6 +164,13 @@ def init_repository(wdd_dir: Path | str, repo: Path | str) -> dict[str, Any]:
     # dispatch log or attempt snapshot getting committed.
     if ensure_dispatch_gitignore(wdd_dir):
         created.append(str(wdd_dir / ".gitignore"))
+
+    # An in-repo worktrees.root (default ".worktrees") must never be
+    # committed either; scaffolded at the REPO ROOT (not .wdd/), and a no-op
+    # for an absolute root outside the repo (nothing there to gitignore).
+    worktrees_root = (config.get("worktrees") or {}).get("root")
+    if ensure_worktrees_gitignore(repo, worktrees_root):
+        created.append(str(repo / ".gitignore"))
 
     # Wrap state write in lock with re-check for race condition safety
     with store.locked():
@@ -361,6 +370,10 @@ def migrate_governance(wdd_dir: Path | str) -> dict[str, Any]:
     # A pre-split .wdd predates the dispatch/ scratch dir too; ensure the
     # gitignore entry the same way a fresh init would.
     ensure_dispatch_gitignore(wdd_dir)
+    # Same for worktrees.root: `.wdd` lives directly at the repo root by
+    # convention throughout this codebase (never relocated independently of
+    # it), so wdd_dir.parent is the repo root here too.
+    ensure_worktrees_gitignore(wdd_dir.parent, config["worktrees"]["root"])
 
     if old_text:
         atomic_write_text(wdd_dir / "constitution.md.pre-config", old_text)

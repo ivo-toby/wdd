@@ -23,7 +23,12 @@ from .store import StateStore
 
 
 def _observations(
-    state: dict[str, Any], repo: Path, *, state_path: str | None = None, repo_arg: str = "."
+    state: dict[str, Any],
+    repo: Path,
+    *,
+    state_path: str | None = None,
+    repo_arg: str = ".",
+    worktrees_root: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     observations: dict[str, Any] = {}
     actions: list[dict[str, str]] = []
@@ -39,7 +44,10 @@ def _observations(
             item["branchHead"] = None
             actions.append({"task": task_id, "action": "resolve_missing_branch"})
         if (state.get("leases") or {}).get(task_id, {}).get("status") == "active":
-            resolved = worktree_for(repo, state["scope"]["id"], task_id, task.get("worktree"))
+            resolved = worktree_for(
+                repo, state["scope"]["id"], task_id, task.get("worktree"),
+                worktrees_root=worktrees_root,
+            )
             entry = worktree_at(repo, resolved)
             if entry:
                 status = run_git(resolved, "status", "--porcelain").stdout.strip()
@@ -74,14 +82,19 @@ def _observations(
 
 
 def monitor_once(
-    store: StateStore, *, repo: Path | str, dry_run: bool = False, state_path: str | None = None
+    store: StateStore,
+    *,
+    repo: Path | str,
+    dry_run: bool = False,
+    state_path: str | None = None,
+    worktrees_root: str | None = None,
 ) -> dict[str, Any]:
     repo_arg = str(repo)
     repo = require_repository(repo)
     with store.locked():
         state = store.read()
         observations, actions = _observations(
-            state, repo, state_path=state_path, repo_arg=repo_arg
+            state, repo, state_path=state_path, repo_arg=repo_arg, worktrees_root=worktrees_root
         )
         prior = (state["monitoring"].get("observations") or {})
         changed = observations != prior

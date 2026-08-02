@@ -473,6 +473,28 @@ only `TASK-003` fell outside `src/auth/**` and kept the plan's declared
 `normal`. An empty `riskRules` list (the default) is a no-op: risk stays
 exactly what the plan file says.
 
+`worktrees.root` (default `.worktrees`) is where `start` creates task
+worktrees: a relative value resolves against the repository root (the
+default lands at `<repo>/.worktrees/<scope>/<task>`); an absolute value is
+used as-is, anywhere on disk. Whichever it resolves to is gitignored at the
+repository root automatically — idempotently, both at `init` and the moment
+a worktree is first created under it — except for an absolute root outside
+the repository, which needs no entry and gets none.
+
+```sh
+wddctl config set worktrees.root "build/wdd-trees"
+```
+
+Already-started tasks are unaffected by a later change: a task's worktree
+location is fixed the moment it is first created (recorded as an explicit
+override only when it differs from the config-derived default — see
+"Portability" in [`artifact-schema.md`](artifact-schema.md)), and a task
+with no recorded override re-derives from whatever `worktrees.root`
+currently says. Changing it after ratification is governance drift like any
+other `config.json` edit (see "Governance drift" below) — the drift gate
+catches a stray change; deliberately moving it mid-scope still needs
+`wddctl constitution amend` the same as any other config change.
+
 ```sh
 wddctl config show
 ```
@@ -1000,7 +1022,7 @@ $ wddctl start --task TASK-001-greeting --repo .
   "revision": 8,
   "specPath": "tasks/TASK-001-greeting.md",
   "task": "TASK-001-greeting",
-  "worktree": "/path/to/repo.wdd/worktrees/SCOPE-greeting-demo/TASK-001-greeting"
+  "worktree": "/path/to/repo/.worktrees/SCOPE-greeting-demo/TASK-001-greeting"
 }
 ```
 
@@ -1210,7 +1232,7 @@ wddctl start --task TASK-001-token-types --repo .
   "task": "TASK-001-token-types",
   "action": "created",
   "branch": "task/TASK-001-token-types",
-  "worktree": "/path/to/repo.wdd/worktrees/SCOPE-auth-refresh/TASK-001-token-types",
+  "worktree": "/path/to/repo/.worktrees/SCOPE-auth-refresh/TASK-001-token-types",
   "baseRef": "wdd/auth-refresh",
   "headSha": "...",
   "specPath": "tasks/TASK-001-token-types.md",
@@ -1220,10 +1242,13 @@ wddctl start --task TASK-001-token-types --repo .
 }
 ```
 
-Implement the task in the printed `worktree` path. Worktrees live beside the
-repository at `<repo>.wdd/worktrees/<scope>/<task>`, never inside its working
-tree, and the location is derived rather than stored (see
-[`artifact-schema.md`](artifact-schema.md)).
+Implement the task in the printed `worktree` path. Worktrees live under
+`config.json`'s `worktrees.root` (default `.worktrees`, resolved inside the
+repository), and the location is derived rather than stored (see
+"`config`" below and [`artifact-schema.md`](artifact-schema.md)). A relative
+`worktrees.root` is gitignored at the repository root automatically, both by
+`init` and the first time a worktree is actually created under it; an
+absolute root outside the repository needs no such entry and gets none.
 
 `start` also materializes an **attempt snapshot**: the task's brief and every
 `context`-ref file are copied, read-only, into a fresh

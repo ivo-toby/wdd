@@ -130,10 +130,17 @@ def refresh_task(
     *,
     repo: Path | str,
     task_id: str,
+    worktrees_root: str | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
-    """Merge the scope base into a task branch and record the new head."""
+    """Merge the scope base into a task branch and record the new head.
+
+    ``worktrees_root`` must match whatever was in effect when this task's
+    worktree was created if it has no recorded ``worktree`` override (see
+    ``git.worktree_for``'s docstring) -- only ever consulted to locate the
+    EXISTING worktree here, never to create one.
+    """
     repo = require_repository(repo)
     state = store.read()
     if _preflight(state, expected_revision, idempotency_key):
@@ -144,7 +151,8 @@ def refresh_task(
     if not branch:
         raise IllegalTransition(f"task {task_id} has no branch; run 'wddctl start' first")
     worktree_path = worktree_for(
-        repo, state["scope"]["id"], task_id, task.get("worktree")
+        repo, state["scope"]["id"], task_id, task.get("worktree"),
+        worktrees_root=worktrees_root,
     )
     if not worktree_path.exists():
         raise IllegalTransition(
