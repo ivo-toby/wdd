@@ -15,11 +15,17 @@ controller already created for you.
 - Never switch, create, or reset branches in the controller checkout — that
   checkout isn't yours to move.
 - Read your brief first: objective, scope, non-scope, conflict domains,
-  verification command. Read named files before doing broad discovery. The
-  controller gives you the brief's **absolute path in its own checkout** —
-  do not look for it inside your worktree. Your branch was cut from a
-  committed base, so briefs that were written but not committed are not
-  there.
+  verification command, **Deliverable**, and **Interfaces**. Deliverable is
+  the contract you're judged against — build to it, not to what "looks
+  reasonable." Interfaces lists what this task Consumes and Produces, with
+  citations into the contract inventory for anything crossing an external
+  or shared surface; follow the citations, never invent an endpoint or
+  field a cited row doesn't back. Read named files before doing broad
+  discovery. The controller's dispatch packet gives you **snapshot copies**
+  of the brief and every `context` file — immutable, taken at dispatch time
+  — plus any other context files listed; read those paths, not the live
+  files in your worktree. Your branch was cut from a committed base, so
+  briefs that were written but not committed are not there either way.
 
 ## Stay in scope
 

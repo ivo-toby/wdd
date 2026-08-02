@@ -39,11 +39,18 @@ Initialize from scratch.
      {"default": "haiku", "highRisk": "sonnet"}, "review": "sonnet"}'` —
      and "harness defaults are fine" is a valid answer: record it as all
      nulls so the question resolves and dispatchers use their own default.
+     If an answer instead names a local or CLI agent (qwen, codex, some
+     other local model) rather than a harness-known alias, that value only
+     resolves once it's registered and probed as a runner — mention this
+     as a follow-on and point at `wdd-runners` before moving on.
    - `ratify` — show the user the current `config.json` values and the
      `constitution.md` text (summarize, link the files), get explicit
      sign-off, then run `wddctl constitution ratify --by <name>`. Never
      ratify content the user has not seen.
-   - `plan` — setup is done; switch to the `wdd-plan` skill.
+   - `agree_spec` (or any other intake rung) — governance is done; the
+     intake ladder has begun. Switch to the `wdd-intake` skill.
+   - `plan` — only legacy-migrated scopes skip the ladder and land here
+     directly; switch to the `wdd-plan` skill.
 3. While resolving questions, also fill the constitution's prose sections
    (Intent, reviewer focus) from what you know of the project — it is prose
    for judgment, never configuration. All machine knobs go in `config.json`.
@@ -68,6 +75,6 @@ ratification — walk the user through re-approval as for a fresh setup.
 - `wddctl next` no longer emits `resolve_config` or `ratify`.
 - The user has explicitly approved what was ratified.
 
-Close with the handoff: offer to start planning — "Setup's done. Should I
-start planning? Point me at a spec or describe the feature." Planning is
-`wdd-plan`; don't make the user discover that.
+Close with the handoff: offer to start the intake ladder — "Setup's done.
+Should I start the intake ladder? Bring a spec or describe the feature."
+The ladder is `wdd-intake`; don't make the user discover that.

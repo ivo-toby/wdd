@@ -15,7 +15,8 @@
       "specPath": "tasks/TASK-001-token-types.md",
       "risk": "high",
       "dependsOn": [],
-      "conflictDomains": ["src/auth/**", "src/schema.ts"]
+      "conflictDomains": ["src/auth/**", "src/schema.ts"],
+      "context": ["spec.md#AC-1"]
     },
     {
       "id": "TASK-002-refresh-endpoint",
@@ -23,7 +24,10 @@
       "specPath": "tasks/TASK-002-refresh-endpoint.md",
       "risk": "high",
       "dependsOn": ["TASK-001-token-types"],
-      "conflictDomains": ["src/auth/routes/**"]
+      "conflictDomains": ["src/auth/routes/**"],
+      "context": ["shared-context/contract-inventory.md#refresh", "spec.md#AC-2"],
+      "model": "strong-model-id",
+      "reviewModel": "strong-model-id"
     },
     {
       "id": "TASK-003-refresh-docs",

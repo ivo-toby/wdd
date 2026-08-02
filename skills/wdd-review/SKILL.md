@@ -13,10 +13,35 @@ job is to find problems and classify them — not to fix them.
 
 ## What to check
 
-- The diff actually delivers the task's stated objective, and nothing more:
-  flag scope creep the same as a missing requirement.
+Read the brief, its `context` files, and the contract inventory from the
+**snapshot paths in your dispatch packet**, not from relative `.wdd/` paths
+in the task worktree — you're reviewing in the task worktree, where live
+`.wdd/` artifacts may not exist (the branch can predate intake artifacts,
+and `dispatch/` is gitignored) or may no longer match what the task was
+actually approved against.
+
+Check in this order — Deliverable, then Interfaces, then acceptance
+criteria — before anything else:
+
+- **Deliverable, first.** Read the task's brief Deliverable section before
+  the diff itself: does the diff actually produce what it declares — what
+  now exists, runs, or answers — and nothing more? Flag scope creep the
+  same as a missing requirement; "does the code look reasonable" is not
+  the question, "does the diff produce this" is.
+- **Interfaces against the contract inventory.** Check the brief's
+  Interfaces section (Consumes/Produces) against
+  `.wdd/shared-context/contract-inventory.md` when research applied to
+  this scope: cite the specific rows the diff should honor, and verify the
+  diff against those cited rows — never against memory of what the API
+  "probably" looks like. The worker's report should cite the reference per
+  endpoint too; uncited or mismatched shapes are P1 — fabricated contracts
+  fail at runtime, not in review.
+- **Acceptance criteria, by number.** Walk the numbered criteria this task
+  discharges — its brief's `context` refs shaped `spec.md#AC-N` — one by
+  one; each cited criterion must be demonstrably met by the diff, not just
+  plausible.
 - Correctness against the task's brief and any adjacent contracts it must
-  honor.
+  honor, beyond what the checks above already cover.
 - Test coverage for the behavior the task claims to add or change — and
   whether the tests could fail. A suite that round-trips schemas, tests a
   helper the production path never calls, re-implements the logic inline,
@@ -24,11 +49,6 @@ job is to find problems and classify them — not to fix them.
   it as missing coverage (P2), not as evidence. For anything that talks to
   an external system, look for assertions on the actual boundary — method,
   path, body — not just on the parsed result.
-- When the brief or constitution names a reference implementation or
-  external contract, spot-check the implemented surface against it. The
-  worker's report should cite the reference per endpoint; uncited or
-  mismatched shapes are P1 — fabricated contracts fail at runtime, not in
-  review.
 - Security and data-handling issues, proportional to what the task touches
   (weight this heavily on high-risk tasks — auth, persistence, migrations,
   public APIs).
@@ -76,7 +96,10 @@ contract here is unchanged either way.
 Once every task in a scope is `done` or `cancelled`, the controller
 dispatches a different kind of review under this same skill: not one
 task's diff against its brief, but the **whole epic branch** against
-`.wdd/spec.md`'s acceptance criteria.
+`spec.md`'s acceptance criteria. The controller supplies the paths to
+`spec.md` (and `design.md`, when applicable) in the dispatch packet — read
+those, the same snapshot-over-worktree discipline as task-level review
+above.
 
 - **What to diff.** The epic branch's head against its merge-base with the
   target branch — everything that would actually land if the epic branch
@@ -85,13 +108,19 @@ task's diff against its brief, but the **whole epic branch** against
   <targetBranch>...<epicBranch>`). Not the target branch's current tip —
   if the target has moved since the epic branch was cut, that drift isn't
   this review's concern.
-- **What to check it against.** `.wdd/spec.md`'s Acceptance criteria
-  section, not a task brief — every criterion the scope was approved
-  against at intake (see `docs/workflow.md`'s "Intake" section) should be
-  demonstrably met by the diff as a whole. Also watch for what no single
-  task's review could catch: integration coherence across tasks, and
-  orphaned partial work (a criterion two tasks were each supposed to
-  half-satisfy, where neither diff alone would have looked incomplete).
+- **What to check it against.** Walk `spec.md`'s Acceptance criteria
+  section number by number — AC-1, AC-2, and so on, not a task brief —
+  checking each one off individually rather than waving the section
+  through as a group; every criterion the scope was approved against at
+  intake (see `docs/workflow.md`'s "Intake" section) must be demonstrably
+  met by the diff as a whole. When the scope ran a design rung, also walk
+  `design.md`'s Epic deliverable section: does the diff, at this
+  head, actually support running the recorded deliverable command and
+  getting what that section says should observably run? Also watch for
+  what no single task's review could catch: integration coherence across
+  tasks, and orphaned partial work (a criterion two tasks were each
+  supposed to half-satisfy, where neither diff alone would have looked
+  incomplete).
 - **Classification.** Same P1/P2/P3 semantics as task-level review above —
   P1 and P2 block, P3 doesn't inflate or downgrade to force or avoid a
   block.

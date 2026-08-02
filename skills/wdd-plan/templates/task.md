@@ -5,6 +5,21 @@
 Define the `RefreshToken` / `AccessToken` types and the storage interface
 the refresh endpoint (TASK-002) will implement against.
 
+## Deliverable
+
+The `RefreshToken`/`AccessToken` types and the storage interface exist in
+`src/auth/tokens.ts`, compile, and are exercised by passing unit tests —
+testable by running the verification command below.
+
+## Interfaces
+
+Consumes:
+- `src/schema.ts` shared type conventions (see contract-inventory row, if any).
+
+Produces:
+- `RefreshToken`, `AccessToken` types and the storage interface, consumed by
+  TASK-002's endpoint implementation.
+
 ## Scope
 
 - Define types in `src/auth/tokens.ts`.
