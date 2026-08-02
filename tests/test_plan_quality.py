@@ -999,6 +999,20 @@ class PlanTemplateTest(unittest.TestCase):
     read/write, no governance gating -- must work mid-setup, exactly like
     `--help`)."""
 
+    def test_preview_without_plan_before_apply_refuses_cleanly(self) -> None:
+        # Regression: state["scope"] is None pre-apply; preview crashed with
+        # a NoneType traceback instead of a refusal (observed live).
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q", tmp], check=True)
+            state = str(Path(tmp) / ".wdd" / "state.json")
+            code, _ = _cli(state, "init", "--repo", tmp)
+            self.assertEqual(code, 0)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code, _ = _cli(state, "plan", "preview")
+            self.assertEqual(code, 2)
+            self.assertIn("no scope has been applied", stderr.getvalue())
+
     def test_plan_skeleton_parses_and_validates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state = str(Path(tmp) / "scratch" / ".wdd" / "state.json")

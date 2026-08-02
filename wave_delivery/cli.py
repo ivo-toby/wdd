@@ -982,6 +982,11 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "plan" and args.plan_command == "preview":
             state = state_from_plan(read_plan(args.plan)) if args.plan else store.read()
+            if state["scope"] is None:
+                raise ValidationError(
+                    "no scope has been applied yet; preview a plan file with "
+                    "--plan plan.json, or run plan apply first"
+                )
             _print_json(
                 {
                     "scope": state["scope"]["id"],
