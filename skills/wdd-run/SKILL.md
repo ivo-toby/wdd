@@ -24,8 +24,14 @@ Each action carries the exact command to use:
 - **`command`** — run it as-is, now.
 - **`recordWith`** — the work needs judgment first (implement, review,
   verify). Do that, then run this to record the outcome.
-- **`model`** — when present, pass it verbatim as the model for the subagent
-  dispatch (worker or reviewer); when absent, use the dispatcher's default.
+- **`model`** — when present, this field is **binding**, not metadata: set
+  it explicitly as the subagent's model on the spawn call (worker or
+  reviewer). Spawning on your harness's default when the payload names a
+  model is a routing violation — the user configured that routing at setup.
+  If your harness cannot set a per-subagent model, stop and tell the user;
+  the remedy is registering the model as a runner (`wdd-runners`), not
+  dispatching on the wrong model. When the field is absent, the
+  dispatcher's default is correct.
 
 Repeat until `next` is empty. Don't translate action names into commands
 yourself; the payload already did that. When you narrate progress, follow
