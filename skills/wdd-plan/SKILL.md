@@ -159,8 +159,19 @@ Two artifacts, two formats — do not mix them up. `plan.json` is JSON for
 the machine. Each task's brief (the file at its `specPath`, under
 `.wdd/tasks/`) is **Markdown prose for the worker** — objective,
 deliverable, interfaces, scope, non-scope, verification — never JSON. A
-worker exercises judgment against sentences, not a data blob. See
-`templates/plan.json` and `templates/task.md` for the exact shapes.
+worker exercises judgment against sentences, not a data blob.
+
+The exact shapes come from the CLI — there is no `plan init`, and no
+template files to hunt for on disk:
+
+```sh
+wddctl plan template > plan.json                       # skeleton plan
+wddctl plan template --brief > .wdd/tasks/TASK-001.md  # skeleton brief
+```
+
+Emit one brief skeleton per task, then replace every placeholder with the
+scope's real content. The skeletons are structurally valid v5 documents;
+what you add is the judgment.
 
 ## Present for approval
 
