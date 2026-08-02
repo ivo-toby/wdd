@@ -12,19 +12,20 @@ This is the normal way to use WDD. You open a session with Claude Code (or
 Codex, or another agent with the skills installed) and say something like
 "let's add refresh tokens" or "what's the status of the auth-refresh
 scope?" You never type `wddctl` yourself. The agent reads a skill —
-`wave-driven-development`, `wdd-setup`, `wdd-plan`, `wdd-run`, `wdd-worker`,
-`wdd-review`, or `wdd-status` — decides it applies, and runs `wddctl`
-commands on your behalf. This is a hard rule, not a suggestion: every one
-of those skills but `wdd-worker` — which never runs `wddctl` at all — opens
-with "you run every `wddctl` command in this skill yourself; presenting a
-command to the user instead of executing it is a protocol violation." The
-worker is deliberately excepted: `wddctl` resolves `--state` and `--repo`
-relative to the working directory, and a worker's working directory is its
-own isolated worktree, not the controller's checkout — running `wddctl`
-there would read the wrong state file, or none at all. A worker commits and
-reports back; the controller records the submission. Your intervention is
-prose: "actually split TASK-002 differently," "block TASK-004." The agent
-translates that into `wddctl block` or a `plan.json` edit.
+`wave-driven-development`, `wdd-setup`, `wdd-intake`, `wdd-plan`, `wdd-run`,
+`wdd-worker`, `wdd-review`, `wdd-status`, or `wdd-runners` — decides it
+applies, and runs `wddctl` commands on your behalf. This is a hard rule, not
+a suggestion: every one of those skills but `wdd-worker` — which never runs
+`wddctl` at all — opens with "you run every `wddctl` command in this skill
+yourself; presenting a command to the user instead of executing it is a
+protocol violation." The worker is deliberately excepted: `wddctl` resolves
+`--state` and `--repo` relative to the working directory, and a worker's
+working directory is its own isolated worktree, not the controller's
+checkout — running `wddctl` there would read the wrong state file, or none
+at all. A worker commits and reports back; the controller records the
+submission. Your intervention is prose: "actually split TASK-002
+differently," "block TASK-004." The agent translates that into `wddctl
+block` or a `plan.json` edit.
 
 **The hard rule is text, not enforcement.** A skill is a Markdown file
 loaded into an agent's context window. It has no execution privileges of
@@ -86,7 +87,7 @@ $ wddctl init --repo .
 {
   "alreadyInitialized": false,
   "created": [".wdd/config.json", ".wdd/constitution.md", ".wdd/tasks",
-              ".wdd/shared-context", ".wdd/state.json"],
+              ".wdd/shared-context", ".wdd/.gitignore", ".wdd/state.json"],
   "hint": "run 'wddctl next' and follow it",
   "openQuestions": [
     {"path": "merge.surface", "options": ["pr", "local"],
@@ -99,7 +100,9 @@ $ wddctl init --repo .
 
 `init` probed the repository and found a verification command (a `tests/`
 directory), so that question is pre-answered; the merge-surface and model
-questions remain. `next` during setup emits exactly one action at a time:
+questions remain. The `.wdd/.gitignore` entry it writes covers
+`dispatch/` — the runner-dispatch scratch directory below — from the first
+commit. `next` during setup emits exactly one action at a time:
 
 ```
 $ wddctl next
@@ -126,30 +129,82 @@ $ wddctl next
   "command": "wddctl constitution ratify --by NAME",
   "judgment": "show the user config.json and constitution.md; ratify only after explicit sign-off"}]}
 $ wddctl constitution ratify --by ivo
-{"decisionFingerprint": "sha256:b84d70...", "duplicate": false, "revision": 1}
+{"decisionFingerprint": "sha256:dfe31857...", "duplicate": false, "revision": 1}
 $ wddctl next
-{"actions": [{"action": "plan", "task": "-",
-  "command": "wddctl plan apply --plan plan.json --repo .",
-  "judgment": "decompose the work per the wdd-plan skill, write task briefs, then apply"}]}
+{"actions": [{"action": "agree_spec", "task": "-",
+  "recordWith": "wddctl intake spec --approved-by NAME",
+  "judgment": "agree .wdd/spec.md with the user (goal, in/out of scope, numbered acceptance criteria) per the wdd-intake skill's spec stage, then record it"}]}
 ```
 
-### Intake: `wdd-plan`, `.wdd/spec.md`, and a recorded approval
+Governance done, `next` hands off to the intake ladder instead of `wdd-plan`
+directly — that's the v5 front half.
 
-`wdd-plan` is the front door: it turns "let's add refresh tokens" into an
-agreed spec, a `plan.json`, and an applied, approved scope. It ingests
-whatever the user brings, pushes back on gaps in one compact round of
-questions, then writes the agreed understanding to `.wdd/spec.md` with
-exactly four sections — Goal, In scope, Out of scope, Acceptance
-criteria — checkable enough that a later finalize pass can review the epic
-branch against it. For this run, the acceptance criteria that matter are
-`issueRefreshToken` existing with a typed signature, and a 401 triggering
-exactly one silent refresh-and-retry, not a loop (the skill's template has
-the full four-section skeleton).
+### Intake: the ladder — spec, research, design
 
-From there it decomposes into tasks — one worker, one branch, one diff,
-one merge each — getting conflict domains right: too coarse serializes
-everything, too narrow lets two workers clobber the same file. Before
-applying, it shows the projected admission order and any lint findings:
+`wdd-intake` owns three rungs, one conversation, before any decomposition
+happens: **spec → research → design**. `next` walks them one at a time and
+names the recording verb; the skill supplies the judgment, `wddctl` the
+bookkeeping. For this run: the agreed spec is refresh tokens plus a
+retry-once client, with two numbered acceptance criteria
+(`issueRefreshToken` existing with a typed signature, and a 401 triggering
+exactly one silent refresh-and-retry). `.wdd/spec.md` gets the skill's
+four-section skeleton; recording binds the approval to the file's exact
+bytes:
+
+```
+$ wddctl intake spec --approved-by ivo
+{"criteria": 2, "duplicate": false, "revision": 2}
+$ wddctl next
+{"actions": [{"action": "research", "task": "-",
+  "recordWith": "wddctl intake research --done --by NAME --artifacts PATH... (or --skip --by NAME --reason '...')",
+  "judgment": "read the named reference implementation and build the contract inventory per the wdd-intake skill's research stage, or record an explicit, attributed skip when no external contract applies"}]}
+```
+
+This scope touches nothing external — no reference API, no protocol to
+transcribe — so research is skipped, explicitly and attributed, not
+silently:
+
+```
+$ wddctl intake research --skip --by ivo --reason "no external contract; refresh tokens are opaque strings this repo issues itself"
+{"duplicate": false, "revision": 3}
+$ wddctl next
+{"actions": [{"action": "agree_design", "task": "-",
+  "recordWith": "wddctl intake design --approved-by NAME --deliverable-command '...'",
+  "judgment": "agree .wdd/design.md (components, interfaces, integration surfaces, epic deliverable) with the user per the wdd-intake skill's design stage, then record it with the command that proves the epic deliverable"}]}
+```
+
+`.wdd/design.md` names two components (`TokenService`, `RefreshClient`),
+their Consumes/Produces, the integration surfaces each owns
+(`src/auth/tokens.ts`, `src/auth/client.ts`), and the epic deliverable —
+the command that proves the whole scope works. The deliverable command is
+required, not optional, and is recorded with the design approval, not in
+global config:
+
+```
+$ wddctl intake design --approved-by ivo --deliverable-command "python3 -m unittest discover -s tests"
+{"duplicate": false, "revision": 4}
+$ wddctl next
+{"actions": [{"action": "plan", "task": "-",
+  "command": "wddctl plan apply --plan plan.json --repo . --approved-by NAME",
+  "judgment": "decompose the work per the wdd-plan skill, write task briefs, show the user the diff for explicit approval, then apply with the approving human's name"}]}
+```
+
+Every rung binds to the bytes it approved; editing `spec.md` or
+`design.md` after this point re-opens that rung, cascades downstream, and
+during execution surfaces as an `intake_drift` blocker — `docs/wddctl.md`'s
+intake section has the full drift-and-cascade transcript; this run stays
+clean.
+
+### Plan: decomposition and a recorded approval
+
+`wdd-plan` no longer agrees anything — the ladder above already did. It
+turns `.wdd/spec.md` and `.wdd/design.md` into `plan.json` plus one brief
+per task, each brief now carrying **Deliverable** and **Interfaces**
+sections and a `context` field pointing at the `.wdd`-relative files the
+worker needs (`spec.md#AC-1`, `design.md`, …). Three tasks: token issuance,
+the endpoint that wires it in, and the client's retry-once logic — one
+worker, one branch, one diff, one merge each. Before applying, it shows the
+projected admission order and any lint findings:
 
 ```
 $ wddctl plan preview --plan plan.json
@@ -161,20 +216,23 @@ $ wddctl plan lint --plan plan.json
 {"findings": [], "strict": false}
 ```
 
-Only on explicit approval does it apply, and the approval is now recorded:
+Only on explicit approval does it apply. `--approved-by` now records a
+**composite** fingerprint — over the normalized plan, every brief file, and
+every `context`-ref file, not just the plan JSON:
 
 ```
 $ wddctl plan apply --plan plan.json --repo . --approved-by ivo
-{"approvedBy": "ivo", "created": false, "duplicate": false, "lint": [],
- "revision": 3, "scope": "SCOPE-auth-refresh",
+{"approvedBy": "ivo", "created": true, "duplicate": false, "lint": [],
+ "revision": 5, "scope": "SCOPE-auth-refresh",
  "diff": {"added": ["TASK-001-token-types", "TASK-002-refresh-endpoint",
                      "TASK-003-client-retry"], "removed": [], "updated": []},
  "base": {"action": "created", "baseRef": "wdd/auth-refresh", "from": "HEAD"}}
 ```
 
 `scope.approval` is now part of state, visible in `status --json` for as
-long as the scope exists. Re-applying later without `--approved-by`
-(adding a task, fixing a domain) preserves it rather than erasing it.
+long as the scope exists. A later edit to a brief or a `context` file —
+without re-running `plan apply --approved-by` — is `plan_drift`, caught by
+the same execution gate as intake drift.
 
 ### The `next` loop, gate by gate
 
@@ -203,12 +261,21 @@ need judgment instead (`await_worker`, `run_review`, `run_verification`,
 $ wddctl start --task TASK-001-token-types --repo .
 {"task": "TASK-001-token-types", "action": "create_branch_and_worktree",
  "branch": "task/TASK-001-token-types", "baseRef": "wdd/auth-refresh",
- "worktree": "/.../worktrees/SCOPE-auth-refresh/TASK-001-token-types", "revision": 4}
+ "worktree": "/.../worktrees/SCOPE-auth-refresh/TASK-001-token-types",
+ "snapshot": "dispatch/TASK-001-token-types-1", "revision": 6}
 ```
 
 One call verified the task admissible, created its branch and an isolated
-worktree, and flipped it to `in_progress`. The controller dispatches a
-worker per `wdd-worker` into that worktree.
+worktree, and flipped it to `in_progress`. `start`'s output now also names
+the task's **snapshot dir** — a read-only, immutable copy of the brief and
+every `context` ref, materialized the instant the task admits. Dispatch
+packets are built from the snapshot, never the live checkout: a file edited
+(or edited-and-restored) in the controller's own worktree after this point
+cannot reach the worker or reviewer either way. Those same recorded digests
+are what let `next` later report `inputs_changed` if a `context` file
+changes while a task is mid-flight — `docs/wddctl.md`'s Runners section has
+the full real `inputs_changed` → `rebind` transcript; this run doesn't hit
+it. The controller dispatches a worker per `wdd-worker` into that worktree.
 
 **Worker implements and commits; controller submits.** The worker writes
 `issueRefreshToken` — using `Math.random()`, as it happens — commits it in
@@ -219,7 +286,7 @@ submission on its behalf:
 ```
 $ wddctl submit --task TASK-001-token-types --repo .
 {"task": "TASK-001-token-types", "event": "task.pr_recorded",
- "headSha": "3f8edde...", "status": "review", "revision": 6}
+ "headSha": "cf5f483...", "status": "review", "revision": 10}
 ```
 
 `submit` reads the head SHA from the branch itself — the worker never types
@@ -242,8 +309,8 @@ finds something real:
 
 ```
 $ wddctl review record --task TASK-001-token-types --reviewer "codex-review" \
-  --findings '[{"severity":"P1","summary":"issueRefreshToken uses Math.random() for the token value; not cryptographically secure","file":"src/auth/tokens.ts","line":9}]'
-{"duplicate": false, "outcome": "blocking", "status": "in_progress", "revision": 8}
+  --findings '[{"severity":"P1","summary":"issueRefreshToken uses Math.random() for the token value; not cryptographically secure","file":"src/auth/tokens.ts","line":2}]'
+{"duplicate": false, "outcome": "blocking", "status": "in_progress", "revision": 12}
 ```
 
 A P1 or P2 finding sets `outcome: blocking` and drops the gate to
@@ -252,14 +319,14 @@ A P1 or P2 finding sets `outcome: blocking` and drops the gate to
 run straight through:
 
 ```
-$ wddctl verify record --task TASK-003-client-retry --status passed --command true
-{"duplicate": false, "status": "merge_ready", "revision": 9}
+$ wddctl verify record --task TASK-003-client-retry --status passed --command "python3 -m unittest discover -s tests"
+{"duplicate": false, "status": "merge_ready", "revision": 13}
 $ wddctl freshness record --task TASK-003-client-retry --repo .
-{"classification": "current", "duplicate": false, "revision": 10}
+{"classification": "current", "duplicate": false, "revision": 14}
 $ wddctl merge --task TASK-003-client-retry --repo .
-{"action": "merged", "baseRef": "wdd/auth-refresh", "headSha": "b489cf7...", "revision": 11}
+{"action": "merged", "baseRef": "wdd/auth-refresh", "headSha": "16f9790...", "revision": 15}
 $ wddctl release --task TASK-003-client-retry --repo .
-{"cleanup": "cleaned_up", "duplicate": false, "revision": 12}
+{"cleanup": "cleaned_up", "duplicate": false, "revision": 16}
 ```
 
 `verify record` jumped the status straight from `in_progress` to
@@ -285,51 +352,23 @@ in its worktree, and reports back; the controller records the resubmission:
 
 ```
 $ wddctl submit --task TASK-001-token-types --repo .
-{"event": "task.head_updated", "headSha": "8f136d5...", "status": "review", "revision": 13}
+{"event": "task.head_updated", "headSha": "5d0673a...", "status": "review", "revision": 17}
 ```
 
 `task.head_updated`, not `task.pr_recorded` — same PR reference, new head.
 A new commit clears review, verification, and freshness outright and sends
 the task back to `review`, with no memory that this diff was flagged once
 already. The reviewer re-reviews from scratch, finds nothing, and the task
-runs the same verify → freshness → merge → release sequence `TASK-003` did.
-
-### Reconciliation and governance drift
-
-Every `reconcileEveryNMerges` merges (3, here), a checkpoint comes due —
-and this is where a durable discovery has to be written down or it's gone.
-`wddctl note` only queues text in `reconcile.pendingNotes`, and
-`reconcile done` *deletes* the queue, not marks it resolved. If a note
-matters beyond this moment, write it into `.wdd/shared-context/` first;
-nothing else remembers it:
+runs the same verify → freshness → merge → release sequence `TASK-003` did
+(revision 22 by the time it's released). `TASK-002-refresh-endpoint` then
+admits — its one dependency is merged — and runs the identical gate
+sequence once implemented:
 
 ```
 $ wddctl next
-{"actions": [{"task": "-", "action": "run_reconciliation", "code": "merge_count",
-  "merges": 3, "recordWith": "wddctl reconcile done"}]}
-$ wddctl note --note "refresh tokens are opaque strings, not JWTs"
-{"duplicate": false, "revision": 25}
-$ wddctl reconcile done
-{"duplicate": false, "revision": 26}
+{"actions": [{"task": "TASK-002-refresh-endpoint", "action": "start_task",
+  "command": "wddctl start --task TASK-002-refresh-endpoint --repo ."}], "blockers": []}
 ```
-
-Governance doesn't stay ratified through an unrecorded edit, either.
-Loosen the review policy directly in `config.json` without going through
-`amend`, and `next` refuses everything until it's re-signed:
-
-```
-$ wddctl config set review.policy always
-{"openQuestions": 0, "path": "review.policy", "value": "always"}
-$ wddctl next
-{"actions": [], "blockers": [{"code": "governance_drift",
-  "message": "config/constitution changed since ratification; amend before executing",
-  "ratified": "sha256:ef67ee...", "actual": "sha256:f5831c..."}]}
-$ wddctl constitution amend --by ivo
-{"decisionFingerprint": "sha256:f5831c...", "duplicate": false, "revision": 27}
-```
-
-`next` unblocks the instant the fingerprint matches — this recurs for the
-life of the scope, any time `config.json` or `constitution.md` changes.
 
 ## Where you intervene
 
@@ -341,26 +380,76 @@ is the full summary `next` and `render` are built from; `render --output
 it, regenerate it after anything changes.
 
 **Editing `plan.json` mid-flight.** `plan apply` is re-runnable and diffs
-against current state — adding a task you missed is a plain re-apply:
+against current state — adding a task you missed is a plain re-apply, but
+a nonempty diff now **requires** `--approved-by`; a bare re-apply refuses
+outright:
 
 ```
 $ wddctl plan apply --plan plan.json --repo .
-{"created": false, "duplicate": false, "lint": [], "revision": 28,
- "diff": {"added": ["TASK-004-session-ui", "TASK-005-token-rotate"],
-          "removed": [], "updated": []}}
+wddctl: plan apply refuses: this plan changes the scope; re-run with --approved-by NAME once the user has reviewed the diff
+$ wddctl plan apply --plan plan.json --repo . --approved-by ivo
+{"approvedBy": "ivo", "created": false, "duplicate": false, "lint": [],
+ "revision": 31, "diff": {"added": ["TASK-004-session-ui", "TASK-005-token-rotate"],
+                           "removed": [], "updated": []}}
 ```
 
 Safe at any point *before* a task starts — `plan apply` refuses outright to
 edit or remove a task that has already left `todo`; you can only fix
 domains on tasks that haven't started, or add new ones.
 
-**Blocking, unblocking, cancelling.**
+**Reconciliation and governance drift.** Every `reconcileEveryNMerges`
+merges (3, here), a checkpoint comes due — and this is where a durable
+discovery has to be written down or it's gone. `wddctl note` only queues
+text in `reconcile.pendingNotes`, and `reconcile done` *deletes* the queue,
+not marks it resolved. If a note matters beyond this moment, write it into
+`.wdd/shared-context/` first; nothing else remembers it. Three tasks are
+merged by the time the plan edit above lands, so the same `next` call that
+proposes starting the two new tasks also reports the checkpoint:
 
 ```
-$ wddctl block --task TASK-004-session-ui --reason "waiting on design sign-off"
-{"duplicate": false, "revision": 29}
-$ wddctl unblock --task TASK-004-session-ui
-{"duplicate": false, "revision": 30}
+$ wddctl next
+{"actions": [
+  {"task": "-", "action": "run_reconciliation", "code": "merge_count",
+   "merges": 3, "recordWith": "wddctl reconcile done"},
+  {"task": "TASK-004-session-ui", "action": "start_task",
+   "command": "wddctl start --task TASK-004-session-ui --repo ."},
+  {"task": "TASK-005-token-rotate", "action": "start_task",
+   "command": "wddctl start --task TASK-005-token-rotate --repo ."}], "blockers": []}
+$ wddctl note --note "refresh tokens are opaque strings, not JWTs"
+{"duplicate": false, "revision": 36}
+$ wddctl reconcile done
+{"duplicate": false, "revision": 37}
+```
+
+Governance doesn't stay ratified through an unrecorded edit, either.
+Loosen the review policy directly in `config.json` without going through
+`amend`, and `next` refuses everything until it's re-signed — the same
+check now also covers the intake ladder's fingerprints, not just
+`config.json`/`constitution.md`:
+
+```
+$ wddctl config set review.policy always
+{"openQuestions": 0, "path": "review.policy", "value": "always"}
+$ wddctl next
+{"actions": [], "blockers": [{"code": "governance_drift",
+  "message": "config/constitution changed since ratification; amend before executing",
+  "ratified": "sha256:dfe31857...", "actual": "sha256:d145263f..."}]}
+$ wddctl constitution amend --by ivo
+{"decisionFingerprint": "sha256:d145263f...", "duplicate": false, "revision": 38}
+```
+
+`next` unblocks the instant the fingerprint matches — this recurs for the
+life of the scope, any time `config.json`, `constitution.md`, or an
+approved intake/plan artifact changes.
+
+**Blocking, unblocking, cancelling.** `TASK-005-token-rotate` is admitted
+and submitted (status `review`) below; block it to demonstrate the verb:
+
+```
+$ wddctl block --task TASK-005-token-rotate --reason "waiting on design sign-off for token rotation"
+{"duplicate": false, "revision": 46}
+$ wddctl unblock --task TASK-005-token-rotate
+{"duplicate": false, "revision": 47}
 ```
 
 Blocking frees the task's conflict domains immediately. `unblock` returns a
@@ -376,7 +465,9 @@ against the base is genuinely different now.
 
 ## Failure modes and what to do
 
-**A refresh conflicts.**
+**A refresh conflicts.** `TASK-004-session-ui` merges cleanly; while
+`TASK-005-token-rotate` is still in flight, an out-of-band edit lands on
+the base branch touching the same file:
 
 ```
 $ wddctl refresh --task TASK-005-token-rotate --repo .
@@ -401,8 +492,8 @@ base and adopts the head you produced:
 
 ```
 $ wddctl refresh --task TASK-005-token-rotate --repo .
-{"action": "adopted_external_merge", "previousHeadSha": "a88f45d...",
- "headSha": "e70a99c...", "duplicate": false, "revision": 33,
+{"action": "adopted_external_merge", "previousHeadSha": "772d4ad...",
+ "headSha": "750e06e...", "duplicate": false, "revision": 45,
  "note": "branch was already current; recorded its head and invalidated evidence"}
 ```
 
@@ -425,7 +516,7 @@ its own.
 
 ```
 $ wddctl note --note "..." --expected-revision 5
-wddctl: expected revision 5, found 28
+wddctl: expected revision 5, found 45
 ```
 
 This only happens when you pass `--expected-revision` yourself — opt-in
@@ -455,6 +546,13 @@ trust the agent doing the work.
 - **Governance drift.** An unratified edit to `config.json` or
   `constitution.md` blocks every governed verb until `amend` re-signs it —
   checked live from the files, no proposal snapshot required.
+- **Approved-bytes fingerprints.** Every intake rung (`spec`/`research`/
+  `design`) and the plan's composite approval are bound to a SHA-256 of the
+  exact artifact bytes at approval time. Editing one afterward is drift,
+  blocked by the same execution gate as governance drift
+  (`intake_drift`/`plan_drift`); a **nonempty plan diff refuses `plan
+  apply` outright without `--approved-by`** — see "Editing `plan.json`
+  mid-flight" above for the real refusal.
 
 **Convention — depends on the agent reading and following the skill:**
 
@@ -464,12 +562,13 @@ trust the agent doing the work.
   check.
 - **Review and verification honesty.** `review record` and
   `verify record --status passed` take your word for it; the schema
-  validates shape, not substance.
+  validates shape, not substance. The same is true of `--approved-by NAME`
+  itself: the state machine now refuses a changed plan without it, but
+  nothing checks that `NAME` actually read the diff before typing it —
+  that discipline is `wdd-plan`'s and `wdd-intake`'s instruction, not a
+  gate.
 - **Task decomposition and sizing.** Nothing stops a `plan.json` with one
   task that touches the entire repository.
-- **Plan approval.** `--approved-by NAME` records who signed off, but
-  nothing refuses an apply that omits it — refusing an unapproved plan is
-  `wdd-plan`'s instruction, not a gate the state machine enforces.
 - **`.wdd/shared-context/`.** A plain folder `wddctl` never writes to; a
   discovery that must survive `reconcile done` needs a controller to write
   it there itself.
@@ -493,14 +592,15 @@ and `next` detect the phase and switch shape on their own.
 
 The ladder mirrors a task's own gates, but at the whole-epic-branch level:
 a final review against `.wdd/spec.md`'s acceptance criteria (the same
-document `wdd-plan` wrote at intake — see above), full verification, a
+document `wdd-intake` wrote at intake — see above), full verification, a
 handoff to the human who performs the actual merge, and `delivered` only
 once that merge is Git-provably real. `wddctl` never merges the epic
 branch into the target branch itself — that step is human-owned by
 design, the same way `merge.mode: human` reserves a task's own merge for
 a person; there is no code path anywhere that lets `wddctl` do it. This
 run continues in a fresh scratch repository, one task, `merge.surface:
-local`, verification `python3 -m unittest`:
+local`, verification `python3 -m unittest discover -s tests` plus a second
+smoke command, and an intake-recorded epic deliverable command:
 
 ```
 $ wddctl next --repo .
@@ -516,13 +616,21 @@ brief. Same P1/P2/P3 vocabulary, same blocking severities:
 
 ```
 $ wddctl finalize review record --reviewer codex-review --findings '[]' --repo .
-{"duplicate": false, "headSha": "3ff80c2...", "outcome": "passed", "revision": 9}
+{"duplicate": false, "headSha": "20bbd294...", "outcome": "passed", "revision": 13}
 $ wddctl next --repo .
 {"actions": [{"action": "final_verification", "task": "-",
-  "recordWith": "wddctl finalize verify record --status passed --command '<verification command>' --repo .",
+  "recordWith": "wddctl finalize verify record --results '[...]' --repo .",
   "judgment": "run full verification against the current epic branch head and record the result"}]}
-$ wddctl finalize verify record --status passed --command "python3 -m unittest" --repo .
-{"duplicate": false, "headSha": "3ff80c2...", "revision": 10, "status": "passed"}
+```
+
+`final_verification`'s evidence is now a **list**, not one command: every
+ratified global `verification.commands` entry, in order, plus the scope's
+own deliverable command recorded at `intake design` — overall `status` is
+`passed` only when every entry is:
+
+```
+$ wddctl finalize verify record --results '[{"command": "python3 -m unittest discover -s tests", "status": "passed"}, {"command": "python3 -c \"print(1)\"", "status": "passed"}, {"command": "python3 -c \"from src.greeting import greet; assert (\\\"Ivo\\\" in greet(\\\"Ivo\\\"))\"", "status": "passed"}]' --repo .
+{"duplicate": false, "headSha": "20bbd294...", "revision": 14, "status": "passed"}
 ```
 
 A clean review and a passed verification, both pinned to the current base
@@ -533,7 +641,7 @@ $ wddctl next --repo .
 {"actions": [{"action": "prepare_handoff", "task": "-",
   "command": "wddctl finalize handoff --repo ."}]}
 $ wddctl finalize handoff --repo .
-{"duplicate": false, "headSha": "3ff80c2...", "pr": null, "revision": 11,
+{"duplicate": false, "headSha": "20bbd294...", "pr": null, "revision": 15,
  "targetBranch": "main",
  "instructions": "push wdd/finalize-demo to your remote (e.g. 'git push origin wdd/finalize-demo') and open a pull request into main yourself; wddctl does not perform this on the local surface. Once the human merge lands, run 'wddctl finalize delivered --by NAME --repo .' to record it."}
 ```
@@ -560,9 +668,9 @@ target branch, entirely outside the controller's reach:
 ```
 $ git merge --no-ff -q wdd/finalize-demo -m "merge scope SCOPE-finalize-demo into main"
 $ wddctl finalize delivered --by ivo --repo .
-{"by": "ivo", "duplicate": false, "headSha": "3ff80c2...", "revision": 12, "targetBranch": "main"}
+{"by": "ivo", "duplicate": false, "headSha": "20bbd294...", "revision": 16, "targetBranch": "main"}
 $ wddctl next --repo .
-{"actions": [], "blockers": [], "phase": "delivered", "revision": 12, "scope": "SCOPE-finalize-demo"}
+{"actions": [], "blockers": [], "phase": "delivered", "revision": 16, "scope": "SCOPE-finalize-demo"}
 ```
 
 `finalize delivered` proves this the same way `merge --observed` proves a
@@ -577,10 +685,81 @@ exactly like a task-level P1 blocks merge — `next` reports
 its own, because the fix is new commits on the base branch, and any new
 commit re-stales the review and routes back to `final_review` on its own.
 
+**Scope archive, and the ladder restarts.** `delivered` is no longer a dead
+end. `wddctl scope archive` retires the completed scope's records (scope,
+tasks, intake, finalize, plan approval) into `.wdd/archive/<scope-id>.json`
+and resets state to post-ratification setup — governance stands, but the
+intake ladder starts over for whatever comes next:
+
+```
+$ wddctl scope archive --repo .
+{"archived": ".wdd/archive/SCOPE-finalize-demo.json", "duplicate": false,
+ "revision": 17, "scope": "SCOPE-finalize-demo"}
+$ wddctl next --repo .
+{"actions": [{"action": "agree_spec", "task": "-",
+  "recordWith": "wddctl intake spec --approved-by NAME",
+  "judgment": "agree .wdd/spec.md with the user (goal, in/out of scope, numbered acceptance criteria) per the wdd-intake skill's spec stage, then record it"}],
+ "blockers": [], "phase": "setup", "revision": 17, "scope": null}
+```
+
+Nothing scope-specific — the deliverable command included — carries
+forward. One repository, successive scopes, each earning its own spec,
+research, and design from scratch.
+
 A scope's lifecycle sentence, end to end: a scope starts at `plan apply`
 and ends at an **observed human merge** — `delivered` is never recorded on
 trust, only on live Git proof that the epic branch actually landed in the
 target branch.
+
+## Appendix: a local runner, worked
+
+Everything above dispatches workers and reviewers as subagents of the
+controller's own harness. `wddctl` can also dispatch through a registered
+**runner** — an external agent CLI, exec'd headless, file-in file-out.
+`wdd-runners` owns setup judgment; this is one real registration and
+dispatch, against the committed stub `tests/fixtures/fake-runner/fake-runner`
+(a stub because it's a canned deterministic script, not a real agent —
+labeled as such rather than passed off as a live CLI) so the transcript
+needs nothing installed on your machine to reproduce. `docs/wddctl.md`'s
+Runners section has the full config/resolution/`inputs_changed` reference;
+this is the worked example.
+
+A task's `plan.json` entry named the runner directly (`"model":
+"stub-runner"`) and was started like any other task. Registration order is
+law — probe the explicit candidate first, register it, then re-sign
+governance:
+
+```
+$ wddctl dispatch --probe-command '["/path/to/fake-runner", "--prompt", "{prompt}", "--worktree", "{worktree}", "--logfile", "{logfile}"]'
+{"digest": "sha256:9c962d10...", "exitCode": 0, "ok": true, "recorded": true,
+ "tokenSeen": true, "wallMs": 71}
+$ wddctl config set runners '{"stub-runner": {"command": ["/path/to/fake-runner", "--prompt", "{prompt}", "--worktree", "{worktree}", "--logfile", "{logfile}"]}}'
+{"openQuestions": 0, "path": "runners", "value": {"stub-runner": {"command": [...]}}}
+$ wddctl constitution amend --by ivo
+{"decisionFingerprint": "sha256:f52af4be...", "duplicate": false, "revision": 9}
+```
+
+The probe records a digest of the exact command bytes; `dispatch --task`
+refuses any runner whose ratified command lacks a passing probe on that
+same digest — a runner that was never probed is configuration fiction, not
+a shortcut. With registration and governance done, dispatching the worker
+is one command:
+
+```
+$ wddctl dispatch --task TASK-001-placeholder --role worker --repo .
+{"digest": "sha256:9c962d10...", "exitCode": 0,
+ "log": ".../dispatch/TASK-001-placeholder-worker-1.log",
+ "model": "stub-runner", "role": "worker", "statusToken": "DONE",
+ "tail": "fake-runner: task complete\nDONE\n",
+ "task": "TASK-001-placeholder", "timedOut": false, "wallMs": 70}
+```
+
+The log tail is right there in the result; the full file on disk holds the
+rest. The `statusToken` is read straight from the trailing output line —
+`DONE` continues the loop exactly like a subagent worker's own status line
+would. The stub never touches Git, so the commit it's supposed to have
+made still has to exist before `wddctl submit`, same discipline as any
+worker, harness-native or not.
 
 ## Appendix: driving `wddctl` yourself
 
