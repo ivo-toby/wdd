@@ -174,7 +174,7 @@ def _check_spec(wdd_dir: Path | str) -> list[dict[str, Any]]:
             "message": (
                 f".wdd/spec.md {reason} — the finalize phase reviews the epic "
                 "branch against it, and without it there is no agreed record of "
-                "what this scope delivers. Run the intake (wdd-plan) first."
+                "what this scope delivers. Run the intake (wdd-intake) first."
             ),
         }
     ]
