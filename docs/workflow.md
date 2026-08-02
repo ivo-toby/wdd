@@ -553,6 +553,12 @@ trust the agent doing the work.
   (`intake_drift`/`plan_drift`); a **nonempty plan diff refuses `plan
   apply` outright without `--approved-by`** — see "Editing `plan.json`
   mid-flight" above for the real refusal.
+- **Input-version binding.** Task-targeted verbs (`submit`, `review record`/
+  `collect`, `verify record`/`collect`, `refresh`, `merge`, `dispatch --task`)
+  hard-refuse when a task's recorded input digests no longer match its
+  brief or `context` files on disk; the remedy is `rebind` (accept the
+  existing work as still valid) or a fresh re-dispatch, never a silent
+  pass-through.
 
 **Convention — depends on the agent reading and following the skill:**
 

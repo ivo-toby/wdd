@@ -90,6 +90,9 @@ That is the whole engine. Everything else is judgment:
 - Plan exists and tasks need dispatching, reviewing, or merging: use
   `wdd-run` (controller), `wdd-worker` (if you are the dispatched worker),
   or `wdd-review` (if you are the dispatched reviewer).
+- Scope already `delivered` and there's more work to bring: `wddctl scope
+  archive --repo .` first, then `wdd-intake` to start the next scope's
+  ladder.
 - Just want to know where things stand: use `wdd-status`.
 - Registering an external agent CLI as a worker or reviewer ("add a
   runner", "use qwen/codex as a worker", a model value naming a local CLI):

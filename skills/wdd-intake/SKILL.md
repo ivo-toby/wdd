@@ -167,9 +167,9 @@ This shows up in two places:
 - **During execution**: the same edit surfaces as an `intake_drift`
   blocker — `next`'s actions go empty, and the blocker names the stale rung
   and the exact commands to fix it: re-run `wddctl intake <rung> ...` to
-  re-approve, then `wddctl plan apply --approved-by NAME` to re-stamp
-  (a pure re-stamp when the plan file itself is unchanged — one command,
-  not a re-plan).
+  re-approve, then `wddctl plan apply --plan plan.json --repo . --approved-by
+  NAME` to re-stamp (a pure re-stamp when the plan file itself is unchanged
+  — one command, not a re-plan).
 
 The ladder also cascades downstream: re-approving a rung invalidates every
 rung after it, because those were approved against upstream bytes that just

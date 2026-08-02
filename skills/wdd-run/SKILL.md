@@ -38,10 +38,12 @@ How you assemble a worker's or reviewer's packet depends on whether the
 task's routed model is harness-native or a registered runner.
 
 **Harness-native (subagent) dispatch** — the common case. Hand the subagent
-absolute paths into the task's **snapshot dir** from `start`'s output, not
-your live checkout — the snapshot is what the approved-bytes doctrine
-actually guarantees, and a file edited (or edited-and-restored) after
-dispatch cannot reach the subagent either way.
+absolute paths into the task's **snapshot dir**, not your live checkout —
+the snapshot is what the approved-bytes doctrine actually guarantees, and a
+file edited (or edited-and-restored) after dispatch cannot reach the
+subagent either way. `start`'s output gives you the snapshot dir as a
+`.wdd`-relative path (e.g. `dispatch/TASK-001-1`); join it to `.wdd/`
+yourself to get the absolute path before handing it to the subagent.
 
 - **Worker packet**: the snapshot's brief and context-ref paths, the
   worktree to work in, its branch, the task's Deliverable (read from the
@@ -123,9 +125,17 @@ actions and starts driving the finalize ladder instead — same one-action,
   There is no `command` — the fix is new commits on the base branch, which
   re-stales the final review and routes the scope back to `final_review`
   on its own.
-- **`final_verification`** → run the constitution's verification command
-  against the current epic branch head, then record the real result —
-  same discipline as `run_verification`.
+- **`final_verification`** → for a v5 (non-legacy) scope, evidence is
+  `--results`: one ordered JSON array covering exactly the ratified global
+  `verification.commands` then the scope's deliverable command (recorded
+  at design approval), each entry `{"command": ..., "status": ...}` in that
+  order. Overall passes only when every entry's status is `passed`. Run
+  EVERY listed command yourself, against the current epic branch head, and
+  record only the statuses you actually observed — the pre-filled array in
+  `recordWith` is a template of what must be run, not a license to stamp
+  `passed` on commands you didn't execute. Legacy scopes keep the old
+  single-command `--status`/`--command` shape — same discipline as
+  `run_verification`.
 - **`prepare_handoff`** → run `command`. On the `pr` surface this pushes
   the epic branch and opens the epic→target PR; on `local` it records
   handoff instructions for you to act on. It never merges anything.
@@ -140,7 +150,11 @@ actions and starts driving the finalize ladder instead — same one-action,
 Once `delivered` is recorded, `next` returns empty actions with
 `"phase": "delivered"` — there is nothing left to do for this scope. Say
 so, summarize what shipped against `.wdd/spec.md`, and offer the handoff:
-more work to bring? That's a new plan (`wdd-plan`); otherwise you're done.
+more work to bring? Archive the delivered scope first — `wddctl scope
+archive --repo .` (governed; you run it) moves its records to
+`.wdd/archive/` and restarts the intake ladder — then hand off to
+`wdd-intake` for the next scope: "Scope's archived. Should I start the
+ladder for the next one?" Nothing to bring? You're done.
 
 ## Worker status tokens
 
@@ -162,11 +176,13 @@ route around:
   since approval. The blocker names the stale rung. Remedy: re-run
   `wddctl intake <rung> ...` to re-approve it (re-approving cascades —
   walk every rung it clears, in order, per `wdd-intake`), then
-  `wddctl plan apply --approved-by NAME` to re-stamp the plan.
+  `wddctl plan apply --plan plan.json --repo . --approved-by NAME` to
+  re-stamp the plan.
 - **`plan_drift`** — the applied plan's composite approval no longer
   matches its current bytes (a brief or a `context` file changed since
-  `plan apply --approved-by`). Remedy: `wddctl plan apply --approved-by
-  NAME` — with the plan file itself unchanged, that's a pure re-stamp.
+  `plan apply --approved-by`). Remedy: `wddctl plan apply --plan plan.json
+  --repo . --approved-by NAME` — with the plan file itself unchanged,
+  that's a pure re-stamp.
 
 Relay the blocker to the user in plain language ("a task's brief changed
 after it was approved; I need you to re-approve it before I can keep
@@ -184,8 +200,15 @@ one silently:
   the input change: `wddctl rebind --task ID --by NAME --repo .`.
 - **Re-dispatch fresh** — discard the in-flight attempt and start over
   against current inputs: `wddctl block --task ID --reason "..."`, then
-  `wddctl unblock --task ID`, then `wddctl start` again, which
-  re-materializes a fresh snapshot.
+  `wddctl unblock --task ID`, then `wddctl start` again. This only
+  genuinely re-materializes a fresh snapshot for a task that's `in_progress`
+  and never submitted (no PR yet) — `unblock` returns it to `todo`, so
+  `start` runs a real new dispatch. A task that already submitted (`review`
+  or `merge_ready`) keeps its PR through block/unblock, so `unblock`
+  returns it to `in_progress` instead, and `start` on an active task is a
+  reattach that PRESERVES the existing snapshot — it does not discard the
+  mismatched attempt. For an already-submitted task, the mismatch stays a
+  human decision: rebind, or cancel the task and replan it fresh.
 
 If a `plan_drift` blocker is present at the same time, re-stamp the plan
 first — a started task's own context edit fires both together, and the

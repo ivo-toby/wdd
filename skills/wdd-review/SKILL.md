@@ -13,6 +13,13 @@ job is to find problems and classify them — not to fix them.
 
 ## What to check
 
+Read the brief, its `context` files, and the contract inventory from the
+**snapshot paths in your dispatch packet**, not from relative `.wdd/` paths
+in the task worktree — you're reviewing in the task worktree, where live
+`.wdd/` artifacts may not exist (the branch can predate intake artifacts,
+and `dispatch/` is gitignored) or may no longer match what the task was
+actually approved against.
+
 Check in this order — Deliverable, then Interfaces, then acceptance
 criteria — before anything else:
 
@@ -89,7 +96,10 @@ contract here is unchanged either way.
 Once every task in a scope is `done` or `cancelled`, the controller
 dispatches a different kind of review under this same skill: not one
 task's diff against its brief, but the **whole epic branch** against
-`.wdd/spec.md`'s acceptance criteria.
+`spec.md`'s acceptance criteria. The controller supplies the paths to
+`spec.md` (and `design.md`, when applicable) in the dispatch packet — read
+those, the same snapshot-over-worktree discipline as task-level review
+above.
 
 - **What to diff.** The epic branch's head against its merge-base with the
   target branch — everything that would actually land if the epic branch
@@ -98,13 +108,13 @@ task's diff against its brief, but the **whole epic branch** against
   <targetBranch>...<epicBranch>`). Not the target branch's current tip —
   if the target has moved since the epic branch was cut, that drift isn't
   this review's concern.
-- **What to check it against.** Walk `.wdd/spec.md`'s Acceptance criteria
+- **What to check it against.** Walk `spec.md`'s Acceptance criteria
   section number by number — AC-1, AC-2, and so on, not a task brief —
   checking each one off individually rather than waving the section
   through as a group; every criterion the scope was approved against at
   intake (see `docs/workflow.md`'s "Intake" section) must be demonstrably
   met by the diff as a whole. When the scope ran a design rung, also walk
-  `.wdd/design.md`'s Epic deliverable section: does the diff, at this
+  `design.md`'s Epic deliverable section: does the diff, at this
   head, actually support running the recorded deliverable command and
   getting what that section says should observably run? Also watch for
   what no single task's review could catch: integration coherence across
