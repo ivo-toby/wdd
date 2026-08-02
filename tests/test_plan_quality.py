@@ -12,7 +12,7 @@ from wave_delivery.cli import main
 from wave_delivery.config import default_config, governance_fingerprint, load_config, save_config, set_value
 from wave_delivery.engine import utc_now
 from wave_delivery.lint import lint_plan
-from wave_delivery.plan import apply_risk_rules
+from wave_delivery.plan import MUTABLE_TASK_FIELDS, apply_risk_rules, brief_skeleton, plan_skeleton, validate_plan
 from wave_delivery.schema import new_setup_state, new_state
 from wave_delivery.setup import init_repository, migrate_governance, setup_next_actions
 from wave_delivery.store import StateStore
@@ -992,6 +992,74 @@ class LintUnownedSurfaceTest(unittest.TestCase):
             )
             plan = _plan([_task("T1", domains=["src/shared/**"])])
             self.assertNotIn("unowned_surface", _codes(lint_plan(plan, wdd)))
+
+
+class PlanTemplateTest(unittest.TestCase):
+    """`wddctl plan template`: deterministic skeleton emitter (Task: no state
+    read/write, no governance gating -- must work mid-setup, exactly like
+    `--help`)."""
+
+    def test_plan_skeleton_parses_and_validates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "scratch" / ".wdd" / "state.json")
+            code, out = _cli(state, "plan", "template")
+            self.assertEqual(code, 0)
+            parsed = json.loads(out)
+            validate_plan(parsed)  # raises ValidationError on failure
+
+    def test_plan_skeleton_contains_all_mutable_task_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "scratch" / ".wdd" / "state.json")
+            code, out = _cli(state, "plan", "template")
+            self.assertEqual(code, 0)
+            for field in MUTABLE_TASK_FIELDS:
+                self.assertIn(f'"{field}"', out)
+
+    def test_brief_skeleton_has_required_lint_headings_and_reads_as_prose(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "scratch" / ".wdd" / "state.json")
+            code, out = _cli(state, "plan", "template", "--brief")
+            self.assertEqual(code, 0)
+            self.assertIn("## Deliverable", out)
+            self.assertIn("## Interfaces", out)
+            # nonprose_brief (lint.py) trips when the stripped text starts
+            # with '{' or '[' -- assert the inverse holds for the skeleton.
+            self.assertNotIn(out.lstrip()[:1], "{[")
+
+    def test_filled_in_skeleton_pair_passes_deliverable_and_interfaces_lint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            (wdd / "tasks").mkdir(parents=True)
+            plan = plan_skeleton()
+            # plan_skeleton's placeholder task specPath is where the emitted
+            # brief skeleton is expected to land once filled in.
+            spec_path = plan["tasks"][0]["specPath"]
+            (wdd / spec_path).parent.mkdir(parents=True, exist_ok=True)
+            (wdd / spec_path).write_text(brief_skeleton(), encoding="utf-8")
+            findings = lint_plan(plan, wdd)
+            codes = _codes(findings)
+            self.assertNotIn("missing_brief", codes)
+            self.assertNotIn("nonprose_brief", codes)
+            self.assertNotIn("missing_deliverable", codes)
+            self.assertNotIn("missing_interfaces", codes)
+
+    def test_works_with_no_state_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "no-such-dir" / ".wdd" / "state.json")
+            code, _ = _cli(state, "plan", "template")
+            self.assertEqual(code, 0)
+            code, _ = _cli(state, "plan", "template", "--brief")
+            self.assertEqual(code, 0)
+
+    def test_deterministic_across_invocations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / ".wdd" / "state.json")
+            _, out1 = _cli(state, "plan", "template")
+            _, out2 = _cli(state, "plan", "template")
+            self.assertEqual(out1, out2)
+            _, brief1 = _cli(state, "plan", "template", "--brief")
+            _, brief2 = _cli(state, "plan", "template", "--brief")
+            self.assertEqual(brief1, brief2)
 
 
 if __name__ == "__main__":

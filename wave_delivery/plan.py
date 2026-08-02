@@ -38,6 +38,107 @@ MUTABLE_TASK_FIELDS = (
 )
 
 
+# `wddctl plan template`'s deterministic skeletons. Hand-synced twin:
+# skills/wdd-plan/templates/plan.json and templates/task.md are the
+# human-readable versions an agent reads directly while authoring a plan by
+# hand (same sync-risk idiom as engine._resolve_model <->
+# runner._resolve_dispatch_model) -- keep the v5 shape here in step with
+# those if MUTABLE_TASK_FIELDS or the brief's linted sections ever change.
+# Both emitters are pure (no timestamps, no randomness, no filesystem/state
+# access) so `wddctl plan template` can run before any state exists, exactly
+# like `--help`.
+def plan_skeleton() -> dict[str, Any]:
+    """A minimal plan.json that already passes validate_plan().
+
+    Placeholder strings throughout (scope id, task id/title/specPath) --
+    the caller fills them in -- but the document's *shape* is already legal:
+    one task carrying every MUTABLE_TASK_FIELDS key, so an agent that just
+    overwrites the placeholder values never has to guess a missing field.
+    """
+    return {
+        "schemaVersion": 1,
+        "kind": PLAN_KIND,
+        "scope": {
+            "id": "SCOPE-your-scope-id",
+            "baseRef": "wdd/your-scope-id",
+            "maxConcurrent": 3,
+            "reviewPolicy": "risk_based",
+            "reconcileEveryNMerges": 3,
+        },
+        "tasks": [
+            {
+                "id": "TASK-001",
+                "title": "TASK-001: replace with a short task title",
+                "specPath": "tasks/TASK-001.md",
+                "risk": "normal",
+                "dependsOn": [],
+                "conflictDomains": ["src/**"],
+                "context": [],
+                "model": None,
+                "reviewModel": None,
+            }
+        ],
+    }
+
+
+# Mirrors templates/task.md's section set exactly: lint.py's
+# _check_deliverable_and_interfaces only requires non-empty '## Deliverable'
+# and '## Interfaces' sections, but the rest (Objective/Scope/Non-scope/
+# Verification/Definition of done) are kept too so a filled-in copy of this
+# skeleton IS a normal brief, not a minimal one that happens to pass lint.
+BRIEF_TEMPLATE = """\
+# TASK-001: replace with a short task title
+
+## Objective
+
+Describe the outcome this task delivers and why it matters, in 1-3 sentences.
+
+## Deliverable
+
+Describe what the diff must produce, in terms a reviewer can check against
+the code: the file(s) or behavior that exist once this task is done.
+
+## Interfaces
+
+Consumes:
+- what this task reads or depends on from other tasks or existing code.
+
+Produces:
+- what this task creates that other tasks or consumers will depend on.
+
+## Scope
+
+- what is explicitly in scope for this task.
+
+## Non-scope
+
+- what is explicitly out of scope (usually: other tasks' deliverables).
+
+## Files to read first
+
+- paths worth reading before starting, if any.
+
+## Conflict domains
+
+- paths this task writes to (should match the plan's conflictDomains).
+
+## Verification
+
+`replace with the exact command that proves this task works`
+
+## Definition of done
+
+- [ ] Deliverable committed.
+- [ ] Verification command passes.
+- [ ] No changes outside the declared conflict domains.
+"""
+
+
+def brief_skeleton() -> str:
+    """A minimal task brief in the Markdown prose shape lint expects."""
+    return BRIEF_TEMPLATE
+
+
 def read_plan(path: Path | str) -> dict[str, Any]:
     path = Path(path)
     try:

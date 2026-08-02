@@ -265,6 +265,107 @@ wddctl plan apply --plan plan-good.json --repo .
 Lint is advisory everywhere lint runs, on `plan apply` included: nothing in
 this check changes admission or merge semantics, only what gets printed.
 
+### `plan template`
+
+Print a deterministic skeleton to fill in — the mechanical starting point
+for wdd-plan decomposition, so an agent that reaches the plan stage doesn't
+have to guess `plan init` or go hunting the filesystem for the skill's
+template files. Pure emitter: no state is read or written, and it isn't a
+governed verb, so it runs with no `.wdd/` at all, exactly like `--help`.
+
+```sh
+wddctl plan template
+```
+
+```json
+{
+  "kind": "wdd_plan",
+  "schemaVersion": 1,
+  "scope": {
+    "baseRef": "wdd/your-scope-id",
+    "id": "SCOPE-your-scope-id",
+    "maxConcurrent": 3,
+    "reconcileEveryNMerges": 3,
+    "reviewPolicy": "risk_based"
+  },
+  "tasks": [
+    {
+      "conflictDomains": [
+        "src/**"
+      ],
+      "context": [],
+      "dependsOn": [],
+      "id": "TASK-001",
+      "model": null,
+      "reviewModel": null,
+      "risk": "normal",
+      "specPath": "tasks/TASK-001.md",
+      "title": "TASK-001: replace with a short task title"
+    }
+  ]
+}
+```
+
+The output already passes `validate_plan()` as-is, so a filled-in copy stays
+structurally legal throughout — the placeholder strings (scope id, task
+id/title/specPath) are what need replacing, not the shape.
+
+```sh
+wddctl plan template --brief
+```
+
+```
+# TASK-001: replace with a short task title
+
+## Objective
+
+Describe the outcome this task delivers and why it matters, in 1-3 sentences.
+
+## Deliverable
+
+Describe what the diff must produce, in terms a reviewer can check against
+the code: the file(s) or behavior that exist once this task is done.
+
+## Interfaces
+
+Consumes:
+- what this task reads or depends on from other tasks or existing code.
+
+Produces:
+- what this task creates that other tasks or consumers will depend on.
+
+## Scope
+
+- what is explicitly in scope for this task.
+
+## Non-scope
+
+- what is explicitly out of scope (usually: other tasks' deliverables).
+
+## Files to read first
+
+- paths worth reading before starting, if any.
+
+## Conflict domains
+
+- paths this task writes to (should match the plan's conflictDomains).
+
+## Verification
+
+`replace with the exact command that proves this task works`
+
+## Definition of done
+
+- [ ] Deliverable committed.
+- [ ] Verification command passes.
+- [ ] No changes outside the declared conflict domains.
+```
+
+The brief carries the two sections `plan lint`'s `missing_deliverable` and
+`missing_interfaces` checks require (non-empty `## Deliverable` and
+`## Interfaces`), plus the rest of `templates/task.md`'s shape, so a filled-in
+copy is a normal brief, not a minimal one that merely passes lint.
+
 ### `config`
 
 Read or write `.wdd/config.json` — every knob `wddctl` (or a dispatching
