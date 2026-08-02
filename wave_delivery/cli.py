@@ -1060,19 +1060,34 @@ def main(argv: list[str] | None = None) -> int:
                 "snapshot"
             )
             if needs_attempt:
-                materialized = materialize_attempt(pre_state, store.path.parent, args.task)
-                state_after, _ = record_attempt(
-                    store,
-                    task_id=args.task,
-                    snapshot=materialized["snapshot"],
-                    inputs=materialized["inputs"],
-                )
-                recorded = state_after["tasks"][args.task]
-                result = {
-                    **result,
-                    "snapshot": recorded["snapshot"],
-                    "inputsRecorded": len(recorded.get("inputs") or []),
-                }
+                # A ValidationError here (most commonly a legacy scope's brief
+                # gone missing on disk) must not wedge the task: task.started
+                # already committed above, so failing the command now would
+                # leave it permanently in_progress -- a same-idempotency-key
+                # retry would self-heal by re-running this exact block and
+                # hit the identical failure forever. Legacy scopes record no
+                # inputs anyway, so degrading to a snapshot-less success loses
+                # no doctrine. A v5 scope with a genuinely missing/edited
+                # source file is caught earlier, at the chokepoint's
+                # require_fresh_intake/plan_drift check, so this except path
+                # is reached in practice only by legacy scopes.
+                try:
+                    materialized = materialize_attempt(pre_state, store.path.parent, args.task)
+                except ValidationError as error:
+                    result = {**result, "snapshot": None, "snapshotError": str(error)}
+                else:
+                    state_after, _ = record_attempt(
+                        store,
+                        task_id=args.task,
+                        snapshot=materialized["snapshot"],
+                        inputs=materialized["inputs"],
+                    )
+                    recorded = state_after["tasks"][args.task]
+                    result = {
+                        **result,
+                        "snapshot": recorded["snapshot"],
+                        "inputsRecorded": len(recorded.get("inputs") or []),
+                    }
             else:
                 result = {
                     **result,
@@ -1484,7 +1499,12 @@ def main(argv: list[str] | None = None) -> int:
                     ("--probe", args.probe),
                     ("--task", args.task),
                 )
-                if value
+                # `is not None`, matching main()'s chokepoint predicate for
+                # --probe-command exactly (getattr(..., None) is not None):
+                # a plain truthiness check here would disagree with it the
+                # moment either predicate's value type admits a falsy-but-
+                # present value (e.g. an empty-but-non-None argv).
+                if value is not None
             ]
             if len(selected) != 1:
                 raise ValidationError(

@@ -14,7 +14,7 @@ WDD's durable state lives under `.wdd/` in the target repository:
   shared-context/          # durable discoveries, and research-rung artifacts
   archive/<SCOPE-ID>.json  # wddctl-owned; written by `wddctl scope archive`
   dispatch/                # wddctl-owned; transient scratch, gitignored, never committed
-  .gitignore                # wddctl-owned; written by init/migrate to ignore dispatch/
+  .gitignore                # wddctl-owned; written by init/migrate, and re-ensured whenever dispatch/ is first created, to ignore dispatch/
 ```
 
 Everything here is either human-authored Markdown/JSON that `wddctl` reads,
@@ -315,7 +315,8 @@ Each entry under `tasks` carries: `id`, `title`, `specPath`, `status`
 (`todo` / `in_progress` / `review` / `merge_ready` / `done` / `blocked` /
 `cancelled`), `risk`, `dependsOn`, `conflictDomains`, `context`, `model`,
 `reviewModel`, `branch`, `worktree`, `headSha`, `pr`, `review`,
-`verification`, `freshness`, `merge`, `blocker`, `snapshot`, and `inputs`.
+`verification`, `freshness`, `merge`, `blocker`, `snapshot`, `inputs`, and
+`rebound`.
 `context`/`model`/`reviewModel` mirror `plan.json`'s `tasks[]` fields of the
 same name (see above) — populated at `plan apply`, re-diffed on every
 re-apply, and covered by the plan-approval composite. The `review`/
@@ -339,9 +340,23 @@ and every task-targeted governed verb refuses on (see `rebind` and
 "Runners" in [`docs/wddctl.md`](wddctl.md)). Legacy scopes (`intake.legacy`)
 still get a `snapshot` (harmless and useful) but `inputs` stays `[]` always
 — there is no approved-bytes doctrine predating them to bind evidence to.
-A `wddctl rebind` re-records `inputs` against current bytes in place
-(same paths re-resolved, new digests) without touching `snapshot`, `review`,
-or `verification` — rebinding is a re-pin, not a new attempt.
+A `wddctl rebind` re-records `inputs` against current bytes in place, without
+touching `snapshot`, `review`, or `verification` — rebinding is a re-pin, not
+a new attempt. It re-resolves the task's CURRENT `specPath`/`context` source
+set (the same resolution `materialize_attempt` uses), not merely the
+previously recorded paths re-hashed in place: a re-approval that also added
+or removed a context ref since the attempt started is picked up too, so the
+path set `inputs` names can change across a rebind, not only the digests.
+`rebind` also records the human attribution on the task itself, as
+`rebound: {"by", "at"}` (see below) — the `--by` name `rebind` requires.
+
+`rebound` (object or `null`, `null` by default) is the attribution of the
+task's most recent `wddctl rebind`: `{"by", "at"}`, the same idiom
+`scope.approval` uses for plan-approval. It exists because the event log
+does not durably store a mutation's `data` (see `events` below) — `rebind`'s
+`--by` would otherwise be recorded nowhere but the log line's derived
+`idempotencyKey`. Only ever set by `rebind`; never cleared, and a later
+rebind simply overwrites it with the newer attribution.
 
 `worktree` is normally `null`, and that is deliberate. A task's worktree lives
 at `<repo>.wdd/worktrees/<scope>/<task>` — a pure function of the checkout it
@@ -365,8 +380,10 @@ it from Git history. Every entry has exactly the shape shown above
 (e.g. a rebind's `by`, a probe's `digest`) feeds only the auto-generated
 `idempotencyKey`'s derivation, not a stored payload field; the durable
 record of *what* is whatever the mutator itself wrote elsewhere in
-`state.json` (a task's re-recorded `inputs`, a new `probes` entry), not the
-event log. Two event types added for runner dispatch: `task.rebound`
+`state.json` (a task's re-recorded `inputs` and `rebound`, a new `probes`
+entry), not the event log -- a rebind's `--by` specifically lands in
+`tasks.<id>.rebound.by` (see above), not merely the event log's derived
+`idempotencyKey`. Two event types added for runner dispatch: `task.rebound`
 (task-scoped) marks exactly when `wddctl rebind` re-pinned a task's
 `inputs`; `runner.probed` (scope-less — `task: null`) marks exactly when a
 passing probe added an entry to `probes` (see above) — cross-reference the
@@ -414,11 +431,14 @@ untouched.
 
 Transient scratch, `wddctl`-owned, **never committed** — `init` and
 `migrate --governance` write a `dispatch/` entry into `.wdd/.gitignore` for
-it (idempotent, content-preserving: it only ever appends the one line,
-never touches anything else already in the file). `wddctl` never reads
-this directory back into `state.json`; it exists purely as working storage
-for two related but distinct things, both keyed by sanitized task ID
-(`[A-Za-z0-9._-]`, anything else replaced with `_`):
+it, and `materialize_attempt`/`dispatch_task` re-ensure the same entry the
+moment `dispatch/` is first created (idempotent, content-preserving: it
+only ever appends the one line, never touches anything else already in the
+file) -- covering an install that predates the scratch dir and never runs
+`init`/`migrate --governance` again. `wddctl` never reads this directory
+back into `state.json`; it exists purely as working storage for two related
+but distinct things, both keyed by sanitized task ID (`[A-Za-z0-9._-]`,
+anything else replaced with `_`):
 
 ```text
 .wdd/dispatch/
@@ -426,7 +446,8 @@ for two related but distinct things, both keyed by sanitized task ID
     tasks/<TASK-ID>.md                     # copy of the task's brief, read-only
     shared-context/<...>                   # copy of every context-ref file, read-only
   <TASK-ID>-<role>-<attempt>.prompt        # the assembled dispatch packet (wddctl dispatch --task)
-  <TASK-ID>-<role>-<attempt>.log           # the runner's captured stdout+stderr
+  <TASK-ID>-<role>-<attempt>.log           # wddctl's own captured stdout+stderr
+  <TASK-ID>-<role>-<attempt>-runner.log    # the {logfile} placeholder target -- the runner's own transcript, if it writes one; a distinct path from the .log above so the two never collide
   <TASK-ID>-<role>-<attempt>-result.json   # reviewer only: the validated wddctl_review_result
 ```
 

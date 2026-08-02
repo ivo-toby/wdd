@@ -474,6 +474,28 @@ class DispatchGitignoreTest(unittest.TestCase):
             lines = (wdd / ".gitignore").read_text(encoding="utf-8").splitlines()
             self.assertEqual(lines, ["state.json", "dispatch/"])
 
+    def test_start_ensures_dispatch_gitignore_even_when_missing(self) -> None:
+        """I2 regression: `migrate_governance` early-returns ("config.json
+        already exists") before its own `ensure_dispatch_gitignore` call, so
+        an existing install whose .gitignore never got the dispatch/ entry
+        (via `wddctl migrate`'s schema path, or any other reason it went
+        missing) never reaches it that way. The entry must also be ensured
+        at the point `dispatch/` itself is first created -- here, by
+        `materialize_attempt` inside `start`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            gitignore = wdd / ".gitignore"
+            self.assertTrue(gitignore.exists())  # init already wrote it
+            gitignore.unlink()
+            _apply_v5_scope(root, wdd, state)
+
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            self.assertTrue(gitignore.exists())
+            self.assertIn("dispatch/", gitignore.read_text(encoding="utf-8").splitlines())
+
 
 class AttemptSnapshotTest(unittest.TestCase):
     """Spec Sec3 ('Handover itself is immutable'): start materializes a
@@ -703,6 +725,66 @@ class AttemptSnapshotTest(unittest.TestCase):
             self.assertEqual(task["inputs"], [])
             self.assertIsNotNone(task["snapshot"])
             self.assertTrue((wdd / task["snapshot"]).is_dir())
+
+    def test_legacy_start_missing_brief_degrades_to_success_with_snapshot_error(self) -> None:
+        """I1 regression: `start_task` commits `task.started` before
+        `materialize_attempt` runs. On a legacy scope with a missing brief
+        file, materialization used to hard-fail AFTER the transition landed
+        -- the whole 'start' command failed, but the task was already
+        in_progress, so a same-idempotency-key retry re-ran this exact block
+        and hit the identical ValidationError forever: permanently wedged,
+        worktree never printed. Legacy scopes record no `inputs` anyway, so
+        degrading to a snapshot-less success loses no doctrine (v5 scopes
+        catch a missing/edited source file earlier, via the chokepoint's
+        plan_drift/intake-drift check, before 'start' ever reaches this
+        point -- see the cli.py comment on 'start')."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            state_path = str(wdd / "state.json")
+            self.assertEqual(_cli(state_path, "init", "--repo", str(root))[0], 0)
+            self.assertEqual(_cli(state_path, "config", "set", "merge.surface", "local")[0], 0)
+            self.assertEqual(
+                _cli(
+                    state_path, "config", "set", "models",
+                    '{"planning": null, "implementation": {"default": null, "highRisk": null}, '
+                    '"review": null}',
+                )[0],
+                0,
+            )
+            config = load_config(wdd)
+            if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
+                self.assertEqual(
+                    _cli(state_path, "config", "set", "verification.commands", '["true"]')[0], 0
+                )
+            self.assertEqual(_cli(state_path, "constitution", "ratify", "--by", "t")[0], 0)
+            _mark_legacy(state_path)
+            (wdd / "tasks").mkdir(exist_ok=True)
+            (wdd / "tasks" / "T1.md").write_text("# T1\n\nLegacy brief.\n", encoding="utf-8")
+            plan = _plan({"baseRef": "wdd/scope-x"})
+            plan_file = root / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            code, out = _cli(
+                state_path, "plan", "apply", "--plan", str(plan_file), "--repo", str(root)
+            )
+            self.assertEqual(code, 0, out)
+
+            # Remove the brief AFTER plan apply -- a legacy scope has no
+            # composite baseline to catch this any earlier the way v5 does.
+            (wdd / "tasks" / "T1.md").unlink()
+
+            code, out = _cli(state_path, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertIsNone(result["snapshot"])
+            self.assertIn("snapshotError", result)
+            self.assertTrue(result["snapshotError"])
+            self.assertTrue(result.get("worktree"))
+
+            task = StateStore(Path(state_path)).read()["tasks"]["T1"]
+            self.assertEqual(task["status"], "in_progress")
+            self.assertIsNone(task["snapshot"])
+            self.assertEqual(task["inputs"], [])
 
 
 class SchemaHandoverFieldsTest(unittest.TestCase):
@@ -1004,6 +1086,37 @@ class InputVersionBindingTest(unittest.TestCase):
             code, out = _cli(state, "next")
             changed = [a for a in json.loads(out)["actions"] if a["action"] == "inputs_changed"]
             self.assertEqual(changed, [])
+
+    def test_rebind_records_by_and_at_on_the_task(self) -> None:
+        """I4 regression: `apply_mutation` persists events as {revision,
+        type, task, idempotencyKey, at} only -- the caller's `data` (here,
+        rebind's `--by`) never lands anywhere durable on its own. `rebind`
+        validated `--by` and then dropped it. It must now be persisted on
+        the task itself, the `{by, at}` idiom `scope.approval` already
+        uses."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _apply_v5_scope(root, wdd, state)
+            _start_and_commit(state, root, "T1")
+
+            (wdd / "tasks" / "T1.md").write_text(
+                "# T1\n\nBrief body for T1 -- edited.\n", encoding="utf-8"
+            )
+            _restamp_plan(root, state)
+
+            task_before = StateStore(Path(state)).read()["tasks"]["T1"]
+            self.assertIsNone(task_before.get("rebound"))
+
+            code, out = _cli(
+                state, "rebind", "--task", "T1", "--by", "reviewer-t", "--repo", str(root)
+            )
+            self.assertEqual(code, 0, out)
+
+            task = StateStore(Path(state)).read()["tasks"]["T1"]
+            self.assertEqual(task["rebound"]["by"], "reviewer-t")
+            self.assertIsInstance(task["rebound"]["at"], str)
+            self.assertTrue(task["rebound"]["at"])
 
     def test_rebind_refuses_when_nothing_to_rebind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1481,6 +1594,34 @@ class DispatchTaskTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
             dispatch_dir = wdd / "dispatch"
             self.assertEqual(stat.S_IMODE(dispatch_dir.stat().st_mode), 0o700)
+
+    def test_logfile_placeholder_does_not_collide_with_wddctls_own_capture(self) -> None:
+        """I3 regression: {logfile} used to substitute to the SAME path
+        wddctl's own post-run `_write_dispatch_file(log_path, output)`
+        writes to (an atomic os.replace) -- a runner that keeps its own
+        transcript at {logfile} had it clobbered the instant wddctl's own
+        capture landed. {logfile} must now resolve to a distinct sibling
+        path, so both files survive with their own content intact."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _dispatch_ready_scope(tmp)
+            sentinel = "runner's own transcript, untouched"
+            with unittest.mock.patch.dict(
+                os.environ, {"FAKE_RUNNER_LOGFILE_SENTINEL": sentinel}
+            ):
+                code, out = _cli(
+                    state, "dispatch", "--task", "T1", "--role", "worker", "--repo", str(root)
+                )
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+
+            wddctl_log = Path(result["log"])
+            self.assertTrue(wddctl_log.is_file())
+            self.assertEqual(wddctl_log.name, "T1-worker-1.log")
+
+            runner_log = wddctl_log.with_name("T1-worker-1-runner.log")
+            self.assertTrue(runner_log.is_file())
+            self.assertEqual(runner_log.read_text(encoding="utf-8"), sentinel)
+            self.assertNotEqual(wddctl_log.read_text(encoding="utf-8"), sentinel)
 
     def test_worker_dispatch_reports_non_done_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

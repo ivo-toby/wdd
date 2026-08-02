@@ -1134,8 +1134,11 @@ snapshot paths, never live controller files — see "Runners" below and
 digests no longer match the current bytes is `inputs_changed`, not silently
 re-bound; a legacy (pre-6b) scope still gets a snapshot (harmless and
 useful) but records no `inputs` — there is no doctrine to bind evidence to.
-`.wdd/dispatch/` is transient scratch, gitignored by `init`/`migrate`, never
-part of durable state.
+`.wdd/dispatch/` is transient scratch, gitignored by `init`/`migrate`, and
+also ensured the moment `dispatch/` itself is first created (`start` or
+`dispatch`) -- so an existing install that predates the scratch dir still
+gets the entry, even though it never runs `init`/`migrate --governance`
+again. Never part of durable state.
 
 Running `start` against a task that is already `in_progress`, `review`, or
 `merge_ready` **re-attaches** it instead of restarting it: the worktree is
@@ -1834,7 +1837,10 @@ non-runner case changes. `{worktree}`/`{prompt}`/`{logfile}` are
 substituted anywhere they appear in any argv element (substring
 replacement, not whole-element matching), never `str.format` — a runner
 command legitimately containing other brace text is never mistaken for a
-placeholder.
+placeholder. `{logfile}` resolves to a sibling path distinct from wddctl's
+own `<task>-<role>-<n>.log` capture (`<task>-<role>-<n>-runner.log`) — a
+runner that keeps its own transcript at `{logfile}` is never clobbered by
+wddctl's own post-run write of the captured stdout+stderr.
 
 **Registration order — probe, then config, then governance**: probing
 must not require a runner to already be ratified config (that would be a
@@ -1896,12 +1902,16 @@ The packet differs by `--role`:
 
 **Log policy** (`.wdd/dispatch/`, spec §6): transient scratch, never
 committed — `init` and `migrate --governance` write a `.wdd/.gitignore`
-entry for `dispatch/`. The directory is `0700`, every file in it `0600`.
-Filenames use attempt numbering per task+role (`<task>-<role>-<n>.log`,
-never overwritten) with task IDs sanitized to `[A-Za-z0-9._-]`. The result
-payload carries only a bounded 4KB tail of the log; the full output lives
-only in the file on disk. Raw agent output can contain anything — it gets
-file permissions and a gitignore entry, not a place in durable state.
+entry for `dispatch/`, and `start`/`dispatch` ensure the same entry again the
+moment they first create the directory (idempotent, content-preserving),
+covering an existing install that predates the scratch dir. The directory is
+`0700`. Attempt snapshot files inside it are `0400` (read-only — see `start`
+above); dispatch prompts/logs/results are `0600`. Filenames use attempt
+numbering per task+role (`<task>-<role>-<n>.log`, never overwritten) with
+task IDs sanitized to `[A-Za-z0-9._-]`. The result payload carries only a
+bounded 4KB tail of the log; the full output lives only in the file on disk.
+Raw agent output can contain anything — it gets file permissions and a
+gitignore entry, not a place in durable state.
 
 `doctor` reports, for every configured runner, whether its command's
 `argv[0]` is present on `PATH` (see `doctor` above) — a cheap first check

@@ -17,6 +17,9 @@ Contract:
 - $FAKE_RUNNER_LOG: when set, appends this invocation's argv (JSON array,
   one line) -- the fake-gh idiom -- so tests can assert placeholder
   substitution ({worktree}/{prompt}/{logfile}) actually happened.
+- $FAKE_RUNNER_LOGFILE_SENTINEL: when set, writes this string to the file
+  named by --logfile -- proves a runner that keeps its own transcript at
+  {logfile} is not clobbered by wddctl's own capture of stdout+stderr.
 """
 
 from __future__ import annotations
@@ -38,6 +41,11 @@ def main() -> int:
     if log_path:
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(sys.argv[1:]) + "\n")
+
+    sentinel = os.environ.get("FAKE_RUNNER_LOGFILE_SENTINEL")
+    if sentinel and args.logfile:
+        with open(args.logfile, "w", encoding="utf-8") as handle:
+            handle.write(sentinel)
 
     try:
         with open(args.prompt, "r", encoding="utf-8") as handle:

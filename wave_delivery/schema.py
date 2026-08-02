@@ -73,6 +73,11 @@ def task_state(
         # "inputs" empty (no binding doctrine to bind to).
         "snapshot": None,
         "inputs": [],
+        # Populated by `wddctl rebind` (front-half spec Sec3, final-review
+        # fix): the recorded human attribution for the most recent rebind,
+        # alongside the re-recorded `inputs` -- never by anything else, and
+        # never cleared once set.
+        "rebound": None,
     }
 
 
@@ -270,6 +275,11 @@ def validate_state(state: dict[str, Any]) -> None:
             entry = _require_mapping(entry, f"tasks.{task_id}.inputs[]")
             _require_string(entry.get("path"), f"tasks.{task_id}.inputs[].path")
             _require_string(entry.get("sha256"), f"tasks.{task_id}.inputs[].sha256")
+        rebound = task.get("rebound")
+        if rebound is not None:
+            rebound = _require_mapping(rebound, f"tasks.{task_id}.rebound")
+            _require_string(rebound.get("by"), f"tasks.{task_id}.rebound.by")
+            _require_string(rebound.get("at"), f"tasks.{task_id}.rebound.at")
 
     detect_dependency_cycle(tasks)
 

@@ -605,6 +605,12 @@ def _resolve_model(
 ) -> str | None:
     """Resolve the model an action should carry, or None if it gets no key.
 
+    Hand-synced twin: `runner.py`'s `_resolve_dispatch_model` implements the
+    identical precedence (task override -> risk-tiered config -> absent) for
+    a single task/role rather than through this `next` action-decoration
+    pipeline (dispatch has no action dict to decorate). Keep the two in step
+    if the precedence ever changes.
+
     ``models`` mirrors config.json's ``models`` shape; ``task_risk`` maps task
     id -> "high"/"normal" for the risk-tiered lookup. ``task_overrides`` maps
     task id -> {"model": ..., "reviewModel": ...}, the task's own persisted

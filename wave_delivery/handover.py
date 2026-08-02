@@ -146,6 +146,13 @@ def materialize_attempt(
     dispatch_dir = wdd_resolved / "dispatch"
     dispatch_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(dispatch_dir, _ATTEMPT_DIR_MODE)
+    # An existing install that predates the dispatch/ scratch dir (created
+    # via `wddctl migrate`'s schema path, never through `migrate_governance`)
+    # never gets this entry otherwise: migrate_governance early-returns
+    # before it once config.json already exists. Ensuring it here, at the
+    # point dispatch/ actually starts existing, is idempotent and
+    # content-preserving either way.
+    ensure_dispatch_gitignore(wdd_resolved)
 
     sanitized = _sanitize_task_id_for_filename(task_id)
     attempt = _next_attempt_number(dispatch_dir, sanitized)
@@ -247,6 +254,17 @@ def inputs_status(
     per-task digests gate the task -- keeping that boundary exact is the
     point of testing against what was actually recorded, not what the task's
     fields currently say to resolve.
+
+    Load-bearing invariant this relies on: comparing the recorded pairs
+    as-is is only sound because `plan.py`'s `_apply_plan_to_state` refuses
+    to change a task's `specPath`/`context` (both in `MUTABLE_TASK_FIELDS`)
+    once the task has left `todo` -- so the RECORDED paths and the task's
+    CURRENT `specPath`/`context` fields can never diverge for a
+    started-or-later task. If that refusal were ever relaxed, a task could
+    be re-pointed at different source files after `start` while this
+    function keeps checking bytes at the OLD paths, silently no longer
+    covering the files the task actually now names -- an evidence hole, not
+    a mismatch this function would ever surface.
     """
     wdd_dir = Path(wdd_dir)
     try:
@@ -316,6 +334,13 @@ def rebind_attempt(
         ]
         updated = copied_state(state)
         updated["tasks"][task_id]["inputs"] = new_inputs
+        # The event log's `data` never lands in state.json (engine.py's
+        # apply_mutation records only revision/type/task/idempotencyKey/at --
+        # `by` feeds the idempotency key derivation and nothing else), so the
+        # human attribution `rebind` requires (--by) must be persisted here,
+        # on the task itself, the same {by, at} idiom plan.py's
+        # `_stamp_approval` uses for plan-approval.
+        updated["tasks"][task_id]["rebound"] = {"by": by, "at": utc_now()}
         return updated
 
     return apply_mutation(

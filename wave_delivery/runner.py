@@ -38,7 +38,7 @@ from typing import Any
 from .engine import apply_mutation, utc_now
 from .errors import IllegalTransition, ValidationError
 from .git import require_repository, worktree_for
-from .handover import materialize_attempt
+from .handover import ensure_dispatch_gitignore, materialize_attempt
 from .review import REVIEW_RESULT_KIND, evidence_shas, normalize_review_results
 from .schema import copied_state
 from .store import StateStore, atomic_write_text
@@ -468,15 +468,27 @@ def dispatch_task(
     dispatch_dir = wdd_dir / "dispatch"
     dispatch_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(dispatch_dir, _DISPATCH_DIR_MODE)
+    # Same rationale as handover.py's materialize_attempt: an existing
+    # install that predates dispatch/ never reaches migrate_governance's
+    # ensure_dispatch_gitignore call (it early-returns once config.json
+    # already exists), so this is ensured at the point dispatch/ actually
+    # starts existing instead. Idempotent, content-preserving.
+    ensure_dispatch_gitignore(wdd_dir)
     sanitized = _sanitize_task_id_for_filename(task_id)
     attempt = _next_log_attempt(dispatch_dir, sanitized, role)
     base_name = f"{sanitized}-{role}-{attempt}"
     prompt_path = dispatch_dir / f"{base_name}.prompt"
     log_path = dispatch_dir / f"{base_name}.log"
+    # A distinct sibling path, not log_path: log_path is also the target of
+    # wddctl's own post-run _write_dispatch_file(log_path, output) below (an
+    # atomic os.replace). A runner that also writes to {logfile} itself --
+    # its own transcript, not wddctl's capture of stdout+stderr -- would
+    # otherwise have that file clobbered the moment wddctl's own write lands.
+    runner_log_path = dispatch_dir / f"{base_name}-runner.log"
     _write_dispatch_file(prompt_path, prompt_text)
 
     argv = _substitute_placeholders(
-        command, worktree=worktree, prompt=prompt_path, logfile=log_path
+        command, worktree=worktree, prompt=prompt_path, logfile=runner_log_path
     )
     environment = os.environ.copy()
     environment["WDDCTL_DISPATCH_TASK"] = task_id
