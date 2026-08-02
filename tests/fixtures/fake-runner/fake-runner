@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Fake runner for dispatch tests: deterministic canned output, no real agent.
+
+Contract:
+- Reads the prompt file named by --prompt (required), so tests can assert it
+  actually saw the assembled dispatch packet; the text itself is not echoed
+  back to keep the canned output deterministic.
+- Default (worker) mode: prints a filler line, then a trailing status token
+  on its own line (default DONE; override with $FAKE_RUNNER_TOKEN).
+- $FAKE_RUNNER_REVIEW_RESULT=1: prints a single wddctl_review_result JSON
+  object instead, sourcing task/baseSha/headSha from the WDDCTL_REVIEW_*
+  env vars dispatch sets (the same contract review.py's run_review already
+  uses). $FAKE_RUNNER_REVIEWER names the reviewer (default fake-reviewer);
+  $FAKE_RUNNER_FINDINGS is a JSON array of findings (default []).
+- $FAKE_RUNNER_FAIL=1: exit 1 with a stderr message, after everything above
+  (so failure-path tests can still assert what would have been produced).
+- $FAKE_RUNNER_LOG: when set, appends this invocation's argv (JSON array,
+  one line) -- the fake-gh idiom -- so tests can assert placeholder
+  substitution ({worktree}/{prompt}/{logfile}) actually happened.
+- $FAKE_RUNNER_LOGFILE_SENTINEL: when set, writes this string to the file
+  named by --logfile -- proves a runner that keeps its own transcript at
+  {logfile} is not clobbered by wddctl's own capture of stdout+stderr.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--worktree")
+    parser.add_argument("--logfile")
+    args = parser.parse_args()
+
+    log_path = os.environ.get("FAKE_RUNNER_LOG")
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(sys.argv[1:]) + "\n")
+
+    sentinel = os.environ.get("FAKE_RUNNER_LOGFILE_SENTINEL")
+    if sentinel and args.logfile:
+        with open(args.logfile, "w", encoding="utf-8") as handle:
+            handle.write(sentinel)
+
+    try:
+        with open(args.prompt, "r", encoding="utf-8") as handle:
+            handle.read()
+    except OSError as error:
+        sys.stderr.write(f"fake-runner: cannot read prompt: {error}\n")
+        return 1
+
+    if os.environ.get("FAKE_RUNNER_REVIEW_RESULT") == "1":
+        findings = json.loads(os.environ.get("FAKE_RUNNER_FINDINGS", "[]"))
+        result = {
+            "schemaVersion": 1,
+            "kind": "wddctl_review_result",
+            "task": os.environ.get("WDDCTL_REVIEW_TASK"),
+            "baseSha": os.environ.get("WDDCTL_REVIEW_BASE_SHA"),
+            "headSha": os.environ.get("WDDCTL_REVIEW_HEAD_SHA"),
+            "reviewer": os.environ.get("FAKE_RUNNER_REVIEWER", "fake-reviewer"),
+            "findings": findings,
+        }
+        print(json.dumps(result))
+    else:
+        token = os.environ.get("FAKE_RUNNER_TOKEN", "DONE")
+        print("fake-runner: task complete")
+        print(token)
+
+    if os.environ.get("FAKE_RUNNER_FAIL") == "1":
+        sys.stderr.write("fake-runner: forced failure (FAKE_RUNNER_FAIL=1)\n")
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

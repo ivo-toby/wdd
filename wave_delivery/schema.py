@@ -65,6 +65,19 @@ def task_state(
         "freshness": None,
         "merge": None,
         "blocker": None,
+        # Handover fields (front-half spec Sec3, phase-6b Task 2): populated by
+        # start's post-`start_task` materialize+record step, never by plan
+        # apply. "inputs" is the recorded digests of the SOURCE files behind
+        # the attempt snapshot named by "snapshot" (Task 3's input-version
+        # binding reads these); legacy scopes get a snapshot but leave
+        # "inputs" empty (no binding doctrine to bind to).
+        "snapshot": None,
+        "inputs": [],
+        # Populated by `wddctl rebind` (front-half spec Sec3, final-review
+        # fix): the recorded human attribution for the most recent rebind,
+        # alongside the re-recorded `inputs` -- never by anything else, and
+        # never cleared once set.
+        "rebound": None,
     }
 
 
@@ -254,6 +267,19 @@ def validate_state(state: dict[str, Any]) -> None:
         freshness = task.get("freshness")
         if freshness is not None and not isinstance(freshness, dict):
             raise ValidationError(f"tasks.{task_id}.freshness must be an object or null")
+        _require_string(task.get("snapshot"), f"tasks.{task_id}.snapshot", nullable=True)
+        inputs = task.get("inputs", [])
+        if not isinstance(inputs, list):
+            raise ValidationError(f"tasks.{task_id}.inputs must be a list")
+        for entry in inputs:
+            entry = _require_mapping(entry, f"tasks.{task_id}.inputs[]")
+            _require_string(entry.get("path"), f"tasks.{task_id}.inputs[].path")
+            _require_string(entry.get("sha256"), f"tasks.{task_id}.inputs[].sha256")
+        rebound = task.get("rebound")
+        if rebound is not None:
+            rebound = _require_mapping(rebound, f"tasks.{task_id}.rebound")
+            _require_string(rebound.get("by"), f"tasks.{task_id}.rebound.by")
+            _require_string(rebound.get("at"), f"tasks.{task_id}.rebound.at")
 
     detect_dependency_cycle(tasks)
 
@@ -297,6 +323,22 @@ def validate_state(state: dict[str, Any]) -> None:
                 _require_string(delivered.get(field), f"finalize.delivered.{field}")
 
     _validate_intake(_require_mapping(state.get("intake"), "intake"))
+
+    # Optional (spec Sec6): absent on any state that predates the runner
+    # registry, or that has never recorded a passing probe. digest ->
+    # {"at", "ok"}, the "monitor precedent" ungoverned observation write --
+    # runner.py's record_probe is the only writer.
+    probes = state.get("probes")
+    if probes is not None:
+        if not isinstance(probes, dict):
+            raise ValidationError("probes must be an object")
+        for digest, entry in probes.items():
+            if not isinstance(digest, str) or not digest:
+                raise ValidationError("probes keys must be non-empty strings")
+            entry = _require_mapping(entry, f"probes.{digest}")
+            _require_string(entry.get("at"), f"probes.{digest}.at")
+            if not isinstance(entry.get("ok"), bool):
+                raise ValidationError(f"probes.{digest}.ok must be a boolean")
 
 
 _VERIFICATION_STATUSES = {"passed", "failed", "unavailable"}

@@ -164,6 +164,10 @@ def _bootstrap_ready_scope(
         assert _cli(state, "config", "set", "verification.commands", '["true"]')[0] == 0
     assert _cli(state, "constitution", "ratify", "--by", "t")[0] == 0
     _mark_legacy(state)
+    # start (phase-6b Task 2) materializes T1's brief into an attempt
+    # snapshot, so it must exist on disk even though legacy plan apply
+    # itself does not require it (init already scaffolds .wdd/tasks/).
+    (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
     plan_file = root / "plan.json"
     plan_file.write_text(
         json.dumps(_plan({"baseRef": base_ref, "reviewPolicy": review_policy})),

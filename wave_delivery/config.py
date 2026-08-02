@@ -42,6 +42,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "riskRules": [],
     "taskProvider": {"type": "local"},
+    "runners": {},
     "openQuestions": [],
 }
 
@@ -111,16 +112,30 @@ def validate_config(config: dict[str, Any]) -> None:
 
     models = config.get("models")
     _require(isinstance(models, dict), "models must be an object")
-    for key in ("planning", "review"):
-        value = models.get(key)
-        _require(value is None or (isinstance(value, str) and value),
-                 f"models.{key} must be null or a non-empty string")
+    value = models.get("planning")
+    _require(value is None or (isinstance(value, str) and value),
+             "models.planning must be null or a non-empty string")
     implementation = models.get("implementation")
     _require(isinstance(implementation, dict), "models.implementation must be an object")
     for key in ("default", "highRisk"):
         value = implementation.get(key)
         _require(value is None or (isinstance(value, str) and value),
                  f"models.implementation.{key} must be null or a non-empty string")
+    # review stays tierable like implementation: a plain string means both
+    # tiers (regression-pinned -- spec Sec3), an object form tiers by task
+    # risk the same way implementation does. Object shape validation matches
+    # implementation's strictness: default/highRisk must each be null or a
+    # non-empty string; unknown extra keys are not rejected (implementation
+    # doesn't reject them either).
+    review = models.get("review")
+    if isinstance(review, dict):
+        for key in ("default", "highRisk"):
+            value = review.get(key)
+            _require(value is None or (isinstance(value, str) and value),
+                     f"models.review.{key} must be null or a non-empty string")
+    else:
+        _require(review is None or (isinstance(review, str) and review),
+                 "models.review must be null, a non-empty string, or an object")
 
     rules = config.get("riskRules")
     _require(isinstance(rules, list), "riskRules must be a list")
@@ -135,6 +150,24 @@ def validate_config(config: dict[str, Any]) -> None:
     _require(isinstance(provider, dict), "taskProvider must be an object")
     _require(provider.get("type") in TASK_PROVIDERS,
              f"taskProvider.type must be one of {sorted(TASK_PROVIDERS)} (jira lands in phase 2)")
+
+    # Optional (spec Sec6): absent entirely on configs that predate the
+    # runner registry -- backward compatible, unlike every required section
+    # above. name -> {"command": [str, ...]} non-empty argv; placeholders
+    # ({worktree}/{prompt}/{logfile}) are a runner.py concern, not validated
+    # here (any non-empty string is a legal argv element).
+    runners = config.get("runners")
+    if runners is not None:
+        _require(isinstance(runners, dict), "runners must be an object")
+        for name, entry in runners.items():
+            _require(isinstance(name, str) and name, "runners keys must be non-empty strings")
+            _require(isinstance(entry, dict), f"runners.{name} must be an object")
+            command = entry.get("command")
+            _require(
+                isinstance(command, list) and command
+                and all(isinstance(item, str) and item for item in command),
+                f"runners.{name}.command must be a non-empty list of non-empty strings",
+            )
 
     questions = config.get("openQuestions")
     _require(isinstance(questions, list), "openQuestions must be a list")

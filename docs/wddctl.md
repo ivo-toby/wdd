@@ -1113,6 +1113,8 @@ wddctl start --task TASK-001-token-types --repo .
   "baseRef": "wdd/auth-refresh",
   "headSha": "...",
   "specPath": "tasks/TASK-001-token-types.md",
+  "snapshot": "dispatch/TASK-001-token-types-1",
+  "inputsRecorded": 2,
   "revision": 3
 }
 ```
@@ -1121,6 +1123,22 @@ Implement the task in the printed `worktree` path. Worktrees live beside the
 repository at `<repo>.wdd/worktrees/<scope>/<task>`, never inside its working
 tree, and the location is derived rather than stored (see
 [`artifact-schema.md`](artifact-schema.md)).
+
+`start` also materializes an **attempt snapshot**: the task's brief and every
+`context`-ref file are copied, read-only, into a fresh
+`.wdd/dispatch/<task>-<attempt>/` directory (`snapshot` above, attempt
+numbering per task, never overwritten), and the SOURCE files' digests are
+recorded on the task (`inputsRecorded`). Workers and reviewers are handed
+snapshot paths, never live controller files — see "Runners" below and
+"Input-version binding" for why. A v5 scope with a task whose recorded
+digests no longer match the current bytes is `inputs_changed`, not silently
+re-bound; a legacy (pre-6b) scope still gets a snapshot (harmless and
+useful) but records no `inputs` — there is no doctrine to bind evidence to.
+`.wdd/dispatch/` is transient scratch, gitignored by `init`/`migrate`, and
+also ensured the moment `dispatch/` itself is first created (`start` or
+`dispatch`) -- so an existing install that predates the scratch dir still
+gets the entry, even though it never runs `init`/`migrate --governance`
+again. Never part of durable state.
 
 Running `start` against a task that is already `in_progress`, `review`, or
 `merge_ready` **re-attaches** it instead of restarting it: the worktree is
@@ -1336,6 +1354,78 @@ uncommitted changes), then verifies with `git merge-base --is-ancestor` that
 the task head actually landed in the base before recording `task.merged`.
 Recording without that live proof is not possible — see Guarantees.
 
+### `rebind`
+
+The remedy for **input-version binding**: the recorded human decision that
+a task's already-collected work and evidence still stand despite its
+recorded input digests no longer matching the current bytes.
+
+```sh
+wddctl rebind --task TASK-001-token-types --by NAME --repo .
+```
+
+```json
+{"duplicate": false, "inputsRecorded": 2, "revision": 14}
+```
+
+Every started task's brief and `context`-ref files are digest-pinned at
+`start` (see `start` above). If a re-approved plan (`plan apply
+--approved-by`) changes one of THIS task's own inputs after it started, the
+task's in-flight attempt and any unmerged review/verification evidence are
+no longer trustworthy — `wddctl next` reports it as an `inputs_changed`
+action (below), and every task-targeted governed verb aimed at that task
+(`submit`, `review record`/`collect`, `verify record`/`collect`, `refresh`,
+`merge`, `dispatch --task`) refuses with a message naming both remedies.
+`rebind` is one of the two: it re-records the task's input digests against
+the CURRENT bytes and marks the moment with a `task.rebound` event (see
+[`artifact-schema.md`](artifact-schema.md) for the exact event-log shape)
+— the attempt and its evidence are not redone, only re-pinned. The other
+remedy is a fresh `start` (re-materializes and re-records, which is genuine
+re-dispatch, not a rebind).
+
+Refuses ("nothing to rebind") when the task has no recorded `inputs` at all
+(a legacy scope, or one that never started) or its recorded digests already
+match current bytes — there is nothing to re-pin. **Merged evidence is
+history**: a `done`/`cancelled` task is never gated by input-version binding
+and `rebind` refuses the same way for it — evidence for already-merged work
+is judged by finalize's whole-epic review against the CURRENT spec, not
+retroactively unmade by a later edit to a brief nobody will read again.
+Rebinding does not touch a task's recorded `review`/`verification` evidence
+— the decision is that the existing work (including any review already
+collected on it) stands, not that it is re-judged. See "Runners" below for
+a captured transcript of the full `inputs_changed` → `rebind` cycle.
+
+`inputs_changed` (surfaced by `wddctl next`, per in-flight task) is the
+per-task twin of the scope-wide `plan_drift` blocker (see "Plan drift"
+above): `plan_drift` covers the WHOLE composite (any brief or context file,
+across every task) and empties `next`'s action list until re-stamped;
+`inputs_changed` covers only the ONE task whose own recorded digests
+mismatch, surfaces alongside other tasks' unaffected actions, and is
+remedied by `rebind` or re-`start`, not by `plan apply`. Editing a task's
+own input fires both at once (the composite covers everything, so it always
+drifts too) — `require_fresh_intake`'s `plan_drift` refusal fires first at
+the governed-verb chokepoint, so the documented remedy order is: re-stamp
+the plan first, then rebind (or re-dispatch) the named task.
+
+### `dispatch`
+
+Probe a candidate or already-configured runner command, or dispatch one
+task through a configured runner — see "Runners" below for the full
+picture (config shape, registration order, and a captured transcript
+against a stub runner).
+
+```sh
+wddctl dispatch --probe-command '["codex", "exec", "--cd", "{worktree}", "{prompt}"]'
+wddctl dispatch --probe RUNNER-NAME --repo .
+wddctl dispatch --task TASK-001-token-types --role worker|reviewer --repo . [--timeout SECONDS]
+```
+
+Exactly one of `--probe-command`, `--probe`, or `--task` is required.
+`--probe-command` is deliberately **ungoverned** (an explicit candidate the
+operator just typed, never yet config); `--probe NAME` and `--task ...`
+are both governed like any other execution verb, and `--task` is
+additionally input-binding-gated like the other task-targeted verbs above.
+
 ### `release`
 
 Remove a finished task's worktree.
@@ -1471,6 +1561,17 @@ the current state if one exists. Doctor only reports; it never refuses.
 ```sh
 wddctl doctor [--json]
 ```
+
+When `config.json` has a non-empty `runners` map (see "Runners" below),
+the report grows a `runners` object, one entry per configured runner name,
+each `{"argv0", "available"}` — the same `shutil.which` check idiom as the
+`git`/`gh`/`acli`/`codex`/`claude` probes above, not a functional probe
+(that's `wddctl dispatch --probe`, which actually execs the command). A
+malformed entry whose `argv0` is itself an unsubstituted
+`{worktree}`/`{prompt}`/`{logfile}` placeholder (which never belongs in
+the binary position) is reported `{"unresolvable": true}` instead of a
+misleading "not found". The key is absent entirely when there is no
+config, an invalid one, or an empty `runners` map — nothing to report.
 
 ## Merge surfaces and modes
 
@@ -1712,6 +1813,233 @@ merged this by hand" without a human having to say so — the next `monitor
 --once` tick surfaces the exact command to record it, and running that
 command is the same `--observed` path described above.
 
+## Runners
+
+A worker is file-in, file-out: worktree + brief + context in, commits +
+status token out. Nothing requires it to be a subagent of the controller's
+own harness. The optional `runners` map in `.wdd/config.json` makes a
+`model` value (a task's `model`/`reviewModel` override, or the risk-tiered
+`models.implementation`/`models.review` config) resolvable to an external
+agent CLI instead of harness-native dispatch:
+
+```json
+"runners": {
+  "qwen-local": {"command": ["pi", "--headless", "--model", "qwen3.6",
+                              "--cd", "{worktree}", "-p", "{prompt}"]},
+  "codex":      {"command": ["codex", "exec", "--cd", "{worktree}", "{prompt}"]}
+}
+```
+
+**Resolution**: a `model` value naming a configured runner dispatches
+through it; any other value is harness-native, exactly as before this
+feature existed — fully backward compatible, and nothing about the
+non-runner case changes. `{worktree}`/`{prompt}`/`{logfile}` are
+substituted anywhere they appear in any argv element (substring
+replacement, not whole-element matching), never `str.format` — a runner
+command legitimately containing other brace text is never mistaken for a
+placeholder. `{logfile}` resolves to a sibling path distinct from wddctl's
+own `<task>-<role>-<n>.log` capture (`<task>-<role>-<n>-runner.log`) — a
+runner that keeps its own transcript at `{logfile}` is never clobbered by
+wddctl's own post-run write of the captured stdout+stderr.
+
+**Registration order — probe, then config, then governance**: probing
+must not require a runner to already be ratified config (that would be a
+governance cycle to register anything), and must not silently execute an
+unapproved command either.
+
+1. `wddctl dispatch --probe-command '[...]'` — **ungoverned**: proves an
+   explicit candidate command (one the operator just typed or approved in
+   conversation, never yet config) by exec'ing it in a scratch temp
+   directory against a canned trivial prompt (`"Reply with exactly:
+   DONE"`). `ok` requires both a zero exit code AND the trailing
+   non-empty output line reading exactly `DONE` — a command that exits 0
+   without ever answering the prompt has proven nothing.
+2. `wddctl config set runners '{"NAME": {"command": [...]}}'` registers it.
+3. `wddctl constitution amend --by NAME` re-signs governance, since step 2
+   edited `config.json` after ratification.
+
+A passing probe records `probes[sha256(command)] = {"at", "ok": true}` in
+`state.json` as an **ungoverned observation** — the same precedent
+`monitor`'s own observation writes use — the moment state exists (before
+that, `--probe-command` reports the result but notes registration will
+re-probe once state exists, since there is nothing yet to record onto).
+`wddctl dispatch --task ID --role worker|reviewer` — the actual task
+dispatch — refuses outright unless the RATIFIED runner's exact command
+digest has a passing probe record: editing the command after probing (even
+just appending a flag) changes the digest and re-refuses, on purpose — the
+guarantee follows the exact bytes a probe proved, not the runner's name.
+`wddctl dispatch --probe NAME` re-verifies an already-ratified runner by
+name and is itself **governed** (it executes config-loaded commands, so it
+refuses under governance/intake/plan drift like any other execution verb);
+the deliberately ungoverned path is only ever `--probe-command`.
+
+**Dispatch** assembles the packet, execs the resolved runner once in the
+task's worktree, and captures its output — no streaming, no interactive
+sessions, no supervision, no retries, no timeout management beyond a
+single optional `--timeout SECONDS` (these non-goals are load-bearing, not
+an oversight: the child agent's own sandboxing, permissions, and timeouts
+are its runner command's business, authored per machine by the operator).
+The packet differs by `--role`:
+
+- **worker**: brief + context paths from the task's own recorded
+  **attempt snapshot** (see `start` above — never live controller files),
+  the brief's `## Deliverable` section, and the status-token contract
+  (`DONE` / `DONE_WITH_CONCERNS` / `NEEDS_CONTEXT` / `BLOCKED` on the
+  trailing output line). The result reports `statusToken` — whichever of
+  those appeared, or `null` if none did (a runner-side failure, reported,
+  never raised).
+- **reviewer**: a FRESH attempt snapshot (materialized at dispatch time,
+  not reused from the worker's), plus the frozen `baseSha`/`headSha` of
+  the diff under review, and the exact same `wddctl_review_result` JSON
+  contract an internal reviewer already speaks (see "External result file
+  envelopes" above) — no new evidence format is invented. Only a genuinely
+  successful exit (code 0) is held to the JSON contract; a nonzero exit or
+  timeout is reported as a plain failure, same as a worker's. A valid
+  result is written to a sibling `<task>-reviewer-<n>-result.json` file,
+  validated by the identical function `review collect` itself uses (SHA
+  consistency with the frozen range included), ready to hand straight to
+  `wddctl review collect --result <path>`.
+
+**Log policy** (`.wdd/dispatch/`, spec §6): transient scratch, never
+committed — `init` and `migrate --governance` write a `.wdd/.gitignore`
+entry for `dispatch/`, and `start`/`dispatch` ensure the same entry again the
+moment they first create the directory (idempotent, content-preserving),
+covering an existing install that predates the scratch dir. The directory is
+`0700`. Attempt snapshot files inside it are `0400` (read-only — see `start`
+above); dispatch prompts/logs/results are `0600`. Filenames use attempt
+numbering per task+role (`<task>-<role>-<n>.log`, never overwritten) with
+task IDs sanitized to `[A-Za-z0-9._-]`. The result payload carries only a
+bounded 4KB tail of the log; the full output lives only in the file on disk.
+Raw agent output can contain anything — it gets file permissions and a
+gitignore entry, not a place in durable state.
+
+`doctor` reports, for every configured runner, whether its command's
+`argv[0]` is present on `PATH` (see `doctor` above) — a cheap first check
+before ever probing.
+
+### Transcript: probe, register, dispatch, `inputs_changed`, `rebind`
+
+Real, unedited output from a scratch repository — `wddctl init` through
+the intake ladder, merge surface `local` — with `PATH` untouched: the
+runner command below names `tests/fixtures/fake-runner/fake-runner`
+directly (a stub that reads its `--prompt` file and prints a canned
+`DONE`, or — with `FAKE_RUNNER_REVIEW_RESULT=1` set — a canned
+`wddctl_review_result` JSON object; see the fixture's own docstring), by
+absolute path rather than a real agent CLI, so this is honestly labeled a
+**stub runner**, not a live one.
+
+```sh
+$ wddctl dispatch --probe-command '["/path/to/fake-runner", "--prompt", "{prompt}", "--worktree", "{worktree}", "--logfile", "{logfile}"]'
+{
+  "digest": "sha256:9c962d10736ce2b85989409be785f28bc2f6be169f25455bdb8ef93bd8ba6d55",
+  "exitCode": 0,
+  "ok": true,
+  "recorded": true,
+  "tokenSeen": true,
+  "wallMs": 48
+}
+$ wddctl config set runners '{"stub-runner": {"command": ["/path/to/fake-runner", "--prompt", "{prompt}", "--worktree", "{worktree}", "--logfile", "{logfile}"]}}'
+{"openQuestions": 0, "path": "runners", "value": {"stub-runner": {"command": ["...", "--prompt", "{prompt}", "--worktree", "{worktree}", "--logfile", "{logfile}"]}}}
+$ wddctl constitution amend --by ivo
+{"decisionFingerprint": "sha256:be9c1296657fce4f701d3783cab08ab28c7f68785a3af3373271e1547c7d0497", "duplicate": false, "revision": 6}
+```
+
+A plan applied with `"model": "stub-runner", "reviewModel": "stub-runner"`
+on its one task, then started (the snapshot from `start` above), dispatches
+cleanly through both roles:
+
+```sh
+$ wddctl dispatch --task TASK-001-greeting --role worker --repo .
+{
+  "digest": "sha256:9c962d10736ce2b85989409be785f28bc2f6be169f25455bdb8ef93bd8ba6d55",
+  "exitCode": 0,
+  "log": "/path/to/repo/.wdd/dispatch/TASK-001-greeting-worker-1.log",
+  "model": "stub-runner",
+  "role": "worker",
+  "statusToken": "DONE",
+  "tail": "fake-runner: task complete\nDONE\n",
+  "task": "TASK-001-greeting",
+  "timedOut": false,
+  "wallMs": 72
+}
+```
+
+(The stub never touches Git — the worker's actual commit still has to
+happen, same as a harness-native worker's would, before `wddctl submit`.)
+
+```sh
+$ wddctl submit --task TASK-001-greeting --repo .
+{"branch": "task/TASK-001-greeting", "duplicate": false, "event": "task.pr_recorded", "headSha": "5368b7c...", "pr": "branch:task/TASK-001-greeting@5368b7c12ae9", "revision": 11, "status": "in_progress", "task": "TASK-001-greeting"}
+$ FAKE_RUNNER_REVIEW_RESULT=1 wddctl dispatch --task TASK-001-greeting --role reviewer --repo .
+{
+  "digest": "sha256:9c962d10736ce2b85989409be785f28bc2f6be169f25455bdb8ef93bd8ba6d55",
+  "exitCode": 0,
+  "findings": 0,
+  "log": "/path/to/repo/.wdd/dispatch/TASK-001-greeting-reviewer-1.log",
+  "model": "stub-runner",
+  "resultPath": "/path/to/repo/.wdd/dispatch/TASK-001-greeting-reviewer-1-result.json",
+  "role": "reviewer",
+  "tail": "{\"schemaVersion\": 1, \"kind\": \"wddctl_review_result\", \"task\": \"TASK-001-greeting\", \"baseSha\": \"657e739...\", \"headSha\": \"5368b7c...\", \"reviewer\": \"fake-reviewer\", \"findings\": []}\n",
+  "task": "TASK-001-greeting",
+  "timedOut": false,
+  "wallMs": 59
+}
+$ wddctl review collect --task TASK-001-greeting --result .wdd/dispatch/TASK-001-greeting-reviewer-1-result.json --repo .
+{"duplicate": false, "revision": 12}
+```
+
+Now the `inputs_changed` → `rebind` cycle: a `context`-ref file this task
+depends on is edited, the plan is re-stamped (clearing the scope-wide
+`plan_drift` this always also causes — see "Plan drift" above — so what's
+left is purely this task's own stale digest), and `next` surfaces the
+per-task action:
+
+```sh
+$ echo "contract v2 -- edited" > .wdd/shared-context/contract.md
+$ wddctl plan apply --plan plan.json --repo . --approved-by ivo2
+{"approvedBy": "ivo2", "created": false, "diff": {"added": [], "removed": [], "scope": {}, "updated": []}, "dryRun": false, "revision": 13, "scope": "SCOPE-greeting-demo", "unchanged": true}
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "inputs_changed",
+      "actual": "sha256:f27055290c4cae7357132615a90b7ced99dc0445fe05e8d7213dbfa9e19ebe3e",
+      "judgment": "shared-context/contract.md changed since task TASK-001-greeting's attempt was dispatched: its recorded input digest no longer matches the current bytes, so unmerged review/verification evidence for it is no longer trustworthy. If a plan_drift blocker is also present above, re-stamp the plan first ('wddctl plan apply --approved-by NAME'); either way, then decide: rebind to accept the existing work as still valid, or discard it and re-dispatch a fresh attempt (block, unblock, then start).",
+      "path": "shared-context/contract.md",
+      "recordWith": "wddctl rebind --task TASK-001-greeting --by NAME --repo .",
+      "recorded": "sha256:6ea6486aa832983fe38184095afa6ed73a406105470003d377bf6deabcb3be96",
+      "task": "TASK-001-greeting"
+    }
+  ],
+  "blockers": [],
+  "revision": 13,
+  "scope": "SCOPE-greeting-demo",
+  "truncated": false
+}
+$ wddctl verify record --task TASK-001-greeting --status passed
+wddctl: inputs changed for task TASK-001-greeting: shared-context/contract.md recorded sha256:6ea6486a..., now sha256:f2705529...; run 'wddctl rebind --task TASK-001-greeting --by NAME --repo .' to accept the existing work as still valid, or re-dispatch a fresh attempt (block, unblock, then start)
+$ wddctl rebind --task TASK-001-greeting --by ivo --repo .
+{"duplicate": false, "inputsRecorded": 2, "revision": 14}
+$ wddctl next --repo .
+{
+  "actions": [
+    {
+      "action": "run_verification",
+      "recordWith": "wddctl verify record --task TASK-001-greeting --status passed --command '<verification command>'",
+      "task": "TASK-001-greeting"
+    }
+  ],
+  "blockers": [],
+  "revision": 14,
+  "scope": "SCOPE-greeting-demo",
+  "truncated": false
+}
+```
+
+The review evidence collected before the edit (`revision 12` above) is
+still exactly what `verify record` and `merge` proceed on — `rebind` never
+touched it; it only re-pinned the digest that was blocking everything else.
+
 ## Gates (what `next` emits per task)
 
 A task moves through gates in this order as evidence accumulates:
@@ -1737,6 +2065,14 @@ re-`submit`) invalidates both review and verification — the task falls back
 to `needs_review` / `needs_verification` even if it passed before. This is
 deliberate: evidence about a commit that no longer exists proves nothing
 about the commit that replaced it.
+
+`inputs_changed` sits outside this linear ladder: it can interrupt any
+in-flight (non-terminal) task, at any gate, whenever a plan re-approval
+touched that task's OWN recorded brief/context digests (see `rebind` above,
+under "Commands"). It suppresses that task's own ladder action
+for the duration — `next` emits `inputs_changed` instead, not alongside —
+while every other task's actions are untouched; `rebind` or a fresh `start`
+is what returns the task to its ladder position.
 
 ## The finalize phase
 

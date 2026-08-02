@@ -12,27 +12,57 @@ from .config import config_path, governance_drift, load_config
 from .errors import ValidationError
 
 
+# A runner command's argv[0] naming one of these is a malformed registration
+# -- placeholders belong in arguments (worktree/prompt/logfile), never in the
+# binary position -- reported as unresolvable rather than fed to
+# shutil.which (which would just, and misleadingly, say "not found").
+_RUNNER_PLACEHOLDERS = {"{worktree}", "{prompt}", "{logfile}"}
+
+
 def _inspect_governance(
     wdd_dir: Path | str | None, state: dict[str, Any] | None
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     governance: dict[str, Any] = {
         "configPresent": False,
         "configValid": False,
         "drift": None,
     }
     if wdd_dir is None or not config_path(wdd_dir).exists():
-        return governance
+        return governance, None
     governance["configPresent"] = True
     try:
-        load_config(wdd_dir)
+        config = load_config(wdd_dir)
     except ValidationError as error:
         governance["configValid"] = False
         governance["error"] = str(error)
-        return governance
+        return governance, None
     governance["configValid"] = True
     if state is not None:
         governance["drift"] = governance_drift(state, wdd_dir)
-    return governance
+    return governance, config
+
+
+def _inspect_runners(config: dict[str, Any] | None) -> dict[str, Any]:
+    """Per configured runner, whether its command's argv[0] is on PATH.
+
+    Same shutil.which idiom as the git/gh/acli/codex/claude probes above --
+    observational only, never a functional probe (that's `wddctl dispatch
+    --probe`, which actually execs the command). Absent entirely when there
+    is no config, or its `runners` map is empty: the key only appears when
+    there is something to report.
+    """
+    runners = (config or {}).get("runners")
+    if not isinstance(runners, dict) or not runners:
+        return {}
+    report: dict[str, Any] = {}
+    for name, entry in runners.items():
+        command = (entry or {}).get("command") if isinstance(entry, dict) else None
+        argv0 = command[0] if isinstance(command, list) and command else None
+        if not isinstance(argv0, str) or not argv0 or argv0 in _RUNNER_PLACEHOLDERS:
+            report[name] = {"argv0": argv0, "available": False, "unresolvable": True}
+        else:
+            report[name] = {"argv0": argv0, "available": shutil.which(argv0) is not None}
+    return report
 
 
 def inspect_capabilities(
@@ -48,7 +78,8 @@ def inspect_capabilities(
         command: shutil.which(command) is not None
         for command in ("git", "gh", "acli", "codex", "claude")
     }
-    return {
+    governance, config = _inspect_governance(wdd_dir, state)
+    payload: dict[str, Any] = {
         "python": {
             "version": platform.python_version(),
             "minimumVersion": "3.10",
@@ -63,5 +94,9 @@ def inspect_capabilities(
             "claudeAutomation": available["claude"],
         },
         "commands": available,
-        "governance": _inspect_governance(wdd_dir, state),
+        "governance": governance,
     }
+    runners = _inspect_runners(config)
+    if runners:
+        payload["runners"] = runners
+    return payload

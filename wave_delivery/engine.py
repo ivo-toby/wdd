@@ -593,29 +593,56 @@ def human_reference(task: dict[str, Any]) -> str:
     return f"branch {branch}" if branch else "an unrecorded reference"
 
 
+def _risk_tier(action: dict[str, Any], task_risk: dict[str, str]) -> str:
+    return "highRisk" if task_risk.get(action["task"]) == "high" else "default"
+
+
 def _resolve_model(
     action: dict[str, Any],
     models: dict[str, Any] | None,
     task_risk: dict[str, str],
+    task_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> str | None:
     """Resolve the model an action should carry, or None if it gets no key.
 
+    Hand-synced twin: `runner.py`'s `_resolve_dispatch_model` implements the
+    identical precedence (task override -> risk-tiered config -> absent) for
+    a single task/role rather than through this `next` action-decoration
+    pipeline (dispatch has no action dict to decorate). Keep the two in step
+    if the precedence ever changes.
+
     ``models`` mirrors config.json's ``models`` shape; ``task_risk`` maps task
-    id -> "high"/"normal" for the risk-tiered lookup. A value is only
-    returned when it is a non-null, non-empty string -- callers must not add
-    a "model" key otherwise.
+    id -> "high"/"normal" for the risk-tiered lookup. ``task_overrides`` maps
+    task id -> {"model": ..., "reviewModel": ...}, the task's own persisted
+    routing fields (front-half spec Sec3): a per-task override always wins
+    over the risk-tiered config, and -- unlike the config-tiered lookup --
+    applies even when no models config is present at all (a legacy repo with
+    a task-level override should still route it). A value is only returned
+    when it is a non-null, non-empty string -- callers must not add a
+    "model" key otherwise.
     """
-    if not models:
-        return None
     kind = action["action"]
     if kind in RISK_TIERED_ACTIONS:
-        implementation = models.get("implementation") or {}
-        tier = "highRisk" if task_risk.get(action["task"]) == "high" else "default"
-        value = implementation.get(tier)
+        override_key = "model"
     elif kind == "run_review":
-        value = models.get("review")
+        override_key = "reviewModel"
     else:
         return None
+    overrides = (task_overrides or {}).get(action["task"]) or {}
+    override = overrides.get(override_key)
+    if isinstance(override, str) and override:
+        return override
+    if not models:
+        return None
+    if kind in RISK_TIERED_ACTIONS:
+        implementation = models.get("implementation") or {}
+        value = implementation.get(_risk_tier(action, task_risk))
+    else:
+        review = models.get("review")
+        # Plain string means both tiers (regression-pinned); object form
+        # tiers by task risk the same way implementation.{default,highRisk}
+        # does.
+        value = review.get(_risk_tier(action, task_risk)) if isinstance(review, dict) else review
     return value if isinstance(value, str) and value else None
 
 
@@ -628,6 +655,7 @@ def decorate_actions(
     task_risk: dict[str, str] | None = None,
     mode: str = "controller",
     task_ref: dict[str, str] | None = None,
+    task_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Attach the literal command for each action, and the resolved model.
 
@@ -639,6 +667,9 @@ def decorate_actions(
     "high"/"normal") is a purpose-built mapping rather than the full state:
     decoration only ever needs one field per task, and this keeps the
     decorator from taking on the whole state shape as a dependency.
+    ``task_overrides`` (task id -> {"model", "reviewModel"}) follows the same
+    purpose-built-mapping principle for the task's own persisted routing
+    fields, rather than passing the whole tasks dict through.
 
     ``mode`` ("controller" or "human") likewise arrives from the caller
     (config.merge_settings), never read here. In human mode, a merge_ready
@@ -673,7 +704,7 @@ def decorate_actions(
                 action["command"] = f"{prefix} {run_now.format(**fields)}"
             if record_with:
                 action["recordWith"] = f"{prefix} {record_with.format(**fields)}"
-        model = _resolve_model(action, models, task_risk)
+        model = _resolve_model(action, models, task_risk, task_overrides)
         if model:
             action["model"] = model
     return result
@@ -754,6 +785,10 @@ def bounded_next_actions(
     full_result = next_actions(state, max_actions=None)
     task_risk = {task_id: task.get("risk") for task_id, task in state["tasks"].items()}
     task_ref = {task_id: human_reference(task) for task_id, task in state["tasks"].items()}
+    task_overrides = {
+        task_id: {"model": task.get("model"), "reviewModel": task.get("reviewModel")}
+        for task_id, task in state["tasks"].items()
+    }
     while limit >= 0:
         result = next_actions(state, max_actions=limit)
         result["blockers"] = full_result["blockers"][:limit]
@@ -769,6 +804,7 @@ def bounded_next_actions(
             task_risk=task_risk,
             mode=mode,
             task_ref=task_ref,
+            task_overrides=task_overrides,
         )
         rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
         if len(rendered.encode("utf-8")) <= max_bytes:
