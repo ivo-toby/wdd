@@ -206,7 +206,7 @@ def record_spec(
     if not isinstance(approved_by, str) or not approved_by:
         raise ValidationError("--approved-by requires a non-empty name")
     wdd_dir = Path(wdd_dir)
-    spec_path = wdd_dir / "spec.md"
+    spec_path = resolve_within_wdd(wdd_dir, "spec.md", label="spec")
 
     def _snapshot() -> tuple[int, str]:
         text = _require_nonempty_file(spec_path, label="spec.md")
@@ -364,7 +364,7 @@ def record_design(
             "the epic deliverable's proof is not optional"
         )
     wdd_dir = Path(wdd_dir)
-    design_path = wdd_dir / "design.md"
+    design_path = resolve_within_wdd(wdd_dir, "design.md", label="design")
 
     def _snapshot() -> str:
         text = _require_nonempty_file(design_path, label="design.md")
@@ -444,7 +444,7 @@ def intake_drift(state: dict[str, Any], wdd_dir: Path | str) -> dict[str, Any] |
     spec = intake.get("spec")
     if spec is None:
         return None
-    spec_path = wdd_dir / "spec.md"
+    spec_path = resolve_within_wdd(wdd_dir, "spec.md", label="spec")
     if not spec_path.exists():
         return {"rung": "spec", "recorded": spec["sha256"], "actual": "missing:spec.md"}
     actual = artifact_sha256(spec_path)
@@ -456,7 +456,7 @@ def intake_drift(state: dict[str, Any], wdd_dir: Path | str) -> dict[str, Any] |
         return None
     if research.get("done") is True:
         for artifact in research.get("artifacts", []):
-            artifact_path = wdd_dir / artifact["path"]
+            artifact_path = resolve_within_wdd(wdd_dir, artifact["path"])
             if not artifact_path.exists():
                 return {
                     "rung": "research",
@@ -471,7 +471,7 @@ def intake_drift(state: dict[str, Any], wdd_dir: Path | str) -> dict[str, Any] |
     design = intake.get("design")
     if design is None:
         return None
-    design_path = wdd_dir / "design.md"
+    design_path = resolve_within_wdd(wdd_dir, "design.md", label="design")
     if not design_path.exists():
         return {"rung": "design", "recorded": design["sha256"], "actual": "missing:design.md"}
     actual = artifact_sha256(design_path)
