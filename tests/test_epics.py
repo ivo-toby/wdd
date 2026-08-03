@@ -1605,6 +1605,12 @@ class MigrateInputGateGreenTest(unittest.TestCase):
             resolved = resolve_artifact(recorded["path"], wdd_dir=wdd, epic=slug)
             self.assertTrue(resolved.exists())
             self.assertEqual(artifact_sha256(resolved), recorded["sha256"])
+            # The REAL gate, not a hand-rolled equivalent: inputs_status must
+            # come back clean post-migration (Task 3 review caught the
+            # hand-rolled check passing while the production gate failed).
+            from wave_delivery.handover import inputs_status
+
+            self.assertIsNone(inputs_status(migrated, wdd, "TASK-001"))
 
 
 class MigrateArchivedRecordsUntouchedTest(unittest.TestCase):

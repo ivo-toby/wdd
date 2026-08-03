@@ -20,6 +20,7 @@ from typing import Any
 from .engine import apply_mutation, utc_now
 from .errors import IllegalTransition, ValidationError
 from .intake import artifact_sha256, resolve_within_wdd
+from .paths import resolve_artifact
 from .schema import copied_state
 from .store import StateStore, atomic_write_text
 
@@ -279,11 +280,19 @@ def inputs_status(
     if not recorded:
         return None
 
-    wdd_resolved = wdd_dir.resolve()
+    # Cross-reference: recorded input paths are namespace-relative refs and
+    # MUST resolve through the one typed resolver (wave_delivery/paths.py,
+    # spec Sec1) — a raw join here reads flat paths and false-flags every
+    # started task after the v6 migration moves artifacts under
+    # epics/<slug>/ (caught empirically in Task 3 review).
+    epic = state.get("epic")
     for entry in recorded:
         path = entry["path"]
         recorded_sha = entry["sha256"]
-        candidate = wdd_resolved / path
+        try:
+            candidate = resolve_artifact(path, wdd_dir=wdd_dir, epic=epic)
+        except ValidationError:
+            return {"path": path, "recorded": recorded_sha, "actual": f"missing:{path}"}
         if not candidate.exists() or not candidate.is_file():
             return {"path": path, "recorded": recorded_sha, "actual": f"missing:{path}"}
         actual_sha = artifact_sha256(candidate)

@@ -37,6 +37,7 @@ from .config import (
     project,
 )
 from .errors import ValidationError
+from .handover import _sanitize_task_id_for_filename
 from .schema import SCHEMA_VERSION, EPIC_SLUG_PATTERN, validate_state
 from .store import StateStore, atomic_write_text
 
@@ -320,22 +321,33 @@ def _write_attempt_manifests(wdd_dir: Path, state: dict[str, Any]) -> None:
     untouched rather than rewritten.
     """
     wdd_dir = Path(wdd_dir)
-    for task in state.get("tasks", {}).values():
-        snapshot = task.get("snapshot")
-        if not snapshot:
-            continue
-        snapshot_dir = wdd_dir / snapshot
-        if not snapshot_dir.is_dir():
-            continue
-        manifest_path = snapshot_dir / _MANIFEST_NAME
-        if manifest_path.exists():
-            continue
+    dispatch_root = wdd_dir / "dispatch"
+    for task_id, task in state.get("tasks", {}).items():
         brief = str(task["specPath"]).split("#", 1)[0]
-        os.chmod(snapshot_dir, _ATTEMPT_DIR_MODE)
-        atomic_write_text(
-            manifest_path, json.dumps({"brief": brief}, indent=2, sort_keys=True) + "\n"
-        )
-        os.chmod(manifest_path, _ATTEMPT_FILE_MODE)
+        # Every attempt dir for the task, not just the current `snapshot`
+        # pointer (spec Sec4 "each existing attempt dir"): superseded
+        # attempts from rebinds/re-dispatches share the sanitized-id
+        # prefix with a numeric suffix.
+        candidates: list[Path] = []
+        snapshot = task.get("snapshot")
+        if snapshot and (wdd_dir / snapshot).is_dir():
+            candidates.append(wdd_dir / snapshot)
+        sanitized = _sanitize_task_id_for_filename(task_id)
+        if dispatch_root.is_dir():
+            for entry in sorted(dispatch_root.glob(f"{sanitized}-*")):
+                if entry.is_dir() and entry not in candidates:
+                    suffix = entry.name[len(sanitized) + 1 :]
+                    if suffix.isdigit():
+                        candidates.append(entry)
+        for snapshot_dir in candidates:
+            manifest_path = snapshot_dir / _MANIFEST_NAME
+            if manifest_path.exists():
+                continue
+            os.chmod(snapshot_dir, _ATTEMPT_DIR_MODE)
+            atomic_write_text(
+                manifest_path, json.dumps({"brief": brief}, indent=2, sort_keys=True) + "\n"
+            )
+            os.chmod(manifest_path, _ATTEMPT_FILE_MODE)
 
 
 def _load_layers_for_migration(wdd_dir: Path, slug: str) -> dict[str, Any]:
