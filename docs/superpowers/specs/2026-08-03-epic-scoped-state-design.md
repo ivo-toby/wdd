@@ -107,8 +107,13 @@ recoverable transaction under the state lock:
    `record.json` is a **reserved filename**: no other verb may create it,
    the typed resolver rejects it as an artifact ref, and `epic new`
    refuses a directory containing one.
-2. Record `state.archivePending = {slug, sourceRevision,
-   recordSha256}` — the journal binds the record's exact bytes.
+2. Record `state.archivePending = {slug, sourceRevision, archivedAt,
+   recordSha256}`. Record generation is a **deterministic function** of
+   the state at `sourceRevision` — excluding the `archivePending` journal
+   event itself — plus the journal's `archivedAt` (the one
+   nondeterministic input, captured once). Regenerating the record from
+   an uncrashed state therefore reproduces the exact bytes behind
+   `recordSha256`; nothing about the record is unreconstructable.
 3. One atomic rename: `epics/<slug>` → `archive/<slug>`.
 4. Reset state to post-ratification setup, clearing `state.epic` and
    `archivePending`. The ladder restarts at `create_epic`.
@@ -127,13 +132,23 @@ naming the on-disk facts):
   record.
 - Journal set, **destination already exists while source also exists**
   (external collision) → do not retry forever: remove the generated
-  `record.json`, clear the journal, and surface a stable
-  `archive_blocked` blocker in `next` naming the colliding path — a
-  human decision, not a loop.
+  `record.json`, clear the journal, and write a durable
+  `state.archiveBlocked = {slug, collidingPath, at}`. `next` derives a
+  stable `archive_blocked` blocker from that field (so the promise
+  survives the journal's removal); re-running `scope archive` once the
+  collision is resolved clears it and starts a fresh transaction.
 - Journal set, neither path present → hard error with diagnostics
   (nothing is guessed).
-- `record.json` present with no journal → remove it and proceed
-  normally (a step-1 crash left it; the transaction never began).
+- No journal, `archiveBlocked` set, both directories present → the
+  post-rollback resting state: legal, `next` emits the blocker, nothing
+  is touched.
+- **Cleanup is scoped to the active epic only**:
+  `epics/<state.epic>/record.json` present with no journal, while
+  `state.epic` still names that epic → remove it and proceed (a step-1
+  crash; the transaction never began). Recovery never scans, touches, or
+  deletes anything under `archive/` — a completed archive's
+  `record.json` with no journal is the *success* state, and pre-v6
+  archive files are never recovery's business.
 
 **Locking layers**: the lock is not reentrant, so recovery has an
 explicit API layering — `read_raw_unlocked()` (no recovery),
@@ -174,20 +189,37 @@ therefore forbidden without a migration.
 **Purpose-projected digests, not one blob.** Evidence never stores the
 full-config digest; it stores the digest of the **projection** relevant
 to its purpose, each computed by the same function over a named key
-subset: `plan` (models, riskRules, review.policy), `review`
-(models.review, review.policy), `taskVerification` and
-`finalVerification` (verification.*, plus the deliverable command for
-final). Gates compare like with like: a models.planning edit stales
-nothing downstream, a verification.commands edit stales exactly the
-verification evidence. The configure approval record alone carries the
-full-view digest (it approves everything).
+subset: `plan` (models, riskRules, review.policy), `taskReview`
+(models.review, review.policy, review.blockingSeverities),
+`finalReview` (models.review, review.blockingSeverities),
+`taskVerification` and `finalVerification` (verification.*, plus the
+deliverable command for final). Gates compare like with like: a
+models.planning edit stales nothing downstream, a verification.commands
+edit stales exactly the verification evidence.
+
+Config projections alone are not sufficient for review evidence — a
+task's risk can rise without any config byte changing its projection. So
+review records additionally bind their **resolved decision values**: a
+task review records the resolved risk tier and the selected review model
+it actually ran under; final review records its selected model. The
+consuming gate re-derives both from the current effective config and
+task state and compares — a re-derived risk or model that differs from
+the recorded one stales the review exactly like a projection mismatch.
+The configure approval record alone carries the full-view digest (it
+approves everything).
 
 **Commands that change the config they run under** (`intake configure`,
-`config set --epic`) do not re-read disk mid-command: a pure
-`derive_effective(snapshot, patch)` produces the post-mutation view from
-the admission snapshot, and the approval records the **derived
-post-mutation digest**. `--use-defaults` is `derive_effective(snapshot,
-empty-overlay)` — its record is never stale on arrival.
+`config set --epic`) do not re-read disk mid-command. The admission
+snapshot is **layered, not merged**: `{defaults, global, overlay,
+effective}`, each layer validated at capture. A pure
+`derive_effective(snapshot, patch)` applies the patch to the *overlay
+layer*, runs the exact structural and value validators overlay loading
+uses (so no patch can reach approval that loading would reject), and
+recomputes the effective view from the retained layers — which is what
+makes override *removal* derivable: dropping an overlay key reveals the
+retained global value, something a pre-merged view cannot do. The
+approval records the **derived post-mutation digest**; `--use-defaults`
+is `derive_effective(snapshot, empty-overlay)` — never stale on arrival.
 
 **The overlay allowlist is structural, not prose.** The exact dotted
 leaves an overlay may contain: `models.planning`,
@@ -340,14 +372,23 @@ already — existing behavior, now documented as covering the merged view).
     explicitly; the dispatch prompt assembler prefers the manifest and
     only falls back to basename matching for pre-manifest dirs — never
     lexicographic guessing.
-  - Intake: a v5 legacy scope (`intake.legacy` sole key) stays exactly
-    that — the legacy exemption covers `configure` and the epic ladder
-    wholesale; migration adds nothing to it. A non-legacy v5 scope keeps
-    its real spec/research/design records (fingerprints still valid —
-    file *content* did not change, and recorded artifact paths are
-    rewritten alongside) and gains `configure: {"legacy": true}` — the
-    same migration-artifact doctrine: constructors never mint it, and it
-    exempts only the configure gate, nothing else.
+  - Intake: a non-legacy v5 scope keeps its real spec/research/design
+    records (fingerprints still valid — file *content* did not change,
+    and recorded artifact paths are rewritten alongside) and gains
+    `configure: {"legacy": true, "sha256": <full effective-config digest
+    at migration time>}`. The exemption covers only the missing human
+    attribution — **drift is still guarded**: any later change to the
+    effective config (overlay or global) mismatches the stamped digest
+    and requires a real, attributed `intake configure` approval. A v5
+    legacy scope keeps `intake.legacy` but likewise gains the same
+    migration-time full-config digest under it, with the same drift
+    semantics — no scope of any vintage can change `merge.surface` or
+    any other runtime key without an approval. Constructors never mint
+    either exemption.
+  - Reserved-name conversion: v5 permitted artifacts literally named
+    `record.json`. Migration refuses to move a file onto the reserved
+    `epics/<slug>/record.json` path, naming the file and a rename
+    remedy — it never silently rewrites or overwrites one.
   - Finalize and task evidence: existing records predate config digests,
     so migration **stamps them** with the migration-time projected
     digests (§2) computed from the then-effective config — for legacy and
