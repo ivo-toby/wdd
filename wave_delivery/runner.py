@@ -459,6 +459,15 @@ def dispatch_task(
                 f"task {task_id} has no recorded attempt snapshot; run 'wddctl start' first"
             )
 
+    # Cross-reference: the snapshot's internal layout mirrors
+    # `wave_delivery/paths.py`'s `resolve_artifact` (spec Sec1, Global
+    # Constraints "one resolver") -- `materialize_attempt`/
+    # `_task_input_sources` (handover.py) resolved every source file
+    # through it before copying, so `task["specPath"]`'s relative form is
+    # the same key the snapshot was written under. Task 1's `epic=None`
+    # transition mode keeps that relative form flat (`tasks/<id>.md`);
+    # Task 4, once refs resolve under `epics/<epic>/...`, must update this
+    # comparison in lockstep or a started task's brief lookup would miss.
     snapshot_root = wdd_dir / snapshot
     brief_path, context_paths = _snapshot_files(snapshot_root, Path(task["specPath"]))
     brief_text = brief_path.read_text(encoding="utf-8") if brief_path else ""

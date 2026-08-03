@@ -33,6 +33,7 @@ from typing import Any
 
 from .engine import apply_mutation, utc_now
 from .errors import IllegalTransition, ValidationError
+from .paths import resolve_artifact
 from .schema import copied_state, derived_phase
 
 
@@ -143,25 +144,23 @@ def _validate_design_text(text: str) -> None:
 
 
 def resolve_within_wdd(wdd_dir: Path, raw_path: str, *, label: str = "research artifact") -> Path:
-    """Resolve a `.wdd`-relative path, refusing anything outside `.wdd/`.
+    """Resolve a `.wdd`-relative artifact ref, labeled for the caller's ref kind.
 
-    Paths are `.wdd`-relative (the same doctrine plan.json's `context` refs
-    use, spec Sec3) unless already absolute; either way the RESOLVED path
-    must sit inside the resolved `.wdd/` directory -- a plain prefix check
-    on resolved paths, so `../..` traversal and symlink escapes are both
-    caught the same way. `label` names what kind of path this is in the
-    refusal message (research artifact, context ref, ...) so a shared
-    containment check doesn't mislabel the caller's own reference kind.
+    Cross-reference: `wave_delivery/paths.py`'s `resolve_artifact` is the
+    ONE typed resolver (spec Sec1, Global Constraints) -- every path/
+    namespace/containment decision lives there. This is a thin,
+    label-preserving wrapper kept for the call sites (and their pinned
+    tests) that need the refusal message to name their own ref kind
+    ("research artifact", "context ref", "task brief", ...) rather than
+    `resolve_artifact`'s generic wording. `epic=None` is Task 1's
+    transition-mode fallback (paths.py's docstring): every call site in
+    this branch still resolves flat against `.wdd/`; Task 4 threads a real
+    epic through.
     """
-    wdd_resolved = wdd_dir.resolve()
-    candidate = Path(raw_path)
-    candidate = candidate if candidate.is_absolute() else (wdd_dir / candidate)
-    resolved = candidate.resolve()
-    if resolved != wdd_resolved and wdd_resolved not in resolved.parents:
-        raise ValidationError(
-            f"{label} path escapes .wdd/: {raw_path!r} (resolved to {resolved})"
-        )
-    return resolved
+    try:
+        return resolve_artifact(raw_path, wdd_dir=wdd_dir, epic=None)
+    except ValidationError as error:
+        raise ValidationError(f"{label}: {error}") from error
 
 
 def _require_ladder_legal(state: dict[str, Any]) -> None:

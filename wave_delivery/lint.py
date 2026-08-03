@@ -14,7 +14,28 @@ from typing import Any
 
 from .domains import WILDCARDS, domains_overlap, matches_domain
 from .engine import admission_schedule
+from .errors import ValidationError
+from .paths import resolve_artifact
 from .plan import state_from_plan
+
+
+def _resolve_brief(wdd_dir: Path | str, spec_path: str) -> Path | None:
+    """A task's brief file, resolved through the one typed resolver.
+
+    Cross-reference: `wave_delivery/paths.py`'s `resolve_artifact` (spec
+    Sec1, Global Constraints "one resolver"); `epic=None` is Task 1's
+    transition-mode fallback (unchanged flat `.wdd/` resolution until Task
+    4). Returns None rather than raising for a ref the resolver rejects
+    (absolute, traversal, wrong namespace, ...) -- lint is advisory and
+    must never crash on a malformed plan.json (module docstring: "lint
+    warns; it never blocks"); callers already treat a brief that isn't
+    there as the ordinary `missing_brief` finding, so folding "rejected
+    ref" into that same "not there" path costs nothing.
+    """
+    try:
+        return resolve_artifact(spec_path, wdd_dir=wdd_dir, epic=None)
+    except ValidationError:
+        return None
 
 
 def _check_serialization(plan_dict: dict[str, Any]) -> list[dict[str, Any]]:
@@ -119,16 +140,17 @@ def _check_coarse_domains(plan_dict: dict[str, Any]) -> list[dict[str, Any]]:
 def _check_briefs(plan_dict: dict[str, Any], wdd_dir: Path | str) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for entry in plan_dict["tasks"]:
-        brief = Path(wdd_dir) / entry["specPath"]
+        brief = _resolve_brief(wdd_dir, entry["specPath"])
+        brief_is_file = brief is not None and brief.is_file()
         content_lines = 0
-        if brief.is_file():
+        if brief_is_file:
             # Non-blank lines, not raw line count: a file of only blank
             # lines has content-free "length" and must still be flagged.
             content_lines = sum(
                 1 for line in brief.read_text(encoding="utf-8").splitlines() if line.strip()
             )
         if content_lines < 2:
-            reason = "does not exist" if not brief.is_file() else "is effectively empty"
+            reason = "does not exist" if not brief_is_file else "is effectively empty"
             findings.append(
                 {
                     "code": "missing_brief",
@@ -158,7 +180,11 @@ def _check_briefs(plan_dict: dict[str, Any], wdd_dir: Path | str) -> list[dict[s
 
 
 def _check_spec(wdd_dir: Path | str) -> list[dict[str, Any]]:
-    spec = Path(wdd_dir) / "spec.md"
+    # Cross-reference: wave_delivery/paths.py's `resolve_artifact` (spec
+    # Sec1, Global Constraints "one resolver"); "spec.md" is a fixed
+    # epic-namespace literal, so this can never raise. `epic=None` is Task
+    # 1's transition-mode fallback (unchanged flat `.wdd/` resolution).
+    spec = resolve_artifact("spec.md", wdd_dir=wdd_dir, epic=None)
     content_lines = 0
     if spec.is_file():
         content_lines = sum(
@@ -226,8 +252,8 @@ def _check_deliverable_and_interfaces(
     """
     findings: list[dict[str, Any]] = []
     for entry in plan_dict["tasks"]:
-        brief = Path(wdd_dir) / entry["specPath"]
-        if not brief.is_file():
+        brief = _resolve_brief(wdd_dir, entry["specPath"])
+        if brief is None or not brief.is_file():
             continue
         sections = _sections(brief.read_text(encoding="utf-8"))
         if not _section_nonempty(sections, "deliverable"):
@@ -330,7 +356,11 @@ def _integration_surfaces(wdd_dir: Path | str) -> list[str]:
     never raise) -- design.md is optional at lint time, unlike at intake
     `design` approval where its presence is enforced.
     """
-    design = Path(wdd_dir) / "design.md"
+    # Cross-reference: wave_delivery/paths.py's `resolve_artifact` (spec
+    # Sec1, Global Constraints "one resolver"); "design.md" is a fixed
+    # epic-namespace literal, so this can never raise. `epic=None` is Task
+    # 1's transition-mode fallback (unchanged flat `.wdd/` resolution).
+    design = resolve_artifact("design.md", wdd_dir=wdd_dir, epic=None)
     if not design.is_file():
         return []
     sections = _sections(design.read_text(encoding="utf-8"))

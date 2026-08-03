@@ -93,9 +93,13 @@ def _task_input_sources(
     `rebind_attempt` (Task 3: re-hashes them in place against current bytes)
     -- both need the identical source-file resolution, so a re-approval that
     adds or removes a context ref is picked up the same way by either path.
-    Anchors (`#...`) are stripped for file resolution; a file referenced
-    twice (brief == a context ref, or a duplicate context ref) appears once,
-    in first-seen order (brief first, then context refs in plan order).
+    Anchors (`#...`) are stripped for file resolution -- centrally, inside
+    the one typed resolver (`wave_delivery/paths.py`'s `resolve_artifact`,
+    spec Sec1, Global Constraints), reached here via
+    `intake.resolve_within_wdd`'s label-preserving wrapper. A file
+    referenced twice (brief == a context ref, or a duplicate context ref)
+    appears once, in first-seen order (brief first, then context refs in
+    plan order).
     """
     try:
         task = state["tasks"][task_id]
@@ -115,8 +119,7 @@ def _task_input_sources(
 
     _add(task["specPath"], label="task brief")
     for ref in task.get("context") or []:
-        path_part = ref.split("#", 1)[0]
-        _add(path_part, label="context ref")
+        _add(ref, label="context ref")
     return sources
 
 

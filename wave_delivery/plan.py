@@ -13,6 +13,7 @@ from .engine import apply_mutation, utc_now
 from .errors import IllegalTransition, ValidationError
 from .git import branch_exists, require_repository, resolve_ref, run_git, validate_ref_name
 from .intake import artifact_sha256, intake_drift, resolve_within_wdd
+from .paths import resolve_artifact
 from .schema import (
     REVIEW_POLICIES,
     RISK_LEVELS,
@@ -502,13 +503,14 @@ def _validate_context_refs(tasks: list[dict[str, Any]], wdd_dir: Path) -> None:
     """Every task `context` ref must resolve to a regular file inside `.wdd/`.
 
     Ref syntax is `<path>[#anchor]` (spec Sec3); the anchor is advisory
-    reading guidance, never resolved mechanically. Mirrors intake.py's
-    research-artifact containment doctrine (`resolve_within_wdd`).
+    reading guidance, stripped before resolution -- centrally, inside the
+    one typed resolver (`wave_delivery/paths.py`'s `resolve_artifact`),
+    reached here via `intake.resolve_within_wdd`'s label-preserving
+    wrapper (Global Constraints: no site resolves paths its own way).
     """
     for entry in tasks:
         for ref in entry.get("context") or []:
-            path_part = ref.split("#", 1)[0]
-            resolved = resolve_within_wdd(wdd_dir, path_part, label="context ref")
+            resolved = resolve_within_wdd(wdd_dir, ref, label="context ref")
             if not resolved.exists() or not resolved.is_file():
                 raise ValidationError(
                     f"task {entry['id']} context ref does not resolve to a file "
@@ -544,7 +546,12 @@ def plan_composite(plan_dict: dict[str, Any], wdd_dir: Path | str) -> str:
             paths.add(ref.split("#", 1)[0])
 
     def _hash_or_refuse(path: str) -> str:
-        resolved = wdd_dir / path
+        # Cross-reference: wave_delivery/paths.py's `resolve_artifact` is the
+        # one typed resolver (spec Sec1, Global Constraints) -- the
+        # composite's brief/context reads go through it too, not a raw
+        # `wdd_dir / path` join. `epic=None` is Task 1's transition-mode
+        # fallback (paths.py docstring); Task 4 threads a real epic through.
+        resolved = resolve_artifact(path, wdd_dir=wdd_dir, epic=None)
         try:
             return artifact_sha256(resolved)
         except FileNotFoundError as error:
