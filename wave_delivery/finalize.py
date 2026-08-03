@@ -198,14 +198,25 @@ def _require_handoff_recorded(state: dict[str, Any]) -> None:
         )
 
 
-def _require_target_branch(wdd_dir: Path) -> tuple[str, dict[str, Any]]:
+def _require_target_branch(
+    wdd_dir: Path, layers: dict[str, Any] | None = None
+) -> tuple[str, dict[str, Any]]:
+    """`branching.targetBranch` plus the config view callers pass on to
+    `merge_settings` for the handoff surface. `layers`, when given, is the
+    caller's already-resolved admission snapshot (spec Sec2 resolve-once,
+    fix-round F2): its `effective` view is used instead of a second bare
+    `load_config` read, so an active epic's `merge.surface` override
+    (`branching.targetBranch` itself is not epic-overlay-allowed, so it is
+    identical either way) actually reaches the handoff/delivered surface
+    computation. Callers with no snapshot fall back to a fresh global read.
+    """
     if not config_path(wdd_dir).exists():
         raise IllegalTransition(
             "this scope predates config.json, so it has no configured "
             "branching.targetBranch; run 'wddctl migrate --governance' to adopt "
             "config.json (preserving any legacy model settings), then re-run this command"
         )
-    config = load_config(wdd_dir)
+    config = layers["effective"] if layers is not None else load_config(wdd_dir)
     return config["branching"]["targetBranch"], config
 
 
@@ -645,7 +656,7 @@ def prepare_handoff(
     _require_not_delivered(state, what="hand off")
     base_ref = _base_ref(state)
     base_sha = resolve_ref(repo_path, base_ref)
-    target_branch, config = _require_target_branch(wdd_dir)
+    target_branch, config = _require_target_branch(wdd_dir, layers)
     # Checked before the review/verification evidence gate: there is no
     # point asking for a clean review of a branch that has nothing to
     # deliver, and this is the guard that closes the vacuous-ancestry
@@ -726,6 +737,7 @@ def record_delivered(
     *,
     by: str,
     repo: Path | str,
+    layers: dict[str, Any] | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
@@ -761,7 +773,7 @@ def record_delivered(
     _require_not_delivered(state, what="deliver")
     _require_handoff_recorded(state)
     base_ref = _base_ref(state)
-    target_branch, _config = _require_target_branch(wdd_dir)
+    target_branch, _config = _require_target_branch(wdd_dir, layers)
 
     run_git(repo_path, "fetch", "origin", target_branch, check=False)
 

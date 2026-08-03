@@ -723,14 +723,23 @@ def epic_config_drift(state: dict[str, Any], wdd_dir: Path | str) -> dict[str, A
     since `intake.configure` was approved (epic-scoped-state plan Task 5,
     spec Sec2: "Editing the overlay mid-epic surfaces an epic_config_drift
     blocker"). Mirrors `governance_drift`'s shape and no-op cases: None when
-    there is nothing to drift from -- a wholesale-legacy scope (exempt from
-    the whole intake ladder, `intake.legacy`), a scope whose `configure` used
-    migration's exemption stamp (no human approval to invalidate -- drift
-    from here on is guarded ordinarily, by a REAL `intake configure` once one
-    is recorded), or a scope that has not recorded `configure` at all yet
-    (nothing approved to compare against; this happens during setup, before
-    any governed verb -- the only caller of `require_fresh_epic_config` --
-    could possibly run).
+    there is nothing to drift from -- a scope that has not recorded
+    `configure` at all yet (nothing approved to compare against; this
+    happens during setup, before any governed verb -- the only caller of
+    `require_fresh_epic_config` -- could possibly run), or (defensive; should
+    not occur post-migration, see migration.py's `convert_v5_to_v6`) a
+    `configure` record with no `sha256` at all.
+
+    A wholesale-legacy scope (`intake.legacy`) is NOT exempt here: migration
+    stamps its `configure` with the identical `{"legacy": true, "sha256":
+    ...}` shape a migrated non-legacy scope gets (spec Sec4: "the exemption
+    covers only the missing human attribution -- drift is still guarded
+    ordinarily"), so its overlay/global edits are gated exactly like any
+    other scope's. Likewise a migration-stamped `configure` (`legacy: true`)
+    on a non-legacy scope is compared, not skipped -- the exemption only
+    means no human approved the CURRENT digest; a mismatch here still
+    demands a real, attributed `intake configure --approved-by` (which
+    replaces the exemption with a real record).
 
     The digest recomputed here covers the FULL effective view (matching what
     `intake configure` itself signs), not a purpose projection: this is a
@@ -739,12 +748,12 @@ def epic_config_drift(state: dict[str, Any], wdd_dir: Path | str) -> dict[str, A
     comparison.
     """
     intake = state.get("intake") or {}
-    if intake.get("legacy") is True:
-        return None
     configure = intake.get("configure")
-    if not isinstance(configure, dict) or configure.get("legacy") is True:
+    if not isinstance(configure, dict):
         return None
     recorded = configure.get("sha256")
+    if recorded is None:
+        return None
     layers = load_layers(wdd_dir, state.get("epic"))
     actual = effective_config_digest(layers["effective"])
     if recorded == actual:

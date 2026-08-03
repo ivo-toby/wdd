@@ -168,13 +168,23 @@ def resolve_within_wdd(
         raise ValidationError(f"{label}: {error}") from error
 
 
-def _require_ladder_legal(state: dict[str, Any]) -> None:
-    """Shared refusal set for all three rung verbs: spec Sec1's three gates.
+def _require_ladder_legal(state: dict[str, Any], *, allow_legacy: bool = False) -> None:
+    """Shared refusal set for the intake rung verbs: spec Sec1's gates.
 
     Ratification first (there is nothing to approve pre-governance), then
-    legacy (the migration exemption is wholesale, per schema.py), then
-    delivered (the ladder is done and archived, not re-opened -- Task 5's
-    `scope archive` is the only path back to a fresh ladder).
+    legacy (the migration exemption is wholesale, per schema.py -- spec/
+    research/design stay refused for a legacy scope), then delivered (the
+    ladder is done and archived, not re-opened -- Task 5's `scope archive`
+    is the only path back to a fresh ladder).
+
+    `allow_legacy=True` (used only by `record_configure`) skips the legacy
+    refusal: Task 3's migration stamps a wholesale-legacy scope's
+    `intake.configure` with the same exemption shape a migrated non-legacy
+    scope gets, and (Task 5, F1 fix-round) `epic_config_drift` now guards
+    that stamp's digest for a legacy scope too -- so `intake configure
+    --approved-by` must stay reachable as ITS remedy, even though the rest
+    of the ladder (spec/research/design) is still wholesale-exempt for a
+    legacy scope.
     """
     if state["constitution"]["status"] != "ratified":
         raise IllegalTransition(
@@ -191,7 +201,7 @@ def _require_ladder_legal(state: dict[str, Any]) -> None:
             "'wddctl epic new --slug SLUG' (spec: the slug is born at the "
             "top of the ladder)"
         )
-    if (state.get("intake") or {}).get("legacy") is True:
+    if not allow_legacy and (state.get("intake") or {}).get("legacy") is True:
         raise IllegalTransition(
             "this scope is a migrated legacy scope, exempt wholesale from the intake ladder"
         )
@@ -267,7 +277,7 @@ def record_configure(
 
     wdd_dir = Path(wdd_dir)
     state = store.read()
-    _require_ladder_legal(state)
+    _require_ladder_legal(state, allow_legacy=True)
     epic = state.get("epic")
 
     # Resolved exactly ONCE for this whole invocation (spec Sec2): every
@@ -279,7 +289,7 @@ def record_configure(
     sha256 = effective_config_digest(derived["effective"])
 
     def mutator(current: dict[str, Any]) -> dict[str, Any]:
-        _require_ladder_legal(current)
+        _require_ladder_legal(current, allow_legacy=True)
         if current.get("epic") != epic:
             raise IllegalTransition(
                 "the active epic changed since this command began; re-run "

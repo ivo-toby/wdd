@@ -721,6 +721,23 @@ def _worktrees_root(config: dict[str, Any] | None) -> str | None:
     return (config.get("worktrees") or {}).get("root")
 
 
+def _governed_config(admission_layers: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The config view a GOVERNED_VERBS handler must use once `main()`'s
+    chokepoint has already resolved an admission snapshot for this
+    invocation (spec Sec2 resolve-once, extended by fix-round F2): the
+    epic-overlaid `effective` view, not a second bare `load_config` read
+    that would silently miss an active epic's override (`merge.surface`,
+    `models.*`, ...) -- exactly the bug this closes for merge_settings and
+    dispatch's model resolution. `admission_layers` is None precisely when
+    the chokepoint's own `config_path(...).exists()` check was None too (a
+    legacy scope with no config.json), so this is a drop-in replacement for
+    the old `load_config(...) if config_path(...).exists() else None`
+    pattern at every governed call site, never a behavior change for that
+    no-config case.
+    """
+    return admission_layers["effective"] if admission_layers is not None else None
+
+
 def _overlaid_plan(
     args: argparse.Namespace, store: StateStore
 ) -> tuple[dict[str, Any], Path, dict[str, Any] | None]:
@@ -1144,8 +1161,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 _print_json(result)
                 return 0
+            # `next` is read-only and outside GOVERNED_VERBS (no admission
+            # chokepoint runs for it, so there is no admission_layers to
+            # thread) -- but it must still reflect an epic override the same
+            # as any governed verb would, so it resolves its own layered
+            # view here rather than the bare global config (fix-round F2:
+            # `next` used to report the un-overlaid mode/models, silently
+            # hiding an active epic's `merge.surface`/`models` overrides).
             config = (
-                load_config(store.path.parent)
+                load_layers(store.path.parent, state.get("epic"))["effective"]
                 if config_path(store.path.parent).exists()
                 else None
             )
@@ -1178,11 +1202,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "start":
-            config = (
-                load_config(store.path.parent)
-                if config_path(store.path.parent).exists()
-                else None
-            )
+            config = _governed_config(admission_layers)
             result, duplicate = start_task(
                 store,
                 repo=args.repo,
@@ -1252,11 +1272,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "submit":
             warning = None
             pr = args.pr
-            config = (
-                load_config(store.path.parent)
-                if config_path(store.path.parent).exists()
-                else None
-            )
+            config = _governed_config(admission_layers)
             if pr is None:
                 state = store.read()
                 if merge_settings(state, config)["surface"] == "pr":
@@ -1329,11 +1345,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             task = state["tasks"][args.task]
             warning = None
-            config = (
-                load_config(store.path.parent)
-                if config_path(store.path.parent).exists()
-                else None
-            )
+            config = _governed_config(admission_layers)
             pr = task.get("pr")
             if (
                 merge_settings(state, config)["surface"] == "pr"
@@ -1473,7 +1485,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "finalize" and args.finalize_command == "delivered":
             _print_json(
-                record_delivered(store, by=args.by, repo=args.repo, **_concurrency(args))
+                record_delivered(
+                    store, by=args.by, repo=args.repo, layers=admission_layers,
+                    **_concurrency(args)
+                )
             )
             return 0
 
@@ -1603,11 +1618,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "refresh":
-            config = (
-                load_config(store.path.parent)
-                if config_path(store.path.parent).exists()
-                else None
-            )
+            config = _governed_config(admission_layers)
             result = refresh_task(
                 store, repo=args.repo, task_id=args.task,
                 worktrees_root=_worktrees_root(config), **_concurrency(args)
@@ -1641,11 +1652,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 0
             state = store.read()
-            config = (
-                load_config(store.path.parent)
-                if config_path(store.path.parent).exists()
-                else None
-            )
+            config = _governed_config(admission_layers)
             settings = merge_settings(state, config)
             if settings["mode"] == "human":
                 try:
@@ -1752,11 +1759,12 @@ def main(argv: list[str] | None = None) -> int:
             if not args.role:
                 raise ValidationError("dispatch --task requires --role worker|reviewer")
             state = store.read()
-            config = (
-                load_config(store.path.parent)
-                if config_path(store.path.parent).exists()
-                else None
-            )
+            # fix-round F2: this used to re-read the bare global config,
+            # silently dropping an active epic's models.implementation/
+            # models.review override at the one point that actually execs a
+            # worker/reviewer -- the chokepoint above already resolved the
+            # layered snapshot for this exact invocation.
+            config = _governed_config(admission_layers)
             result = dispatch_task(
                 state,
                 config,

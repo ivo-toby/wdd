@@ -25,7 +25,9 @@ from wave_delivery.config import (
     default_config,
     derive_effective,
     effective_config_digest,
+    epic_config_drift,
     get_value,
+    governance_fingerprint,
     load_config,
     load_layers,
     load_overlay,
@@ -1388,6 +1390,106 @@ class MigrateConfigureStampTest(unittest.TestCase):
             self.assertNotEqual(stamped, current)
 
 
+def _migrated_ratified_wdd(tmp: str, *, legacy: bool) -> tuple[Path, str]:
+    """A migrated (v5->v6) scope whose ratification fingerprint is REAL
+    (computed over an actual config.json + constitution.md), so governance
+    drift never fires on its own -- isolating epic_config_drift for these
+    tests from the (already-covered, ChokepointPrecedenceTest) interplay
+    where a global-config edit trips both gates at once."""
+    wdd = _wdd_root(tmp)
+    # Matches _ratified_repo's convention: default_config()'s merge.surface
+    # is already "pr", so an overlay/global edit TO "pr" below is only a
+    # genuine change (and therefore genuine drift) starting from "local".
+    save_config(wdd, {**load_config(wdd), "merge": {**load_config(wdd)["merge"], "surface": "local"}})
+    (wdd / "constitution.md").write_text("# Constitution\n\nBe good.\n", encoding="utf-8")
+    fingerprint = governance_fingerprint(wdd)
+    state = _v5_state(legacy=legacy, tasks={})
+    state["constitution"]["ratification"]["decisionFingerprint"] = fingerprint
+    path = wdd / "state.json"
+    _write_v5_state(path, state)
+    apply_migration(path)
+    return wdd, str(path)
+
+
+class EpicConfigDriftAfterMigrationTest(unittest.TestCase):
+    """F1 regression: migration's exemption stamp (`configure: {"legacy":
+    true, "sha256": ...}`) covers only the missing human attribution --
+    drift is still guarded ordinarily from there (spec Sec4). Before the
+    fix, `epic_config_drift` returned None unconditionally for ANY scope
+    whose `configure` carried `legacy: true`, and for ANY scope with
+    `intake.legacy` at all -- silently disabling drift detection for every
+    migrated scope. Covers both a migrated non-legacy scope (overlay edit)
+    and a wholesale-legacy scope (global config edit, per Task 3's identical
+    stamp shape on both)."""
+
+    def test_migrated_non_legacy_scope_overlay_edit_trips_drift_and_is_remedied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd, state = _migrated_ratified_wdd(tmp, legacy=False)
+            migrated = json.loads(Path(state).read_text())
+            self.assertIsNone(epic_config_drift(migrated, wdd))
+
+            assert _cli(state, "config", "set", "--epic", "merge.surface", "pr")[0] == 0
+            edited = StateStore(Path(state)).read()
+            self.assertIsNotNone(epic_config_drift(edited, wdd))
+
+            # Chokepoint refuses a governed verb, naming the remedy.
+            code, _out, err = _cli_full(state, "reconcile", "done")
+            self.assertNotEqual(code, 0)
+            self.assertIn("epic config drift", err)
+            self.assertIn("intake configure", err)
+
+            # `next` surfaces the same blocker.
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["blockers"][0]["code"], "epic_config_drift")
+
+            # A real, attributed re-approval clears the drift and replaces
+            # the migration-stamped exemption with a real record.
+            assert _cli(state, "intake", "configure", "--approved-by", "carol")[0] == 0
+            reapproved = StateStore(Path(state)).read()
+            self.assertIsNone(epic_config_drift(reapproved, wdd))
+            configure = reapproved["intake"]["configure"]
+            self.assertEqual(configure["by"], "carol")
+            self.assertNotIn("legacy", configure)
+
+    def test_wholesale_legacy_scope_global_config_edit_trips_drift_and_is_remedied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd, state = _migrated_ratified_wdd(tmp, legacy=True)
+            migrated = json.loads(Path(state).read_text())
+            self.assertIsNone(epic_config_drift(migrated, wdd))
+
+            config = load_config(wdd)
+            config["merge"]["surface"] = "pr"
+            save_config(wdd, config)
+            edited = StateStore(Path(state)).read()
+            self.assertIsNotNone(epic_config_drift(edited, wdd))
+
+            # A global-config edit also trips governance drift (it feeds
+            # governance_fingerprint too); re-sign governance first so the
+            # chokepoint's epic-config gate -- the one this test targets --
+            # is what actually fires, isolating it from the (separately
+            # covered) governance-outranks-epic-config precedence case.
+            assert _cli(state, "constitution", "amend", "--by", "t2")[0] == 0
+            reamended = StateStore(Path(state)).read()
+            self.assertIsNotNone(epic_config_drift(reamended, wdd))
+
+            code, _out, err = _cli_full(state, "reconcile", "done")
+            self.assertNotEqual(code, 0)
+            self.assertIn("epic config drift", err)
+            self.assertIn("intake configure", err)
+
+            # The remedy must be reachable for a wholesale-legacy scope too:
+            # `intake configure` is not part of the ladder it is exempt
+            # from, so it stays legal here even though spec/research/design
+            # remain refused.
+            assert _cli(state, "intake", "configure", "--approved-by", "carol")[0] == 0
+            reapproved = StateStore(Path(state)).read()
+            self.assertIsNone(epic_config_drift(reapproved, wdd))
+            self.assertIs(reapproved["intake"]["legacy"], True)
+            self.assertEqual(reapproved["intake"]["configure"]["by"], "carol")
+
+
 class MigrateEvidenceStampTest(unittest.TestCase):
     """Existing review/verification records (task- and finalize-level)
     are stamped with migration-time projected digests, and task review
@@ -1777,6 +1879,30 @@ def _epic_repo(tmp: str, slug: str = "demo") -> tuple[Path, str]:
     tests build on."""
     root, state = _ratified_repo(tmp)
     assert _cli(state, "epic", "new", "--slug", slug)[0] == 0
+    return root, state
+
+
+def _ratified_repo_pr_surface(tmp: str) -> tuple[Path, str]:
+    """`_ratified_repo`, but keeps `merge.surface` at its built-in default
+    ("pr") instead of overriding it to "local" -- Task 5 fix-round F2's
+    "an epic overlay's merge.surface=local overrides a global pr config"
+    regressions need a global value to actually override."""
+    root = _git_repo(tmp)
+    wdd = root / ".wdd"
+    state = str(wdd / "state.json")
+    assert _cli(state, "init", "--repo", str(root))[0] == 0
+    # Resolves the merge.surface open question WITHOUT changing its value
+    # (the whole point of this fixture): default_config()'s "pr" set back
+    # to itself.
+    assert _cli(state, "config", "set", "merge.surface", "pr")[0] == 0
+    assert _cli(
+        state, "config", "set", "models",
+        '{"planning": null, "implementation": {"default": null, "highRisk": null}, "review": null}',
+    )[0] == 0
+    config = load_config(wdd)
+    if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
+        assert _cli(state, "config", "set", "verification.commands", '["true"]')[0] == 0
+    assert _cli(state, "constitution", "ratify", "--by", "t")[0] == 0
     return root, state
 
 
@@ -2227,15 +2353,27 @@ def _epic_ladder_to_plan(
     approver: str = "t",
     task_domains: list[str] | None = None,
     review_policy: str = "risk_based",
+    overlay: dict[str, str] | None = None,
 ) -> None:
     """epic new -> configure (--use-defaults) -> spec/research-skip/design ->
     a one-task, composite-approved plan apply. The Task 5 counterpart of
     test_intake.py's `_apply_ladder_and_plan`, written locally per this
     file's no-cross-file-imports convention. `task_domains` lets a caller
     steer T1 into a riskRule's pattern for the risk re-derivation scenarios.
+    `overlay` (dotted path -> JSON-encoded value string) sets epic overlay
+    leaves BEFORE `intake configure` runs -- Task 5 fix-round F2's "epic
+    override reaches merge/dispatch" regressions need it approved, not left
+    to trip epic_config_drift (F1's concern, not this one). Given a nonempty
+    overlay, `configure` uses `--approved-by` (the "as currently written"
+    form) instead of `--use-defaults`, which would reset the overlay to {}.
     """
     assert _cli(state, "epic", "new", "--slug", slug)[0] == 0
-    assert _cli(state, "intake", "configure", "--use-defaults", "--by", approver)[0] == 0
+    for path, value in (overlay or {}).items():
+        assert _cli(state, "config", "set", "--epic", path, value)[0] == 0
+    if overlay:
+        assert _cli(state, "intake", "configure", "--approved-by", approver)[0] == 0
+    else:
+        assert _cli(state, "intake", "configure", "--use-defaults", "--by", approver)[0] == 0
     epic_dir = wdd / "epics" / slug
     (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
     assert _cli(state, "intake", "spec", "--approved-by", approver)[0] == 0
@@ -2639,6 +2777,112 @@ class SolScenarioRegressionTest(unittest.TestCase):
             self.assertNotEqual(code, 0)
             self.assertIn("final verification evidence is stale", err)
             self.assertIn("finalize verify record", err)
+
+
+_FAKE_RUNNER = str(Path(__file__).resolve().parent / "fixtures" / "fake-runner" / "fake-runner")
+
+
+def _fake_runner_command() -> list[str]:
+    """The fake-runner fixture idiom (test_handover.py's `_runner_command`),
+    duplicated locally per this file's no-cross-file-imports convention."""
+    return [_FAKE_RUNNER, "--prompt", "{prompt}", "--worktree", "{worktree}", "--logfile", "{logfile}"]
+
+
+class EpicOverrideReachesMergeAndDispatchTest(unittest.TestCase):
+    """F2 regression: an active epic's overlay overrides used to be inert at
+    the surfaces that actually act on them -- `merge_settings` (submit's and
+    merge's PR-vs-local branching) and dispatch's worker model resolution
+    were all fed a bare, un-overlaid `load_config` read instead of the
+    admission snapshot's `effective` view, silently dropping any epic
+    override at the one point each surface actually consults it."""
+
+    def test_epic_overlay_local_surface_overrides_a_global_pr_config_at_submit_and_merge(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo_pr_surface(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root, overlay={"merge.surface": '"local"'})
+            _start_and_commit(state, root)
+
+            # If the epic override were inert, submit would see the GLOBAL
+            # "pr" surface and attempt a real `git push origin` against a
+            # repo with no configured remote -- an unconditional failure
+            # (push is not wrapped in try/except: cli.py's submit handler
+            # pushes before any PR attempt, on purpose) -- instead of the
+            # clean, PR-machinery-free local-surface submit this overlay
+            # asks for.
+            code, out, err = _cli_full(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertNotIn("warning", payload)
+
+            assert _cli(
+                state, "review", "record", "--task", "T1", "--reviewer", "t", "--findings", "[]"
+            )[0] == 0
+            assert _cli(state, "verify", "record", "--task", "T1", "--status", "passed")[0] == 0
+            assert _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0] == 0
+
+            # Same signal at merge: a wrongly-resolved "pr" surface pushes
+            # the advanced base to origin post-merge, which -- with no
+            # remote configured -- degrades into a "warning" key on the
+            # result (cli.py's merge handler) instead of the warning-free
+            # result the correctly-resolved "local" surface produces.
+            code, out = _cli(state, "merge", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            merge_payload = json.loads(out)
+            self.assertNotIn("warning", merge_payload)
+
+    def test_epic_overlay_model_override_reaches_worker_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo_pr_surface(tmp)
+            wdd = root / ".wdd"
+            command = _fake_runner_command()
+            runners_payload = json.dumps({"epic-model": {"command": command}})
+            assert _cli(state, "config", "set", "runners", runners_payload)[0] == 0
+            # Registering a runner edits config.json; re-sign so dispatch
+            # below is not blocked by governance drift.
+            assert _cli(state, "constitution", "amend", "--by", "t2")[0] == 0
+            assert _cli(state, "dispatch", "--probe", "epic-model", "--repo", str(root))[0] == 0
+
+            _epic_ladder_to_plan(
+                state, wdd, root,
+                overlay={
+                    "models.implementation": '{"default": "epic-model", "highRisk": "epic-model"}'
+                },
+            )
+            assert _cli(state, "start", "--task", "T1", "--repo", str(root))[0] == 0
+
+            # The GLOBAL models.implementation is still {default: null,
+            # highRisk: null} (set by _ratified_repo_pr_surface) -- if the
+            # epic override were inert here, dispatch would resolve
+            # model=None and refuse "not a configured runner" instead of
+            # actually exec'ing the fake runner under the overridden model.
+            code, out, err = _cli_full(
+                state, "dispatch", "--task", "T1", "--role", "worker", "--repo", str(root)
+            )
+            self.assertEqual(code, 0, err)
+            result = json.loads(out)
+            self.assertEqual(result["model"], "epic-model")
+            self.assertEqual(result["exitCode"], 0)
+            self.assertEqual(result["statusToken"], "DONE")
+
+
+class NoBareLoadConfigInGovernedMergeSettingsSitesTest(unittest.TestCase):
+    """F2 audit: every `merge_settings`-feeding site in cli.py, plus
+    dispatch --task's model resolution, must read the admission snapshot's
+    `effective` view via `_governed_config`, never a second bare
+    `load_config` (spec Sec2 resolve-once, extended by this fix-round).
+    A textual check, not a functional one -- the functional regressions
+    above are what actually prove the behavior; this pins the count so a
+    future edit cannot silently reintroduce a bare read at one of these six
+    sites without also updating this test."""
+
+    def test_six_governed_call_sites_use_the_layered_snapshot_helper(self) -> None:
+        import wave_delivery.cli as cli_module
+
+        source = Path(cli_module.__file__).read_text(encoding="utf-8")
+        self.assertEqual(source.count("config = _governed_config(admission_layers)"), 6)
 
 
 if __name__ == "__main__":
