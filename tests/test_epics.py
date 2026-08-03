@@ -36,9 +36,24 @@ from wave_delivery.config import (
     validate_overlay,
 )
 from wave_delivery.errors import ValidationError
-from wave_delivery.intake import resolve_within_wdd
+from wave_delivery.intake import artifact_sha256, resolve_within_wdd
+from wave_delivery.migration import (
+    SUPPORTED_SOURCE_VERSIONS,
+    _slugify_scope_id,
+    apply_migration,
+    convert_v5_to_v6,
+    plan_migration,
+    read_source,
+)
 from wave_delivery.paths import resolve_artifact
-from wave_delivery.schema import new_setup_state
+from wave_delivery.schema import (
+    SCHEMA_VERSION,
+    TASK_STATUSES,
+    new_setup_state,
+    new_state,
+    task_state,
+    validate_state,
+)
 from wave_delivery.store import StateStore
 
 
@@ -909,6 +924,776 @@ class OverlayAllowlistLaxnessInsideObjectLeafTest(unittest.TestCase):
     def test_bogus_key_inside_models_review_object_leaf_is_currently_accepted(self) -> None:
         overlay = {"models": {"review": {"default": "x", "bogus": "y"}}}
         validate_overlay(overlay)  # must not raise (documented tolerance)
+
+
+# ---------------------------------------------------------------------------
+# Task 3: schema v6 (epic identity, intake.configure, archivePending/
+# archiveBlocked, evidence-binding extras) and the v5 -> v6 migration table
+# (spec Sec4).
+# ---------------------------------------------------------------------------
+
+
+class SchemaV6EpicFieldTest(unittest.TestCase):
+    """`state.epic`: slug-or-null (spec Sec1)."""
+
+    def test_null_epic_is_valid(self) -> None:
+        state = new_state("SCOPE-x")
+        state["epic"] = None
+        validate_state(state)
+
+    def test_valid_slug_is_accepted(self) -> None:
+        state = new_state("SCOPE-x")
+        state["epic"] = "checkout-flow"
+        validate_state(state)
+
+    def test_single_character_slug_is_rejected(self) -> None:
+        # [a-z0-9][a-z0-9-]{1,63} requires at least 2 characters total.
+        state = new_state("SCOPE-x")
+        state["epic"] = "a"
+        with self.assertRaises(ValidationError):
+            validate_state(state)
+
+    def test_uppercase_slug_is_rejected(self) -> None:
+        state = new_state("SCOPE-x")
+        state["epic"] = "Checkout"
+        with self.assertRaises(ValidationError):
+            validate_state(state)
+
+    def test_slug_with_underscore_is_rejected(self) -> None:
+        state = new_state("SCOPE-x")
+        state["epic"] = "checkout_flow"
+        with self.assertRaises(ValidationError):
+            validate_state(state)
+
+    def test_new_state_defaults_epic_to_none(self) -> None:
+        self.assertIsNone(new_state("SCOPE-x")["epic"])
+        self.assertIsNone(new_setup_state()["epic"])
+
+
+class SchemaV6ArchiveFieldsTest(unittest.TestCase):
+    """`archivePending`/`archiveBlocked`: nullable, shape-checked when
+    present (spec Sec1); constructors never mint either (Task 6 is the
+    sole writer)."""
+
+    def test_both_default_to_none(self) -> None:
+        state = new_state("SCOPE-x")
+        self.assertIsNone(state["archivePending"])
+        self.assertIsNone(state["archiveBlocked"])
+
+    def test_valid_archive_pending_is_accepted(self) -> None:
+        state = new_state("SCOPE-x")
+        state["archivePending"] = {
+            "slug": "checkout",
+            "sourceRevision": 4,
+            "archivedAt": "2026-01-01T00:00:00Z",
+            "recordSha256": "sha256:" + "a" * 64,
+        }
+        validate_state(state)
+
+    def test_archive_pending_rejects_negative_revision(self) -> None:
+        state = new_state("SCOPE-x")
+        state["archivePending"] = {
+            "slug": "checkout",
+            "sourceRevision": -1,
+            "archivedAt": "2026-01-01T00:00:00Z",
+            "recordSha256": "sha256:" + "a" * 64,
+        }
+        with self.assertRaises(ValidationError):
+            validate_state(state)
+
+    def test_archive_pending_requires_all_fields(self) -> None:
+        state = new_state("SCOPE-x")
+        state["archivePending"] = {"slug": "checkout"}
+        with self.assertRaises(ValidationError):
+            validate_state(state)
+
+    def test_valid_archive_blocked_is_accepted(self) -> None:
+        state = new_state("SCOPE-x")
+        state["archiveBlocked"] = {
+            "slug": "checkout",
+            "collidingPath": "archive/checkout",
+            "at": "2026-01-01T00:00:00Z",
+        }
+        validate_state(state)
+
+    def test_archive_blocked_requires_all_fields(self) -> None:
+        state = new_state("SCOPE-x")
+        state["archiveBlocked"] = {"slug": "checkout"}
+        with self.assertRaises(ValidationError):
+            validate_state(state)
+
+
+class SchemaV6IntakeConfigureTest(unittest.TestCase):
+    """`intake.configure`: the real attributed shape `{by, at, sha256}`
+    (Task 5's verb) or migration's exemption shape `{"legacy": true,
+    "sha256": ...}` (spec Sec4) -- under EITHER an already-legacy
+    (`intake.legacy`) or a non-legacy intake section."""
+
+    def test_attributed_shape_is_accepted_on_non_legacy_intake(self) -> None:
+        state = new_state("SCOPE-x")
+        state["intake"] = {
+            "configure": {"by": "alice", "at": "2026-01-01T00:00:00Z", "sha256": "sha256:" + "a" * 64}
+        }
+        validate_state(state)
+
+    def test_exemption_shape_is_accepted_on_non_legacy_intake(self) -> None:
+        state = new_state("SCOPE-x")
+        state["intake"] = {"configure": {"legacy": True, "sha256": "sha256:" + "a" * 64}}
+        validate_state(state)
+
+    def test_legacy_scope_may_carry_configure_alongside_legacy(self) -> None:
+        state = new_state("SCOPE-x")
+        state["intake"] = {
+            "legacy": True,
+            "configure": {"legacy": True, "sha256": "sha256:" + "a" * 64},
+        }
+        validate_state(state)
+
+    def test_legacy_scope_without_configure_is_still_valid(self) -> None:
+        state = new_state("SCOPE-x")
+        state["intake"] = {"legacy": True}
+        validate_state(state)
+
+    def test_configure_exemption_rejects_unknown_keys(self) -> None:
+        state = new_state("SCOPE-x")
+        state["intake"] = {
+            "configure": {"legacy": True, "sha256": "sha256:" + "a" * 64, "by": "alice"}
+        }
+        with self.assertRaises(ValidationError):
+            validate_state(state)
+
+    def test_configure_missing_sha256_is_rejected(self) -> None:
+        state = new_state("SCOPE-x")
+        state["intake"] = {"configure": {"by": "alice", "at": "2026-01-01T00:00:00Z"}}
+        with self.assertRaises(ValidationError):
+            validate_state(state)
+
+    def test_legacy_true_with_extra_unknown_key_besides_configure_is_rejected(self) -> None:
+        state = new_state("SCOPE-x")
+        state["intake"] = {"legacy": True, "bogus": True}
+        with self.assertRaises(ValidationError):
+            validate_state(state)
+
+
+class SchemaV6ReviewEvidenceExtrasTest(unittest.TestCase):
+    """resolvedRisk/reviewModel/configSha256: permissive when absent
+    (legacy-stamped/pre-Task-5 records), shape-checked when present (spec
+    Sec2)."""
+
+    def _task_with_review(self, review: dict | None) -> dict:
+        task = task_state("T1")
+        task["review"] = review
+        state = new_state("SCOPE-x")
+        state["tasks"] = {"T1": task}
+        return state
+
+    def test_review_without_any_extras_is_still_valid(self) -> None:
+        validate_state(self._task_with_review({"baseSha": "a", "headSha": "b", "findings": [], "reviewer": "x"}))
+
+    def test_review_with_valid_extras_is_accepted(self) -> None:
+        review = {
+            "baseSha": "a", "headSha": "b", "findings": [], "reviewer": "x",
+            "resolvedRisk": "high", "reviewModel": "gpt-review", "configSha256": "sha256:" + "a" * 64,
+        }
+        validate_state(self._task_with_review(review))
+
+    def test_review_with_invalid_resolved_risk_is_rejected(self) -> None:
+        review = {"baseSha": "a", "headSha": "b", "findings": [], "reviewer": "x", "resolvedRisk": "extreme"}
+        with self.assertRaises(ValidationError):
+            validate_state(self._task_with_review(review))
+
+    def test_review_with_empty_config_sha_is_rejected(self) -> None:
+        review = {"baseSha": "a", "headSha": "b", "findings": [], "reviewer": "x", "configSha256": ""}
+        with self.assertRaises(ValidationError):
+            validate_state(self._task_with_review(review))
+
+    def test_final_review_rejects_resolved_risk(self) -> None:
+        # finalReview evidence binds a model but no per-task risk tier
+        # (spec Sec2: "final review records its selected model").
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "review": {
+                "headSha": "a", "outcome": "passed", "findings": [], "reviewer": "x",
+                "at": "t", "resolvedRisk": "high",
+            }
+        }
+        with self.assertRaises(ValidationError):
+            validate_state(state)
+
+    def test_final_review_accepts_review_model_and_config_sha(self) -> None:
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "review": {
+                "headSha": "a", "outcome": "passed", "findings": [], "reviewer": "x", "at": "t",
+                "reviewModel": "gpt-review", "configSha256": "sha256:" + "a" * 64,
+            }
+        }
+        validate_state(state)
+
+    def test_task_verification_config_sha_is_shape_checked(self) -> None:
+        task = task_state("T1")
+        task["verification"] = {"baseSha": "a", "headSha": "b", "status": "passed", "configSha256": ""}
+        state = new_state("SCOPE-x")
+        state["tasks"] = {"T1": task}
+        with self.assertRaises(ValidationError):
+            validate_state(state)
+
+
+# --- v5 -> v6 migration (spec Sec4) ----------------------------------------
+
+
+def _wdd_root(tmp: str) -> Path:
+    wdd = Path(tmp) / ".wdd"
+    save_config(wdd, default_config())
+    return wdd
+
+
+def _write_text(path: Path, content: str = "content\n") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _v5_state(*, scope_id: str | None = "SCOPE-demo", legacy: bool = True, tasks: dict | None = None) -> dict:
+    """A hand-built v5-shaped state (schemaVersion 5, no epic/archivePending/
+    archiveBlocked -- those postdate v5). `task_state()` itself is reused for
+    per-task shape since it is unaffected by the v6 bump (only the top-level
+    state shape changed)."""
+    scope = None
+    if scope_id is not None:
+        scope = {
+            "id": scope_id, "baseRef": None, "maxConcurrent": None, "reviewPolicy": "risk_based",
+        }
+    if legacy:
+        intake: dict = {"legacy": True}
+    else:
+        intake = {
+            "spec": {
+                "by": "tester", "at": "2026-01-01T00:00:00Z",
+                "sha256": "sha256:" + "a" * 64, "criteria": 1,
+            },
+            "research": {"by": "tester", "at": "2026-01-01T00:00:00Z", "skipped": True, "reason": "n/a"},
+            "design": {
+                "by": "tester", "at": "2026-01-01T00:00:00Z",
+                "sha256": "sha256:" + "b" * 64, "deliverableCommand": "pytest -q",
+            },
+        }
+    return {
+        "schemaVersion": 5,
+        "revision": 0,
+        "scope": scope,
+        "constitution": {
+            "status": "ratified",
+            "ratification": {"by": "tester", "decisionFingerprint": "sha256:c", "at": "2026-01-01T00:00:00Z"},
+        },
+        "tasks": tasks if tasks is not None else {},
+        "reconcile": {
+            "everyNMerges": 3, "mergesSinceCheckpoint": 0, "lastCheckpointAt": None, "pendingNotes": [],
+        },
+        "monitoring": {
+            "mode": "manual", "status": "inactive", "lastCheckedAt": None,
+            "nextCheckDueAt": None, "observations": {},
+        },
+        "events": [],
+        "appliedIdempotencyKeys": [],
+        "telemetry": {"eventApplications": 0, "renderCount": 0},
+        "intake": intake,
+    }
+
+
+def _write_v5_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+class MigrateSlugDerivationTest(unittest.TestCase):
+    """slug from the active scope id, or 'legacy' when no scope (spec
+    Sec4); a scope id that cannot be turned into a valid slug also falls
+    back to 'legacy' rather than ever writing an invalid `state.epic`
+    (documented judgment call in migration.py's `_slugify_scope_id`)."""
+
+    def test_scope_prefix_convention_id(self) -> None:
+        self.assertEqual(_slugify_scope_id("SCOPE-checkout"), "checkout")
+
+    def test_no_scope_id_falls_back_to_legacy(self) -> None:
+        self.assertEqual(_slugify_scope_id(None), "legacy")
+        self.assertEqual(_slugify_scope_id(""), "legacy")
+
+    def test_unusable_id_falls_back_to_legacy(self) -> None:
+        self.assertEqual(_slugify_scope_id("---"), "legacy")
+
+    def test_id_without_scope_prefix_is_lowercased_and_sanitized(self) -> None:
+        self.assertEqual(_slugify_scope_id("Checkout_Flow"), "checkout-flow")
+
+
+class MigrateV5ToV6FileMovesTest(unittest.TestCase):
+    """spec.md/design.md/plan.json/tasks/ + recorded research artifacts
+    move into epics/<slug>/; shared-context/ never moves (spec Sec4)."""
+
+    def test_spec_design_plan_and_tasks_move_into_epic_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            _write_text(wdd / "spec.md", "spec\n")
+            _write_text(wdd / "design.md", "design\n")
+            _write_text(wdd / "plan.json", "{}\n")
+            _write_text(wdd / "tasks" / "TASK-001.md", "brief\n")
+            state = _v5_state(legacy=False, tasks={"TASK-001": task_state("TASK-001")})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            result = apply_migration(path)
+            self.assertEqual(result["to"], 6)
+
+            epic_dir = wdd / "epics" / "demo"
+            self.assertEqual((epic_dir / "spec.md").read_text(), "spec\n")
+            self.assertEqual((epic_dir / "design.md").read_text(), "design\n")
+            self.assertEqual((epic_dir / "plan.json").read_text(), "{}\n")
+            self.assertEqual((epic_dir / "tasks" / "TASK-001.md").read_text(), "brief\n")
+            self.assertFalse((wdd / "spec.md").exists())
+            self.assertFalse((wdd / "design.md").exists())
+            self.assertFalse((wdd / "plan.json").exists())
+            self.assertFalse((wdd / "tasks" / "TASK-001.md").exists())
+
+    def test_shared_context_is_never_moved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            _write_text(wdd / "shared-context" / "notes.md", "notes\n")
+            _write_text(wdd / "tasks" / "TASK-001.md", "brief\n")
+            task = task_state("TASK-001", context=["shared-context/notes.md"])
+            state = _v5_state(legacy=False, tasks={"TASK-001": task})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            apply_migration(path)
+            self.assertEqual((wdd / "shared-context" / "notes.md").read_text(), "notes\n")
+
+    def test_recorded_research_artifacts_move(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            artifact_path = wdd / "research" / "inventory.md"
+            _write_text(artifact_path, "inventory\n")
+            state = _v5_state(legacy=False, tasks={})
+            state["intake"]["research"] = {
+                "by": "tester", "at": "2026-01-01T00:00:00Z", "done": True,
+                "artifacts": [{"path": "research/inventory.md", "sha256": artifact_sha256(artifact_path)}],
+            }
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            apply_migration(path)
+            self.assertTrue((wdd / "epics" / "demo" / "research" / "inventory.md").exists())
+            self.assertFalse(artifact_path.exists())
+
+    def test_unrecorded_research_directory_contents_are_left_alone(self) -> None:
+        # Only artifacts RECORDED in intake.research.artifacts[] move (spec
+        # Sec4) -- a stray file in the flat research/ dir that was never
+        # recorded is not part of the migration table.
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            stray = wdd / "research" / "scratch.md"
+            _write_text(stray, "scratch\n")
+            state = _v5_state(legacy=True, tasks={})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            apply_migration(path)
+            self.assertTrue(stray.exists())
+
+
+class MigrateReservedNameRefusalTest(unittest.TestCase):
+    """Migration refuses to move a file onto the reserved 'record.json'
+    name, naming the file and a rename remedy (spec Sec4); nothing is
+    moved and state.json is untouched -- the refusal happens entirely in
+    memory before any physical side effect."""
+
+    def test_refuses_moving_a_file_named_record_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            _write_text(wdd / "tasks" / "record.json", "{}\n")
+            task = task_state("TASK-001", spec_path="tasks/record.json")
+            state = _v5_state(legacy=True, tasks={"TASK-001": task})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+            original = path.read_text()
+
+            with self.assertRaises(ValidationError) as ctx:
+                apply_migration(path)
+            message = str(ctx.exception)
+            self.assertIn("record.json", message)
+            self.assertIn("rename", message)
+
+            self.assertTrue((wdd / "tasks" / "record.json").exists())
+            self.assertEqual(path.read_text(), original)
+            self.assertFalse((wdd / "epics").exists())
+
+
+class MigrateConfigureStampTest(unittest.TestCase):
+    """intake.configure gains migration's exemption stamp -- the full
+    effective-config digest at migration time -- on both non-legacy and
+    legacy scopes (spec Sec4); drift is still guarded at the digest level
+    from then on."""
+
+    def test_non_legacy_scope_gains_configure_exemption_with_full_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            state = _v5_state(legacy=False, tasks={})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            apply_migration(path)
+            migrated = json.loads(path.read_text())
+            configure = migrated["intake"]["configure"]
+            self.assertIs(configure["legacy"], True)
+            layers = load_layers(wdd, migrated["epic"])
+            self.assertEqual(configure["sha256"], effective_config_digest(layers["effective"]))
+            # Real intake records are untouched by the exemption.
+            self.assertIn("spec", migrated["intake"])
+            self.assertIn("design", migrated["intake"])
+
+    def test_legacy_scope_keeps_legacy_and_gains_configure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            state = _v5_state(legacy=True, tasks={})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            apply_migration(path)
+            migrated = json.loads(path.read_text())
+            self.assertIs(migrated["intake"]["legacy"], True)
+            self.assertIs(migrated["intake"]["configure"]["legacy"], True)
+
+    def test_configure_stamp_drifts_at_the_digest_level_after_a_global_config_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            state = _v5_state(legacy=False, tasks={})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+            apply_migration(path)
+            migrated = json.loads(path.read_text())
+            stamped = migrated["intake"]["configure"]["sha256"]
+
+            config = load_config(wdd)
+            config["merge"]["surface"] = "local"
+            save_config(wdd, config)
+            layers = load_layers(wdd, migrated["epic"])
+            current = effective_config_digest(layers["effective"])
+            self.assertNotEqual(stamped, current)
+
+
+class MigrateEvidenceStampTest(unittest.TestCase):
+    """Existing review/verification records (task- and finalize-level)
+    are stamped with migration-time projected digests, and task review
+    additionally gains resolvedRisk/reviewModel from current state (spec
+    Sec2/Sec4)."""
+
+    def test_task_review_and_verification_gain_projection_digests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            task = task_state("TASK-001", risk="high")
+            task["review"] = {"baseSha": "a" * 40, "headSha": "b" * 40, "findings": [], "reviewer": "alice"}
+            task["verification"] = {
+                "baseSha": "a" * 40, "headSha": "b" * 40, "status": "passed", "command": "pytest -q",
+            }
+            state = _v5_state(legacy=True, tasks={"TASK-001": task})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            apply_migration(path)
+            migrated = json.loads(path.read_text())
+            review = migrated["tasks"]["TASK-001"]["review"]
+            verification = migrated["tasks"]["TASK-001"]["verification"]
+            self.assertEqual(review["resolvedRisk"], "high")
+
+            layers = load_layers(wdd, migrated["epic"])
+            self.assertEqual(
+                review["configSha256"],
+                effective_config_digest(project(layers["effective"], "taskReview")),
+            )
+            self.assertEqual(
+                verification["configSha256"],
+                effective_config_digest(project(layers["effective"], "taskVerification")),
+            )
+
+    def test_task_review_uses_task_override_review_model_when_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            task = task_state("TASK-001", review_model="gpt-review-override")
+            task["review"] = {"baseSha": "a" * 40, "headSha": "b" * 40, "findings": [], "reviewer": "alice"}
+            state = _v5_state(legacy=True, tasks={"TASK-001": task})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            apply_migration(path)
+            migrated = json.loads(path.read_text())
+            self.assertEqual(
+                migrated["tasks"]["TASK-001"]["review"]["reviewModel"], "gpt-review-override"
+            )
+
+    def test_tasks_without_review_or_verification_are_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            task = task_state("TASK-001")
+            state = _v5_state(legacy=True, tasks={"TASK-001": task})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            apply_migration(path)
+            migrated = json.loads(path.read_text())
+            self.assertIsNone(migrated["tasks"]["TASK-001"]["review"])
+            self.assertIsNone(migrated["tasks"]["TASK-001"]["verification"])
+
+    def test_finalize_review_and_verification_gain_digests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            state = _v5_state(legacy=True, tasks={})
+            state["finalize"] = {
+                "review": {
+                    "headSha": "a" * 40, "outcome": "passed", "findings": [],
+                    "reviewer": "alice", "at": "2026-01-01T00:00:00Z",
+                },
+                "verification": {
+                    "headSha": "a" * 40, "status": "passed", "command": "pytest -q",
+                    "justification": None, "at": "2026-01-01T00:00:00Z",
+                },
+            }
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            apply_migration(path)
+            migrated = json.loads(path.read_text())
+            layers = load_layers(wdd, migrated["epic"])
+            self.assertEqual(
+                migrated["finalize"]["review"]["configSha256"],
+                effective_config_digest(project(layers["effective"], "finalReview")),
+            )
+            self.assertEqual(
+                migrated["finalize"]["verification"]["configSha256"],
+                effective_config_digest(project(layers["effective"], "finalVerification")),
+            )
+            self.assertNotIn("resolvedRisk", migrated["finalize"]["review"])
+
+
+class MigrateAttemptManifestTest(unittest.TestCase):
+    """manifest.json is written into every existing attempt snapshot dir,
+    naming the brief file (spec Sec4); runner.py's dispatch assembler
+    prefers it."""
+
+    def test_manifest_written_naming_the_brief(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            _write_text(wdd / "tasks" / "TASK-001.md", "brief\n")
+            snapshot_dir = wdd / "dispatch" / "TASK-001-1"
+            _write_text(snapshot_dir / "tasks" / "TASK-001.md", "brief\n")
+            task = task_state("TASK-001")
+            task["snapshot"] = "dispatch/TASK-001-1"
+            task["inputs"] = [{"path": "tasks/TASK-001.md", "sha256": "sha256:" + "a" * 64}]
+            state = _v5_state(legacy=True, tasks={"TASK-001": task})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            apply_migration(path)
+            manifest_path = snapshot_dir / "manifest.json"
+            self.assertTrue(manifest_path.exists())
+            manifest = json.loads(manifest_path.read_text())
+            self.assertEqual(manifest["brief"], "tasks/TASK-001.md")
+
+    def test_no_snapshot_means_no_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            _write_text(wdd / "tasks" / "TASK-001.md", "brief\n")
+            state = _v5_state(legacy=True, tasks={"TASK-001": task_state("TASK-001")})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            apply_migration(path)
+            self.assertFalse((wdd / "dispatch").exists())
+
+    def test_dispatch_prefers_manifest_over_stale_relative_match(self) -> None:
+        # Exercises runner.py's _snapshot_files directly: once a manifest
+        # names the brief, it wins even when a DIFFERENT file happens to sit
+        # at the exact namespace-relative path the (now-stale) specPath names.
+        from wave_delivery.runner import _snapshot_files
+
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot_dir = Path(tmp) / "snap"
+            _write_text(snapshot_dir / "tasks" / "TASK-001.md", "STALE\n")
+            _write_text(snapshot_dir / "the-real-brief.md", "REAL\n")
+            (snapshot_dir / "manifest.json").write_text(
+                json.dumps({"brief": "the-real-brief.md"}), encoding="utf-8"
+            )
+            brief_path, context_paths = _snapshot_files(snapshot_dir, Path("tasks/TASK-001.md"))
+            self.assertEqual(brief_path.read_text(), "REAL\n")
+            # manifest.json itself is never handed to the worker as context.
+            self.assertNotIn(snapshot_dir / "manifest.json", context_paths)
+
+    def test_dispatch_falls_back_to_basename_matching_without_a_manifest(self) -> None:
+        # Pre-manifest snapshot dir: no manifest.json at all. The brief file
+        # sits at a DIFFERENT relative path than specPath currently names
+        # (as a migrated-but-never-remanifested snapshot might), so the
+        # exact-relative-path match misses -- basename matching finds it by
+        # filename instead of ever guessing lexicographically.
+        from wave_delivery.runner import _snapshot_files
+
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot_dir = Path(tmp) / "snap"
+            _write_text(snapshot_dir / "epics" / "demo" / "tasks" / "TASK-001.md", "REAL\n")
+            _write_text(snapshot_dir / "context.md", "context\n")
+            brief_path, context_paths = _snapshot_files(snapshot_dir, Path("tasks/TASK-001.md"))
+            self.assertEqual(brief_path.name, "TASK-001.md")
+            self.assertEqual(brief_path.read_text(), "REAL\n")
+            self.assertEqual([p.name for p in context_paths], ["context.md"])
+
+
+class MigrateIdempotencyTest(unittest.TestCase):
+    """Re-running migrate on an already-v6 state is refused, not silently
+    re-applied -- the no-op contract (spec Sec4: "migrate is idempotent")."""
+
+    def test_rerunning_migrate_on_a_v6_state_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            state = _v5_state(legacy=True, tasks={})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            apply_migration(path)
+            with self.assertRaises(ValidationError) as ctx:
+                apply_migration(path)
+            self.assertIn(f"already schema v{SCHEMA_VERSION}", str(ctx.exception))
+
+
+class MigratePlanIsPureTest(unittest.TestCase):
+    """`plan_migration`/`--dry-run` never writes state.json or moves a
+    single file -- the v5 -> v6 step's move-planning only reads the
+    filesystem (Global Constraints: dry-run first)."""
+
+    def test_plan_migration_does_not_touch_the_filesystem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            _write_text(wdd / "tasks" / "TASK-001.md", "brief\n")
+            state = _v5_state(legacy=True, tasks={"TASK-001": task_state("TASK-001")})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+            original = path.read_text()
+
+            result = plan_migration(path)
+            self.assertEqual(result["to"], 6)
+            self.assertEqual(path.read_text(), original)
+            self.assertTrue((wdd / "tasks" / "TASK-001.md").exists())
+            self.assertFalse((wdd / "epics").exists())
+
+
+class MigrateInputGateGreenTest(unittest.TestCase):
+    """Post-migration, a recorded input digest still matches the (moved)
+    file's bytes at its new, epic-namespaced location -- input binding
+    stays green across migration (spec Sec4)."""
+
+    def test_recorded_input_digest_still_resolves_and_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            brief = wdd / "tasks" / "TASK-001.md"
+            _write_text(brief, "brief body\n")
+            digest = artifact_sha256(brief)
+            task = task_state("TASK-001")
+            task["inputs"] = [{"path": "tasks/TASK-001.md", "sha256": digest}]
+            state = _v5_state(legacy=False, tasks={"TASK-001": task})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            apply_migration(path)
+            migrated = json.loads(path.read_text())
+            slug = migrated["epic"]
+            recorded = migrated["tasks"]["TASK-001"]["inputs"][0]
+            resolved = resolve_artifact(recorded["path"], wdd_dir=wdd, epic=slug)
+            self.assertTrue(resolved.exists())
+            self.assertEqual(artifact_sha256(resolved), recorded["sha256"])
+
+
+class MigrateArchivedRecordsUntouchedTest(unittest.TestCase):
+    """Archived v5 records stay readable where they are -- migration never
+    scans or touches archive/ (spec Sec4)."""
+
+    def test_flat_archive_dir_is_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            archived_record = wdd / "archive" / "old-epic" / "record.json"
+            _write_text(archived_record, '{"kind": "old"}\n')
+            state = _v5_state(legacy=True, tasks={})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            apply_migration(path)
+            self.assertEqual(archived_record.read_text(), '{"kind": "old"}\n')
+
+
+class MigrateTaskStatusMatrixTest(unittest.TestCase):
+    """Spec Sec4's test contract: every task status x legacy/non-legacy
+    intake x with/without an attempt snapshot migrates cleanly to a
+    v6-valid state."""
+
+    def test_full_matrix(self) -> None:
+        for status in sorted(TASK_STATUSES):
+            for legacy in (True, False):
+                for with_snapshot in (True, False):
+                    with self.subTest(status=status, legacy=legacy, snapshot=with_snapshot):
+                        with tempfile.TemporaryDirectory() as tmp:
+                            wdd = _wdd_root(tmp)
+                            _write_text(wdd / "tasks" / "TASK-001.md", "brief\n")
+                            task = task_state("TASK-001")
+                            task["status"] = status
+                            task["review"] = {
+                                "baseSha": "a" * 40, "headSha": "b" * 40,
+                                "findings": [], "reviewer": "alice",
+                            }
+                            task["verification"] = {
+                                "baseSha": "a" * 40, "headSha": "b" * 40,
+                                "status": "passed", "command": "pytest -q",
+                            }
+                            if with_snapshot:
+                                snapshot_dir = wdd / "dispatch" / "TASK-001-1"
+                                _write_text(snapshot_dir / "tasks" / "TASK-001.md", "brief\n")
+                                task["snapshot"] = "dispatch/TASK-001-1"
+                                task["inputs"] = [
+                                    {"path": "tasks/TASK-001.md", "sha256": "sha256:" + "a" * 64}
+                                ]
+                            state = _v5_state(legacy=legacy, tasks={"TASK-001": task})
+                            path = wdd / "state.json"
+                            _write_v5_state(path, state)
+
+                            apply_migration(path)
+                            migrated = StateStore(path).read()  # validates v6 shape
+
+                            self.assertEqual(migrated["tasks"]["TASK-001"]["status"], status)
+                            self.assertTrue(
+                                (wdd / "epics" / migrated["epic"] / "tasks" / "TASK-001.md").exists()
+                            )
+                            if with_snapshot:
+                                self.assertTrue(
+                                    (wdd / "dispatch" / "TASK-001-1" / "manifest.json").exists()
+                                )
+
+
+class MigrateComposedFromEarlierVersionsTest(unittest.TestCase):
+    """v2/v3/v4 sources still chain all the way through to v6 in one
+    `migrate` call (Global Constraints: composing the whole chain, mirrored
+    from the pre-existing v4 -> v5 composition in migration.py)."""
+
+    def test_supported_source_versions_include_v5(self) -> None:
+        self.assertEqual(SUPPORTED_SOURCE_VERSIONS, {2, 3, 4, 5})
+
+    def test_v5_source_reaches_v6_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            state = _v5_state(legacy=True, tasks={})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+            source = read_source(path)
+            migrated = convert_v5_to_v6(source, wdd_dir=wdd)
+            self.assertEqual(migrated["schemaVersion"], 6)
+            validate_state(migrated)
+
+    def test_v5_to_v6_conversion_refuses_a_non_v5_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValidationError):
+                convert_v5_to_v6(new_state("SCOPE-x"), wdd_dir=Path(tmp))
 
 
 if __name__ == "__main__":

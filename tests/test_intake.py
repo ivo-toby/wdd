@@ -336,8 +336,8 @@ class ConstructorIntakeTest(unittest.TestCase):
     migrate does (Sol-review P1: a constructor-minted exemption would be a
     doctrine bypass)."""
 
-    def test_schema_version_is_5(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 5)
+    def test_schema_version_is_6(self) -> None:
+        self.assertEqual(SCHEMA_VERSION, 6)
 
     def test_new_state_intake_is_empty_not_legacy(self) -> None:
         state = new_state("SCOPE-x")
@@ -500,18 +500,22 @@ class IntakeCompleteTest(unittest.TestCase):
 
 
 class MigrationV4ToV5Test(unittest.TestCase):
-    """migrate: SUPPORTED_SOURCE_VERSIONS = {2, 3, 4}; v4 -> v5 is a bump
-    plus `intake: {"legacy": True}`; earlier conversions still chain
-    through it."""
+    """migrate: SUPPORTED_SOURCE_VERSIONS = {2, 3, 4, 5}; v4 -> v5 is a bump
+    plus `intake: {"legacy": True}`; earlier conversions still chain through
+    it, and (epic-scoped-state plan, Task 3) the chain now continues on to
+    v6, which additionally stamps a migration-time `configure` exemption
+    alongside `legacy` (spec Sec4) -- neither exemption is ever self-minted."""
 
     def test_supported_source_versions(self) -> None:
-        self.assertEqual(SUPPORTED_SOURCE_VERSIONS, {2, 3, 4})
+        self.assertEqual(SUPPORTED_SOURCE_VERSIONS, {2, 3, 4, 5})
 
-    def test_v4_converts_to_v5_with_legacy_intake(self) -> None:
-        migrated = convert(_v4_state())
-        self.assertEqual(migrated["schemaVersion"], 5)
-        self.assertEqual(migrated["intake"], {"legacy": True})
-        validate_state(migrated)
+    def test_v4_converts_to_v6_with_legacy_intake(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            migrated = convert(_v4_state(), wdd_dir=Path(tmp))
+            self.assertEqual(migrated["schemaVersion"], 6)
+            self.assertIs(migrated["intake"]["legacy"], True)
+            self.assertIs(migrated["intake"]["configure"]["legacy"], True)
+            validate_state(migrated)
 
     def test_v4_conversion_preserves_scope_and_tasks(self) -> None:
         source = _v4_state()
@@ -521,41 +525,45 @@ class MigrationV4ToV5Test(unittest.TestCase):
             "worktree": None, "headSha": None, "pr": None, "review": None,
             "verification": None, "freshness": None, "merge": None, "blocker": None,
         }
-        migrated = convert(source)
-        self.assertEqual(migrated["scope"]["id"], "SCOPE-x")
-        self.assertIn("T1", migrated["tasks"])
+        with tempfile.TemporaryDirectory() as tmp:
+            migrated = convert(source, wdd_dir=Path(tmp))
+            self.assertEqual(migrated["scope"]["id"], "SCOPE-x")
+            self.assertIn("T1", migrated["tasks"])
 
-    def test_v3_and_v2_still_chain_through_to_v5_legacy(self) -> None:
+    def test_v3_and_v2_still_chain_through_to_v6_legacy(self) -> None:
         v3 = deepcopy(_v4_state())
         v3["schemaVersion"] = 3
-        migrated = convert(v3)
-        self.assertEqual(migrated["schemaVersion"], 5)
-        self.assertEqual(migrated["intake"], {"legacy": True})
+        with tempfile.TemporaryDirectory() as tmp:
+            migrated = convert(v3, wdd_dir=Path(tmp))
+            self.assertEqual(migrated["schemaVersion"], 6)
+            self.assertIs(migrated["intake"]["legacy"], True)
+            self.assertIs(migrated["intake"]["configure"]["legacy"], True)
 
-    def test_version_hint_covers_2_3_and_4(self) -> None:
-        for version in (2, 3, 4):
+    def test_version_hint_covers_2_3_4_and_5(self) -> None:
+        for version in (2, 3, 4, 5):
             state = _v4_state()
             state["schemaVersion"] = version
             with self.assertRaises(ValidationError) as raised:
                 validate_state(state)
             self.assertIn("migrate --dry-run", str(raised.exception))
 
-    def test_file_based_migration_reports_v4_source_to_v5_target(self) -> None:
+    def test_file_based_migration_reports_v4_source_to_v6_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
             path.write_text(json.dumps(_v4_state()), encoding="utf-8")
             result = plan_migration(path)
             self.assertEqual(result["from"], 4)
-            self.assertEqual(result["to"], 5)
+            self.assertEqual(result["to"], 6)
 
-    def test_apply_migration_writes_a_valid_v5_legacy_state(self) -> None:
+    def test_apply_migration_writes_a_valid_v6_legacy_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
             path.write_text(json.dumps(_v4_state()), encoding="utf-8")
             apply_migration(path)
             migrated = StateStore(path).read()
-            self.assertEqual(migrated["schemaVersion"], 5)
-            self.assertEqual(migrated["intake"], {"legacy": True})
+            self.assertEqual(migrated["schemaVersion"], 6)
+            self.assertIs(migrated["intake"]["legacy"], True)
+            self.assertIs(migrated["intake"]["configure"]["legacy"], True)
 
     def test_reading_a_v4_file_directly_is_refused_with_a_migration_hint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -792,8 +792,14 @@ class MigrationTests(BaseTest):
         self.assertTrue(Path(result["backup"]).exists())
 
         migrated = StateStore(path).read()
-        self.assertEqual(migrated["schemaVersion"], 5)
-        self.assertEqual(migrated["intake"], {"legacy": True})
+        self.assertEqual(migrated["schemaVersion"], 6)
+        # v5 -> v6 (epic-scoped-state plan, Task 3) additionally stamps a
+        # migration-time `configure` exemption alongside `legacy` (spec
+        # Sec4); this fixture has no config.json at all, so the digest is
+        # over the built-in default view (see migration.py's
+        # `_load_layers_for_migration`).
+        self.assertIs(migrated["intake"]["legacy"], True)
+        self.assertIs(migrated["intake"]["configure"]["legacy"], True)
         self.assertEqual(migrated["tasks"]["T1"]["risk"], "normal")
         self.assertEqual(migrated["tasks"]["T1"]["title"], "T1")
         # v2 required review for every task; migrating must not drop that.
