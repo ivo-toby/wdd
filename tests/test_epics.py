@@ -14,10 +14,13 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from wave_delivery.cli import main
 from wave_delivery.config import (
@@ -39,7 +42,14 @@ from wave_delivery.config import (
     validate_overlay,
 )
 from wave_delivery.doctor import inspect_capabilities
-from wave_delivery.errors import IllegalTransition, ValidationError
+from wave_delivery.errors import IllegalTransition, RevisionConflict, ValidationError
+from wave_delivery.finalize import (
+    _canonical_record_bytes,
+    _record_sha256,
+    archive_scope,
+    generate_archive_record,
+    recover_archive_transaction,
+)
 from wave_delivery.intake import artifact_sha256, resolve_within_wdd
 from wave_delivery.migration import (
     SUPPORTED_SOURCE_VERSIONS,
@@ -2883,6 +2893,454 @@ class NoBareLoadConfigInGovernedMergeSettingsSitesTest(unittest.TestCase):
 
         source = Path(cli_module.__file__).read_text(encoding="utf-8")
         self.assertEqual(source.count("config = _governed_config(admission_layers)"), 6)
+
+
+# ---------------------------------------------------------------------------
+# Task 6: transactional archive -- the four-step move, the deterministic
+# record, and the exhaustive crash-recovery matrix (spec Sec1).
+# ---------------------------------------------------------------------------
+
+
+def _epic_ladder_to_delivered(
+    state: str, wdd: Path, root: Path, *, slug: str = "demo", approver: str = "t"
+) -> None:
+    """`_epic_ladder_to_plan` walked the rest of the way to `delivered` --
+    Task 6's shared fixture for archive-transaction tests. Local-surface
+    task execution (start/commit/submit/verify/freshness/merge) plus the
+    finalize ladder (review/verify/handoff/delivered) via a real git merge,
+    mirroring test_intake.py's `_run_to_delivered` (no cross-file imports,
+    per this file's convention). Default reviewPolicy (risk_based) + default
+    risk (normal) skips task-level review, same as test_intake.py's
+    FullLifecycleE2ETest.
+    """
+    _epic_ladder_to_plan(state, wdd, root, slug=slug, approver=approver)
+    _start_and_commit(state, root)
+    assert _cli(state, "submit", "--task", "T1", "--repo", str(root))[0] == 0
+    assert _cli(state, "verify", "record", "--task", "T1", "--status", "passed")[0] == 0
+    assert _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0] == 0
+    assert _cli(state, "merge", "--task", "T1", "--repo", str(root))[0] == 0
+
+    assert _cli(
+        state, "finalize", "review", "record", "--reviewer", approver, "--findings", "[]",
+        "--repo", str(root),
+    )[0] == 0
+    results = json.dumps(
+        [{"command": "true", "status": "passed"}, {"command": "true", "status": "passed"}]
+    )
+    code, out = _cli(
+        state, "finalize", "verify", "record", "--results", results, "--repo", str(root)
+    )
+    assert code == 0, out
+    code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+    assert code == 0, out
+
+    base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+         "merge", "--no-ff", "-m", "final merge", base_ref],
+        cwd=root, check=True,
+    )
+    code, out = _cli(state, "finalize", "delivered", "--by", approver, "--repo", str(root))
+    assert code == 0, out
+
+
+def _delivered_repo(tmp: str, *, slug: str = "demo") -> tuple[Path, str, Path]:
+    """A delivered, epic-scoped scope ready for `scope archive` -- the
+    shared starting point for every crash-recovery-matrix test below."""
+    root, state = _ratified_repo(tmp)
+    wdd = root / ".wdd"
+    bare = Path(tmp) / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True)
+    _epic_ladder_to_delivered(state, wdd, root, slug=slug)
+    return root, state, wdd
+
+
+class GenerateArchiveRecordDeterminismTest(unittest.TestCase):
+    """`generate_archive_record`: a pure function of `state` plus the one
+    nondeterministic input (`archivedAt`) -- spec Sec1's "deterministic
+    function... nothing about the record is unreconstructable"."""
+
+    def test_same_inputs_yield_byte_identical_output(self) -> None:
+        state = new_state("SCOPE-demo", base_ref="wdd/demo")
+        state["tasks"] = {"T1": task_state("T1")}
+        first = generate_archive_record(state, "2026-08-01T00:00:00Z")
+        second = generate_archive_record(state, "2026-08-01T00:00:00Z")
+        self.assertEqual(first, second)
+        self.assertEqual(_canonical_record_bytes(first), _canonical_record_bytes(second))
+
+    def test_archived_at_is_the_only_varying_input(self) -> None:
+        state = new_state("SCOPE-demo", base_ref="wdd/demo")
+        a = generate_archive_record(state, "2026-08-01T00:00:00Z")
+        b = generate_archive_record(state, "2026-08-02T00:00:00Z")
+        self.assertNotEqual(a["archivedAt"], b["archivedAt"])
+        a_rest = {k: v for k, v in a.items() if k != "archivedAt"}
+        b_rest = {k: v for k, v in b.items() if k != "archivedAt"}
+        self.assertEqual(a_rest, b_rest)
+
+    def test_excludes_the_archive_pending_journal_event_from_event_count(self) -> None:
+        """The exclusion rule that makes recovery's regeneration byte-
+        identical to what step 1 originally wrote: a state that has NOT yet
+        journaled `archivePending` must produce the identical record to the
+        SAME state plus `archivePending` set and one more trailing event
+        (the journal event itself, always the last one appended)."""
+        base_events = [
+            {
+                "revision": 1, "type": "scope.delivered", "task": None,
+                "idempotencyKey": "k1", "at": "2026-08-01T00:00:00Z",
+            }
+        ]
+        pre = new_state("SCOPE-demo", base_ref="wdd/demo")
+        pre["events"] = list(base_events)
+        pre_record = generate_archive_record(pre, "2026-08-03T00:00:00Z")
+        self.assertEqual(pre_record["eventCount"], 1)
+
+        post = new_state("SCOPE-demo", base_ref="wdd/demo")
+        post["events"] = list(base_events) + [
+            {
+                "revision": 2, "type": "scope.archive_pending", "task": None,
+                "idempotencyKey": "k2", "at": "2026-08-03T00:00:00Z",
+            }
+        ]
+        post["archivePending"] = {
+            "slug": "demo", "sourceRevision": 1,
+            "archivedAt": "2026-08-03T00:00:00Z", "recordSha256": "sha256:x",
+        }
+        post_record = generate_archive_record(post, "2026-08-03T00:00:00Z")
+        self.assertEqual(pre_record, post_record)
+
+
+class ArchiveScopeTransactionalMoveTest(unittest.TestCase):
+    """archive_scope's four steps, uncrashed, end to end: the whole
+    `epics/<slug>/` directory moves to `archive/<slug>/`, and state resets
+    total-no-leak (scope/epic/archivePending/archiveBlocked all null)."""
+
+    def test_archive_moves_epic_dir_and_resets_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _delivered_repo(tmp)
+
+            code, out = _cli(state, "scope", "archive", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+
+            self.assertFalse((wdd / "epics" / "demo").exists())
+            archive_dir = wdd / "archive" / "demo"
+            self.assertTrue(archive_dir.is_dir())
+            record_path = archive_dir / "record.json"
+            self.assertEqual(Path(result["archived"]), record_path)
+            self.assertTrue((archive_dir / "spec.md").exists())
+            self.assertTrue((archive_dir / "design.md").exists())
+            self.assertTrue((archive_dir / "config.json").exists())
+
+            payload = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertIn("T1", payload["tasks"])
+            self.assertEqual(payload["finalize"]["verification"]["status"], "passed")
+
+            after = StateStore(Path(state)).read()
+            self.assertIsNone(after["scope"])
+            self.assertIsNone(after["epic"])
+            self.assertIsNone(after["archivePending"])
+            self.assertIsNone(after["archiveBlocked"])
+            self.assertEqual(after["tasks"], {})
+            self.assertNotIn("finalize", after)
+            self.assertEqual(after["intake"], {})
+            # Governance and the audit trail survive.
+            self.assertEqual(after["constitution"]["status"], "ratified")
+            self.assertGreater(len(after["events"]), 0)
+
+
+class ArchiveRecoveryRowOneTest(unittest.TestCase):
+    """Recovery row 1: journal set, source (`epics/<slug>/`) present,
+    destination absent -- crash between step 2 (journal) and step 3
+    (rename). A fresh command (`load_recovered`, what `next`/`status`/
+    `doctor` all use) verifies/regenerates the record and completes the
+    transaction."""
+
+    def _crash_after_journal(self, store: StateStore, root: Path) -> dict:
+        with mock.patch("wave_delivery.finalize.os.rename", side_effect=OSError("crash")):
+            with self.assertRaises(OSError):
+                archive_scope(store, repo=root)
+        return store.read()
+
+    def test_completes_via_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _delivered_repo(tmp)
+            store = StateStore(Path(state))
+            crashed = self._crash_after_journal(store, root)
+
+            self.assertIsNotNone(crashed["archivePending"])
+            self.assertTrue((wdd / "epics" / "demo").exists())
+            self.assertFalse((wdd / "archive" / "demo").exists())
+            expected_sha = crashed["archivePending"]["recordSha256"]
+            record_bytes = (wdd / "epics" / "demo" / "record.json").read_bytes()
+            self.assertEqual(_record_sha256(record_bytes), expected_sha)
+
+            recovered = store.load_recovered()
+            self.assertIsNone(recovered["epic"])
+            self.assertIsNone(recovered["archivePending"])
+            self.assertFalse((wdd / "epics" / "demo").exists())
+            record_path = wdd / "archive" / "demo" / "record.json"
+            self.assertTrue(record_path.exists())
+            self.assertEqual(_record_sha256(record_path.read_bytes()), expected_sha)
+
+    def test_missing_record_is_regenerated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _delivered_repo(tmp)
+            store = StateStore(Path(state))
+            crashed = self._crash_after_journal(store, root)
+            expected_sha = crashed["archivePending"]["recordSha256"]
+            (wdd / "epics" / "demo" / "record.json").unlink()
+
+            recovered = store.load_recovered()
+            record_path = wdd / "archive" / "demo" / "record.json"
+            self.assertEqual(_record_sha256(record_path.read_bytes()), expected_sha)
+            self.assertIsNone(recovered["archivePending"])
+
+    def test_corrupted_record_is_regenerated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _delivered_repo(tmp)
+            store = StateStore(Path(state))
+            crashed = self._crash_after_journal(store, root)
+            expected_sha = crashed["archivePending"]["recordSha256"]
+            (wdd / "epics" / "demo" / "record.json").write_text(
+                '{"tampered": true}\n', encoding="utf-8"
+            )
+
+            recovered = store.load_recovered()
+            record_path = wdd / "archive" / "demo" / "record.json"
+            self.assertEqual(_record_sha256(record_path.read_bytes()), expected_sha)
+            self.assertIsNone(recovered["archivePending"])
+
+
+class ArchiveRecoveryRowTwoTest(unittest.TestCase):
+    """Recovery row 2: journal set, destination present, source absent --
+    crash between step 3 (rename) and step 4 (reset). The reset has not
+    happened, so the (pre-reset) state is still authoritative for
+    verifying/regenerating the ARCHIVED record.json."""
+
+    def _crash_after_rename(self, store: StateStore, root: Path) -> dict:
+        """Let step 2's journal write through, then fail step 4's reset
+        write -- the rename (step 3) lands in between, unpatched, so it
+        genuinely succeeds. Row 2's shape needs exactly this: journaled,
+        destination present, source gone, reset never happened."""
+        original_write = StateStore.write
+        calls = {"n": 0}
+
+        def flaky_write(self_store, s):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("crash")
+            return original_write(self_store, s)
+
+        with mock.patch.object(StateStore, "write", flaky_write):
+            with self.assertRaises(OSError):
+                archive_scope(store, repo=root)
+        return store.read()
+
+    def test_completes_via_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _delivered_repo(tmp)
+            store = StateStore(Path(state))
+            crashed = self._crash_after_rename(store, root)
+
+            self.assertFalse((wdd / "epics" / "demo").exists())
+            self.assertTrue((wdd / "archive" / "demo").is_dir())
+            self.assertIsNotNone(crashed["archivePending"])
+            expected_sha = crashed["archivePending"]["recordSha256"]
+
+            recovered = store.load_recovered()
+            self.assertIsNone(recovered["epic"])
+            self.assertIsNone(recovered["archivePending"])
+            record_path = wdd / "archive" / "demo" / "record.json"
+            self.assertEqual(_record_sha256(record_path.read_bytes()), expected_sha)
+
+    def test_corrupted_archived_record_is_regenerated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _delivered_repo(tmp)
+            store = StateStore(Path(state))
+            crashed = self._crash_after_rename(store, root)
+            expected_sha = crashed["archivePending"]["recordSha256"]
+            (wdd / "archive" / "demo" / "record.json").write_text(
+                '{"tampered": true}\n', encoding="utf-8"
+            )
+
+            store.load_recovered()
+            record_path = wdd / "archive" / "demo" / "record.json"
+            self.assertEqual(_record_sha256(record_path.read_bytes()), expected_sha)
+
+
+class ArchiveRecoveryHardErrorTest(unittest.TestCase):
+    """Recovery row 4: journal set, neither path present -- pathological
+    total loss. Nothing is guessed; recovery fails loudly, naming the slug
+    and the on-disk facts."""
+
+    def test_journal_set_neither_path_present_is_a_hard_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _delivered_repo(tmp)
+            store = StateStore(Path(state))
+            with mock.patch("wave_delivery.finalize.os.rename", side_effect=OSError("crash")):
+                with self.assertRaises(OSError):
+                    archive_scope(store, repo=root)
+            shutil.rmtree(wdd / "epics" / "demo")
+
+            with self.assertRaises(ValidationError) as ctx:
+                store.load_recovered()
+            self.assertIn("demo", str(ctx.exception))
+
+
+class ArchiveCollisionBlockedResolutionE2ETest(unittest.TestCase):
+    """Recovery row 3 (external collision -> durable `archiveBlocked`) and
+    row 5 (the legal, idempotent resting state), end to end: `next` surfaces
+    the blocker, `scope archive` refuses while unresolved, and re-running it
+    once the collision is gone clears the block and archives fresh."""
+
+    def test_collision_blocks_next_surfaces_it_then_resolve_and_re_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _delivered_repo(tmp)
+            store = StateStore(Path(state))
+
+            with mock.patch("wave_delivery.finalize.os.rename", side_effect=OSError("crash")):
+                with self.assertRaises(OSError):
+                    archive_scope(store, repo=root)
+
+            # External collision: archive/demo/ appears while the journal is
+            # still pending and the rename never happened.
+            colliding = wdd / "archive" / "demo"
+            colliding.mkdir(parents=True)
+            (colliding / "unrelated.txt").write_text("not ours\n", encoding="utf-8")
+
+            recovered = store.load_recovered()
+            self.assertIsNone(recovered["archivePending"])
+            self.assertIsNotNone(recovered["archiveBlocked"])
+            self.assertEqual(recovered["archiveBlocked"]["slug"], "demo")
+            self.assertEqual(recovered["archiveBlocked"]["collidingPath"], str(colliding))
+            # The generated record is removed; the epic's real content and
+            # the external collision's own content are both untouched --
+            # recovery never resets on an unresolved collision.
+            self.assertFalse((wdd / "epics" / "demo" / "record.json").exists())
+            self.assertTrue((wdd / "epics" / "demo" / "spec.md").exists())
+            self.assertTrue((colliding / "unrelated.txt").exists())
+            self.assertEqual(recovered["epic"], "demo")
+            self.assertIsNotNone(recovered["scope"])
+
+            # Row 5: the resting state is idempotent.
+            again = store.load_recovered()
+            self.assertEqual(again["archiveBlocked"], recovered["archiveBlocked"])
+
+            # `next` surfaces the durable blocker and empties actions.
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            next_result = json.loads(out)
+            self.assertEqual(next_result["actions"], [])
+            self.assertEqual(next_result["blockers"][0]["code"], "archive_blocked")
+            self.assertEqual(next_result["blockers"][0]["collidingPath"], str(colliding))
+
+            # Re-running `scope archive` while unresolved refuses, naming it.
+            code, _out, err = _cli_full(state, "scope", "archive", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn(str(colliding), err)
+
+            # Resolve the collision, then re-run: clears archiveBlocked and
+            # starts a fresh transaction from the still-intact epic dir.
+            shutil.rmtree(colliding)
+            code, out = _cli(state, "scope", "archive", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertFalse((wdd / "epics" / "demo").exists())
+            self.assertTrue((wdd / "archive" / "demo" / "record.json").exists())
+            final = StateStore(Path(state)).read()
+            self.assertIsNone(final["archiveBlocked"])
+            self.assertIsNone(final["archivePending"])
+            self.assertIsNone(final["epic"])
+
+
+class ArchiveRecoveryStrayRecordCleanupTest(unittest.TestCase):
+    """Recovery row 6: a step-1 crash (record.json written into the active
+    epic's own directory before the journal was ever set) is cleaned up
+    transparently, scoped to `state.epic` only. Triggered here via an
+    ORDINARY governed mutation (`intake configure`, not `scope archive`
+    itself) specifically to prove `apply_mutation`'s own `recover_locked()`
+    call cannot self-deadlock: the state lock is not reentrant, so a nested
+    acquisition would hang (or time out into `LockUnavailable`) rather than
+    let this command complete.
+    """
+
+    def test_stray_record_removed_and_governed_mutation_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            stray = wdd / "epics" / "demo" / "record.json"
+            stray.write_text('{"kind": "stray"}\n', encoding="utf-8")
+
+            code, out = _cli(state, "intake", "configure", "--use-defaults", "--by", "t")
+            self.assertEqual(code, 0, out)
+            self.assertFalse(stray.exists())
+            self.assertTrue((wdd / "epics" / "demo" / "config.json").exists())
+            state_after = StateStore(Path(state)).read()
+            self.assertEqual(state_after["epic"], "demo")
+
+    def test_unrelated_epic_content_is_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (wdd / "epics" / "demo" / "spec.md").write_text("keep me\n", encoding="utf-8")
+            (wdd / "epics" / "demo" / "record.json").write_text("{}\n", encoding="utf-8")
+
+            store = StateStore(Path(state))
+            recovered = store.load_recovered()
+            self.assertFalse((wdd / "epics" / "demo" / "record.json").exists())
+            self.assertEqual(
+                (wdd / "epics" / "demo" / "spec.md").read_text(encoding="utf-8"), "keep me\n"
+            )
+            self.assertEqual(recovered["epic"], "demo")
+
+
+class RecoveryNeverReadsArchiveTest(unittest.TestCase):
+    """spec Sec1: recovery never scans, reads, or otherwise touches anything
+    under `archive/` beyond the exact path named by `archivePending.slug` /
+    `archiveBlocked.slug`. Proven by permission-denying `archive/` (and,
+    more precisely, an unrelated already-archived epic's own directory)
+    entirely and running recovery paths that have no legitimate reason to
+    look inside it."""
+
+    def setUp(self) -> None:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root bypasses directory permission checks")
+
+    def test_clean_state_recovery_does_not_need_archive_dir_access(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            archive_dir = wdd / "archive"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            archive_dir.chmod(0o000)
+            try:
+                store = StateStore(Path(state))
+                recovered = store.load_recovered()
+                self.assertEqual(recovered["epic"], "demo")
+            finally:
+                archive_dir.chmod(0o755)
+
+    def test_other_archived_epic_directory_is_never_touched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            other = wdd / "archive" / "other-epic"
+            other.mkdir(parents=True)
+            (other / "record.json").write_text("{}\n", encoding="utf-8")
+            other.chmod(0o000)
+            try:
+                (wdd / "epics" / "demo" / "record.json").write_text("{}\n", encoding="utf-8")
+                store = StateStore(Path(state))
+                recovered = store.load_recovered()
+                self.assertFalse((wdd / "epics" / "demo" / "record.json").exists())
+                self.assertEqual(recovered["epic"], "demo")
+            finally:
+                other.chmod(0o755)
 
 
 if __name__ == "__main__":

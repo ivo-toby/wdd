@@ -914,6 +914,33 @@ def _apply_execution_drift(
                 **drift,
             },
         )
+
+    # `archiveBlocked` (spec Sec1's recovery matrix, row 5): a durable field
+    # that survives the journal's own removal, precisely so this blocker
+    # keeps showing up even after `recover_archive_transaction` has already
+    # run (state is read via `load_recovered()` above, in `main()`, before
+    # this function ever runs). Highest precedence of everything this
+    # function inserts -- an archive stuck on an external collision is the
+    # most actionable thing to surface, and (being resolved by re-running
+    # `wddctl scope archive`, not by anything intake/config/governance-shaped)
+    # never legitimately co-occurs with the other blockers above in a way
+    # where a different one should win.
+    archive_blocked = state.get("archiveBlocked")
+    if archive_blocked is not None:
+        result["actions"] = []
+        result["blockers"].insert(
+            0,
+            {
+                "code": "archive_blocked",
+                "message": (
+                    f"scope archive is blocked: {archive_blocked['collidingPath']} already "
+                    f"exists, colliding with epic slug {archive_blocked['slug']!r}; move or "
+                    "remove it, then re-run 'wddctl scope archive --repo .' to start a fresh "
+                    "transaction"
+                ),
+                **archive_blocked,
+            },
+        )
     return result
 
 
@@ -1037,7 +1064,11 @@ def main(argv: list[str] | None = None) -> int:
                         )
 
         if args.command == "doctor":
-            state = store.read() if store.exists() else None
+            # Read-only (spec Sec1 locking layers): heals a crashed archive
+            # transaction before reporting, rather than surfacing it only as
+            # an orphan (`load_recovered` acquires its own lock -- this is
+            # the ONLY state read in this command, so no nesting risk).
+            state = store.load_recovered() if store.exists() else None
             _print_json(inspect_capabilities(store.path.parent, state))
             return 0
 
@@ -1124,7 +1155,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "status":
-            state = store.read()
+            # Read-only: heals a crashed archive transaction first (spec
+            # Sec1 locking layers), so a delivered scope stuck mid-archive
+            # reports its true, post-recovery phase rather than a stale one.
+            state = store.load_recovered()
             if derived_phase(state) == "setup" and (state["scope"] is None or config_path(store.path.parent).exists()):
                 config = load_config(store.path.parent)
                 _print_json(
@@ -1144,7 +1178,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "next":
-            state = store.read()
+            # Read-only: same recovery-first doctrine as `status` above --
+            # `next` is what a caller polls to discover the durable
+            # `archive_blocked` resting state (_apply_execution_drift below),
+            # so it must see a healed state, not a stale mid-transaction one.
+            state = store.load_recovered()
             if derived_phase(state) == "setup" and (state["scope"] is None or config_path(store.path.parent).exists()):
                 _print_json(
                     setup_next_actions(

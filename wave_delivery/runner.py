@@ -44,10 +44,11 @@ from .schema import copied_state
 from .store import StateStore, atomic_write_text
 
 
-# Same character class as finalize.py's _sanitize_scope_id_for_filename /
-# handover.py's _sanitize_task_id_for_filename (the archive idiom): task ids
-# double as filesystem path components under .wdd/dispatch/, so anything
-# outside [A-Za-z0-9._-] is replaced rather than trusted verbatim.
+# Same character class as handover.py's _sanitize_task_id_for_filename
+# (finalize.py's archive path is slug-governed since Task 6, epic-scoped-state
+# plan, and no longer needs this idiom itself): task ids double as filesystem
+# path components under .wdd/dispatch/, so anything outside [A-Za-z0-9._-] is
+# replaced rather than trusted verbatim.
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 
 _DISPATCH_DIR_MODE = 0o700

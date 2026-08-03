@@ -501,7 +501,11 @@ def apply_mutation(
     whose event depends on state they must not read outside the lock.
     """
     with store.locked():
-        state = store.read()
+        # Heal any crashed archive transaction (spec Sec1's recovery matrix)
+        # BEFORE this mutation's own precondition checks run, under the same
+        # lock acquisition -- `recover_locked` assumes the lock is already
+        # held and never acquires it itself, so this cannot self-deadlock.
+        state = store.recover_locked()
         if callable(event_type):
             event_type = event_type(state)
         key = idempotency_key or event_id(

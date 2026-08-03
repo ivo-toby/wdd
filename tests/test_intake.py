@@ -2672,14 +2672,19 @@ class ScopeArchiveTest(unittest.TestCase):
             before = StateStore(Path(state)).read()
             self.assertEqual(len(before["reconcile"]["pendingNotes"]), 1)
             scope_id = before["scope"]["id"]
+            slug = before["epic"]
 
             code, out = _cli(state, "scope", "archive", "--repo", str(root))
             self.assertEqual(code, 0, out)
             result = json.loads(out)
 
+            # Task 6 (epic-scoped-state plan): archive now MOVES the whole
+            # epic directory -- record.json lives inside archive/<slug>/,
+            # not the old flat archive/<scope-id>.json.
             archive_path = Path(result["archived"])
             self.assertTrue(archive_path.exists())
-            self.assertEqual(archive_path, root / ".wdd" / "archive" / f"{scope_id}.json")
+            self.assertEqual(archive_path, root / ".wdd" / "archive" / slug / "record.json")
+            self.assertFalse((root / ".wdd" / "epics" / slug).exists())
             payload = json.loads(archive_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["scope"]["id"], scope_id)
             self.assertIn("T1", payload["tasks"])
@@ -2692,6 +2697,7 @@ class ScopeArchiveTest(unittest.TestCase):
 
             after = StateStore(Path(state)).read()
             self.assertIsNone(after["scope"])
+            self.assertIsNone(after["epic"])
             self.assertEqual(after["tasks"], {})
             self.assertNotIn("finalize", after)
             self.assertEqual(after["intake"], {})
@@ -2754,17 +2760,23 @@ class ScopeArchiveTest(unittest.TestCase):
 
     def test_traversal_scope_id_cannot_escape_the_archive_directory(self) -> None:
         """M4 regression: validate_plan places no character restriction on
-        scope.id (only non-empty str), and archive_scope used to interpolate
-        it directly into a filename with no containment check -- the one
-        unrecoverable write in this module. Scope ids come from plan.json in
+        scope.id (only non-empty str) -- pre-Task-6, archive_scope
+        interpolated it directly into a filename with no containment check.
+        Task 6 (epic-scoped-state plan) makes this architecturally
+        unreachable rather than sanitization-dependent: the archive path is
+        governed by `state.epic` (the slug, validated by EPIC_SLUG_PATTERN
+        at `epic new` time), never by scope.id -- so a malicious scope.id
+        can only ever end up as inert JSON payload data inside record.json,
+        never as a path component. Scope ids come from plan.json in
         practice, so this hand-edits state.json directly (the plan-apply
         path isn't the thing under test) to simulate one that would
-        traverse out of .wdd/archive/ if used unsanitized."""
+        traverse out of .wdd/archive/ if it were ever used unsanitized."""
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _run_to_delivered(tmp)
             store = StateStore(Path(state))
             current = store.read()
             current["scope"]["id"] = "../../evil"
+            slug = current["epic"]
             store.write(current)
 
             code, out = _cli(state, "scope", "archive", "--repo", str(root))
@@ -2772,8 +2784,12 @@ class ScopeArchiveTest(unittest.TestCase):
             result = json.loads(out)
             archive_path = Path(result["archived"]).resolve()
             archive_dir = (root / ".wdd" / "archive").resolve()
-            self.assertEqual(archive_path.parent, archive_dir)
+            self.assertEqual(archive_path, archive_dir / slug / "record.json")
+            self.assertEqual(archive_path.parent, archive_dir / slug)
             self.assertTrue(archive_path.exists())
+            payload = json.loads(archive_path.read_text(encoding="utf-8"))
+            # The malicious id survives as inert data -- never as a path.
+            self.assertEqual(payload["scope"]["id"], "../../evil")
 
 
 class FullLifecycleE2ETest(unittest.TestCase):
@@ -2943,10 +2959,16 @@ class FullLifecycleE2ETest(unittest.TestCase):
             self.assertEqual(delivered_state["finalize"]["delivered"]["by"], "t")
 
             # --- scope archive: the ladder's rollover -------------------------
+            # Task 6 (epic-scoped-state plan): archive now MOVES the whole
+            # epic directory -- epics/demo/ is gone, archive/demo/record.json
+            # (plus the rest of the epic's content) is the moved destination.
             code, out = _cli(state, "scope", "archive", "--repo", str(root))
             self.assertEqual(code, 0, out)
             archive_path = Path(json.loads(out)["archived"])
             self.assertTrue(archive_path.exists())
+            self.assertEqual(archive_path, wdd / "archive" / "demo" / "record.json")
+            self.assertFalse((wdd / "epics" / "demo").exists())
+            self.assertTrue((wdd / "archive" / "demo").is_dir())
             payload = json.loads(archive_path.read_text(encoding="utf-8"))
             self.assertIn("spec", payload["intake"])
             self.assertIn("T1", payload["tasks"])
@@ -2962,11 +2984,11 @@ class FullLifecycleE2ETest(unittest.TestCase):
             self.assertEqual(after_archive["constitution"]["status"], "ratified")
 
             # --- next says create_epic again: a fresh ladder for scope #2 ----
-            # Task 4: the pre-Task-6 archive verb resets state but does not
-            # move epics/demo/ off disk (that transactional move is Task 6's
-            # concern), so a second epic reuses a fresh slug -- "demo" is
-            # still occupied by round 1's real content, not the crash-orphan
-            # shape `epic new` would adopt.
+            # Task 6: "demo" is now archived (epics/demo/ was moved wholesale
+            # to archive/demo/), and slugs are immutable/unique across BOTH
+            # epics/ and archive/ (spec Sec1) -- `epic new --slug demo` would
+            # be refused as an archived-slug collision, so a second epic
+            # still needs a fresh slug ("demo-2").
             code, out = _cli(state, "next")
             self.assertEqual(code, 0, out)
             self.assertEqual(json.loads(out)["actions"][0]["action"], "create_epic")

@@ -25,8 +25,9 @@ from .schema import copied_state
 from .store import StateStore, atomic_write_text
 
 
-# Same character class as finalize.py's _sanitize_scope_id_for_filename (the
-# archive idiom, per Global Constraints): task ids double as filesystem path
+# Same character class runner.py's own _UNSAFE_FILENAME_CHARS uses (finalize.py's
+# archive path is slug-governed since Task 6, epic-scoped-state plan, and no
+# longer needs this idiom itself): task ids double as filesystem path
 # components under .wdd/dispatch/, so anything outside [A-Za-z0-9._-] is
 # replaced rather than trusted verbatim.
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
