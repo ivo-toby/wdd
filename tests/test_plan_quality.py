@@ -23,7 +23,7 @@ def _plan(tasks: list[dict]) -> dict:
         "schemaVersion": 1,
         "kind": "wdd_plan",
         "scope": {
-            "id": "SCOPE-q",
+            "id": "SCOPE-demo",
             "baseRef": None,
             "maxConcurrent": 3,
             "reviewPolicy": "risk_based",
@@ -217,15 +217,20 @@ def _mark_legacy(state: str) -> None:
 
 
 def _walk_intake(state: str, wdd: Path, approver: str = "t") -> None:
-    """Canonical ladder walk (plan Task 2/3): spec -> research skip -> design."""
-    (wdd / "spec.md").write_text(
+    """Canonical ladder walk (plan Task 2/3): epic new -> spec -> research
+    skip -> design. Task 4 (spec Sec1): the slug is born at the top of the
+    ladder, so a real epic ("demo") must exist before any rung verb is legal
+    on a non-legacy scope -- every rung artifact lives under `epics/demo/`."""
+    assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+    epic_dir = wdd / "epics" / "demo"
+    (epic_dir / "spec.md").write_text(
         "# Spec\n\n## Goal\n\nShip it.\n\n## In scope\n\n- x\n\n"
         "## Out of scope\n\n- y\n\n## Acceptance criteria\n\n"
         "- [ ] AC-1: the thing works\n", encoding="utf-8")
     assert _cli(state, "intake", "spec", "--approved-by", approver)[0] == 0
     assert _cli(state, "intake", "research", "--skip", "--by", approver,
                 "--reason", "no external contracts")[0] == 0
-    (wdd / "design.md").write_text(
+    (epic_dir / "design.md").write_text(
         "# Design\n\n## Components\n\n- core\n\n## Interfaces\n\n"
         "- core: consumes nothing, produces lib\n\n"
         "## Integration surfaces\n\n- `src/core.py` — owned by: core task\n\n"
@@ -235,9 +240,12 @@ def _walk_intake(state: str, wdd: Path, approver: str = "t") -> None:
 
 
 def _write_briefs(wdd: Path, plan: dict) -> None:
-    (wdd / "tasks").mkdir(parents=True, exist_ok=True)
+    # PlanApprovalTest's only caller: writes into the active epic's
+    # namespace (Task 4, spec Sec1), not flat.
+    epic_dir = wdd / "epics" / "demo"
+    (epic_dir / "tasks").mkdir(parents=True, exist_ok=True)
     for task in plan["tasks"]:
-        path = wdd / task["specPath"]
+        path = epic_dir / task["specPath"]
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
             path.write_text(f"# {task['id']}\n\nBrief.\n", encoding="utf-8")

@@ -358,9 +358,14 @@ def _design_text() -> str:
 
 
 def _walk_intake(state: str, wdd: Path, approver: str = "t") -> None:
-    """Canonical ladder walk: spec -> research skip -> design. Copied from
-    tests/test_intake.py's helper of the same name."""
-    (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+    """Canonical ladder walk: epic new -> spec -> research skip -> design.
+    Copied from tests/test_intake.py's helper of the same name. Task 4
+    (spec Sec1): the slug is born at the top of the ladder, so a real epic
+    ("demo") must exist before any rung verb is legal on a non-legacy scope
+    -- every rung artifact below lives under `epics/demo/`, not flat."""
+    assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+    epic_dir = wdd / "epics" / "demo"
+    (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
     assert _cli(state, "intake", "spec", "--approved-by", approver)[0] == 0
     assert (
         _cli(
@@ -369,7 +374,7 @@ def _walk_intake(state: str, wdd: Path, approver: str = "t") -> None:
         )[0]
         == 0
     )
-    (wdd / "design.md").write_text(_design_text(), encoding="utf-8")
+    (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
     assert (
         _cli(
             state, "intake", "design", "--approved-by", approver,
@@ -410,8 +415,9 @@ def _apply_v5_scope(
     overrides -- model/review_model feed Task 4's dispatch tests; risk feeds
     the e2e test's need for a task where review is actually required)."""
     _walk_intake(state, wdd)
-    (wdd / "tasks").mkdir(exist_ok=True)
-    (wdd / "tasks" / f"{task_id}.md").write_text(
+    epic_dir = wdd / "epics" / "demo"
+    (epic_dir / "tasks").mkdir(exist_ok=True)
+    (epic_dir / "tasks" / f"{task_id}.md").write_text(
         f"# {task_id}\n\nBrief body for {task_id}.\n\n## Deliverable\n\n"
         f"{task_id} works end to end.\n", encoding="utf-8"
     )
@@ -428,7 +434,7 @@ def _apply_v5_scope(
     plan = {
         "schemaVersion": 1,
         "kind": "wdd_plan",
-        "scope": {"id": "SCOPE-x", "baseRef": "wdd/scope-x"},
+        "scope": {"id": "SCOPE-demo", "baseRef": "wdd/scope-x"},
         "tasks": [task_entry],
     }
     plan_file = root / "plan.json"
@@ -527,7 +533,7 @@ class AttemptSnapshotTest(unittest.TestCase):
             context_copy = attempt_dir / "shared-context" / "contract.md"
             self.assertEqual(
                 brief_copy.read_text(encoding="utf-8"),
-                (wdd / "tasks" / "T1.md").read_text(encoding="utf-8"),
+                (wdd / "epics" / "demo" / "tasks" / "T1.md").read_text(encoding="utf-8"),
             )
             self.assertEqual(context_copy.read_text(encoding="utf-8"), "contract body\n")
             for copy in (brief_copy, context_copy):
@@ -542,7 +548,14 @@ class AttemptSnapshotTest(unittest.TestCase):
                 {"tasks/T1.md", "shared-context/contract.md"},
             )
             for entry in task["inputs"]:
-                self.assertEqual(entry["sha256"], artifact_sha256(wdd / entry["path"]))
+                # shared-context/ refs are always global; everything else
+                # (here, tasks/T1.md) resolves under the active epic's
+                # namespace (Task 4, spec Sec1).
+                source = (
+                    wdd / entry["path"] if entry["path"].startswith("shared-context/")
+                    else wdd / "epics" / "demo" / entry["path"]
+                )
+                self.assertEqual(entry["sha256"], artifact_sha256(source))
 
     def test_context_ref_anchor_strips_to_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -930,11 +943,12 @@ def _apply_v5_scope_two_tasks(
     per-task context refs -- for sibling-task-unaffected coverage that
     `_apply_v5_scope`'s single task cannot exercise."""
     _walk_intake(state, wdd)
-    (wdd / "tasks").mkdir(exist_ok=True)
+    epic_dir = wdd / "epics" / "demo"
+    (epic_dir / "tasks").mkdir(exist_ok=True)
     contexts = contexts or {}
     tasks = []
     for task_id in ("T1", "T2"):
-        (wdd / "tasks" / f"{task_id}.md").write_text(
+        (epic_dir / "tasks" / f"{task_id}.md").write_text(
             f"# {task_id}\n\nBrief body for {task_id}.\n", encoding="utf-8"
         )
         tasks.append(
@@ -949,7 +963,7 @@ def _apply_v5_scope_two_tasks(
     plan = {
         "schemaVersion": 1,
         "kind": "wdd_plan",
-        "scope": {"id": "SCOPE-x", "baseRef": "wdd/scope-x"},
+        "scope": {"id": "SCOPE-demo", "baseRef": "wdd/scope-x"},
         "tasks": tasks,
     }
     plan_file = root / "plan.json"
@@ -1045,7 +1059,7 @@ class InputVersionBindingTest(unittest.TestCase):
                 _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0], 0
             )
 
-            (wdd / "tasks" / "T1.md").write_text(
+            (wdd / "epics" / "demo" / "tasks" / "T1.md").write_text(
                 "# T1\n\nBrief body for T1 -- edited.\n", encoding="utf-8"
             )
             _restamp_plan(root, state)
@@ -1062,7 +1076,8 @@ class InputVersionBindingTest(unittest.TestCase):
             _start_and_commit(state, root, "T1")
 
             new_brief = "# T1\n\nBrief body for T1 -- edited.\n"
-            (wdd / "tasks" / "T1.md").write_text(new_brief, encoding="utf-8")
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "tasks" / "T1.md").write_text(new_brief, encoding="utf-8")
             _restamp_plan(root, state)
 
             code, out, err = _cli_full(state, "submit", "--task", "T1", "--repo", str(root))
@@ -1074,7 +1089,9 @@ class InputVersionBindingTest(unittest.TestCase):
             self.assertEqual(result["inputsRecorded"], 1)
 
             task = StateStore(Path(state)).read()["tasks"]["T1"]
-            self.assertEqual(task["inputs"][0]["sha256"], artifact_sha256(wdd / "tasks" / "T1.md"))
+            self.assertEqual(
+                task["inputs"][0]["sha256"], artifact_sha256(epic_dir / "tasks" / "T1.md")
+            )
             events = StateStore(Path(state)).read()["events"]
             rebound = [e for e in events if e["type"] == "task.rebound"]
             self.assertEqual(len(rebound), 1)
@@ -1100,7 +1117,7 @@ class InputVersionBindingTest(unittest.TestCase):
             _apply_v5_scope(root, wdd, state)
             _start_and_commit(state, root, "T1")
 
-            (wdd / "tasks" / "T1.md").write_text(
+            (wdd / "epics" / "demo" / "tasks" / "T1.md").write_text(
                 "# T1\n\nBrief body for T1 -- edited.\n", encoding="utf-8"
             )
             _restamp_plan(root, state)
@@ -1140,7 +1157,7 @@ class InputVersionBindingTest(unittest.TestCase):
             code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
             self.assertEqual(code, 0, out)
 
-            (wdd / "tasks" / "T1.md").write_text(
+            (wdd / "epics" / "demo" / "tasks" / "T1.md").write_text(
                 "# T1\n\nBrief body for T1 -- edited.\n", encoding="utf-8"
             )
             _restamp_plan(root, state)
@@ -1187,7 +1204,7 @@ class InputVersionBindingTest(unittest.TestCase):
                 StateStore(Path(state)).read()["tasks"]["T1"]["status"], "done"
             )
 
-            (wdd / "tasks" / "T1.md").write_text(
+            (wdd / "epics" / "demo" / "tasks" / "T1.md").write_text(
                 "# T1\n\nBrief body for T1 -- edited post-merge.\n", encoding="utf-8"
             )
 
@@ -1295,7 +1312,7 @@ class InputVersionBindingTest(unittest.TestCase):
             _apply_v5_scope(root, wdd, state)
             _start_and_commit(state, root, "T1")
 
-            (wdd / "tasks" / "T1.md").write_text(
+            (wdd / "epics" / "demo" / "tasks" / "T1.md").write_text(
                 "# T1\n\nBrief body for T1 -- edited.\n", encoding="utf-8"
             )
 
@@ -1767,7 +1784,7 @@ class DispatchTaskTest(unittest.TestCase):
     def test_dispatch_gated_by_input_binding_like_other_task_verbs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state, wdd = _dispatch_ready_scope(tmp)
-            (wdd / "tasks" / "T1.md").write_text(
+            (wdd / "epics" / "demo" / "tasks" / "T1.md").write_text(
                 "# T1\n\nBrief body for T1 -- edited.\n\n## Deliverable\n\nT1 works.\n",
                 encoding="utf-8",
             )

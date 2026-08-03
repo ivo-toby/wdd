@@ -180,6 +180,16 @@ def _require_ladder_legal(state: dict[str, Any]) -> None:
             "intake verbs require the constitution to be ratified first; "
             "run 'wddctl constitution ratify --by NAME'"
         )
+    # The slug is born at the top of the ladder (spec Sec1): without an
+    # active epic, rung artifacts would resolve flat and plan apply's
+    # SCOPE-<slug> derivation would silently never fire (Task 4 review,
+    # Important). Legacy scopes are exempt below, wholesale.
+    if state.get("epic") is None and (state.get("intake") or {}).get("legacy") is not True:
+        raise IllegalTransition(
+            "no active epic: the ladder starts with "
+            "'wddctl epic new --slug SLUG' (spec: the slug is born at the "
+            "top of the ladder)"
+        )
     if (state.get("intake") or {}).get("legacy") is True:
         raise IllegalTransition(
             "this scope is a migrated legacy scope, exempt wholesale from the intake ladder"

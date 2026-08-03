@@ -1842,7 +1842,13 @@ class CliTests(BaseTest):
             self.assertEqual(run("config", "set", "verification.commands", '["true"]'), 0)
         self.assertEqual(run("constitution", "ratify", "--by", "tester"), 0)
 
-        (wdd / "spec.md").write_text(
+        # Task 4: create_epic is the ladder's true first rung -- the slug is
+        # born at the top of the ladder (spec Sec1). plan_document()'s scope
+        # id ("SCOPE-demo") is already the epic-derived id this slug yields.
+        self.assertEqual(run("epic", "new", "--slug", "demo"), 0)
+        epic_dir = wdd / "epics" / "demo"
+
+        (epic_dir / "spec.md").write_text(
             "# Spec\n\n## Goal\n\nShip it.\n\n## In scope\n\n- x\n\n"
             "## Out of scope\n\n- y\n\n## Acceptance criteria\n\n"
             "- [ ] AC-1: the thing works\n",
@@ -1856,7 +1862,7 @@ class CliTests(BaseTest):
             ),
             0,
         )
-        (wdd / "design.md").write_text(
+        (epic_dir / "design.md").write_text(
             "# Design\n\n## Components\n\n- core\n\n## Interfaces\n\n"
             "- core: consumes nothing, produces lib\n\n"
             "## Integration surfaces\n\n- `src/core.py` — owned by: core task\n\n"
@@ -1870,9 +1876,9 @@ class CliTests(BaseTest):
         plan_path = wdd / "plan.json"
         plan = self.plan_document()
         plan_path.write_text(json.dumps(plan), encoding="utf-8")
-        (wdd / "tasks").mkdir(exist_ok=True)
+        (epic_dir / "tasks").mkdir(exist_ok=True)
         for task in plan["tasks"]:
-            (wdd / task.get("specPath", f"tasks/{task['id']}.md")).write_text(
+            (epic_dir / task.get("specPath", f"tasks/{task['id']}.md")).write_text(
                 f"# {task['id']}\n\nBrief.\n", encoding="utf-8"
             )
 

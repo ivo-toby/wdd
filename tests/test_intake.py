@@ -88,7 +88,7 @@ def _cli_full(state: str, *argv: str) -> tuple[int, str, str]:
 def _plan_document(
     task_ids: tuple[str, ...] | list[str],
     *,
-    scope_id: str = "SCOPE-x",
+    scope_id: str = "SCOPE-demo",
     base_ref: str = "wdd/scope-x",
     review_policy: str | None = None,
 ) -> dict:
@@ -171,21 +171,28 @@ def _design_text(
 
 
 def _walk_intake(
-    state: str, wdd: Path, approver: str = "t", *, deliverable_command: str = "true"
+    state: str, wdd: Path, approver: str = "t", *, deliverable_command: str = "true",
+    slug: str = "demo",
 ) -> None:
-    """Canonical ladder walk (plan Task 2): spec -> research skip -> design.
+    """Canonical ladder walk (plan Task 2): epic new -> spec -> research skip
+    -> design.
 
     Added once per test file per the plan's convention; later phase-6a tasks
     in this same file reuse it to build init->ratify->(ladder) fixtures
-    without repeating the raw CLI sequence.
+    without repeating the raw CLI sequence. Task 4 (spec Sec1): the slug is
+    born at the top of the ladder, so a real epic must exist before any rung
+    verb is legal on a non-legacy scope -- every rung artifact below lives
+    under `epics/<slug>/`, not flat.
     """
-    (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+    assert _cli(state, "epic", "new", "--slug", slug)[0] == 0
+    epic_dir = wdd / "epics" / slug
+    (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
     assert _cli(state, "intake", "spec", "--approved-by", approver)[0] == 0
     assert _cli(
         state, "intake", "research", "--skip", "--by", approver,
         "--reason", "no external contracts",
     )[0] == 0
-    (wdd / "design.md").write_text(_design_text(), encoding="utf-8")
+    (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
     assert _cli(
         state, "intake", "design", "--approved-by", approver,
         "--deliverable-command", deliverable_command,
@@ -229,8 +236,9 @@ def _apply_ladder_and_plan(
     exempts fixtures that aren't exercising the ladder.
     """
     _walk_intake(state, wdd, approver, deliverable_command=deliverable_command)
-    (wdd / "tasks").mkdir(exist_ok=True)
-    (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+    epic_dir = wdd / "epics" / "demo"
+    (epic_dir / "tasks").mkdir(exist_ok=True)
+    (epic_dir / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
     plan_file = root / "plan.json"
     plan_file.write_text(
         json.dumps(_plan_document(["T1"], review_policy=review_policy)), encoding="utf-8"
@@ -611,7 +619,9 @@ class IntakeSpecVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
-            (wdd / "spec.md").write_text(
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: a", "- [ ] AC-2: b", "- [ ] AC-3: c")),
                 encoding="utf-8",
             )
@@ -622,25 +632,28 @@ class IntakeSpecVerbTest(unittest.TestCase):
             recorded = StateStore(Path(state)).read()["intake"]["spec"]
             self.assertEqual(recorded["by"], "t")
             self.assertEqual(recorded["criteria"], 3)
-            self.assertEqual(recorded["sha256"], artifact_sha256(wdd / "spec.md"))
+            self.assertEqual(recorded["sha256"], artifact_sha256(epic_dir / "spec.md"))
 
     def test_refuses_when_spec_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _root, state = _ratified_repo(tmp)
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
             code, _out = _cli(state, "intake", "spec", "--approved-by", "t")
             self.assertNotEqual(code, 0)
 
     def test_refuses_when_spec_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text("   \n", encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text("   \n", encoding="utf-8")
             code, _out = _cli(state, "intake", "spec", "--approved-by", "t")
             self.assertNotEqual(code, 0)
 
     def test_refuses_missing_required_section(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(sections=("Goal", "In scope", "Acceptance criteria")),
                 encoding="utf-8",
             )
@@ -650,7 +663,8 @@ class IntakeSpecVerbTest(unittest.TestCase):
     def test_refuses_unnumbered_checklist_line(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: a", "- [ ] do the other thing")),
                 encoding="utf-8",
             )
@@ -660,7 +674,8 @@ class IntakeSpecVerbTest(unittest.TestCase):
     def test_refuses_duplicate_numbers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: a", "- [ ] AC-1: b")),
                 encoding="utf-8",
             )
@@ -670,7 +685,8 @@ class IntakeSpecVerbTest(unittest.TestCase):
     def test_refuses_non_contiguous_numbers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: a", "- [ ] AC-3: b")),
                 encoding="utf-8",
             )
@@ -680,7 +696,8 @@ class IntakeSpecVerbTest(unittest.TestCase):
     def test_refuses_numbers_not_starting_at_one(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-2: a", "- [ ] AC-3: b")),
                 encoding="utf-8",
             )
@@ -700,7 +717,8 @@ class IntakeSpecVerbTest(unittest.TestCase):
     def test_refuses_approved_by_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             code, _out = _cli(state, "intake", "spec", "--approved-by", "")
             self.assertNotEqual(code, 0)
 
@@ -721,8 +739,13 @@ class IntakeSpecVerbTest(unittest.TestCase):
             (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             store = StateStore(Path(state))
             delivered_state = deepcopy(store.read())
+            # An active epic so the check under test (delivered-phase
+            # refusal) is the one that actually fires -- without it, Task
+            # 4's new "no active epic" gate would raise first and this
+            # would stop pinning what its name says.
+            delivered_state["epic"] = "demo"
             delivered_state["scope"] = {
-                "id": "SCOPE-x", "baseRef": "wdd/x", "maxConcurrent": None,
+                "id": "SCOPE-demo", "baseRef": "wdd/x", "maxConcurrent": None,
                 "reviewPolicy": "risk_based",
             }
             delivered_state["tasks"] = {
@@ -745,7 +768,9 @@ class IntakeResearchVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
-            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             (wdd / "shared-context").mkdir(exist_ok=True)
             artifact = wdd / "shared-context" / "contract-inventory.md"
@@ -766,7 +791,8 @@ class IntakeResearchVerbTest(unittest.TestCase):
     def test_happy_skip_records_reason(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, out = _cli(
                 state, "intake", "research", "--skip", "--by", "t", "--reason", "no contracts"
@@ -779,7 +805,8 @@ class IntakeResearchVerbTest(unittest.TestCase):
     def test_mode_exclusivity_neither_refused_by_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, _out = _cli(state, "intake", "research", "--by", "t")
             self.assertNotEqual(code, 0)
@@ -787,7 +814,8 @@ class IntakeResearchVerbTest(unittest.TestCase):
     def test_mode_exclusivity_both_refused_by_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, _out = _cli(
                 state, "intake", "research", "--done", "--skip", "--by", "t",
@@ -805,7 +833,8 @@ class IntakeResearchVerbTest(unittest.TestCase):
         caller passed, not on what they happened to compute to."""
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, _out, err = _cli_full(
                 state, "intake", "research", "--done", "--skip", "--by", "t",
@@ -819,7 +848,8 @@ class IntakeResearchVerbTest(unittest.TestCase):
     def test_done_without_artifacts_is_refused_by_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, _out, err = _cli_full(state, "intake", "research", "--done", "--by", "t")
             self.assertNotEqual(code, 0)
@@ -828,7 +858,8 @@ class IntakeResearchVerbTest(unittest.TestCase):
     def test_skip_without_reason_is_refused_by_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, _out, err = _cli_full(state, "intake", "research", "--skip", "--by", "t")
             self.assertNotEqual(code, 0)
@@ -837,6 +868,7 @@ class IntakeResearchVerbTest(unittest.TestCase):
     def test_refuses_before_spec(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _root, state = _ratified_repo(tmp)
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
             code, _out = _cli(
                 state, "intake", "research", "--skip", "--by", "t", "--reason", "no contracts"
             )
@@ -845,7 +877,8 @@ class IntakeResearchVerbTest(unittest.TestCase):
     def test_refuses_artifact_outside_wdd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             (root / "outside.md").write_text("x\n", encoding="utf-8")
             code, _out, err = _cli_full(
@@ -860,7 +893,8 @@ class IntakeResearchVerbTest(unittest.TestCase):
     def test_refuses_artifact_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, _out = _cli(
                 state, "intake", "research", "--done", "--by", "t",
@@ -872,7 +906,8 @@ class IntakeResearchVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
-            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (wdd / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             (wdd / "shared-context").mkdir(exist_ok=True)
             (wdd / "shared-context" / "empty.md").write_text("", encoding="utf-8")
@@ -885,7 +920,8 @@ class IntakeResearchVerbTest(unittest.TestCase):
     def test_refuses_skip_with_empty_reason(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
-            (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, _out = _cli(state, "intake", "research", "--skip", "--by", "t", "--reason", "")
             self.assertNotEqual(code, 0)
@@ -896,12 +932,14 @@ class IntakeDesignVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
-            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             assert _cli(
                 state, "intake", "research", "--skip", "--by", "t", "--reason", "no contracts"
             )[0] == 0
-            (wdd / "design.md").write_text(_design_text(), encoding="utf-8")
+            (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
             code, out = _cli(
                 state, "intake", "design", "--approved-by", "t",
                 "--deliverable-command", "pytest -q",
@@ -909,18 +947,20 @@ class IntakeDesignVerbTest(unittest.TestCase):
             self.assertEqual(code, 0, out)
             recorded = StateStore(Path(state)).read()["intake"]["design"]
             self.assertEqual(recorded["deliverableCommand"], "pytest -q")
-            self.assertEqual(recorded["sha256"], artifact_sha256(wdd / "design.md"))
+            self.assertEqual(recorded["sha256"], artifact_sha256(epic_dir / "design.md"))
 
     def test_refuses_deliverable_command_omission(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
-            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             assert _cli(
                 state, "intake", "research", "--skip", "--by", "t", "--reason", "no contracts"
             )[0] == 0
-            (wdd / "design.md").write_text(_design_text(), encoding="utf-8")
+            (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
             code, _out = _cli(state, "intake", "design", "--approved-by", "t")
             self.assertNotEqual(code, 0)
 
@@ -928,12 +968,14 @@ class IntakeDesignVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
-            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             assert _cli(
                 state, "intake", "research", "--skip", "--by", "t", "--reason", "no contracts"
             )[0] == 0
-            (wdd / "design.md").write_text(_design_text(), encoding="utf-8")
+            (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
             code, _out = _cli(
                 state, "intake", "design", "--approved-by", "t", "--deliverable-command", "   "
             )
@@ -943,9 +985,11 @@ class IntakeDesignVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
-            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
-            (wdd / "design.md").write_text(_design_text(), encoding="utf-8")
+            (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
             code, _out = _cli(
                 state, "intake", "design", "--approved-by", "t", "--deliverable-command", "true"
             )
@@ -955,7 +999,9 @@ class IntakeDesignVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
-            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             assert _cli(
                 state, "intake", "research", "--skip", "--by", "t", "--reason", "no contracts"
@@ -969,12 +1015,14 @@ class IntakeDesignVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
-            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             assert _cli(
                 state, "intake", "research", "--skip", "--by", "t", "--reason", "no contracts"
             )[0] == 0
-            (wdd / "design.md").write_text(
+            (epic_dir / "design.md").write_text(
                 _design_text(sections=("Components", "Interfaces", "Epic deliverable")),
                 encoding="utf-8",
             )
@@ -995,13 +1043,14 @@ class IntakeCascadeTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             _walk_intake(state, wdd)
+            epic_dir = wdd / "epics" / "demo"
             _inject_scope_with_approval(state)
             before = StateStore(Path(state)).read()
             self.assertIn("approval", before["scope"])
             self.assertIsNotNone(before["intake"]["research"])
             self.assertIsNotNone(before["intake"]["design"])
 
-            (wdd / "spec.md").write_text(
+            (epic_dir / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: a", "- [ ] AC-2: b")), encoding="utf-8"
             )
             code, out = _cli(state, "intake", "spec", "--approved-by", "t")
@@ -1089,7 +1138,8 @@ class IntakeDriftTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             _walk_intake(state, wdd)
-            (wdd / "spec.md").write_text(_spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8")
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "spec.md").write_text(_spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8")
             current = StateStore(Path(state)).read()
             drift = intake_drift(current, wdd)
             self.assertEqual(drift["rung"], "spec")
@@ -1099,7 +1149,8 @@ class IntakeDriftTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             _walk_intake(state, wdd)
-            (wdd / "spec.md").unlink()
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "spec.md").unlink()
             current = StateStore(Path(state)).read()
             drift = intake_drift(current, wdd)
             self.assertEqual(drift["rung"], "spec")
@@ -1109,7 +1160,8 @@ class IntakeDriftTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
-            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (wdd / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             (wdd / "shared-context").mkdir(exist_ok=True)
             artifact = wdd / "shared-context" / "contract-inventory.md"
@@ -1127,7 +1179,8 @@ class IntakeDriftTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
-            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (wdd / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             (wdd / "shared-context").mkdir(exist_ok=True)
             artifact = wdd / "shared-context" / "contract-inventory.md"
@@ -1147,7 +1200,8 @@ class IntakeDriftTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             _walk_intake(state, wdd)
-            (wdd / "design.md").write_text(
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "design.md").write_text(
                 _design_text() + "\nextra content\n", encoding="utf-8"
             )
             current = StateStore(Path(state)).read()
@@ -1159,7 +1213,8 @@ class IntakeDriftTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             _walk_intake(state, wdd)
-            (wdd / "design.md").unlink()
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "design.md").unlink()
             current = StateStore(Path(state)).read()
             drift = intake_drift(current, wdd)
             self.assertEqual(drift["rung"], "design")
@@ -1172,7 +1227,9 @@ class IntakeStatusTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             self.assertEqual(intake_status(StateStore(Path(state)).read())["nextRung"], "spec")
-            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             self.assertEqual(
                 intake_status(StateStore(Path(state)).read())["nextRung"], "research"
@@ -1181,7 +1238,7 @@ class IntakeStatusTest(unittest.TestCase):
                 state, "intake", "research", "--skip", "--by", "t", "--reason", "n/a"
             )[0] == 0
             self.assertEqual(intake_status(StateStore(Path(state)).read())["nextRung"], "design")
-            (wdd / "design.md").write_text(_design_text(), encoding="utf-8")
+            (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
             assert _cli(
                 state, "intake", "design", "--approved-by", "t", "--deliverable-command", "true"
             )[0] == 0
@@ -1205,7 +1262,8 @@ class IntakeFunctionLevelRefusalTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
-            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            (wdd / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             store = StateStore(Path(state))
             with self.assertRaises(ValidationError):
@@ -1219,12 +1277,14 @@ class IntakeFunctionLevelRefusalTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
-            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             assert _cli(
                 state, "intake", "research", "--skip", "--by", "t", "--reason", "n/a"
             )[0] == 0
-            (wdd / "design.md").write_text(_design_text(), encoding="utf-8")
+            (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
             store = StateStore(Path(state))
             with self.assertRaises(ValidationError):
                 record_design(store, wdd, approved_by="t", deliverable_command="")
@@ -1302,7 +1362,8 @@ class SetupLadderNextTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             _walk_intake(state, wdd)
-            (wdd / "spec.md").write_text(
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
             )
             code, out = _cli(state, "next")
@@ -1349,11 +1410,12 @@ class PlanApplyGateTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             _walk_intake(state, wdd)
-            (wdd / "spec.md").write_text(
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
             )
-            (wdd / "tasks").mkdir(exist_ok=True)
-            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            (epic_dir / "tasks").mkdir(exist_ok=True)
+            (epic_dir / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
             plan_file = root / "plan.json"
             plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
             code, _out, err = _cli_full(
@@ -1368,8 +1430,9 @@ class PlanApplyGateTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             _walk_intake(state, wdd)
-            (wdd / "tasks").mkdir(exist_ok=True)
-            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "tasks").mkdir(exist_ok=True)
+            (epic_dir / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
             plan_file = root / "plan.json"
             plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
             code, _out, err = _cli_full(
@@ -1388,8 +1451,9 @@ class PlanApprovalCompositeTest(unittest.TestCase):
         root, state = _ratified_repo(tmp)
         wdd = root / ".wdd"
         _walk_intake(state, wdd)
-        (wdd / "tasks").mkdir(exist_ok=True)
-        (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief v1.\n", encoding="utf-8")
+        epic_dir = wdd / "epics" / "demo"
+        (epic_dir / "tasks").mkdir(exist_ok=True)
+        (epic_dir / "tasks" / "T1.md").write_text("# T1\n\nBrief v1.\n", encoding="utf-8")
         return root, wdd, state
 
     def test_composite_is_recorded_on_approval(self) -> None:
@@ -1421,7 +1485,9 @@ class PlanApprovalCompositeTest(unittest.TestCase):
             # _diff_plan alone would call this "unchanged" -- the re-stamp
             # (same --approved-by, same plan file) is exactly how the
             # operator signs off on the edit and moves the composite.
-            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief v2, edited.\n", encoding="utf-8")
+            (wdd / "epics" / "demo" / "tasks" / "T1.md").write_text(
+                "# T1\n\nBrief v2, edited.\n", encoding="utf-8"
+            )
             code, out = _cli(
                 state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
                 "--approved-by", "t",
@@ -1513,11 +1579,13 @@ class PlanApprovalCompositeTest(unittest.TestCase):
         state)."""
         with tempfile.TemporaryDirectory() as tmp:
             root, wdd, _state = self._ready(tmp)
-            (wdd / "tasks" / "T2.md").write_text("# T2\n\nBrief.\n", encoding="utf-8")
+            (wdd / "epics" / "demo" / "tasks" / "T2.md").write_text(
+                "# T2\n\nBrief.\n", encoding="utf-8"
+            )
             plan_forward = _plan_document(["T1", "T2"])
             plan_reversed = _plan_document(["T2", "T1"])
-            composite_forward = plan_composite(plan_forward, wdd)
-            composite_reversed = plan_composite(plan_reversed, wdd)
+            composite_forward = plan_composite(plan_forward, wdd, epic="demo")
+            composite_reversed = plan_composite(plan_reversed, wdd, epic="demo")
             self.assertEqual(composite_forward, composite_reversed)
 
 
@@ -1531,8 +1599,9 @@ class PlanTaskHandoverFieldsTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             _walk_intake(state, wdd)
-            (wdd / "tasks").mkdir(exist_ok=True)
-            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "tasks").mkdir(exist_ok=True)
+            (epic_dir / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
             (wdd / "shared-context").mkdir(exist_ok=True)
             (wdd / "shared-context" / "notes.md").write_text("row\n", encoding="utf-8")
             plan = _plan_document(["T1"])
@@ -1556,8 +1625,9 @@ class PlanTaskHandoverFieldsTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             _walk_intake(state, wdd)
-            (wdd / "tasks").mkdir(exist_ok=True)
-            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            epic_dir = wdd / "epics" / "demo"
+            (epic_dir / "tasks").mkdir(exist_ok=True)
+            (epic_dir / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
             plan = _plan_document(["T1"])
             plan_file = root / "plan.json"
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
@@ -1681,7 +1751,7 @@ class ExecutionGateIntakeDriftTest(unittest.TestCase):
             wdd = root / ".wdd"
             _apply_ladder_and_plan(state, wdd, root)
 
-            (wdd / "spec.md").write_text(
+            (wdd / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
             )
             code, _out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
@@ -1695,7 +1765,7 @@ class ExecutionGateIntakeDriftTest(unittest.TestCase):
             wdd = root / ".wdd"
             _apply_ladder_and_plan(state, wdd, root)
 
-            (wdd / "spec.md").write_text(
+            (wdd / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
             )
             code, out = _cli(state, "next")
@@ -1712,7 +1782,7 @@ class ExecutionGateIntakeDriftTest(unittest.TestCase):
             wdd = root / ".wdd"
             _apply_ladder_and_plan(state, wdd, root)
 
-            (wdd / "spec.md").write_text(
+            (wdd / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
             )
             self.assertNotEqual(
@@ -1761,7 +1831,7 @@ class ExecutionGateIntakeDriftTest(unittest.TestCase):
             wdd = root / ".wdd"
             _apply_ladder_and_plan(state, wdd, root)
 
-            (wdd / "spec.md").write_text(
+            (wdd / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
             )
             self.assertNotEqual(
@@ -1822,7 +1892,9 @@ class ExecutionGatePlanDriftTest(unittest.TestCase):
             wdd = root / ".wdd"
             _apply_ladder_and_plan(state, wdd, root)
 
-            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief, edited.\n", encoding="utf-8")
+            (wdd / "epics" / "demo" / "tasks" / "T1.md").write_text(
+                "# T1\n\nBrief, edited.\n", encoding="utf-8"
+            )
             code, _out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
             self.assertNotEqual(code, 0)
             self.assertIn("plan drift", err)
@@ -1833,7 +1905,9 @@ class ExecutionGatePlanDriftTest(unittest.TestCase):
             wdd = root / ".wdd"
             _apply_ladder_and_plan(state, wdd, root)
 
-            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief, edited.\n", encoding="utf-8")
+            (wdd / "epics" / "demo" / "tasks" / "T1.md").write_text(
+                "# T1\n\nBrief, edited.\n", encoding="utf-8"
+            )
             code, out = _cli(state, "next")
             self.assertEqual(code, 0, out)
             result = json.loads(out)
@@ -1846,7 +1920,9 @@ class ExecutionGatePlanDriftTest(unittest.TestCase):
             wdd = root / ".wdd"
             _apply_ladder_and_plan(state, wdd, root)
 
-            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief, edited.\n", encoding="utf-8")
+            (wdd / "epics" / "demo" / "tasks" / "T1.md").write_text(
+                "# T1\n\nBrief, edited.\n", encoding="utf-8"
+            )
             self.assertNotEqual(
                 _cli(state, "start", "--task", "T1", "--repo", str(root))[0], 0
             )
@@ -1904,7 +1980,7 @@ class ExecutionGateFinalizeDriftTest(unittest.TestCase):
             root, state = _run_to_finalize(tmp)
             wdd = root / ".wdd"
 
-            (wdd / "spec.md").write_text(
+            (wdd / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
             )
             code, _out, err = _cli_full(
@@ -1919,7 +1995,7 @@ class ExecutionGateFinalizeDriftTest(unittest.TestCase):
             root, state = _run_to_finalize(tmp)
             wdd = root / ".wdd"
 
-            (wdd / "spec.md").write_text(
+            (wdd / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
             )
             code, out = _cli(state, "next", "--repo", str(root))
@@ -2106,13 +2182,14 @@ class CompositeHashesEffectivePlanTest(unittest.TestCase):
 
     def _first_apply_with_overrides(self, state: str, wdd: Path, root: Path) -> None:
         _walk_intake(state, wdd)
-        (wdd / "tasks").mkdir(exist_ok=True)
-        (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+        epic_dir = wdd / "epics" / "demo"
+        (epic_dir / "tasks").mkdir(exist_ok=True)
+        (epic_dir / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
         plan = {
             "schemaVersion": 1,
             "kind": "wdd_plan",
             "scope": {
-                "id": "SCOPE-x",
+                "id": "SCOPE-demo",
                 "baseRef": "wdd/scope-x",
                 "mergeSurface": "local",
                 "mergeMode": "controller",
@@ -2139,7 +2216,7 @@ class CompositeHashesEffectivePlanTest(unittest.TestCase):
             plan2 = {
                 "schemaVersion": 1,
                 "kind": "wdd_plan",
-                "scope": {"id": "SCOPE-x"},
+                "scope": {"id": "SCOPE-demo"},
                 "tasks": [{"id": "T1", "specPath": "tasks/T1.md", "title": "T1 renamed"}],
             }
             plan_file = root / "plan.json"
@@ -2169,7 +2246,7 @@ class CompositeHashesEffectivePlanTest(unittest.TestCase):
             plan2 = {
                 "schemaVersion": 1,
                 "kind": "wdd_plan",
-                "scope": {"id": "SCOPE-x"},
+                "scope": {"id": "SCOPE-demo"},
                 "tasks": [{"id": "T1", "specPath": "tasks/T1.md"}],
             }
             plan_file = root / "plan.json"
@@ -2200,7 +2277,7 @@ class CompositeHashesEffectivePlanTest(unittest.TestCase):
                 "schemaVersion": 1,
                 "kind": "wdd_plan",
                 "scope": {
-                    "id": "SCOPE-x",
+                    "id": "SCOPE-demo",
                     "mergeSurface": "local",
                     "mergeMode": "controller",
                 },
@@ -2237,7 +2314,7 @@ class BothDriftBlockerOrderTest(unittest.TestCase):
 
             # Intake/plan drift: edit the spec after the ladder + plan were
             # approved.
-            (wdd / "spec.md").write_text(
+            (wdd / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: changed",)), encoding="utf-8"
             )
             # Governance drift: constitution ratified against a config that
@@ -2363,7 +2440,9 @@ class FinalVerificationMultiCommandTest(unittest.TestCase):
             # A required list of two distinct commands so reordering is
             # observable: override the deliverable command via a fresh
             # design re-approval (only clears scope.approval), then re-stamp.
-            (root / ".wdd" / "design.md").write_text(_design_text(), encoding="utf-8")
+            (root / ".wdd" / "epics" / "demo" / "design.md").write_text(
+                _design_text(), encoding="utf-8"
+            )
             assert _cli(
                 state, "intake", "design", "--approved-by", "t",
                 "--deliverable-command", "echo deliverable",

@@ -1947,6 +1947,17 @@ class EpicScopeIdDerivationTest(unittest.TestCase):
             state, "intake", "design", "--approved-by", "t", "--deliverable-command", "true"
         )[0] == 0
 
+    def test_intake_rungs_refuse_without_an_active_epic(self) -> None:
+        # Task 4 review, Important: the ladder was walkable flat (no epic
+        # new), silently defeating the SCOPE-<slug> invariant. The rung
+        # verbs themselves must refuse and name the remedy.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            (root / ".wdd" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            code, _out, err = _cli_full(state, "intake", "spec", "--approved-by", "t")
+            self.assertNotEqual(code, 0)
+            self.assertIn("wddctl epic new", err)
+
     def test_plan_apply_rejects_a_scope_id_other_than_scope_dash_slug(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _epic_repo(tmp, "demo")
