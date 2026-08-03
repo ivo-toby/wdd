@@ -31,6 +31,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .config import derive_effective, effective_config_digest, load_layers, save_overlay
 from .engine import apply_mutation, utc_now
 from .errors import IllegalTransition, ValidationError
 from .paths import resolve_artifact
@@ -208,6 +209,104 @@ def _clear_scope_approval(state: dict[str, Any]) -> None:
         del state["scope"]["approval"]
 
 
+def _require_configured(state: dict[str, Any]) -> None:
+    """`agree_spec` refuses until `intake configure` is recorded (epic-
+    scoped-state plan Task 5, spec Sec2). Checked only by `record_spec`:
+    research/design already require spec first, so gating the first rung is
+    sufficient -- there is no path to research/design without spec.
+    """
+    if (state.get("intake") or {}).get("configure") is None:
+        raise IllegalTransition(
+            "intake spec requires the epic to be configured first; run 'wddctl "
+            "intake configure --approved-by NAME' (or --use-defaults --by NAME)"
+        )
+
+
+def record_configure(
+    store: Any,
+    wdd_dir: Path | str,
+    *,
+    approved_by: str | None = None,
+    use_defaults: bool = False,
+    by: str | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """`wddctl intake configure`: the configure step (spec Sec2), one legal
+    outcome per invocation:
+
+    - `--approved-by NAME`: approves the epic overlay AS CURRENTLY WRITTEN
+      (built up beforehand via `config set --epic`).
+    - `--use-defaults --by NAME`: the explicit decision to inherit
+      everything -- silence is not an option. Also WRITES the empty
+      overlay to disk (never leaves a stale, unapproved overlay behind).
+
+    Exactly one form is legal; the CLI enforces this by argument shape.
+    `sha256` is `effective_config_digest` of the DERIVED POST-MUTATION full
+    view: layers are resolved from disk exactly ONCE (resolve-once, spec
+    Sec2 "Commands that change the config they run under ... do not re-read
+    disk mid-command"), then `derive_effective` recomputes `effective` from
+    the retained global/defaults layers -- the same pure function `config
+    set --epic` already uses, never a second implementation. Re-recording
+    clears `scope.approval` ONLY -- spec/research/design do not depend on
+    config, so their records are untouched.
+    """
+    if (approved_by is not None) == bool(use_defaults):
+        raise ValidationError(
+            "intake configure requires exactly one of --approved-by NAME or "
+            "--use-defaults --by NAME"
+        )
+    if use_defaults:
+        if not isinstance(by, str) or not by:
+            raise ValidationError("--use-defaults requires --by NAME")
+        actor = by
+    else:
+        if not isinstance(approved_by, str) or not approved_by:
+            raise ValidationError("--approved-by requires a non-empty name")
+        actor = approved_by
+
+    wdd_dir = Path(wdd_dir)
+    state = store.read()
+    _require_ladder_legal(state)
+    epic = state.get("epic")
+
+    # Resolved exactly ONCE for this whole invocation (spec Sec2): every
+    # byte the recorded digest binds to comes from this single snapshot, not
+    # a second read taken inside the lock below.
+    layers = load_layers(wdd_dir, epic)
+    patch = {} if use_defaults else layers["overlay"]
+    derived = derive_effective(layers, patch)
+    sha256 = effective_config_digest(derived["effective"])
+
+    def mutator(current: dict[str, Any]) -> dict[str, Any]:
+        _require_ladder_legal(current)
+        if current.get("epic") != epic:
+            raise IllegalTransition(
+                "the active epic changed since this command began; re-run "
+                "'wddctl intake configure ...'"
+            )
+        updated = copied_state(current)
+        if use_defaults:
+            # The explicit decision to inherit everything is written to
+            # disk too -- never leaves a nonempty, unapproved overlay
+            # sitting behind an approval that claims defaults.
+            save_overlay(wdd_dir, epic, {})
+        updated["intake"] = dict(updated.get("intake") or {})
+        updated["intake"]["configure"] = {"by": actor, "at": utc_now(), "sha256": sha256}
+        _clear_scope_approval(updated)
+        return updated
+
+    return apply_mutation(
+        store,
+        event_type="intake.configured",
+        task_id=None,
+        data={},
+        idempotency_key=idempotency_key,
+        expected_revision=expected_revision,
+        mutator=mutator,
+    )
+
+
 def record_spec(
     store: Any,
     wdd_dir: Path | str,
@@ -225,6 +324,7 @@ def record_spec(
     # transition-mode `epic=None`, this is no longer path-independent of state.
     state = store.read()
     _require_ladder_legal(state)
+    _require_configured(state)
 
     def _snapshot(epic: str | None) -> tuple[int, str]:
         spec_path = resolve_within_wdd(wdd_dir, "spec.md", label="spec", epic=epic)
@@ -236,6 +336,7 @@ def record_spec(
 
     def mutator(current: dict[str, Any]) -> dict[str, Any]:
         _require_ladder_legal(current)
+        _require_configured(current)
         # Re-derived under the lock: an edit to spec.md between the pre-lock
         # read and now must not approve stale bytes -- an approval of text
         # that has since changed approves nothing.

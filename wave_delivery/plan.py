@@ -317,33 +317,36 @@ def apply_risk_rules(
     domain might cover the same file, the answer is "they overlap" — a task
     wrongly reviewed costs a review, a task wrongly unreviewed costs a merge.
 
-    A newly ratified riskRule can match a task that already left "todo".
-    Re-deriving its risk would make `_apply_plan_to_state`'s immutability
-    check refuse the (identical, otherwise-unrelated) re-apply of the plan
-    file forever after, since risk is a MUTABLE_TASK_FIELD only while a task
-    is still todo. When `state` is given, tasks it already tracks with a
-    non-todo status keep their stored risk instead of the freshly derived
-    one — derivation still applies in full to todo tasks and to tasks new
-    to the plan.
+    Epic-scoped-state plan Task 5 (spec Sec2 "Risk re-derivation covers
+    started tasks") supersedes the earlier v5 doctrine here: a plan re-stamp
+    now re-derives risk for EVERY task, not only ones still `todo` -- a
+    riskRule ratified (or an epic overlay re-approved) mid-scope must be
+    honored immediately, even for a task that already started. What stays
+    upward-only is per-task, not status-gated: once a task's risk has ever
+    been "high" (explicitly in the plan, matched by a rule, or already
+    stored in state from an earlier apply), it never drops back to "normal"
+    just because a rule was loosened or removed -- a risk *drop* never
+    removes an already-applicable requirement (matching the existing
+    explicit-high-never-lowered doctrine, extended across re-applies).
+    `_apply_plan_to_state` is the enforcement counterpart: it allows the
+    `risk` field alone to change on a non-todo task, exactly because this
+    function may now legitimately raise it there.
     """
     high_patterns = [
         rule["pattern"] for rule in config.get("riskRules", []) if rule["risk"] == "high"
     ]
-    if not high_patterns:
-        return plan_dict
     state_tasks = state["tasks"] if state is not None else {}
     tasks = []
     for entry in plan_dict["tasks"]:
-        existing = state_tasks.get(entry["id"])
-        if existing is not None and existing["status"] != "todo":
-            tasks.append({**entry, "risk": existing["risk"]})
-            continue
         derived = entry["risk"]
-        if derived != "high" and any(
+        if high_patterns and derived != "high" and any(
             domains_overlap(pattern, domain)
             for pattern in high_patterns
             for domain in entry["conflictDomains"]
         ):
+            derived = "high"
+        existing = state_tasks.get(entry["id"])
+        if existing is not None and existing.get("risk") == "high":
             derived = "high"
         tasks.append({**entry, "risk": derived})
     return {**plan_dict, "tasks": tasks}
@@ -470,12 +473,21 @@ def _apply_plan_to_state(state: dict[str, Any], plan: dict[str, Any]) -> dict[st
         changed = [field for field in MUTABLE_TASK_FIELDS if task.get(field) != entry[field]]
         if not changed:
             continue
-        if task["status"] != "todo":
+        # "risk" is exempt from the todo-only immutability rule below (epic-
+        # scoped-state plan Task 5, spec Sec2): apply_risk_rules now
+        # re-derives it for every task, including ones already started, so a
+        # legitimate risk change on a non-todo task must land here rather
+        # than refuse. Every OTHER mutable field is still frozen the moment
+        # a task leaves todo.
+        frozen_changed = [field for field in changed if field != "risk"]
+        if frozen_changed and task["status"] != "todo":
             raise IllegalTransition(
-                f"cannot change {', '.join(changed)} on {task_id}; it is {task['status']}, not todo"
+                f"cannot change {', '.join(frozen_changed)} on {task_id}; "
+                f"it is {task['status']}, not todo"
             )
         for field in MUTABLE_TASK_FIELDS:
-            task[field] = entry[field]
+            if field == "risk" or task["status"] == "todo":
+                task[field] = entry[field]
 
     scope = plan["scope"]
     if state["scope"]["baseRef"] and scope["baseRef"] != state["scope"]["baseRef"]:

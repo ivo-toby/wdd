@@ -473,18 +473,17 @@ def setup_next_actions(
     ):
         # The slug is born at the top of the ladder (Task 4, spec Sec1):
         # `create_epic` is emitted before any intake rung, right after
-        # ratify. The ladder is otherwise unchanged --
-        # create_epic -> configure -> agree_spec -> research -> agree_design
-        # -> plan -- but `configure_epic` (the middle step, spec Sec2) is
-        # Task 5's action slot, not wired here: this task only threads the
-        # ladder as far as create_epic -> agree_spec. The extra
-        # `intake.spec is None` guard keeps this rung 0 of the SAME
-        # first-unset-thing chain `_intake_ladder_action` walks below: once
-        # any ladder progress already exists (a scope that recorded spec
-        # without ever creating an epic -- unreachable through this ladder
-        # going forward, but a legal pre-Task-4 shape), there is nothing to
-        # gain by retroactively demanding epic creation; the ladder
-        # continues from wherever the recorded intake data says it is.
+        # ratify. The ladder is
+        # create_epic -> configure_epic -> agree_spec -> research ->
+        # agree_design -> plan; `configure_epic` (spec Sec2) is wired in the
+        # branch just below this one. The extra `intake.spec is None` guard
+        # keeps this rung 0 of the SAME first-unset-thing chain
+        # `_intake_ladder_action` walks below: once any ladder progress
+        # already exists (a scope that recorded spec without ever creating
+        # an epic -- unreachable through this ladder going forward, but a
+        # legal pre-Task-4 shape), there is nothing to gain by retroactively
+        # demanding epic creation; the ladder continues from wherever the
+        # recorded intake data says it is.
         actions.append(
             {
                 "task": "-",
@@ -495,6 +494,35 @@ def setup_next_actions(
                     "dash slug, and optionally a display title) per the wdd-intake "
                     "skill, then create the epic. Slugs are immutable -- there is "
                     "no rename verb; retiring one means archiving it."
+                ),
+            }
+        )
+    elif (
+        state.get("scope") is None
+        and state.get("epic") is not None
+        and (state.get("intake") or {}).get("legacy") is not True
+        and (state.get("intake") or {}).get("configure") is None
+    ):
+        # configure_epic (Task 5, spec Sec2): the middle step of the ladder,
+        # between create_epic and agree_spec. `record_spec` itself also
+        # refuses without a recorded `configure` (belt and braces -- this is
+        # only the surfaced NEXT-ACTION half of that gate).
+        actions.append(
+            {
+                "task": "-",
+                "action": "configure_epic",
+                "recordWith": (
+                    f"{prefix} intake configure --approved-by NAME "
+                    "(or --use-defaults --by NAME)"
+                ),
+                "judgment": (
+                    "walk the user through the epic-overridable keys in ONE compact "
+                    "round, in their own terms -- which merge surface, which models, "
+                    "what proves this epic works -- per wdd-intake, translating their "
+                    "answers into 'wddctl config set --epic PATH VALUE' calls (or none "
+                    "at all if they want every default), then record the decision "
+                    "with recordWith. Silence is not an option: an explicit "
+                    "--use-defaults is required to inherit everything."
                 ),
             }
         )

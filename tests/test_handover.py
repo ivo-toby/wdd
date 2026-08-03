@@ -358,12 +358,15 @@ def _design_text() -> str:
 
 
 def _walk_intake(state: str, wdd: Path, approver: str = "t") -> None:
-    """Canonical ladder walk: epic new -> spec -> research skip -> design.
-    Copied from tests/test_intake.py's helper of the same name. Task 4
-    (spec Sec1): the slug is born at the top of the ladder, so a real epic
-    ("demo") must exist before any rung verb is legal on a non-legacy scope
-    -- every rung artifact below lives under `epics/demo/`, not flat."""
+    """Canonical ladder walk: epic new -> configure -> spec -> research skip
+    -> design. Copied from tests/test_intake.py's helper of the same name.
+    Task 4 (spec Sec1): the slug is born at the top of the ladder, so a real
+    epic ("demo") must exist before any rung verb is legal on a non-legacy
+    scope -- every rung artifact below lives under `epics/demo/`, not flat.
+    Task 5 (spec Sec2): `agree_spec` additionally refuses until `intake
+    configure` is recorded -- every ladder walk now needs this step too."""
     assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+    assert _cli(state, "intake", "configure", "--use-defaults", "--by", approver)[0] == 0
     epic_dir = wdd / "epics" / "demo"
     (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
     assert _cli(state, "intake", "spec", "--approved-by", approver)[0] == 0
@@ -1725,9 +1728,21 @@ class DispatchTaskTest(unittest.TestCase):
             # Edit the registered runner's command bytes (still named
             # "test-runner"), then re-ratify so this isn't just governance
             # drift -- isolating the digest-mismatch refusal specifically.
+            # Task 5: the same global edit also stales `intake.configure`
+            # (its digest covers the whole effective view, spec Sec2) and,
+            # in turn, `scope.approval` once reconfigured -- walk that full
+            # remedy chain too so only the runner-digest refusal is left.
             edited_command = _runner_command() + ["--extra-flag"]
             _register_runner(state, "test-runner", edited_command)
             self.assertEqual(_cli(state, "constitution", "amend", "--by", "t2")[0], 0)
+            self.assertEqual(_cli(state, "intake", "configure", "--approved-by", "t2")[0], 0)
+            self.assertEqual(
+                _cli(
+                    state, "plan", "apply", "--plan", str(root / "plan.json"),
+                    "--repo", str(root), "--approved-by", "t2",
+                )[0],
+                0,
+            )
 
             code, out, err = _cli_full(
                 state, "dispatch", "--task", "T1", "--role", "worker", "--repo", str(root)

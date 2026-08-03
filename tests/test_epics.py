@@ -59,6 +59,12 @@ from wave_delivery.schema import (
 from wave_delivery.setup import create_epic, epic_orphans, setup_next_actions
 from wave_delivery.store import StateStore
 
+# Task 5 (configure gate, drift, evidence binding) additions live below the
+# Task 1-4 classes already in this file; they reuse the module-level helpers
+# above (_git_repo/_cli/_cli_full/_ratified_repo/_epic_repo/_spec_text/
+# _design_text) plus a few local-only ones of their own, per this file's
+# no-cross-file-imports convention.
+
 
 class ResolveArtifactNamespaceTest(unittest.TestCase):
     """Each lexical namespace maps to the right root (spec Sec1)."""
@@ -1468,9 +1474,14 @@ class MigrateEvidenceStampTest(unittest.TestCase):
                 migrated["finalize"]["review"]["configSha256"],
                 effective_config_digest(project(layers["effective"], "finalReview")),
             )
+            # Task 5: finalVerification's digest additionally covers the epic
+            # deliverable command (spec Sec2) -- None here, since this is a
+            # legacy scope with no recorded intake.design.
+            from wave_delivery.finalize import _final_verification_projection_digest
+
             self.assertEqual(
                 migrated["finalize"]["verification"]["configSha256"],
-                effective_config_digest(project(layers["effective"], "finalVerification")),
+                _final_verification_projection_digest(layers["effective"], None),
             )
             self.assertNotIn("resolvedRisk", migrated["finalize"]["review"])
 
@@ -1810,9 +1821,21 @@ class EpicNewLadderOrderTest(unittest.TestCase):
             self.assertEqual(action["action"], "create_epic")
             self.assertIn("epic new", action["command"])
 
-    def test_next_emits_agree_spec_immediately_after_epic_new(self) -> None:
+    def test_next_emits_configure_epic_immediately_after_epic_new(self) -> None:
+        # Task 5 (spec Sec2): configure_epic is the middle rung, between
+        # create_epic and agree_spec.
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _epic_repo(tmp)
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            action = json.loads(out)["actions"][0]
+            self.assertEqual(action["action"], "configure_epic")
+            self.assertIn("intake configure", action["recordWith"])
+
+    def test_next_emits_agree_spec_immediately_after_configure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp)
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             code, out = _cli(state, "next")
             self.assertEqual(code, 0, out)
             self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_spec")
@@ -1937,6 +1960,7 @@ class EpicScopeIdDerivationTest(unittest.TestCase):
     """Test contract: scope-id derivation + mismatch rejection."""
 
     def _walk_to_plan(self, state: str, epic_dir: Path) -> None:
+        assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
         (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
         assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
         assert _cli(
@@ -2021,6 +2045,7 @@ class EpicV6NoFlatFallbackRegressionTest(unittest.TestCase):
     def test_intake_spec_refuses_naming_the_epic_path_when_only_flat_spec_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _epic_repo(tmp, "demo")
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             wdd = root / ".wdd"
             # Only the flat decoy exists; epics/demo/spec.md does not -- the
             # verb must refuse rather than silently reading the flat file.
@@ -2051,6 +2076,7 @@ class EpicV6NoFlatFallbackRegressionTest(unittest.TestCase):
             self.assertNotEqual(code, 0)
 
     def _walk_and_plan(self, state: str, root: Path, epic_dir: Path) -> None:
+        assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
         (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
         assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
         assert _cli(
@@ -2127,6 +2153,10 @@ class EpicFullLadderAndPlanApplyE2ETest(unittest.TestCase):
             epic_dir = wdd / "epics" / "checkout-v2"
 
             code, out = _cli(state, "next")
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "configure_epic")
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
+
+            code, out = _cli(state, "next")
             self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_spec")
             (epic_dir / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: checkout completes",)), encoding="utf-8"
@@ -2181,6 +2211,434 @@ class EpicFullLadderAndPlanApplyE2ETest(unittest.TestCase):
             code, out = _cli(state, "next", "--repo", str(root))
             actions = [action["action"] for action in json.loads(out)["actions"]]
             self.assertIn("start_task", actions)
+
+
+# ---------------------------------------------------------------------------
+# Task 5: configure gate, drift, and evidence binding (spec Sec2).
+# ---------------------------------------------------------------------------
+
+
+def _epic_ladder_to_plan(
+    state: str,
+    wdd: Path,
+    root: Path,
+    *,
+    slug: str = "demo",
+    approver: str = "t",
+    task_domains: list[str] | None = None,
+    review_policy: str = "risk_based",
+) -> None:
+    """epic new -> configure (--use-defaults) -> spec/research-skip/design ->
+    a one-task, composite-approved plan apply. The Task 5 counterpart of
+    test_intake.py's `_apply_ladder_and_plan`, written locally per this
+    file's no-cross-file-imports convention. `task_domains` lets a caller
+    steer T1 into a riskRule's pattern for the risk re-derivation scenarios.
+    """
+    assert _cli(state, "epic", "new", "--slug", slug)[0] == 0
+    assert _cli(state, "intake", "configure", "--use-defaults", "--by", approver)[0] == 0
+    epic_dir = wdd / "epics" / slug
+    (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
+    assert _cli(state, "intake", "spec", "--approved-by", approver)[0] == 0
+    assert _cli(
+        state, "intake", "research", "--skip", "--by", approver, "--reason", "n/a"
+    )[0] == 0
+    (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
+    assert _cli(
+        state, "intake", "design", "--approved-by", approver, "--deliverable-command", "true"
+    )[0] == 0
+    (epic_dir / "tasks").mkdir(parents=True, exist_ok=True)
+    (epic_dir / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+    plan = {
+        "schemaVersion": 1,
+        "kind": "wdd_plan",
+        "scope": {
+            "id": f"SCOPE-{slug}",
+            "baseRef": f"wdd/{slug}",
+            "reviewPolicy": review_policy,
+        },
+        "tasks": [
+            {
+                "id": "T1",
+                "specPath": "tasks/T1.md",
+                "conflictDomains": task_domains or [],
+            }
+        ],
+    }
+    plan_file = root / "plan.json"
+    plan_file.write_text(json.dumps(plan), encoding="utf-8")
+    code, out = _cli(
+        state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+        "--approved-by", approver,
+    )
+    assert code == 0, out
+
+
+def _start_and_commit(state: str, root: Path, task_id: str = "T1", message: str = "do work") -> None:
+    code, out = _cli(state, "start", "--task", task_id, "--repo", str(root))
+    assert code == 0, out
+    worktree = Path(json.loads(out)["worktree"])
+    (worktree / "change.txt").write_text(f"{message}\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+         "-c", "commit.gpgsign=false", "commit", "-qm", message],
+        cwd=worktree, check=True,
+    )
+
+
+class IntakeConfigureVerbTest(unittest.TestCase):
+    """Test contract: the two legal `intake configure` forms, sha256 over the
+    derived post-mutation full view, and `agree_spec` refusing without it."""
+
+    def test_agree_spec_refuses_until_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp, "demo")
+            (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(
+                _spec_text(), encoding="utf-8"
+            )
+            code, out, err = _cli_full(state, "intake", "spec", "--approved-by", "t")
+            self.assertNotEqual(code, 0)
+            self.assertIn("intake configure", err)
+
+    def test_approved_by_records_digest_over_current_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp, "demo")
+            wdd = root / ".wdd"
+            assert _cli(state, "config", "set", "--epic", "merge.surface", "pr")[0] == 0
+            code, out = _cli(state, "intake", "configure", "--approved-by", "t")
+            self.assertEqual(code, 0, out)
+            recorded = StateStore(Path(state)).read()["intake"]["configure"]
+            self.assertEqual(recorded["by"], "t")
+            layers = load_layers(wdd, "demo")
+            self.assertEqual(recorded["sha256"], effective_config_digest(layers["effective"]))
+            # The overlay as written is what got approved, untouched by the
+            # approval itself.
+            self.assertEqual(load_overlay(wdd, "demo"), {"merge": {"surface": "pr"}})
+
+    def test_use_defaults_records_digest_over_empty_overlay_and_resets_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp, "demo")
+            wdd = root / ".wdd"
+            assert _cli(state, "config", "set", "--epic", "merge.surface", "pr")[0] == 0
+            code, out = _cli(state, "intake", "configure", "--use-defaults", "--by", "t")
+            self.assertEqual(code, 0, out)
+            # The explicit "inherit everything" decision resets the overlay
+            # on disk -- a nonempty, unapproved overlay must never sit behind
+            # an approval that claims defaults.
+            self.assertEqual(load_overlay(wdd, "demo"), {})
+            recorded = StateStore(Path(state)).read()["intake"]["configure"]
+            layers = load_layers(wdd, "demo")
+            derived = derive_effective(layers, {})
+            self.assertEqual(recorded["sha256"], effective_config_digest(derived["effective"]))
+
+    def test_exactly_one_form_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp, "demo")
+            code, _out, err = _cli_full(state, "intake", "configure")
+            self.assertNotEqual(code, 0)
+            self.assertIn("exactly one", err)
+            code, _out, err = _cli_full(
+                state, "intake", "configure", "--approved-by", "t", "--use-defaults", "--by", "t"
+            )
+            self.assertNotEqual(code, 0)
+            code, _out, err = _cli_full(state, "intake", "configure", "--use-defaults")
+            self.assertNotEqual(code, 0)
+            self.assertIn("--by", err)
+
+    def test_reconfigure_clears_scope_approval_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root)
+            before = StateStore(Path(state)).read()
+            self.assertIn("approval", before["scope"])
+            spec_before = before["intake"]["spec"]
+            design_before = before["intake"]["design"]
+
+            code, out = _cli(state, "intake", "configure", "--approved-by", "t2")
+            self.assertEqual(code, 0, out)
+            after = StateStore(Path(state)).read()
+            self.assertNotIn("approval", after["scope"])
+            self.assertEqual(after["intake"]["spec"], spec_before)
+            self.assertEqual(after["intake"]["design"], design_before)
+
+
+class EpicConfigDriftTest(unittest.TestCase):
+    """Test contract: overlay edit -> epic_config_drift blocker in `next`
+    (actions emptied) and chokepoint refusal for governed verbs; an edit to
+    an unrelated key stales nothing."""
+
+    def test_overlay_edit_after_configure_trips_drift_blocker_in_next(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root)
+            assert _cli(state, "config", "set", "--epic", "merge.surface", "pr")[0] == 0
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["actions"], [])
+            self.assertEqual(result["blockers"][0]["code"], "epic_config_drift")
+
+    def test_overlay_edit_after_configure_refuses_governed_verb(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root)
+            assert _cli(state, "config", "set", "--epic", "merge.surface", "pr")[0] == 0
+            code, _out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("epic config drift", err)
+            self.assertIn("intake configure", err)
+
+    def test_reapproving_configure_clears_the_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root)
+            assert _cli(state, "config", "set", "--epic", "merge.surface", "pr")[0] == 0
+            code, _out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            assert _cli(state, "intake", "configure", "--approved-by", "t")[0] == 0
+            # Re-recording configure clears scope.approval too (spec Sec2) --
+            # a plan re-stamp is required before any governed verb resumes.
+            code, _out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("plan drift", err)
+            assert _cli(
+                state, "plan", "apply", "--plan", str(root / "plan.json"), "--repo", str(root),
+                "--approved-by", "t",
+            )[0] == 0
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+    def test_unrelated_epic_overlay_key_edit_does_not_trip_review_evidence(self) -> None:
+        # Task 5, spec Sec2: "an edit to an unrelated key (models.planning)
+        # stales nothing" -- recorded task review evidence must survive an
+        # overlay edit to a projection-disjoint key once the drift itself is
+        # re-approved (models.planning is outside taskReview's projection).
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root, review_policy="always")
+            _start_and_commit(state, root)
+            assert _cli(state, "submit", "--task", "T1", "--repo", str(root))[0] == 0
+            assert _cli(
+                state, "review", "record", "--task", "T1", "--reviewer", "t", "--findings", "[]"
+            )[0] == 0
+            recorded_review = StateStore(Path(state)).read()["tasks"]["T1"]["review"]
+            self.assertIn("configSha256", recorded_review)
+
+            assert _cli(state, "config", "set", "--epic", "models.planning", '"gpt-x"')[0] == 0
+            assert _cli(state, "intake", "configure", "--approved-by", "t")[0] == 0
+            assert _cli(
+                state, "plan", "apply", "--plan", str(root / "plan.json"), "--repo", str(root),
+                "--approved-by", "t",
+            )[0] == 0
+
+            assert _cli(state, "verify", "record", "--task", "T1", "--status", "passed")[0] == 0
+            assert _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0] == 0
+            code, out = _cli(state, "merge", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+
+class ChokepointPrecedenceTest(unittest.TestCase):
+    """Test contract: precedence order pinned -- governance -> epic config
+    -> intake artifacts -> plan composite; one blocker at a time."""
+
+    def test_governance_drift_outranks_epic_config_drift_in_next(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root)
+            # A GLOBAL config edit changes the effective view intake.configure
+            # signed too (by construction, spec Sec2), so it trips governance
+            # drift AND epic config drift simultaneously.
+            assert _cli(state, "config", "set", "verification.commands", '["false"]')[0] == 0
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            result = json.loads(out)
+            self.assertEqual(result["blockers"][0]["code"], "governance_drift")
+
+    def test_governance_drift_outranks_epic_config_drift_at_chokepoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root)
+            assert _cli(state, "config", "set", "verification.commands", '["false"]')[0] == 0
+            code, _out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("governance drift", err)
+
+    def test_full_remedy_chain_in_precedence_order(self) -> None:
+        """Amend fixes governance; the epic-config gate then surfaces next
+        (still stale, since the effective view it signed changed too); a
+        reconfigure fixes that but clears scope.approval, so plan drift
+        surfaces last; a plan re-stamp finally clears everything."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root)
+            assert _cli(state, "config", "set", "verification.commands", '["false"]')[0] == 0
+
+            code, _out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("governance drift", err)
+
+            assert _cli(state, "constitution", "amend", "--by", "t")[0] == 0
+            code, _out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("epic config drift", err)
+
+            assert _cli(state, "intake", "configure", "--approved-by", "t")[0] == 0
+            code, _out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("plan drift", err)
+
+            assert _cli(
+                state, "plan", "apply", "--plan", str(root / "plan.json"), "--repo", str(root),
+                "--approved-by", "t",
+            )[0] == 0
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+
+class SolScenarioRegressionTest(unittest.TestCase):
+    """The three round-1 P1 scenarios from Sol's review, each pinned as a
+    named regression test (plan Task 5's Files/Test contract)."""
+
+    def test_scenario_a_global_config_change_needs_full_remedy_chain_to_resume(self) -> None:
+        """(a) global config change + amend + unchanged overlay cannot resume
+        execution without a plan re-stamp (amend clears scope.approval)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root)
+            self.assertIn("approval", StateStore(Path(state)).read()["scope"])
+
+            assert _cli(state, "config", "set", "verification.commands", '["false"]')[0] == 0
+            assert _cli(state, "constitution", "amend", "--by", "t")[0] == 0
+            # amend alone cleared scope.approval; the overlay is unchanged,
+            # but the effective view intake.configure signed still moved
+            # (the changed global config feeds it) -- neither a governed verb
+            # nor a bare re-approval of the SAME plan bytes may resume
+            # execution without walking BOTH remedies.
+            self.assertNotIn("approval", StateStore(Path(state)).read()["scope"])
+            code, _out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("epic config drift", err)
+
+            assert _cli(state, "intake", "configure", "--approved-by", "t")[0] == 0
+            code, _out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("plan drift", err)
+
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(root / "plan.json"), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+    def test_scenario_b_started_normal_risk_task_new_high_rule_merge_needs_review(self) -> None:
+        """(b) started normal-risk task + new high riskRule + configure/plan
+        re-approval -> merge refuses without review."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(
+                state, wdd, root, task_domains=["src/auth/**"], review_policy="risk_based"
+            )
+            self.assertEqual(StateStore(Path(state)).read()["tasks"]["T1"]["risk"], "normal")
+            _start_and_commit(state, root)
+            assert _cli(state, "submit", "--task", "T1", "--repo", str(root))[0] == 0
+            # risk_based + normal risk: no review required yet.
+            assert _cli(state, "verify", "record", "--task", "T1", "--status", "passed")[0] == 0
+            assert _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0] == 0
+            before = StateStore(Path(state)).read()["tasks"]["T1"]
+            self.assertEqual(before["status"], "merge_ready")
+            self.assertIsNone(before["review"])
+
+            # riskRules is an epic-overlay-allowed leaf (config.py's
+            # OVERLAY_ALLOWED_LEAVES); overriding it per-epic (rather than
+            # globally) keeps this scenario about the configure/plan re-
+            # approval chain alone, with no governance drift entangled.
+            assert _cli(
+                state, "config", "set", "--epic", "riskRules",
+                '[{"pattern": "src/auth/**", "risk": "high"}]',
+            )[0] == 0
+            assert _cli(state, "intake", "configure", "--approved-by", "t")[0] == 0
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(root / "plan.json"), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+            after = StateStore(Path(state)).read()["tasks"]["T1"]
+            self.assertEqual(after["risk"], "high")
+
+            code, _out, err = _cli_full(state, "merge", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("needs_review", err)
+
+            assert _cli(
+                state, "review", "record", "--task", "T1", "--reviewer", "t", "--findings", "[]"
+            )[0] == 0
+            code, out = _cli(state, "merge", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+    def test_scenario_c_stale_final_verification_config_projection_refuses_handoff(self) -> None:
+        """(c) verification evidence recorded under old verification.commands
+        + config change -> handoff refuses, evidence stale."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            bare = Path(tmp) / "origin.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+            subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True)
+            _epic_ladder_to_plan(state, wdd, root, review_policy="always")
+            _start_and_commit(state, root)
+            assert _cli(state, "submit", "--task", "T1", "--repo", str(root))[0] == 0
+            assert _cli(
+                state, "review", "record", "--task", "T1", "--reviewer", "t", "--findings", "[]"
+            )[0] == 0
+            assert _cli(state, "verify", "record", "--task", "T1", "--status", "passed")[0] == 0
+            assert _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0] == 0
+            assert _cli(state, "merge", "--task", "T1", "--repo", str(root))[0] == 0
+
+            assert _cli(
+                state, "finalize", "review", "record", "--reviewer", "t", "--findings", "[]",
+                "--repo", str(root),
+            )[0] == 0
+            results = json.dumps([{"command": "true", "status": "passed"}, {"command": "true", "status": "passed"}])
+            assert _cli(
+                state, "finalize", "verify", "record", "--results", results, "--repo", str(root)
+            )[0] == 0
+            final_verification = StateStore(Path(state)).read()["finalize"]["verification"]
+            self.assertIn("configSha256", final_verification)
+
+            # Handoff succeeds before any config change -- proves the later
+            # refusal is genuinely about staleness, not some other precondition.
+            code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            # A verification.commands change also trips governance drift
+            # (config.json is covered by governance_fingerprint wholesale);
+            # amend + a bare plan re-stamp clear THAT without re-proving the
+            # verification work itself -- isolating the config-projection
+            # staleness this scenario is actually about.
+            assert _cli(state, "config", "set", "verification.commands", '["true", "false"]')[0] == 0
+            assert _cli(state, "constitution", "amend", "--by", "t")[0] == 0
+            assert _cli(state, "intake", "configure", "--approved-by", "t")[0] == 0
+            assert _cli(
+                state, "plan", "apply", "--plan", str(root / "plan.json"), "--repo", str(root),
+                "--approved-by", "t",
+            )[0] == 0
+
+            code, _out, err = _cli_full(state, "finalize", "handoff", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("final verification evidence is stale", err)
+            self.assertIn("finalize verify record", err)
 
 
 if __name__ == "__main__":

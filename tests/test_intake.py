@@ -174,17 +174,19 @@ def _walk_intake(
     state: str, wdd: Path, approver: str = "t", *, deliverable_command: str = "true",
     slug: str = "demo",
 ) -> None:
-    """Canonical ladder walk (plan Task 2): epic new -> spec -> research skip
-    -> design.
+    """Canonical ladder walk (plan Task 2): epic new -> configure -> spec ->
+    research skip -> design.
 
     Added once per test file per the plan's convention; later phase-6a tasks
     in this same file reuse it to build init->ratify->(ladder) fixtures
     without repeating the raw CLI sequence. Task 4 (spec Sec1): the slug is
     born at the top of the ladder, so a real epic must exist before any rung
     verb is legal on a non-legacy scope -- every rung artifact below lives
-    under `epics/<slug>/`, not flat.
+    under `epics/<slug>/`, not flat. Task 5 (spec Sec2): `agree_spec`
+    additionally refuses until `intake configure` is recorded.
     """
     assert _cli(state, "epic", "new", "--slug", slug)[0] == 0
+    assert _cli(state, "intake", "configure", "--use-defaults", "--by", approver)[0] == 0
     epic_dir = wdd / "epics" / slug
     (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
     assert _cli(state, "intake", "spec", "--approved-by", approver)[0] == 0
@@ -620,6 +622,7 @@ class IntakeSpecVerbTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             epic_dir = wdd / "epics" / "demo"
             (epic_dir / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: a", "- [ ] AC-2: b", "- [ ] AC-3: c")),
@@ -638,6 +641,7 @@ class IntakeSpecVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             code, _out = _cli(state, "intake", "spec", "--approved-by", "t")
             self.assertNotEqual(code, 0)
 
@@ -645,6 +649,7 @@ class IntakeSpecVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text("   \n", encoding="utf-8")
             code, _out = _cli(state, "intake", "spec", "--approved-by", "t")
             self.assertNotEqual(code, 0)
@@ -653,6 +658,7 @@ class IntakeSpecVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(sections=("Goal", "In scope", "Acceptance criteria")),
                 encoding="utf-8",
@@ -664,6 +670,7 @@ class IntakeSpecVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: a", "- [ ] do the other thing")),
                 encoding="utf-8",
@@ -675,6 +682,7 @@ class IntakeSpecVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: a", "- [ ] AC-1: b")),
                 encoding="utf-8",
@@ -686,6 +694,7 @@ class IntakeSpecVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: a", "- [ ] AC-3: b")),
                 encoding="utf-8",
@@ -697,6 +706,7 @@ class IntakeSpecVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-2: a", "- [ ] AC-3: b")),
                 encoding="utf-8",
@@ -718,6 +728,7 @@ class IntakeSpecVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             code, _out = _cli(state, "intake", "spec", "--approved-by", "")
             self.assertNotEqual(code, 0)
@@ -769,6 +780,7 @@ class IntakeResearchVerbTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             epic_dir = wdd / "epics" / "demo"
             (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
@@ -792,6 +804,7 @@ class IntakeResearchVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, out = _cli(
@@ -806,6 +819,7 @@ class IntakeResearchVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, _out = _cli(state, "intake", "research", "--by", "t")
@@ -815,6 +829,7 @@ class IntakeResearchVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, _out = _cli(
@@ -834,6 +849,7 @@ class IntakeResearchVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, _out, err = _cli_full(
@@ -849,6 +865,7 @@ class IntakeResearchVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, _out, err = _cli_full(state, "intake", "research", "--done", "--by", "t")
@@ -859,6 +876,7 @@ class IntakeResearchVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, _out, err = _cli_full(state, "intake", "research", "--skip", "--by", "t")
@@ -869,6 +887,7 @@ class IntakeResearchVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             code, _out = _cli(
                 state, "intake", "research", "--skip", "--by", "t", "--reason", "no contracts"
             )
@@ -878,6 +897,7 @@ class IntakeResearchVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             (root / "outside.md").write_text("x\n", encoding="utf-8")
@@ -894,6 +914,7 @@ class IntakeResearchVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, _out = _cli(
@@ -907,6 +928,7 @@ class IntakeResearchVerbTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (wdd / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             (wdd / "shared-context").mkdir(exist_ok=True)
@@ -921,6 +943,7 @@ class IntakeResearchVerbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _ratified_repo(tmp)
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (root / ".wdd" / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             code, _out = _cli(state, "intake", "research", "--skip", "--by", "t", "--reason", "")
@@ -933,6 +956,7 @@ class IntakeDesignVerbTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             epic_dir = wdd / "epics" / "demo"
             (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
@@ -954,6 +978,7 @@ class IntakeDesignVerbTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             epic_dir = wdd / "epics" / "demo"
             (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
@@ -969,6 +994,7 @@ class IntakeDesignVerbTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             epic_dir = wdd / "epics" / "demo"
             (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
@@ -986,6 +1012,7 @@ class IntakeDesignVerbTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             epic_dir = wdd / "epics" / "demo"
             (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
@@ -1000,6 +1027,7 @@ class IntakeDesignVerbTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             epic_dir = wdd / "epics" / "demo"
             (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
@@ -1016,6 +1044,7 @@ class IntakeDesignVerbTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             epic_dir = wdd / "epics" / "demo"
             (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
@@ -1161,6 +1190,7 @@ class IntakeDriftTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (wdd / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             (wdd / "shared-context").mkdir(exist_ok=True)
@@ -1180,6 +1210,7 @@ class IntakeDriftTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (wdd / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             (wdd / "shared-context").mkdir(exist_ok=True)
@@ -1228,6 +1259,7 @@ class IntakeStatusTest(unittest.TestCase):
             wdd = root / ".wdd"
             self.assertEqual(intake_status(StateStore(Path(state)).read())["nextRung"], "spec")
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             epic_dir = wdd / "epics" / "demo"
             (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
@@ -1263,6 +1295,7 @@ class IntakeFunctionLevelRefusalTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             (wdd / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
             store = StateStore(Path(state))
@@ -1278,6 +1311,7 @@ class IntakeFunctionLevelRefusalTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             epic_dir = wdd / "epics" / "demo"
             (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
@@ -1309,6 +1343,7 @@ class SetupLadderNextTest(unittest.TestCase):
             action = json.loads(out)["actions"][0]
             self.assertEqual(action["action"], "create_epic")
             assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             epic_dir = wdd / "epics" / "demo"
 
             code, out = _cli(state, "next")
@@ -2789,6 +2824,11 @@ class FullLifecycleE2ETest(unittest.TestCase):
 
             code, out = _cli(state, "next")
             self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "configure_epic")
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
+
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
             self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_spec")
 
             # --- ladder rung 1: spec approve ---------------------------------
@@ -2931,6 +2971,10 @@ class FullLifecycleE2ETest(unittest.TestCase):
             self.assertEqual(code, 0, out)
             self.assertEqual(json.loads(out)["actions"][0]["action"], "create_epic")
             assert _cli(state, "epic", "new", "--slug", "demo-2")[0] == 0
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "configure_epic")
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
             code, out = _cli(state, "next")
             self.assertEqual(code, 0, out)
             self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_spec")

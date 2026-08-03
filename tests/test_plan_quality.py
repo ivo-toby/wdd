@@ -76,11 +76,14 @@ class RiskRulesTest(unittest.TestCase):
         out = apply_risk_rules(plan, self._config([{"pattern": "**", "risk": "high"}]))
         self.assertEqual(out["tasks"][0]["risk"], "normal")
 
-    def test_non_todo_task_keeps_stored_risk_on_new_matching_rule(self) -> None:
-        # A riskRule ratified mid-scope must not re-derive risk for a task
-        # that already left "todo" — that field becomes immutable the moment
-        # a task starts, so re-deriving it would make every later re-apply of
-        # the same plan file refuse forever (the exact bug this guards).
+    def test_non_todo_task_risk_rises_on_new_matching_rule(self) -> None:
+        # Epic-scoped-state plan Task 5 (spec Sec2 "Risk re-derivation covers
+        # started tasks") supersedes the earlier v5 doctrine pinned here: a
+        # riskRule ratified mid-scope now DOES re-derive risk for a task that
+        # already left "todo" -- risk raises are honored immediately, even
+        # for started tasks. `_apply_plan_to_state`'s immutability check was
+        # updated in lockstep to exempt the `risk` field alone from the
+        # todo-only freeze, so this no longer collides with re-apply.
         plan = _plan([
             _task("T1", domains=["src/auth/token.py"]),
             _task("T2", domains=["src/auth/session.py"]),
@@ -95,8 +98,17 @@ class RiskRulesTest(unittest.TestCase):
             plan, self._config([{"pattern": "src/auth/**", "risk": "high"}]), state
         )
         by_id = {entry["id"]: entry for entry in out["tasks"]}
-        self.assertEqual(by_id["T1"]["risk"], "normal")
+        self.assertEqual(by_id["T1"]["risk"], "high")
         self.assertEqual(by_id["T2"]["risk"], "high")
+
+    def test_non_todo_task_risk_never_drops_once_high(self) -> None:
+        # Upward-only at execution (spec Sec2): a risk *drop* never removes
+        # an already-applicable requirement, even across re-applies where the
+        # matching rule was since loosened or removed entirely.
+        plan = _plan([_task("T1", domains=["docs/readme.md"])])
+        state = {"tasks": {"T1": {"status": "in_progress", "risk": "high"}}}
+        out = apply_risk_rules(plan, self._config([]), state)
+        self.assertEqual(out["tasks"][0]["risk"], "high")
 
 
 def _codes(findings: list[dict]) -> set[str]:
@@ -217,11 +229,14 @@ def _mark_legacy(state: str) -> None:
 
 
 def _walk_intake(state: str, wdd: Path, approver: str = "t") -> None:
-    """Canonical ladder walk (plan Task 2/3): epic new -> spec -> research
-    skip -> design. Task 4 (spec Sec1): the slug is born at the top of the
-    ladder, so a real epic ("demo") must exist before any rung verb is legal
-    on a non-legacy scope -- every rung artifact lives under `epics/demo/`."""
+    """Canonical ladder walk (plan Task 2/3): epic new -> configure -> spec
+    -> research skip -> design. Task 4 (spec Sec1): the slug is born at the
+    top of the ladder, so a real epic ("demo") must exist before any rung
+    verb is legal on a non-legacy scope -- every rung artifact lives under
+    `epics/demo/`. Task 5 (spec Sec2): `agree_spec` additionally refuses
+    until `intake configure` is recorded."""
     assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+    assert _cli(state, "intake", "configure", "--use-defaults", "--by", approver)[0] == 0
     epic_dir = wdd / "epics" / "demo"
     (epic_dir / "spec.md").write_text(
         "# Spec\n\n## Goal\n\nShip it.\n\n## In scope\n\n- x\n\n"
@@ -579,7 +594,7 @@ class ConfigOverlayEndToEndTest(unittest.TestCase):
 
 
 class MidScopeRiskRuleReapplyTest(unittest.TestCase):
-    def test_started_task_survives_new_matching_risk_rule_on_reapply(self) -> None:
+    def test_started_task_risk_rises_on_new_matching_risk_rule_on_reapply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _git_repo(tmp)
             wdd = root / ".wdd"
@@ -618,22 +633,25 @@ class MidScopeRiskRuleReapplyTest(unittest.TestCase):
             self.assertEqual(code, 0)
 
             # Re-applying the identical plan file must not refuse: T1 is
-            # in_progress and the new rule now matches its domain, but its
-            # stored risk ("normal") must be left alone.
+            # in_progress and the new rule now matches its domain. Epic-
+            # scoped-state plan Task 5 (spec Sec2) supersedes the earlier v5
+            # doctrine pinned here -- risk raises are honored immediately,
+            # even for a task that already started, so T1's risk rises to
+            # "high" rather than being grandfathered at "normal".
             code, out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
             self.assertEqual(code, 0, out)
             after = StateStore(wdd / "state.json").read()
-            self.assertEqual(after["tasks"]["T1"]["risk"], "normal")
+            self.assertEqual(after["tasks"]["T1"]["risk"], "high")
 
             # Adding a brand-new task to the same plan file must re-apply
-            # cleanly, with the new task's risk derived (high) since it was
-            # never in the "todo → started" path T1 went through.
+            # cleanly, with the new task's risk derived (high); T1's risk
+            # stays high (upward-only) rather than reverting.
             plan["tasks"].append(_task("T2", domains=["src/auth/session.py"]))
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
             code, out = _cli(state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root))
             self.assertEqual(code, 0, out)
             after = StateStore(wdd / "state.json").read()
-            self.assertEqual(after["tasks"]["T1"]["risk"], "normal")
+            self.assertEqual(after["tasks"]["T1"]["risk"], "high")
             self.assertEqual(after["tasks"]["T2"]["risk"], "high")
 
 

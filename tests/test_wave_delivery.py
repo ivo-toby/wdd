@@ -1848,6 +1848,10 @@ class CliTests(BaseTest):
         self.assertEqual(run("epic", "new", "--slug", "demo"), 0)
         epic_dir = wdd / "epics" / "demo"
 
+        # Task 5: agree_spec refuses until the epic is configured first
+        # (spec Sec2).
+        self.assertEqual(run("intake", "configure", "--use-defaults", "--by", "tester"), 0)
+
         (epic_dir / "spec.md").write_text(
             "# Spec\n\n## Goal\n\nShip it.\n\n## In scope\n\n- x\n\n"
             "## Out of scope\n\n- y\n\n## Acceptance criteria\n\n"

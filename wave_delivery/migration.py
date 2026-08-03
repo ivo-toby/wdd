@@ -37,6 +37,7 @@ from .config import (
     project,
 )
 from .errors import ValidationError
+from .finalize import _final_verification_projection_digest
 from .handover import _sanitize_task_id_for_filename
 from .schema import SCHEMA_VERSION, EPIC_SLUG_PATTERN, validate_state
 from .store import StateStore, atomic_write_text
@@ -450,8 +451,17 @@ def convert_v5_to_v6(state: dict[str, Any], *, wdd_dir: Path | str) -> dict[str,
             final_review["configSha256"] = effective_config_digest(project(effective, "finalReview"))
         final_verification = finalize.get("verification")
         if isinstance(final_verification, dict):
-            final_verification["configSha256"] = effective_config_digest(
-                project(effective, "finalVerification")
+            # Deliverable-command-inclusive digest (Task 5, spec Sec2:
+            # "verification.*, plus the deliverable command for final") --
+            # `_final_verification_projection_digest` is the ONE
+            # implementation finalize.py's evidence recording/gates also use,
+            # imported here rather than reimplemented (config.project() has
+            # no state access, so it cannot fold this in itself).
+            deliverable_command = ((migrated.get("intake") or {}).get("design") or {}).get(
+                "deliverableCommand"
+            )
+            final_verification["configSha256"] = _final_verification_projection_digest(
+                effective, deliverable_command
             )
 
     validate_state(migrated)

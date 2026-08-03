@@ -32,7 +32,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .config import config_path, load_config, merge_settings
+from .config import config_path, effective_config_digest, load_config, merge_settings, project
 from .engine import apply_mutation, utc_now
 from .errors import IllegalTransition, ValidationError
 from .git import is_ancestor, require_repository, resolve_ref, run_git
@@ -62,6 +62,61 @@ def _sanitize_scope_id_for_filename(scope_id: str) -> str:
             f"scope id sanitizes to an empty archive filename: {scope_id!r}"
         )
     return sanitized
+
+
+def _final_review_model(effective: dict[str, Any]) -> str | None:
+    """The model finalize review's evidence binds to (spec Sec2: "final
+    review records its selected model"). No per-task risk tier exists at
+    scope granularity, so unlike task review this does not tier by risk --
+    matching `finalize_next_actions`'s existing (pre-Task-5) model-decoration
+    behavior exactly: `models.review` is used only when it is a plain,
+    non-empty string; a tiered object form yields no model at either site.
+    """
+    review_model = (effective.get("models") or {}).get("review")
+    return review_model if isinstance(review_model, str) and review_model else None
+
+
+def _final_review_evidence_binding(layers: dict[str, Any] | None) -> dict[str, Any]:
+    if layers is None:
+        return {}
+    effective = layers["effective"]
+    return {
+        "reviewModel": _final_review_model(effective),
+        "configSha256": effective_config_digest(project(effective, "finalReview")),
+    }
+
+
+def _final_verification_projection_digest(
+    effective: dict[str, Any], deliverable_command: str | None
+) -> str:
+    """finalVerification's projection digest additionally covers the epic
+    deliverable command (spec Sec2: "verification.*, plus the deliverable
+    command for final"). `config.project()` has no access to state, so it
+    cannot include this itself (see its own docstring, which explicitly
+    defers this to Task 5/finalize.py). Folds the command in as an extra key
+    alongside the projection before hashing with the same
+    `effective_config_digest` -- still the one fingerprint implementation,
+    just fed a slightly larger view for this one purpose. `migration.py`'s
+    v5->v6 stamp uses this same helper so the migration-time digest and a
+    freshly recomputed one are never two different implementations.
+    """
+    projection = project(effective, "finalVerification")
+    return effective_config_digest({**projection, "deliverableCommand": deliverable_command})
+
+
+def _final_verification_evidence_binding(
+    layers: dict[str, Any] | None, state: dict[str, Any]
+) -> dict[str, Any]:
+    if layers is None:
+        return {}
+    deliverable_command = ((state.get("intake") or {}).get("design") or {}).get(
+        "deliverableCommand"
+    )
+    return {
+        "configSha256": _final_verification_projection_digest(
+            layers["effective"], deliverable_command
+        ),
+    }
 
 
 def _require_finalize_phase(state: dict[str, Any]) -> None:
@@ -154,7 +209,16 @@ def _require_target_branch(wdd_dir: Path) -> tuple[str, dict[str, Any]]:
     return config["branching"]["targetBranch"], config
 
 
-def _blocking_severities(wdd_dir: Path) -> set[str]:
+def _blocking_severities(wdd_dir: Path, effective: dict[str, Any] | None = None) -> set[str]:
+    """`review.blockingSeverities`. `effective`, when given, is an already-
+    resolved admission snapshot's merged view (spec Sec2 resolve-once) --
+    this key is NOT epic-overlay-allowed (config.py's OVERLAY_ALLOWED_LEAVES),
+    so passing it only avoids a second config.json read within the same
+    command, not a missed override. Callers with no snapshot (`next`'s
+    read-only rendering) still get a fresh global read.
+    """
+    if effective is not None:
+        return set(effective["review"]["blockingSeverities"])
     if not config_path(wdd_dir).exists():
         return {"P1", "P2"}
     return set(load_config(wdd_dir)["review"]["blockingSeverities"])
@@ -170,6 +234,7 @@ def record_final_review(
     findings: list[dict[str, Any]],
     reviewer: str,
     repo: Path | str,
+    layers: dict[str, Any] | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
@@ -183,7 +248,7 @@ def record_final_review(
         raise ValidationError("reviewer must be a non-empty string")
     validated = validate_findings(findings)
     repo_path = require_repository(repo)
-    blocking = _blocking_severities(store.path.parent)
+    blocking = _blocking_severities(store.path.parent, layers["effective"] if layers else None)
 
     # Fail fast, before any (currently cheap, but not guaranteed to stay so)
     # work below runs -- mirrors the pre-lock check prepare_handoff and
@@ -205,6 +270,7 @@ def record_final_review(
             "findings": validated,
             "reviewer": reviewer,
             "at": utc_now(),
+            **_final_review_evidence_binding(layers),
         }
         return updated
 
@@ -223,14 +289,31 @@ def _is_legacy_intake(state: dict[str, Any]) -> bool:
     return (state.get("intake") or {}).get("legacy") is True
 
 
-def _required_verification_commands(state: dict[str, Any], wdd_dir: Path) -> list[str]:
+def _required_verification_commands(
+    state: dict[str, Any], wdd_dir: Path, effective: dict[str, Any] | None = None
+) -> list[str]:
     """The v5 non-legacy required command list, in order (spec Sec2/Sec5):
-    the ratified global ``verification.commands`` then the scope's epic
+    the epic-effective ``verification.commands`` then the scope's epic
     deliverable command (``intake.design.deliverableCommand`` -- always
     present on a v5 non-legacy scope that reached finalize, since the intake
     ladder must be complete before `plan apply` and the ladder never clears
-    without re-recording design)."""
-    commands = list(load_config(wdd_dir)["verification"]["commands"]) if config_path(wdd_dir).exists() else []
+    without re-recording design).
+
+    ``verification.commands`` IS epic-overlay-allowed (config.py's
+    OVERLAY_ALLOWED_LEAVES): `effective`, when given, is an already-resolved
+    admission snapshot's merged view (spec Sec2 resolve-once) and MUST be
+    consulted instead of the bare global config, or an epic's own override
+    would be silently ignored here while still feeding the
+    finalVerification digest this same evidence recording stamps. Callers
+    with no snapshot (`next`'s read-only rendering) fall back to a fresh
+    global-only read, matching this function's behavior before Task 5.
+    """
+    if effective is not None:
+        commands = list(effective["verification"]["commands"])
+    elif config_path(wdd_dir).exists():
+        commands = list(load_config(wdd_dir)["verification"]["commands"])
+    else:
+        commands = []
     design = (state.get("intake") or {}).get("design") or {}
     deliverable = design.get("deliverableCommand")
     if deliverable:
@@ -328,6 +411,7 @@ def record_final_verification(
     justification: str | None = None,
     results: list[dict[str, Any]] | None = None,
     repo: Path | str,
+    layers: dict[str, Any] | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
@@ -361,8 +445,19 @@ def record_final_verification(
         if status not in {"passed", "failed", "unavailable"}:
             raise ValidationError("verification status must be passed, failed, or unavailable")
         if status == "unavailable":
-            if not justification and config_path(wdd_dir).exists():
-                justification = load_config(wdd_dir)["verification"].get("unavailableJustification")
+            if not justification:
+                # verification.unavailableJustification IS epic-overlay-
+                # allowed: prefer the already-resolved admission snapshot
+                # (spec Sec2 resolve-once) over a second, non-epic-aware
+                # config.json read.
+                if layers is not None:
+                    justification = layers["effective"]["verification"].get(
+                        "unavailableJustification"
+                    )
+                elif config_path(wdd_dir).exists():
+                    justification = load_config(wdd_dir)["verification"].get(
+                        "unavailableJustification"
+                    )
             if not justification:
                 raise ValidationError(
                     "verification status 'unavailable' requires --justification (or a "
@@ -383,7 +478,10 @@ def record_final_verification(
         # Validated pre-lock so a bad --results refuses before any side effects;
         # re-validated inside the mutator below against the locked state, same
         # two-stage pattern as every other finalize verb in this module.
-        _validate_verification_results(results, _required_verification_commands(state, wdd_dir))
+        _validate_verification_results(
+            results,
+            _required_verification_commands(state, wdd_dir, layers["effective"] if layers else None),
+        )
 
     repo_path = require_repository(repo)
 
@@ -398,6 +496,7 @@ def record_final_verification(
         base_sha = resolve_ref(repo_path, _base_ref(state))
         updated = copied_state(state)
         updated.setdefault("finalize", {})
+        binding = _final_verification_evidence_binding(layers, state)
         if legacy:
             updated["finalize"]["verification"] = {
                 "headSha": base_sha,
@@ -405,16 +504,21 @@ def record_final_verification(
                 "command": command,
                 "justification": justification,
                 "at": utc_now(),
+                **binding,
             }
         else:
             entries = _validate_verification_results(
-                results, _required_verification_commands(state, wdd_dir)
+                results,
+                _required_verification_commands(
+                    state, wdd_dir, layers["effective"] if layers else None
+                ),
             )
             updated["finalize"]["verification"] = {
                 "headSha": base_sha,
                 "commands": entries,
                 "status": _overall_verification_status(entries),
                 "at": utc_now(),
+                **binding,
             }
         return updated
 
@@ -447,7 +551,9 @@ def _handoff_summary(state: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _require_current_finalize_evidence(state: dict[str, Any], base_sha: str) -> None:
+def _require_current_finalize_evidence(
+    state: dict[str, Any], base_sha: str, layers: dict[str, Any] | None = None
+) -> None:
     """Handoff's precondition: clean review + passed verification, both fresh.
 
     Named after what to redo, not just that evidence is missing or stale --
@@ -456,6 +562,13 @@ def _require_current_finalize_evidence(state: dict[str, Any], base_sha: str) -> 
     `finalize verify record` refuses the legacy `--status/--command`
     invocation outright (it wants `--results`), so naming the wrong contract
     here would send the operator down a dead end.
+
+    `layers`, when given, additionally re-derives the finalReview/
+    finalVerification config projections (+ finalReview's bound model) and
+    refuses if either no longer matches what the recorded evidence bound to
+    (spec Sec2, epic-scoped-state plan Task 5): a config edit after the
+    review/verification ran stales it exactly like a moved headSha does,
+    even though headSha itself did not move.
     """
     legacy = _is_legacy_intake(state)
     verify_hint = (
@@ -463,18 +576,17 @@ def _require_current_finalize_evidence(state: dict[str, Any], base_sha: str) -> 
         if legacy
         else "wddctl finalize verify record --results '[{\"command\":...,\"status\":...}, ...]' --repo ."
     )
+    review_hint = "wddctl finalize review record --reviewer NAME --findings '[]' --repo ."
     finalize = state.get("finalize") or {}
     review = finalize.get("review")
     if not isinstance(review, dict) or review.get("outcome") != "passed":
         raise IllegalTransition(
-            "handoff requires a clean final review; run 'wddctl finalize review record "
-            "--reviewer NAME --findings [] --repo .'"
+            f"handoff requires a clean final review; run '{review_hint}'"
         )
     if review.get("headSha") != base_sha:
         raise IllegalTransition(
             f"final review evidence is stale (pinned to {review.get('headSha')}, base is now "
-            f"at {base_sha}); re-run 'wddctl finalize review record --reviewer NAME "
-            "--findings [] --repo .'"
+            f"at {base_sha}); re-run '{review_hint}'"
         )
     verification = finalize.get("verification")
     if not isinstance(verification, dict) or verification.get("status") != "passed":
@@ -484,12 +596,36 @@ def _require_current_finalize_evidence(state: dict[str, Any], base_sha: str) -> 
             f"final verification evidence is stale (pinned to {verification.get('headSha')}, "
             f"base is now at {base_sha}); re-run '{verify_hint}'"
         )
+    if layers is not None:
+        expected_review = _final_review_evidence_binding(layers)
+        if "reviewModel" in review and review.get("reviewModel") != expected_review["reviewModel"]:
+            raise IllegalTransition(
+                f"final review evidence is stale (recorded reviewModel "
+                f"{review.get('reviewModel')!r} no longer matches the currently resolved "
+                f"{expected_review['reviewModel']!r}); re-run '{review_hint}'"
+            )
+        if "configSha256" in review and review.get("configSha256") != expected_review["configSha256"]:
+            raise IllegalTransition(
+                "final review evidence is stale (its config projection no longer matches "
+                f"the current config); re-run '{review_hint}'"
+            )
+        expected_verification = _final_verification_evidence_binding(layers, state)
+        if (
+            "configSha256" in verification
+            and verification.get("configSha256") != expected_verification["configSha256"]
+        ):
+            raise IllegalTransition(
+                "final verification evidence is stale (its config projection -- including "
+                f"the epic deliverable command -- no longer matches the current config); "
+                f"re-run '{verify_hint}'"
+            )
 
 
 def prepare_handoff(
     store: StateStore,
     *,
     repo: Path | str,
+    layers: dict[str, Any] | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
@@ -517,7 +653,7 @@ def prepare_handoff(
     # with no merged work hits, not something masked by a missing-evidence
     # message that would send the operator down the wrong path.
     _require_something_to_deliver(repo_path, base_sha, target_branch)
-    _require_current_finalize_evidence(state, base_sha)
+    _require_current_finalize_evidence(state, base_sha, layers)
     surface = merge_settings(state, config)["surface"]
 
     pr_url: str | None = None
@@ -558,7 +694,7 @@ def prepare_handoff(
                 f"{current_base_sha}); re-run 'wddctl finalize handoff --repo .'"
             )
         _require_something_to_deliver(repo_path, base_sha, target_branch)
-        _require_current_finalize_evidence(current, base_sha)
+        _require_current_finalize_evidence(current, base_sha, layers)
         updated = copied_state(current)
         updated.setdefault("finalize", {})
         updated["finalize"]["handoff"] = {

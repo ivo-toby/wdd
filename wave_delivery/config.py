@@ -718,6 +718,57 @@ def effective_config_digest(view: dict[str, Any]) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def epic_config_drift(state: dict[str, Any], wdd_dir: Path | str) -> dict[str, Any] | None:
+    """Detect an epic overlay (or the global config it layers over) edited
+    since `intake.configure` was approved (epic-scoped-state plan Task 5,
+    spec Sec2: "Editing the overlay mid-epic surfaces an epic_config_drift
+    blocker"). Mirrors `governance_drift`'s shape and no-op cases: None when
+    there is nothing to drift from -- a wholesale-legacy scope (exempt from
+    the whole intake ladder, `intake.legacy`), a scope whose `configure` used
+    migration's exemption stamp (no human approval to invalidate -- drift
+    from here on is guarded ordinarily, by a REAL `intake configure` once one
+    is recorded), or a scope that has not recorded `configure` at all yet
+    (nothing approved to compare against; this happens during setup, before
+    any governed verb -- the only caller of `require_fresh_epic_config` --
+    could possibly run).
+
+    The digest recomputed here covers the FULL effective view (matching what
+    `intake configure` itself signs), not a purpose projection: this is a
+    governance-style approval of "everything", the same doctrine as
+    `governance_fingerprint`, not evidence-binding's narrower per-purpose
+    comparison.
+    """
+    intake = state.get("intake") or {}
+    if intake.get("legacy") is True:
+        return None
+    configure = intake.get("configure")
+    if not isinstance(configure, dict) or configure.get("legacy") is True:
+        return None
+    recorded = configure.get("sha256")
+    layers = load_layers(wdd_dir, state.get("epic"))
+    actual = effective_config_digest(layers["effective"])
+    if recorded == actual:
+        return None
+    return {"recorded": recorded, "actual": actual}
+
+
+def require_fresh_epic_config(state: dict[str, Any], wdd_dir: Path | str) -> None:
+    """Chokepoint gate (epic-scoped-state plan Task 5): refuse every governed
+    verb once the epic config drifted from what `intake configure` approved.
+    Sits between `require_fresh_governance` and `require_fresh_intake` at the
+    CLI chokepoint (spec Sec2's precedence: governance -> epic config ->
+    intake artifacts -> plan composite).
+    """
+    drift = epic_config_drift(state, wdd_dir)
+    if drift is not None:
+        raise IllegalTransition(
+            "epic config drift: the epic overlay (or the global config it layers "
+            f"over) changed since intake.configure was approved (recorded "
+            f"{drift['recorded']}, current {drift['actual']}); run 'wddctl intake "
+            "configure --approved-by NAME' (or --use-defaults --by NAME) to re-approve"
+        )
+
+
 def project(view: dict[str, Any], purpose: str) -> dict[str, Any]:
     """The named key-subset projections (spec Sec2). Feed the result to
     `effective_config_digest` for a purpose-projected digest -- the same

@@ -18,12 +18,14 @@ from .config import (
     check_ratifiable,
     config_path,
     derive_effective,
+    epic_config_drift,
     get_value,
     governance_drift,
     governance_fingerprint,
     load_config,
     load_layers,
     merge_settings,
+    require_fresh_epic_config,
     require_fresh_governance,
     resolve_config_source,
     save_config,
@@ -66,6 +68,7 @@ from .github import comment_pr, create_pr, push_branch
 from .handover import inputs_status, materialize_attempt, record_attempt, rebind_attempt
 from .intake import (
     intake_status,
+    record_configure,
     record_design,
     record_research,
     record_spec,
@@ -459,6 +462,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_concurrency_flags(intake_design)
 
+    intake_configure = intake_subparsers.add_parser(
+        "configure",
+        help="approve the epic overlay (or explicitly inherit every default) -- "
+        "the configure step, spec Sec2; required before 'intake spec'",
+    )
+    intake_configure.add_argument(
+        "--approved-by", dest="approved_by", default=None,
+        help="approve the epic overlay AS CURRENTLY WRITTEN (built up via 'config set --epic')",
+    )
+    intake_configure.add_argument(
+        "--use-defaults", action="store_true",
+        help="explicitly inherit every default; also resets the overlay to empty",
+    )
+    intake_configure.add_argument(
+        "--by", default=None, help="required with --use-defaults",
+    )
+    _add_concurrency_flags(intake_configure)
+
     intake_subparsers.add_parser("status", help="show the intake section and the next rung")
 
     scope = subparsers.add_parser(
@@ -712,13 +733,22 @@ def _overlaid_plan(
     artifacts are recorded, and this is the one place both callers already
     touch the store, so the state ride-alongs rather than each caller
     re-reading it.
+
+    Uses the EPIC-MERGED effective view (`load_layers(...)["effective"]`),
+    not the bare global config (epic-scoped-state plan Task 5 fix): `models`
+    and `riskRules` are both epic-overlay-allowed leaves (config.py's
+    `OVERLAY_ALLOWED_LEAVES`), so an epic's own overrides -- approved via
+    `intake configure` -- must actually feed risk derivation and the
+    scope-default fallbacks here, or the overlay would have no effect on
+    either. `epic=None` (no active epic, or a legacy scope) degrades to the
+    global-only view, matching prior behavior exactly.
     """
     plan = read_plan(args.plan)
     wdd_dir = store.path.parent
     state = store.read() if store.exists() else None
     if config_path(wdd_dir).exists():
         raw_plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
-        config = load_config(wdd_dir)
+        config = load_layers(wdd_dir, (state or {}).get("epic"))["effective"]
         plan = apply_config_defaults(plan, raw_plan["scope"], config)
         plan = apply_risk_rules(plan, config, state)
     return plan, wdd_dir, state
@@ -785,12 +815,15 @@ def _apply_execution_drift(
     blocker below still applies.
 
     The chokepoint in `main()` (`require_fresh_governance` then
-    `require_fresh_intake`) raises governance drift first when both are
-    present, so this must surface the same blocker at position 0: the
-    intake/plan gate is checked and inserted FIRST, then governance drift is
-    checked and inserted last -- since both insert at position 0, governance
-    (inserted last) ends up leading whenever both fire, matching the raise
-    order, while either single-drift case is unaffected by the reordering.
+    `require_fresh_epic_config` then `require_fresh_intake`) raises
+    governance drift first, then epic config drift, then intake/plan drift,
+    when more than one is present -- spec Sec2's precedence order (governance
+    -> epic config -> intake artifacts -> plan composite). This surfaces the
+    identical order by inserting at position 0 in the REVERSE of that
+    precedence: intake/plan first, then epic config, then governance last --
+    since each insert lands at position 0, the last one in (governance) ends
+    up leading, matching the raise order, while any single-drift case is
+    unaffected by the reordering.
     """
     gate = intake_gate_status(state, wdd_dir)
     if gate is not None:
@@ -836,6 +869,22 @@ def _apply_execution_drift(
                     "approved); run 'wddctl plan apply --approved-by NAME' to re-stamp"
                 )
             result["blockers"].insert(0, {"code": code, "message": message, **detail})
+
+    epic_drift = epic_config_drift(state, wdd_dir)
+    if epic_drift is not None:
+        result["actions"] = []
+        result["blockers"].insert(
+            0,
+            {
+                "code": "epic_config_drift",
+                "message": (
+                    "the epic overlay (or the global config it layers over) changed "
+                    "since intake.configure was approved; run 'wddctl intake configure "
+                    "--approved-by NAME' (or --use-defaults --by NAME) to re-approve"
+                ),
+                **epic_drift,
+            },
+        )
 
     drift = governance_drift(state, wdd_dir)
     if drift is not None:
@@ -930,10 +979,24 @@ def main(argv: list[str] | None = None) -> int:
             # command the user just typed or approved in conversation, never
             # yet config -- `--probe NAME` and `--task ...` stay governed.
             governed = False
+        # Resolve once per invocation (spec Sec2): the layered config
+        # snapshot every evidence-recording/evidence-consuming handler below
+        # needs (review/verify record+collect, finalize review/verify
+        # record, finalize handoff, merge) is read from disk here, exactly
+        # ONCE, and threaded down as `admission_layers` -- no handler below
+        # re-reads config.json/the epic overlay itself. This is what closes
+        # the check/use race: an overlay edited after this point cannot
+        # influence evidence recorded during the same invocation, and the
+        # digest recorded on evidence is the digest that was gate-checked
+        # just above.
+        admission_layers: dict[str, Any] | None = None
         if governed and store.exists():
             gated_state = store.read()
             require_fresh_governance(gated_state, store.path.parent)
+            require_fresh_epic_config(gated_state, store.path.parent)
             require_fresh_intake(gated_state, store.path.parent)
+            if config_path(store.path.parent).exists():
+                admission_layers = load_layers(store.path.parent, gated_state.get("epic"))
             if verb in TASK_INPUT_GATED_VERBS:
                 gated_task_id = getattr(args, "task", None)
                 gated_task = (gated_state.get("tasks") or {}).get(gated_task_id) if gated_task_id else None
@@ -1261,6 +1324,7 @@ def main(argv: list[str] | None = None) -> int:
                 findings=findings,
                 reviewer=args.reviewer,
                 repo=args.repo,
+                layers=admission_layers,
                 **_concurrency(args),
             )
             task = state["tasks"][args.task]
@@ -1313,7 +1377,8 @@ def main(argv: list[str] | None = None) -> int:
             from .review import collect_review
 
             state, duplicate = collect_review(
-                store, task_id=args.task, result_paths=args.result, repo=args.repo, **_concurrency(args)
+                store, task_id=args.task, result_paths=args.result, repo=args.repo,
+                layers=admission_layers, **_concurrency(args)
             )
             _print_json({"revision": state["revision"], "duplicate": duplicate})
             return 0
@@ -1325,6 +1390,7 @@ def main(argv: list[str] | None = None) -> int:
                 status=args.status,
                 command=args.verify_command_text,
                 repo=args.repo,
+                layers=admission_layers,
                 **_concurrency(args),
             )
             _print_json(
@@ -1340,7 +1406,8 @@ def main(argv: list[str] | None = None) -> int:
             from .review import collect_verification
 
             state, duplicate = collect_verification(
-                store, task_id=args.task, result_path=args.result, repo=args.repo, **_concurrency(args)
+                store, task_id=args.task, result_path=args.result, repo=args.repo,
+                layers=admission_layers, **_concurrency(args)
             )
             _print_json({"revision": state["revision"], "duplicate": duplicate})
             return 0
@@ -1356,6 +1423,7 @@ def main(argv: list[str] | None = None) -> int:
                 findings=findings,
                 reviewer=args.reviewer,
                 repo=args.repo,
+                layers=admission_layers,
                 **_concurrency(args),
             )
             review = (state.get("finalize") or {}).get("review") or {}
@@ -1381,6 +1449,7 @@ def main(argv: list[str] | None = None) -> int:
                 justification=args.justification,
                 results=args.results,
                 repo=args.repo,
+                layers=admission_layers,
                 **_concurrency(args),
             )
             verification = (state.get("finalize") or {}).get("verification") or {}
@@ -1395,7 +1464,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "finalize" and args.finalize_command == "handoff":
-            _print_json(prepare_handoff(store, repo=args.repo, **_concurrency(args)))
+            _print_json(
+                prepare_handoff(
+                    store, repo=args.repo, layers=admission_layers, **_concurrency(args)
+                )
+            )
             return 0
 
         if args.command == "finalize" and args.finalize_command == "delivered":
@@ -1479,6 +1552,24 @@ def main(argv: list[str] | None = None) -> int:
             _print_json({"revision": state["revision"], "duplicate": duplicate})
             return 0
 
+        if args.command == "intake" and args.intake_command == "configure":
+            state, duplicate = record_configure(
+                store,
+                store.path.parent,
+                approved_by=args.approved_by,
+                use_defaults=args.use_defaults,
+                by=args.by,
+                **_concurrency(args),
+            )
+            _print_json(
+                {
+                    "revision": state["revision"],
+                    "duplicate": duplicate,
+                    "sha256": state["intake"]["configure"]["sha256"],
+                }
+            )
+            return 0
+
         if args.command == "intake" and args.intake_command == "status":
             _print_json(intake_status(store.read()))
             return 0
@@ -1543,7 +1634,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "merge":
             if args.observed:
                 _print_json(
-                    observe_merge(store, repo=args.repo, task_id=args.task, **_concurrency(args))
+                    observe_merge(
+                        store, repo=args.repo, task_id=args.task, layers=admission_layers,
+                        **_concurrency(args)
+                    )
                 )
                 return 0
             state = store.read()
@@ -1564,7 +1658,10 @@ def main(argv: list[str] | None = None) -> int:
                     "directly; wddctl will not merge it. Once merged, run "
                     f"'wddctl merge --task {args.task} --repo {args.repo} --observed' to record it."
                 )
-            result = merge_task(store, repo=args.repo, task_id=args.task, **_concurrency(args))
+            result = merge_task(
+                store, repo=args.repo, task_id=args.task, layers=admission_layers,
+                **_concurrency(args)
+            )
             if settings["surface"] == "pr":
                 base_ref = store.read()["scope"].get("baseRef")
                 if base_ref:

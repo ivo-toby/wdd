@@ -932,6 +932,13 @@ class EndToEndSetupTest(unittest.TestCase):
             self._cli(state, "epic", "new", "--slug", "demo")
             epic_dir = wdd / "epics" / "demo"
 
+            # Task 5: configure_epic is the ladder's middle rung, between
+            # create_epic and agree_spec (spec Sec2).
+            payload = self._cli(state, "next")
+            self.assertEqual(payload["actions"][0]["action"], "configure_epic")
+
+            self._cli(state, "intake", "configure", "--use-defaults", "--by", "test")
+
             payload = self._cli(state, "next")
             self.assertEqual(payload["actions"][0]["action"], "agree_spec")
 
