@@ -233,6 +233,17 @@ prose. A gate that only runs unit tests will happily pass a package that
 does not start. Propose the amendment before applying; config changes after
 ratification go through `wddctl constitution amend`.
 
+Flows that can only be proven against a live third party — OAuth against a
+real identity provider, payments, rate-limited external APIs — are where
+workers drift, precisely because no test can fail there. Those tasks still
+get gates: contract-conformance tests that pin every observable artifact
+byte-for-byte to the cited contract — the exact URL the code builds, the
+exact rewrite a proxy applies to a canned upstream response, the exact
+headers sent — each asserting against the inventory row, not against what
+the implementation happens to produce. A flow with no live test and no
+conformance test is ungated, and ungated is where fabrication survives
+review. Name these tests in the brief's Verification section explicitly.
+
 Report the outcome the way the router's "Talking to the user" section
 demands: what was agreed, how many tasks, which starts first — not
 revisions, scope IDs, or the commands you ran.
