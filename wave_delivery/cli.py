@@ -1761,7 +1761,9 @@ def main(argv: list[str] | None = None) -> int:
                         value = json.loads(args.value)
                     except json.JSONDecodeError:
                         value = args.value
-                    patch = set_overlay_value(layers["overlay"], args.path, value)
+                    patch = set_overlay_value(
+                        layers["overlay"], args.path, value, effective=layers["effective"]
+                    )
                     derived = derive_effective(layers, patch)
                     save_overlay(wdd_dir, epic, derived["overlay"])
                     _print_json(

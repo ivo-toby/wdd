@@ -69,6 +69,34 @@ def _require_string_list(value: Any, name: str) -> None:
     )
 
 
+def _parse_strict_json(text: str, *, context: str) -> Any:
+    """The one JSON parse used for every WDD-authored config file (global
+    `config.json` AND an epic overlay's `config.json`): duplicate object
+    keys and non-finite number literals (NaN/Infinity/-Infinity) are
+    rejected rather than silently accepted by Python's `json` module --
+    the same byte-precision `effective_config_digest` demands of what it
+    hashes. `context` names what is being parsed (typically the file path)
+    so the raised `ValidationError` can name both the file and the
+    offending key/literal. Still raises the stdlib's own
+    `json.JSONDecodeError` for ordinary malformed JSON; callers translate
+    that into a `ValidationError` themselves (they know the right wording
+    for "not valid JSON" in their context).
+    """
+
+    def _reject_duplicate(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        seen: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in seen:
+                raise ValidationError(f"{context}: duplicate JSON key {key!r}")
+            seen[key] = value
+        return seen
+
+    def _reject_constant(name: str) -> Any:
+        raise ValidationError(f"{context}: non-finite number literal {name!r} is not allowed")
+
+    return json.loads(text, object_pairs_hook=_reject_duplicate, parse_constant=_reject_constant)
+
+
 def validate_config(config: dict[str, Any]) -> None:
     _require(isinstance(config, dict), "must be an object")
     _require(config.get("schemaVersion") == CONFIG_SCHEMA_VERSION,
@@ -197,9 +225,11 @@ def validate_config(config: dict[str, Any]) -> None:
 def load_config(wdd_dir: Path | str) -> dict[str, Any]:
     path = config_path(wdd_dir)
     try:
-        config = json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError as error:
         raise ValidationError(f"config file does not exist: {path}; run 'wddctl init'") from error
+    try:
+        config = _parse_strict_json(text, context=f"config file ({path})")
     except json.JSONDecodeError as error:
         raise ValidationError(f"config file is not valid JSON: {path}: {error}") from error
     validate_config(config)
@@ -394,6 +424,15 @@ def _check_overlay_allowlist(overlay: dict[str, Any], prefix: str = "") -> None:
         value = overlay[key]
         dotted = f"{prefix}.{key}" if prefix else key
         if dotted in _ALLOWED_LEAVES:
+            # Reaching an allowed leaf stops the walk here -- keys INSIDE an
+            # object-shaped leaf (e.g. an unknown key nested in
+            # `models.review`) are not further checked by name. This
+            # mirrors `validate_config`'s own documented tolerance for
+            # `models.review`'s object form (see its comment: "unknown
+            # extra keys are not rejected"); deliberate, not an oversight
+            # (pinned by OverlayAllowlistLaxnessInsideObjectLeafTest in
+            # tests/test_epics.py so a future tightening of either
+            # validator is a conscious, visible change).
             continue
         if dotted in _ALLOWED_PREFIXES and isinstance(value, dict):
             _check_overlay_allowlist(value, dotted)
@@ -443,6 +482,42 @@ def _apply_leaves(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, An
     return result
 
 
+# Top-level sections `validate_config` treats as optional for backward
+# compatibility with a config.json written before they existed (see its
+# `runners`/`worktrees` comments) -- never overlay-allowed themselves.
+_OPTIONAL_GLOBAL_SECTIONS: tuple[str, ...] = ("runners", "worktrees")
+
+
+def _hydrate_optional_sections(config: dict[str, Any]) -> dict[str, Any]:
+    """Copy of `config` with any of `_OPTIONAL_GLOBAL_SECTIONS` missing from
+    it filled in from `default_config()`. A legacy config predating one of
+    these sections is a valid `global` layer (`validate_config` allows the
+    omission) -- but `effective` must resolve to a concrete value for every
+    known path, not just carry the name for `resolve_config_source`'s
+    'default' tier to report while crashing on the value lookup (fix-round
+    F1). `global` itself is deliberately left un-hydrated by every caller
+    of this function -- hydrating it too would make `resolve_config_source`
+    find these keys in `global` and report source='global' instead of the
+    correct 'default'.
+    """
+    hydrated = deepcopy(config)
+    defaults = DEFAULT_CONFIG
+    for section in _OPTIONAL_GLOBAL_SECTIONS:
+        if section not in hydrated:
+            hydrated[section] = deepcopy(defaults[section])
+    return hydrated
+
+
+def _effective_view(global_config: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """The ONE place `effective` is computed from a `global` layer and an
+    overlay -- used by both `load_layers` and `derive_effective` so the two
+    can never drift apart. Hydrates missing optional top-level sections
+    (see `_hydrate_optional_sections`) onto `global_config` first, then
+    applies the overlay's leaves on top (fix-round F1).
+    """
+    return _apply_leaves(_hydrate_optional_sections(global_config), overlay)
+
+
 def validate_overlay(overlay: Any) -> None:
     """The loader's validators for an epic overlay (spec Sec2): allowlist
     membership by name, then value-shape validity via the same
@@ -461,27 +536,13 @@ def epic_overlay_path(wdd_dir: Path | str, epic: str) -> Path:
     return Path(wdd_dir) / "epics" / epic / "config.json"
 
 
-def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    seen: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in seen:
-            raise ValidationError(f"epic overlay: duplicate JSON key {key!r}")
-        seen[key] = value
-    return seen
-
-
-def _reject_json_constant(name: str) -> Any:
-    raise ValidationError(
-        f"epic overlay: non-finite number literal {name!r} is not allowed"
-    )
-
-
 def load_overlay(wdd_dir: Path | str, epic: str | None) -> dict[str, Any]:
     """The sparse overlay for `epic`, or `{}` for no active epic or a
     missing overlay file (spec Sec2: "Missing overlay file = empty
-    overlay"). Duplicate JSON object keys and non-finite number literals
-    are rejected at parse -- the same byte-precision the digest function
-    demands (spec Sec2).
+    overlay"). Parsed via `_parse_strict_json` -- duplicate JSON object
+    keys and non-finite number literals are rejected at parse, the same
+    byte-precision the digest function demands (spec Sec2); `load_config`
+    parses the global layer through the same helper (fix-round F3).
     """
     if epic is None:
         return {}
@@ -493,9 +554,7 @@ def load_overlay(wdd_dir: Path | str, epic: str | None) -> dict[str, Any]:
     except OSError as error:
         raise ValidationError(f"epic overlay could not be read: {path}: {error}") from error
     try:
-        overlay = json.loads(
-            text, object_pairs_hook=_reject_duplicate_pairs, parse_constant=_reject_json_constant
-        )
+        overlay = _parse_strict_json(text, context=f"epic overlay ({path})")
     except json.JSONDecodeError as error:
         raise ValidationError(f"epic overlay is not valid JSON: {path}: {error}") from error
     validate_overlay(overlay)
@@ -510,7 +569,13 @@ def save_overlay(wdd_dir: Path | str, epic: str, overlay: dict[str, Any]) -> Non
     )
 
 
-def set_overlay_value(overlay: dict[str, Any], dotted: str, value: Any) -> dict[str, Any]:
+def set_overlay_value(
+    overlay: dict[str, Any],
+    dotted: str,
+    value: Any,
+    *,
+    effective: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build a new sparse overlay with `dotted` set to `value`, used by
     `config set --epic`. Unlike `set_value` (which requires the path to
     already exist in a fully-hydrated config), the overlay is sparse:
@@ -518,9 +583,32 @@ def set_overlay_value(overlay: dict[str, Any], dotted: str, value: Any) -> dict[
     and value-shape validation are NOT done here -- every overlay mutation
     goes through `derive_effective`, which validates the resulting overlay
     before it is treated as approved.
+
+    Sub-leaf seeding (fix-round F2): when `dotted` targets a path STRICTLY
+    BELOW one of the allowlisted leaves (e.g. `models.implementation.default`,
+    below the `models.implementation` leaf), the overlay's leaf-atomic apply
+    (`_apply_leaves`) will later replace that WHOLE leaf with whatever this
+    function builds -- so building a bare `{"default": value}` here would
+    silently null out sibling keys (e.g. `highRisk`) the caller never
+    touched. Instead, if the leaf isn't already present in `overlay` (a
+    prior sub-leaf set on the same leaf already seeded it -- don't reseed
+    over it), the new leaf is seeded from a deep copy of `effective`'s
+    CURRENT value at that leaf before the sub-key is set, so untouched
+    siblings are preserved from wherever they were effective (epic, global,
+    or default). `effective` is optional and only consulted for below-leaf
+    paths; callers that only ever set exact-leaf paths (the CLI's normal
+    case for e.g. `merge.surface`) never need it.
     """
     updated = deepcopy(overlay)
-    parts = dotted.split(".")
+    parts = tuple(dotted.split("."))
+    for leaf_parts in _ALLOWED_LEAF_PARTS:
+        depth = len(leaf_parts)
+        if len(parts) > depth and parts[:depth] == leaf_parts and not _leaf_present(
+            updated, leaf_parts
+        ):
+            seed = deepcopy(_leaf_get(effective, leaf_parts)) if effective is not None else {}
+            _leaf_set(updated, leaf_parts, seed)
+            break
     node = updated
     for part in parts[:-1]:
         child = node.get(part)
@@ -535,18 +623,19 @@ def set_overlay_value(overlay: dict[str, Any], dotted: str, value: Any) -> dict[
 def load_layers(wdd_dir: Path | str, epic: str | None) -> dict[str, Any]:
     """The admission snapshot (spec Sec2): `{defaults, global, overlay,
     effective}`, each layer validated at capture. Resolution per key path
-    is `epic overlay -> global config.json -> built-in default`; since
-    `validate_config` requires every allowlisted section to be present in
-    `global`, the built-in default only actually surfaces for keys a
-    legacy config predates (`runners`, `worktrees` -- neither is
-    overlay-allowed), but the layer is always returned for callers that
-    need it (e.g. `resolve_config_source`'s 'default' tier).
+    is `epic overlay -> global config.json -> built-in default`; a legacy
+    `global` missing an optional section (`runners`, `worktrees` -- neither
+    is overlay-allowed) is hydrated onto `effective` from the built-in
+    default by `_effective_view` (fix-round F1), so `resolve_config_source`'s
+    'default' tier has a concrete value to return, not just a name. `global`
+    itself is returned un-hydrated -- that's what lets the 'default' tier
+    be distinguished from 'global' in the first place.
     """
     wdd_dir = Path(wdd_dir)
     defaults = default_config()
     global_config = load_config(wdd_dir)
     overlay = load_overlay(wdd_dir, epic)
-    effective = _apply_leaves(global_config, overlay)
+    effective = _effective_view(global_config, overlay)
     validate_config(effective)
     return {
         "defaults": defaults,
@@ -566,7 +655,7 @@ def derive_effective(layers: dict[str, Any], patch: dict[str, Any]) -> dict[str,
     removal-reveals-global pin). Never touches disk.
     """
     validate_overlay(patch)
-    effective = _apply_leaves(layers["global"], patch)
+    effective = _effective_view(layers["global"], patch)
     validate_config(effective)
     return {
         "defaults": layers["defaults"],

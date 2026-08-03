@@ -24,6 +24,8 @@ from wave_delivery.config import (
     default_config,
     derive_effective,
     effective_config_digest,
+    get_value,
+    load_config,
     load_layers,
     load_overlay,
     project,
@@ -707,6 +709,206 @@ class ResolveConfigSourceTest(unittest.TestCase):
                 "review.policy",
             },
         )
+
+
+class LegacyConfigDefaultHydrationTest(unittest.TestCase):
+    """A legacy config.json predating `runners`/`worktrees` (both optional
+    per validate_config, spec Sec6) must not crash `config get --epic`:
+    `effective` needs a concrete value for these keys even though `global`
+    legitimately lacks them -- otherwise `resolve_config_source` names the
+    'default' tier and then crashes trying to read the value out of
+    `effective` (fix-round F1)."""
+
+    def _legacy_wdd(self, tmp: str) -> Path:
+        config = default_config()
+        del config["runners"]
+        del config["worktrees"]
+        return _wdd_with_config(tmp, config)
+
+    def test_runners_resolves_to_default_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = self._legacy_wdd(tmp)
+            layers = load_layers(wdd, None)
+            value, source = resolve_config_source(layers, "runners")
+            self.assertEqual(value, {})
+            self.assertEqual(source, "default")
+            self.assertEqual(get_value(layers["effective"], "runners"), {})
+
+    def test_worktrees_root_resolves_to_default_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = self._legacy_wdd(tmp)
+            layers = load_layers(wdd, None)
+            value, source = resolve_config_source(layers, "worktrees.root")
+            self.assertEqual(value, ".worktrees")
+            self.assertEqual(source, "default")
+
+    def test_global_layer_itself_stays_unhydrated(self) -> None:
+        # 'global' must stay the raw, un-hydrated config -- only 'effective'
+        # is hydrated. If 'global' were hydrated too, resolve_config_source
+        # could never report source='default' for these keys (it would find
+        # them in 'global' first).
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = self._legacy_wdd(tmp)
+            layers = load_layers(wdd, None)
+            self.assertNotIn("runners", layers["global"])
+            self.assertNotIn("worktrees", layers["global"])
+
+    def test_digest_of_effective_view_is_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = self._legacy_wdd(tmp)
+            layers = load_layers(wdd, None)
+            first = effective_config_digest(layers["effective"])
+            second = effective_config_digest(layers["effective"])
+            self.assertEqual(first, second)
+
+
+class SetOverlayValueSubLeafSeedingTest(unittest.TestCase):
+    """`set_overlay_value` seeds a new overlay leaf from the CURRENT
+    EFFECTIVE leaf value when `dotted` targets a path BELOW an allowlisted
+    leaf (e.g. `models.implementation.default`, below the
+    `models.implementation` leaf), so siblings the caller didn't touch (e.g.
+    `highRisk`) survive the later leaf-atomic apply instead of being
+    silently nulled by a freshly-created `{sub_key: value}` object
+    (fix-round F2)."""
+
+    def test_sub_leaf_set_preserves_sibling_default_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = default_config()
+            config["models"]["implementation"] = {"default": "a", "highRisk": "b"}
+            wdd = _wdd_with_config(tmp, config)
+            layers = load_layers(wdd, "my-epic")
+            patch = set_overlay_value(
+                layers["overlay"],
+                "models.implementation.default",
+                "X",
+                effective=layers["effective"],
+            )
+            self.assertEqual(
+                patch["models"]["implementation"], {"default": "X", "highRisk": "b"}
+            )
+            derived = derive_effective(layers, patch)
+            self.assertEqual(
+                derived["effective"]["models"]["implementation"],
+                {"default": "X", "highRisk": "b"},
+            )
+
+    def test_sub_leaf_set_without_effective_still_creates_sparse_leaf(self) -> None:
+        # Backward-compat: callers that only ever touch exact-leaf paths
+        # (never below-leaf) don't need to pass `effective`; a below-leaf
+        # call made without it falls back to the pre-fix sparse behavior
+        # rather than crashing on a missing seed source.
+        overlay = set_overlay_value({}, "models.implementation.default", "X")
+        self.assertEqual(overlay, {"models": {"implementation": {"default": "X"}}})
+
+    def test_second_sub_leaf_set_does_not_reseed_over_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = default_config()
+            config["models"]["implementation"] = {"default": "a", "highRisk": "b"}
+            wdd = _wdd_with_config(tmp, config)
+            layers = load_layers(wdd, "my-epic")
+            first_patch = set_overlay_value(
+                layers["overlay"],
+                "models.implementation.default",
+                "X",
+                effective=layers["effective"],
+            )
+            derived = derive_effective(layers, first_patch)
+            second_patch = set_overlay_value(
+                derived["overlay"],
+                "models.implementation.highRisk",
+                "Y",
+                effective=derived["effective"],
+            )
+            self.assertEqual(
+                second_patch["models"]["implementation"],
+                {"default": "X", "highRisk": "Y"},
+            )
+
+
+class ConfigSetEpicSubLeafCliTest(unittest.TestCase):
+    """`config set --epic` on a sub-leaf path preserves untouched siblings
+    end to end through the CLI (fix-round F2)."""
+
+    def _run(self, tmp: str, *argv: str) -> tuple[int, str]:
+        state = str(Path(tmp) / ".wdd" / "state.json")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = main(["--state", state, *argv])
+        return code, stdout.getvalue()
+
+    def _write_state_with_epic(self, tmp: str, epic: str) -> None:
+        wdd = Path(tmp) / ".wdd"
+        state_store = StateStore(wdd / "state.json")
+        state = new_setup_state()
+        state["epic"] = epic
+        state_store.write(state)
+
+    def test_set_epic_sub_leaf_preserves_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = default_config()
+            config["models"]["implementation"] = {"default": "a", "highRisk": "b"}
+            _wdd_with_config(tmp, config)
+            self._write_state_with_epic(tmp, "my-epic")
+            code, _ = self._run(
+                tmp, "config", "set", "--epic", "models.implementation.default", '"X"'
+            )
+            self.assertEqual(code, 0)
+            code, out = self._run(
+                tmp, "config", "get", "--epic", "models.implementation.highRisk"
+            )
+            self.assertEqual(code, 0)
+            payload = json.loads(out)
+            self.assertEqual(payload["value"], "b")
+            self.assertEqual(payload["source"], "epic")
+
+
+class GlobalConfigParsePrecisionTest(unittest.TestCase):
+    """`load_config` gets the same byte-precision parsing `load_overlay`
+    already had: duplicate object keys and non-finite number literals
+    (NaN/Infinity/-Infinity) are rejected rather than silently accepted by
+    Python's `json` module -- both now go through one shared
+    `_parse_strict_json` helper (fix-round F3)."""
+
+    def test_duplicate_key_in_config_json_is_rejected_naming_file_and_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            wdd.mkdir(parents=True)
+            path = wdd / "config.json"
+            path.write_text('{"schemaVersion": 1, "schemaVersion": 1}', encoding="utf-8")
+            with self.assertRaises(ValidationError) as ctx:
+                load_config(wdd)
+            message = str(ctx.exception)
+            self.assertIn(str(path), message)
+            self.assertIn("schemaVersion", message)
+
+    def test_non_finite_literal_in_config_json_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            wdd.mkdir(parents=True)
+            path = wdd / "config.json"
+            path.write_text('{"weight": NaN}', encoding="utf-8")
+            with self.assertRaises(ValidationError):
+                load_config(wdd)
+
+    def test_ordinary_valid_config_still_loads(self) -> None:
+        # Regression guard: the new parse path must not reject well-formed
+        # configs with no duplicates or non-finite literals.
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            self.assertEqual(load_config(wdd), default_config())
+
+
+class OverlayAllowlistLaxnessInsideObjectLeafTest(unittest.TestCase):
+    """Key laxness INSIDE an object-shaped allowed leaf mirrors global
+    `validate_config`'s own documented tolerance for `models.review`'s
+    object form (unknown extra keys are not rejected there either) --
+    pinned here so a future tightening of either validator is a conscious,
+    visible change rather than an accidental behavior drift (fix-round
+    Minor)."""
+
+    def test_bogus_key_inside_models_review_object_leaf_is_currently_accepted(self) -> None:
+        overlay = {"models": {"review": {"default": "x", "bogus": "y"}}}
+        validate_overlay(overlay)  # must not raise (documented tolerance)
 
 
 if __name__ == "__main__":
