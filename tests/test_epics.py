@@ -1,4 +1,7 @@
-"""Epic-scoped-state plan (2026-08-03), Task 1: the typed path resolver.
+"""Epic-scoped-state plan (2026-08-03).
+
+Task 1: the typed path resolver. Task 2: the layered config overlay,
+digests, projections, and derive_effective.
 
 Local helpers only (no cross-file imports between test modules, per the
 phase-6a/6b test conventions carried forward -- see Global Constraints in
@@ -8,13 +11,33 @@ same plan add classes to this same file.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
+from wave_delivery.cli import main
+from wave_delivery.config import (
+    OVERLAY_ALLOWED_LEAVES,
+    default_config,
+    derive_effective,
+    effective_config_digest,
+    load_layers,
+    load_overlay,
+    project,
+    resolve_config_source,
+    save_config,
+    save_overlay,
+    set_overlay_value,
+    validate_overlay,
+)
 from wave_delivery.errors import ValidationError
 from wave_delivery.intake import resolve_within_wdd
 from wave_delivery.paths import resolve_artifact
+from wave_delivery.schema import new_setup_state
+from wave_delivery.store import StateStore
 
 
 class ResolveArtifactNamespaceTest(unittest.TestCase):
@@ -248,6 +271,442 @@ class ResolveWithinWddLabelTest(unittest.TestCase):
             message = str(ctx.exception)
             self.assertIn("context ref", message)
             self.assertNotIn("research artifact", message)
+
+
+def _wdd_with_config(tmp: str, config: dict | None = None) -> Path:
+    wdd = Path(tmp) / ".wdd"
+    save_config(wdd, config if config is not None else default_config())
+    return wdd
+
+
+class LoadLayersTest(unittest.TestCase):
+    """load_layers returns {defaults, global, overlay, effective}; per-key
+    fallback is epic overlay -> global -> default (spec Sec2)."""
+
+    def test_no_epic_yields_empty_overlay_and_effective_equals_global(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            layers = load_layers(wdd, None)
+            self.assertEqual(layers["overlay"], {})
+            self.assertEqual(layers["effective"], layers["global"])
+            self.assertEqual(layers["defaults"], default_config())
+
+    def test_missing_overlay_file_is_empty_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            layers = load_layers(wdd, "my-epic")
+            self.assertEqual(layers["overlay"], {})
+            self.assertEqual(layers["effective"], layers["global"])
+
+    def test_overlay_leaf_overrides_global_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            save_overlay(wdd, "my-epic", {"merge": {"surface": "local"}})
+            layers = load_layers(wdd, "my-epic")
+            self.assertEqual(layers["global"]["merge"]["surface"], "pr")
+            self.assertEqual(layers["effective"]["merge"]["surface"], "local")
+
+    def test_unoverridden_leaf_falls_through_to_global(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            save_overlay(wdd, "my-epic", {"merge": {"surface": "local"}})
+            layers = load_layers(wdd, "my-epic")
+            # models.planning wasn't touched by the overlay -- falls through.
+            self.assertEqual(layers["effective"]["models"]["planning"], None)
+
+    def test_per_key_fallback_is_independent_per_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = default_config()
+            config["models"]["planning"] = "global-planner"
+            config["models"]["review"] = "global-reviewer"
+            wdd = _wdd_with_config(tmp, config)
+            save_overlay(wdd, "my-epic", {"models": {"review": "epic-reviewer"}})
+            layers = load_layers(wdd, "my-epic")
+            self.assertEqual(layers["effective"]["models"]["planning"], "global-planner")
+            self.assertEqual(layers["effective"]["models"]["review"], "epic-reviewer")
+
+
+class OverlayAllowlistTest(unittest.TestCase):
+    """The overlay allowlist is enforced BY NAME at every entry point:
+    overlay load, `config set --epic` (exercised via set_overlay_value +
+    derive_effective, the same path the CLI handler uses), and a direct
+    derive_effective call (standing in for configure approval until
+    Task 5)."""
+
+    def test_all_documented_leaves_are_individually_accepted(self) -> None:
+        samples = {
+            "models.planning": "gpt-planner",
+            "models.implementation": {"default": "gpt-impl", "highRisk": "gpt-impl-hi"},
+            "models.review": "gpt-review",
+            "verification.commands": ["pytest -q"],
+            "verification.unavailableJustification": None,
+            "merge.surface": "local",
+            "riskRules": [{"pattern": "src/**", "risk": "high"}],
+            "review.policy": "always",
+        }
+        for dotted, value in samples.items():
+            overlay = set_overlay_value({}, dotted, value)
+            validate_overlay(overlay)  # must not raise
+
+    def test_rejects_unknown_top_level_key_by_name_at_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            (wdd / "epics" / "my-epic").mkdir(parents=True)
+            (wdd / "epics" / "my-epic" / "config.json").write_text(
+                json.dumps({"runners": {"codex": {"command": ["codex"]}}}), encoding="utf-8"
+            )
+            with self.assertRaises(ValidationError) as ctx:
+                load_overlay(wdd, "my-epic")
+            self.assertIn("runners", str(ctx.exception))
+
+    def test_rejects_worktrees_root_by_name(self) -> None:
+        overlay = {"worktrees": {"root": "custom"}}
+        with self.assertRaises(ValidationError) as ctx:
+            validate_overlay(overlay)
+        self.assertIn("worktrees.root", str(ctx.exception))
+
+    def test_rejects_disallowed_sibling_within_allowed_container(self) -> None:
+        # merge.surface is allowed; merge.mode is not -- rejected by name,
+        # not just by the top-level 'merge' container being touched.
+        overlay = {"merge": {"surface": "local", "mode": "human"}}
+        with self.assertRaises(ValidationError) as ctx:
+            validate_overlay(overlay)
+        self.assertIn("merge.mode", str(ctx.exception))
+
+    def test_rejects_review_blocking_severities(self) -> None:
+        overlay = {"review": {"blockingSeverities": ["P1"]}}
+        with self.assertRaises(ValidationError) as ctx:
+            validate_overlay(overlay)
+        self.assertIn("review.blockingSeverities", str(ctx.exception))
+
+    def test_set_overlay_value_then_derive_effective_rejects_forbidden_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            layers = load_layers(wdd, "my-epic")
+            patch = set_overlay_value(layers["overlay"], "branching.targetBranch", "develop")
+            with self.assertRaises(ValidationError) as ctx:
+                derive_effective(layers, patch)
+            self.assertIn("branching.targetBranch", str(ctx.exception))
+
+    def test_derive_effective_rejects_forbidden_key_directly(self) -> None:
+        # Stands in for configure approval until Task 5 wires the verb.
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            layers = load_layers(wdd, "my-epic")
+            with self.assertRaises(ValidationError) as ctx:
+                derive_effective(layers, {"taskProvider": {"type": "jira"}})
+            self.assertIn("taskProvider", str(ctx.exception))
+
+    def test_overlay_value_shape_is_validated_like_global_config(self) -> None:
+        with self.assertRaises(ValidationError):
+            validate_overlay({"merge": {"surface": "carrier-pigeon"}})
+        with self.assertRaises(ValidationError):
+            validate_overlay({"review": {"policy": "yolo"}})
+        with self.assertRaises(ValidationError):
+            validate_overlay({"riskRules": [{"pattern": "x", "risk": "extreme"}]})
+
+
+class DeriveEffectiveMaskingTest(unittest.TestCase):
+    """The layered-snapshot pin: an overlay leaf masks the global value;
+    dropping it from a later patch reveals the retained global value."""
+
+    def test_overlay_masks_global_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            layers = load_layers(wdd, "my-epic")
+            self.assertEqual(layers["effective"]["merge"]["surface"], "pr")
+            derived = derive_effective(layers, {"merge": {"surface": "local"}})
+            self.assertEqual(derived["effective"]["merge"]["surface"], "local")
+            self.assertEqual(derived["global"]["merge"]["surface"], "pr")
+
+    def test_removal_reveals_retained_global_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            layers = load_layers(wdd, "my-epic")
+            masked = derive_effective(layers, {"merge": {"surface": "local"}})
+            self.assertEqual(masked["effective"]["merge"]["surface"], "local")
+            # Empty patch == "--use-defaults": drop the override.
+            revealed = derive_effective(masked, {})
+            self.assertEqual(revealed["effective"]["merge"]["surface"], "pr")
+            self.assertEqual(revealed["overlay"], {})
+
+    def test_removal_of_one_leaf_does_not_disturb_another(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            layers = load_layers(wdd, "my-epic")
+            both = derive_effective(
+                layers, {"merge": {"surface": "local"}, "review": {"policy": "always"}}
+            )
+            only_review = derive_effective(both, {"review": {"policy": "always"}})
+            self.assertEqual(only_review["effective"]["merge"]["surface"], "pr")
+            self.assertEqual(only_review["effective"]["review"]["policy"], "always")
+
+
+class DeriveEffectiveRejectsWhatLoadingRejectsTest(unittest.TestCase):
+    def test_same_forbidden_key_rejected_both_ways(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            (wdd / "epics" / "my-epic").mkdir(parents=True)
+            (wdd / "epics" / "my-epic" / "config.json").write_text(
+                json.dumps({"branching": {"targetBranch": "develop"}}), encoding="utf-8"
+            )
+            with self.assertRaises(ValidationError):
+                load_overlay(wdd, "my-epic")
+            layers = load_layers(wdd, None)
+            with self.assertRaises(ValidationError):
+                derive_effective(layers, {"branching": {"targetBranch": "develop"}})
+
+    def test_same_bad_value_rejected_both_ways(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            (wdd / "epics" / "my-epic").mkdir(parents=True)
+            (wdd / "epics" / "my-epic" / "config.json").write_text(
+                json.dumps({"merge": {"surface": "carrier-pigeon"}}), encoding="utf-8"
+            )
+            with self.assertRaises(ValidationError):
+                load_overlay(wdd, "my-epic")
+            layers = load_layers(wdd, None)
+            with self.assertRaises(ValidationError):
+                derive_effective(layers, {"merge": {"surface": "carrier-pigeon"}})
+
+
+class EffectiveConfigDigestTest(unittest.TestCase):
+    """One digest function, byte-precise (spec Sec2)."""
+
+    def test_key_order_does_not_affect_digest(self) -> None:
+        view = {"b": 1, "a": 2, "nested": {"z": 1, "y": 2}}
+        reordered = {"a": 2, "nested": {"y": 2, "z": 1}, "b": 1}
+        self.assertEqual(effective_config_digest(view), effective_config_digest(reordered))
+
+    def test_array_order_is_preserved(self) -> None:
+        first = {"commands": ["a", "b"]}
+        second = {"commands": ["b", "a"]}
+        self.assertNotEqual(effective_config_digest(first), effective_config_digest(second))
+
+    def test_unicode_is_stable_and_distinguishing(self) -> None:
+        ascii_view = {"justification": "cafe"}
+        unicode_view = {"justification": "café"}
+        # Same digest function must be deterministic and distinguish these.
+        self.assertEqual(
+            effective_config_digest(ascii_view), effective_config_digest(dict(ascii_view))
+        )
+        self.assertNotEqual(
+            effective_config_digest(ascii_view), effective_config_digest(unicode_view)
+        )
+
+    def test_empty_overlay_and_missing_key_are_not_confused(self) -> None:
+        # An empty overlay's effective view (pure global) must not collide
+        # with a view that merely omits an unrelated key.
+        with_key = {"riskRules": []}
+        without_key = {}
+        self.assertNotEqual(effective_config_digest(with_key), effective_config_digest(without_key))
+
+    def test_digest_is_stable_for_equal_views(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            layers = load_layers(wdd, None)
+            self.assertEqual(
+                effective_config_digest(layers["effective"]),
+                effective_config_digest(layers["effective"]),
+            )
+
+    def test_digest_changes_when_effective_view_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            layers = load_layers(wdd, "my-epic")
+            before = effective_config_digest(layers["effective"])
+            derived = derive_effective(layers, {"merge": {"surface": "local"}})
+            after = effective_config_digest(derived["effective"])
+            self.assertNotEqual(before, after)
+
+    def test_rejects_non_finite_number(self) -> None:
+        with self.assertRaises(ValidationError):
+            effective_config_digest({"weight": float("nan")})
+        with self.assertRaises(ValidationError):
+            effective_config_digest({"weight": float("inf")})
+
+    def test_overlay_json_with_duplicate_keys_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            (wdd / "epics" / "my-epic").mkdir(parents=True)
+            (wdd / "epics" / "my-epic" / "config.json").write_text(
+                '{"merge": {"surface": "local"}, "merge": {"surface": "pr"}}', encoding="utf-8"
+            )
+            with self.assertRaises(ValidationError):
+                load_overlay(wdd, "my-epic")
+
+    def test_overlay_json_with_non_finite_literal_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            (wdd / "epics" / "my-epic").mkdir(parents=True)
+            (wdd / "epics" / "my-epic" / "config.json").write_text(
+                '{"riskRules": [{"pattern": "x", "risk": "high", "weight": NaN}]}',
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValidationError):
+                load_overlay(wdd, "my-epic")
+
+
+class ProjectionPartitioningTest(unittest.TestCase):
+    """Gates compare like with like: an edit to one config area must not
+    stale evidence recorded under an unrelated projection (spec Sec2)."""
+
+    def test_models_planning_edit_changes_no_evidence_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            layers = load_layers(wdd, "my-epic")
+            before = {
+                purpose: effective_config_digest(project(layers["effective"], purpose))
+                for purpose in ("taskReview", "finalReview", "taskVerification", "finalVerification")
+            }
+            derived = derive_effective(layers, {"models": {"planning": "new-planner"}})
+            after = {
+                purpose: effective_config_digest(project(derived["effective"], purpose))
+                for purpose in ("taskReview", "finalReview", "taskVerification", "finalVerification")
+            }
+            self.assertEqual(before, after)
+            # The plan projection DOES include models -- sanity check it moved.
+            plan_before = effective_config_digest(project(layers["effective"], "plan"))
+            plan_after = effective_config_digest(project(derived["effective"], "plan"))
+            self.assertNotEqual(plan_before, plan_after)
+
+    def test_verification_commands_edit_changes_exactly_the_two_verification_projections(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            layers = load_layers(wdd, "my-epic")
+            purposes = ("plan", "taskReview", "finalReview", "taskVerification", "finalVerification")
+            before = {
+                purpose: effective_config_digest(project(layers["effective"], purpose))
+                for purpose in purposes
+            }
+            derived = derive_effective(layers, {"verification": {"commands": ["pytest -q"]}})
+            after = {
+                purpose: effective_config_digest(project(derived["effective"], purpose))
+                for purpose in purposes
+            }
+            changed = {purpose for purpose in purposes if before[purpose] != after[purpose]}
+            self.assertEqual(changed, {"taskVerification", "finalVerification"})
+
+    def test_unknown_purpose_is_rejected(self) -> None:
+        with self.assertRaises(ValidationError):
+            project(default_config(), "codeReview")
+
+
+class ConfigEpicCliTest(unittest.TestCase):
+    """`config get`/`set` gain `--epic` (spec Sec2)."""
+
+    def _run(self, tmp: str, *argv: str) -> tuple[int, str]:
+        state = str(Path(tmp) / ".wdd" / "state.json")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = main(["--state", state, *argv])
+        return code, stdout.getvalue()
+
+    def test_set_epic_refuses_when_no_active_epic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _wdd_with_config(tmp)
+            code, out = self._run(tmp, "config", "set", "--epic", "merge.surface", "local")
+            self.assertNotEqual(code, 0)
+
+    def test_set_epic_refusal_names_epic_new(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _wdd_with_config(tmp)
+            stderr = io.StringIO()
+            state = str(Path(tmp) / ".wdd" / "state.json")
+            with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                code = main(
+                    ["--state", state, "config", "set", "--epic", "merge.surface", "local"]
+                )
+            self.assertNotEqual(code, 0)
+            self.assertIn("wddctl epic new", stderr.getvalue())
+
+    def test_get_epic_without_active_epic_reports_global_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _wdd_with_config(tmp)
+            code, out = self._run(tmp, "config", "get", "--epic", "merge.surface")
+            self.assertEqual(code, 0)
+            payload = json.loads(out)
+            self.assertEqual(payload["value"], "pr")
+            self.assertEqual(payload["source"], "global")
+
+    def _write_state_with_epic(self, tmp: str, epic: str) -> None:
+        wdd = Path(tmp) / ".wdd"
+        state_store = StateStore(wdd / "state.json")
+        state = new_setup_state()
+        state["epic"] = epic
+        state_store.write(state)
+
+    def test_set_epic_writes_overlay_when_epic_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _wdd_with_config(tmp)
+            self._write_state_with_epic(tmp, "my-epic")
+            code, out = self._run(tmp, "config", "set", "--epic", "merge.surface", "local")
+            self.assertEqual(code, 0)
+            payload = json.loads(out)
+            self.assertEqual(payload["value"], "local")
+            self.assertEqual(payload["epic"], "my-epic")
+            wdd = Path(tmp) / ".wdd"
+            overlay = load_overlay(wdd, "my-epic")
+            self.assertEqual(overlay, {"merge": {"surface": "local"}})
+
+    def test_get_epic_reports_epic_source_after_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _wdd_with_config(tmp)
+            self._write_state_with_epic(tmp, "my-epic")
+            code, _ = self._run(tmp, "config", "set", "--epic", "merge.surface", "local")
+            self.assertEqual(code, 0)
+            code, out = self._run(tmp, "config", "get", "--epic", "merge.surface")
+            self.assertEqual(code, 0)
+            payload = json.loads(out)
+            self.assertEqual(payload["value"], "local")
+            self.assertEqual(payload["source"], "epic")
+
+    def test_get_epic_deeper_path_under_overridden_leaf_reports_epic_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _wdd_with_config(tmp)
+            self._write_state_with_epic(tmp, "my-epic")
+            wdd = Path(tmp) / ".wdd"
+            save_overlay(wdd, "my-epic", {"models": {"implementation": {"default": "gpt-x"}}})
+            code, out = self._run(
+                tmp, "config", "get", "--epic", "models.implementation.default"
+            )
+            self.assertEqual(code, 0)
+            payload = json.loads(out)
+            self.assertEqual(payload["value"], "gpt-x")
+            self.assertEqual(payload["source"], "epic")
+
+    def test_plain_get_set_unaffected_by_epic_flag_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _wdd_with_config(tmp)
+            code, out = self._run(tmp, "config", "get", "merge.surface")
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out), "pr")
+
+
+class ResolveConfigSourceTest(unittest.TestCase):
+    def test_unknown_path_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            layers = load_layers(wdd, "my-epic")
+            with self.assertRaises(ValidationError):
+                resolve_config_source(layers, "models.nonexistent")
+
+    def test_overlay_allowed_leaves_constant_matches_documented_set(self) -> None:
+        self.assertEqual(
+            set(OVERLAY_ALLOWED_LEAVES),
+            {
+                "models.planning",
+                "models.implementation",
+                "models.review",
+                "verification.commands",
+                "verification.unavailableJustification",
+                "merge.surface",
+                "riskRules",
+                "review.policy",
+            },
+        )
 
 
 if __name__ == "__main__":

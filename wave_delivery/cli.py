@@ -17,13 +17,18 @@ from typing import Any
 from .config import (
     check_ratifiable,
     config_path,
+    derive_effective,
     get_value,
     governance_drift,
     governance_fingerprint,
     load_config,
+    load_layers,
     merge_settings,
     require_fresh_governance,
+    resolve_config_source,
     save_config,
+    save_overlay,
+    set_overlay_value,
     set_value,
 )
 from .constitution import probe_repository, ratification_status, read_proposal, write_proposal
@@ -583,11 +588,22 @@ def build_parser() -> argparse.ArgumentParser:
     config_subparsers = config_cmd.add_subparsers(dest="config_command", required=True)
     config_get = config_subparsers.add_parser("get", help="print one value as JSON")
     config_get.add_argument("path", help="dotted path, e.g. merge.surface")
+    config_get.add_argument(
+        "--epic",
+        action="store_true",
+        help="resolve through the active epic's overlay; prints {path, value, source}",
+    )
     config_set = config_subparsers.add_parser(
         "set", help="set one value (JSON literal, or bare string fallback)"
     )
     config_set.add_argument("path", help="dotted path, e.g. merge.surface")
     config_set.add_argument("value", help='e.g. local or \'["pytest -q"]\'')
+    config_set.add_argument(
+        "--epic",
+        action="store_true",
+        help="write to the active epic's overlay instead of the global config "
+        "(allowlist-checked; requires an active epic)",
+    )
     config_subparsers.add_parser("show", help="print the whole config")
     return parser
 
@@ -1720,6 +1736,42 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "config":
             wdd_dir = store.path.parent
+            if getattr(args, "epic", False):
+                # epic overlay resolution (epic-scoped-state plan, Task 2,
+                # spec Sec2) -- state.epic is a v6 field (Task 3); until
+                # then this is always None, so `get --epic` degrades to
+                # the plain global/default view and `set --epic` always
+                # refuses below (correctly -- there is no verb yet to
+                # create an epic; Task 4 adds `wddctl epic new`).
+                state = store.read() if store.exists() else None
+                epic = (state or {}).get("epic")
+                if args.config_command == "get":
+                    layers = load_layers(wdd_dir, epic)
+                    value, source = resolve_config_source(layers, args.path)
+                    _print_json({"path": args.path, "value": value, "source": source})
+                    return 0
+                if args.config_command == "set":
+                    if epic is None:
+                        raise ValidationError(
+                            "config set --epic: no active epic (state.epic is null); "
+                            "run 'wddctl epic new --slug SLUG' first"
+                        )
+                    layers = load_layers(wdd_dir, epic)
+                    try:
+                        value = json.loads(args.value)
+                    except json.JSONDecodeError:
+                        value = args.value
+                    patch = set_overlay_value(layers["overlay"], args.path, value)
+                    derived = derive_effective(layers, patch)
+                    save_overlay(wdd_dir, epic, derived["overlay"])
+                    _print_json(
+                        {
+                            "path": args.path,
+                            "value": get_value(derived["effective"], args.path),
+                            "epic": epic,
+                        }
+                    )
+                    return 0
             config = load_config(wdd_dir)
             if args.config_command == "get":
                 _print_json(get_value(config, args.path))
