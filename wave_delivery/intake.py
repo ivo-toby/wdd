@@ -143,7 +143,9 @@ def _validate_design_text(text: str) -> None:
     _require_sections(text, _REQUIRED_DESIGN_SECTIONS, label="design.md")
 
 
-def resolve_within_wdd(wdd_dir: Path, raw_path: str, *, label: str = "research artifact") -> Path:
+def resolve_within_wdd(
+    wdd_dir: Path, raw_path: str, *, label: str = "research artifact", epic: str | None = None
+) -> Path:
     """Resolve a `.wdd`-relative artifact ref, labeled for the caller's ref kind.
 
     Cross-reference: `wave_delivery/paths.py`'s `resolve_artifact` is the
@@ -152,13 +154,15 @@ def resolve_within_wdd(wdd_dir: Path, raw_path: str, *, label: str = "research a
     label-preserving wrapper kept for the call sites (and their pinned
     tests) that need the refusal message to name their own ref kind
     ("research artifact", "context ref", "task brief", ...) rather than
-    `resolve_artifact`'s generic wording. `epic=None` is Task 1's
-    transition-mode fallback (paths.py's docstring): every call site in
-    this branch still resolves flat against `.wdd/`; Task 4 threads a real
-    epic through.
+    `resolve_artifact`'s generic wording. `epic` defaults to `None` (Task
+    1's transition-mode fallback, still flat) but every call site in THIS
+    module now threads the caller's `state.get("epic")` explicitly (Task 4,
+    spec Sec1: "every resolve_artifact/resolve_within_wdd call site threads
+    epic=state.epic") -- the default only covers a caller with no state at
+    all to read epic from.
     """
     try:
-        return resolve_artifact(raw_path, wdd_dir=wdd_dir, epic=None)
+        return resolve_artifact(raw_path, wdd_dir=wdd_dir, epic=epic)
     except ValidationError as error:
         raise ValidationError(f"{label}: {error}") from error
 
@@ -206,23 +210,26 @@ def record_spec(
     if not isinstance(approved_by, str) or not approved_by:
         raise ValidationError("--approved-by requires a non-empty name")
     wdd_dir = Path(wdd_dir)
-    spec_path = resolve_within_wdd(wdd_dir, "spec.md", label="spec")
+    # state must be read before the first resolution: spec.md's epic-namespace
+    # location depends on state.epic (Task 4, spec Sec1) -- unlike Task 1's
+    # transition-mode `epic=None`, this is no longer path-independent of state.
+    state = store.read()
+    _require_ladder_legal(state)
 
-    def _snapshot() -> tuple[int, str]:
+    def _snapshot(epic: str | None) -> tuple[int, str]:
+        spec_path = resolve_within_wdd(wdd_dir, "spec.md", label="spec", epic=epic)
         text = _require_nonempty_file(spec_path, label="spec.md")
         return _validate_spec_text(text), artifact_sha256(spec_path)
 
     # Fail fast, before the lock -- mirrors finalize.py's two-stage guard.
-    _snapshot()
-    state = store.read()
-    _require_ladder_legal(state)
+    _snapshot(state.get("epic"))
 
     def mutator(current: dict[str, Any]) -> dict[str, Any]:
         _require_ladder_legal(current)
         # Re-derived under the lock: an edit to spec.md between the pre-lock
         # read and now must not approve stale bytes -- an approval of text
         # that has since changed approves nothing.
-        criteria, sha256 = _snapshot()
+        criteria, sha256 = _snapshot(current.get("epic"))
         updated = copied_state(current)
         updated["intake"] = dict(updated.get("intake") or {})
         updated["intake"]["spec"] = {
@@ -273,27 +280,8 @@ def record_research(
     if skip_reason is not None and not skip_reason.strip():
         raise ValidationError("--reason requires a non-empty string")
     wdd_dir = Path(wdd_dir)
-
-    def _snapshot_artifacts() -> list[dict[str, str]] | None:
-        if done_artifacts is None:
-            return None
-        if not done_artifacts:
-            raise ValidationError("--done requires at least one --artifacts path")
-        records = []
-        for raw_path in done_artifacts:
-            resolved = resolve_within_wdd(wdd_dir, raw_path)
-            if not resolved.exists() or not resolved.is_file():
-                raise ValidationError(
-                    f"research artifact does not exist or is not a regular file: {raw_path}"
-                )
-            if resolved.stat().st_size == 0:
-                raise ValidationError(f"research artifact is empty: {raw_path}")
-            relative = resolved.relative_to(wdd_dir.resolve())
-            records.append({"path": str(relative), "sha256": artifact_sha256(resolved)})
-        return records
-
-    # Fail fast, before the lock.
-    _snapshot_artifacts()
+    # state read up front, mirroring record_spec: artifact resolution below
+    # depends on state.epic (Task 4).
     state = store.read()
     _require_ladder_legal(state)
     if (state.get("intake") or {}).get("spec") is None:
@@ -302,6 +290,35 @@ def record_research(
             "run 'wddctl intake spec --approved-by NAME'"
         )
 
+    def _snapshot_artifacts(epic: str | None) -> list[dict[str, str]] | None:
+        if done_artifacts is None:
+            return None
+        if not done_artifacts:
+            raise ValidationError("--done requires at least one --artifacts path")
+        records = []
+        for raw_path in done_artifacts:
+            resolved = resolve_within_wdd(wdd_dir, raw_path, epic=epic)
+            if not resolved.exists() or not resolved.is_file():
+                raise ValidationError(
+                    f"research artifact does not exist or is not a regular file: {raw_path}"
+                )
+            if resolved.stat().st_size == 0:
+                raise ValidationError(f"research artifact is empty: {raw_path}")
+            # Recorded as the namespace-relative REF itself (anchor stripped),
+            # never a path derived from the resolved physical location: once
+            # epic is real, `resolved` lives under `epics/<epic>/...`, and a
+            # "path" of that shape would be rejected by `resolve_artifact` the
+            # next time it is read back (it refuses any ref beginning
+            # `epics/`). This mirrors the fix ce8e2e9 made to
+            # handover.inputs_status's READ side; here it is the WRITE side.
+            records.append(
+                {"path": raw_path.split("#", 1)[0], "sha256": artifact_sha256(resolved)}
+            )
+        return records
+
+    # Fail fast, before the lock.
+    _snapshot_artifacts(state.get("epic"))
+
     def mutator(current: dict[str, Any]) -> dict[str, Any]:
         _require_ladder_legal(current)
         if (current.get("intake") or {}).get("spec") is None:
@@ -309,7 +326,7 @@ def record_research(
                 "intake research requires a recorded spec first; "
                 "run 'wddctl intake spec --approved-by NAME'"
             )
-        artifacts = _snapshot_artifacts()
+        artifacts = _snapshot_artifacts(current.get("epic"))
         updated = copied_state(current)
         updated["intake"] = dict(updated.get("intake") or {})
         if artifacts is not None:
@@ -364,15 +381,6 @@ def record_design(
             "the epic deliverable's proof is not optional"
         )
     wdd_dir = Path(wdd_dir)
-    design_path = resolve_within_wdd(wdd_dir, "design.md", label="design")
-
-    def _snapshot() -> str:
-        text = _require_nonempty_file(design_path, label="design.md")
-        _validate_design_text(text)
-        return artifact_sha256(design_path)
-
-    # Fail fast, before the lock.
-    _snapshot()
     state = store.read()
     _require_ladder_legal(state)
     if (state.get("intake") or {}).get("research") is None:
@@ -381,6 +389,15 @@ def record_design(
             "--done --by NAME --artifacts PATH...' or '--skip --by NAME --reason \"...\"'"
         )
 
+    def _snapshot(epic: str | None) -> str:
+        design_path = resolve_within_wdd(wdd_dir, "design.md", label="design", epic=epic)
+        text = _require_nonempty_file(design_path, label="design.md")
+        _validate_design_text(text)
+        return artifact_sha256(design_path)
+
+    # Fail fast, before the lock.
+    _snapshot(state.get("epic"))
+
     def mutator(current: dict[str, Any]) -> dict[str, Any]:
         _require_ladder_legal(current)
         if (current.get("intake") or {}).get("research") is None:
@@ -388,7 +405,7 @@ def record_design(
                 "intake design requires recorded research first; run 'wddctl intake research "
                 "--done --by NAME --artifacts PATH...' or '--skip --by NAME --reason \"...\"'"
             )
-        sha256 = _snapshot()
+        sha256 = _snapshot(current.get("epic"))
         updated = copied_state(current)
         updated["intake"] = dict(updated.get("intake") or {})
         updated["intake"]["design"] = {
@@ -440,11 +457,15 @@ def intake_drift(state: dict[str, Any], wdd_dir: Path | str) -> dict[str, Any] |
     intake = state.get("intake") or {}
     if intake.get("legacy") is True:
         return None
+    # Cross-reference: every resolution below threads state.epic (Task 4,
+    # spec Sec1) -- a v6 state with an active epic never falls back to a
+    # flat read, even for a rung recorded before this scope had one.
+    epic = state.get("epic")
 
     spec = intake.get("spec")
     if spec is None:
         return None
-    spec_path = resolve_within_wdd(wdd_dir, "spec.md", label="spec")
+    spec_path = resolve_within_wdd(wdd_dir, "spec.md", label="spec", epic=epic)
     if not spec_path.exists():
         return {"rung": "spec", "recorded": spec["sha256"], "actual": "missing:spec.md"}
     actual = artifact_sha256(spec_path)
@@ -456,7 +477,7 @@ def intake_drift(state: dict[str, Any], wdd_dir: Path | str) -> dict[str, Any] |
         return None
     if research.get("done") is True:
         for artifact in research.get("artifacts", []):
-            artifact_path = resolve_within_wdd(wdd_dir, artifact["path"])
+            artifact_path = resolve_within_wdd(wdd_dir, artifact["path"], epic=epic)
             if not artifact_path.exists():
                 return {
                     "rung": "research",
@@ -471,7 +492,7 @@ def intake_drift(state: dict[str, Any], wdd_dir: Path | str) -> dict[str, Any] |
     design = intake.get("design")
     if design is None:
         return None
-    design_path = resolve_within_wdd(wdd_dir, "design.md", label="design")
+    design_path = resolve_within_wdd(wdd_dir, "design.md", label="design", epic=epic)
     if not design_path.exists():
         return {"rung": "design", "recorded": design["sha256"], "actual": "missing:design.md"}
     actual = artifact_sha256(design_path)

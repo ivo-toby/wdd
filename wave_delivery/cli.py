@@ -32,7 +32,13 @@ from .config import (
     set_value,
 )
 from .constitution import probe_repository, ratification_status, read_proposal, write_proposal
-from .setup import _intake_ladder_action, init_repository, migrate_governance, setup_next_actions
+from .setup import (
+    _intake_ladder_action,
+    create_epic,
+    init_repository,
+    migrate_governance,
+    setup_next_actions,
+)
 from .doctor import inspect_capabilities
 from .engine import (
     ACTIVE_STATUSES,
@@ -121,6 +127,12 @@ GOVERNED_VERBS = {
     ("dispatch", None),
     # The escape hatch bypasses transitions, not governance.
     ("event", "apply"),
+    # `epic new` (Task 4, spec Sec1) mutates state.epic and creates
+    # epics/<slug>/ -- governed like plan/intake's OWN mutating verbs are
+    # NOT (they are how governance/ladder progress gets re-signed), but
+    # unlike them epic new has no remedy role of its own to protect, so it
+    # stays governed like start/submit/merge.
+    ("epic", "new"),
 }
 
 # Task-targeted governed verbs additionally gated by input-version binding
@@ -384,6 +396,24 @@ def build_parser() -> argparse.ArgumentParser:
     _add_concurrency_flags(finalize_delivered)
 
     finalize_subparsers.add_parser("status", help="show the finalize section and phase")
+
+    epic = subparsers.add_parser("epic", help="epic lifecycle: create and adopt")
+    epic_subparsers = epic.add_subparsers(dest="epic_command", required=True)
+    epic_new = epic_subparsers.add_parser(
+        "new",
+        help=(
+            "create a new epic directory and set it active -- the first action of "
+            "every epic (spec Sec1). Slugs are immutable: there is no rename verb; "
+            "retiring one means archiving it."
+        ),
+    )
+    epic_new.add_argument(
+        "--slug", required=True, help="epic slug: [a-z0-9][a-z0-9-]{1,63}, unique, immutable"
+    )
+    epic_new.add_argument(
+        "--title", default=None, help="optional display title, recorded on the epic.created event"
+    )
+    _add_concurrency_flags(epic_new)
 
     intake = subparsers.add_parser(
         "intake", help="the spec/research/design ladder before plan apply"
@@ -1376,6 +1406,19 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "finalize" and args.finalize_command == "status":
             _print_json(finalize_status(store.read()))
+            return 0
+
+        if args.command == "epic" and args.epic_command == "new":
+            state, duplicate = create_epic(
+                store,
+                store.path.parent,
+                slug=args.slug,
+                title=args.title,
+                **_concurrency(args),
+            )
+            _print_json(
+                {"epic": state["epic"], "revision": state["revision"], "duplicate": duplicate}
+            )
             return 0
 
         if args.command == "intake" and args.intake_command == "spec":

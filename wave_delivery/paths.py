@@ -22,12 +22,16 @@ table above is closed, not a partial list with a permissive fallback --
 that is what makes this a *typed* resolver rather than a generic
 containment check.
 
-`epic=None` is this branch's transition mode (Task 1 of the
-epic-scoped-state plan): every call site rewired in this task still calls
-with `epic=None`, so epic-namespaced refs resolve FLAT against `.wdd/`,
-byte-identical to pre-epic resolution -- `epics/<slug>/` directories do
-not exist yet on this branch. Task 4 is what starts passing a real epic
-slug and flips epic-namespaced refs over to `.wdd/epics/<epic>/...`.
+`epic=None` was Task 1's transition mode: every call site resolved
+epic-namespaced refs FLAT against `.wdd/`, byte-identical to pre-epic
+resolution, since `epics/<slug>/` directories did not exist yet. Task 4
+(`wddctl epic new`, schema v6's `state.epic`) is what starts minting real
+epic directories; every call site now threads the caller's actual
+`state.epic` through, so `epic=None` remains meaningful ONLY for a state
+that genuinely has no active epic yet (pre-`epic new` setup, or a
+scope that predates this doctrine) -- epic-namespaced refs still resolve
+flat in that case, and move under `.wdd/epics/<epic>/...` the moment a
+real slug is threaded.
 """
 
 from __future__ import annotations
@@ -61,9 +65,11 @@ def resolve_artifact(ref: str, *, wdd_dir: Path | str, epic: str | None) -> Path
 
     `epic=None` resolves `tasks/`, `research/`, `spec.md`, `design.md`,
     `plan.json` refs flat against `wdd_dir` itself -- the Task 1
-    transition-mode fallback described in this module's docstring. Once an
-    `epic` slug is given (Task 4), those same refs resolve under
-    `wdd_dir/epics/<epic>/...` instead; `shared-context/` refs are
+    transition-mode fallback described in this module's docstring, still
+    correct for a state with no active epic. Once a real `epic` slug is
+    given (Task 4's `wddctl epic new`), those same refs resolve under
+    `wdd_dir/epics/<epic>/...` instead, with NO flat fallback even if a
+    same-named file happens to exist flat; `shared-context/` refs are
     ALWAYS global regardless of `epic`.
 
     Does not check existence -- callers check `resolved.exists()`

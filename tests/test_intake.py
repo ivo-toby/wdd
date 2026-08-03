@@ -1241,6 +1241,16 @@ class SetupLadderNextTest(unittest.TestCase):
             root, state = _ratified_repo(tmp)
             wdd = root / ".wdd"
 
+            # Task 4: create_epic is the ladder's true first rung, before
+            # any intake action -- the slug is born at the top of the
+            # ladder (spec Sec1).
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            action = json.loads(out)["actions"][0]
+            self.assertEqual(action["action"], "create_epic")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            epic_dir = wdd / "epics" / "demo"
+
             code, out = _cli(state, "next")
             self.assertEqual(code, 0, out)
             action = json.loads(out)["actions"][0]
@@ -1248,7 +1258,7 @@ class SetupLadderNextTest(unittest.TestCase):
             self.assertIn("recordWith", action)
             self.assertNotIn("stale", action)
 
-            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
             assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
 
             code, out = _cli(state, "next")
@@ -1261,7 +1271,7 @@ class SetupLadderNextTest(unittest.TestCase):
             code, out = _cli(state, "next")
             self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_design")
 
-            (wdd / "design.md").write_text(_design_text(), encoding="utf-8")
+            (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
             assert _cli(
                 state, "intake", "design", "--approved-by", "t", "--deliverable-command", "true"
             )[0] == 0
@@ -1275,10 +1285,12 @@ class SetupLadderNextTest(unittest.TestCase):
             # not fail on first use for lack of the flag.
             self.assertIn("--approved-by", plan_action["command"])
 
-            (wdd / "tasks").mkdir(exist_ok=True)
-            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            (epic_dir / "tasks").mkdir(parents=True, exist_ok=True)
+            (epic_dir / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
             plan_file = root / "plan.json"
-            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            plan_file.write_text(
+                json.dumps(_plan_document(["T1"], scope_id="SCOPE-demo")), encoding="utf-8"
+            )
             code, out = _cli(
                 state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
                 "--approved-by", "t",
@@ -2601,14 +2613,19 @@ class ScopeArchiveTest(unittest.TestCase):
             after = StateStore(Path(state)).read()
             self.assertNotIn("leases", after)
 
-    def test_next_says_agree_spec_after_archive(self) -> None:
+    def test_next_says_create_epic_after_archive(self) -> None:
+        """Task 4: the ladder's true first rung after a fresh rollover is
+        create_epic, not agree_spec -- the slug is born at the top of the
+        ladder (spec Sec1), and archive resets state.epic to null along
+        with everything else scope-carrying."""
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _run_to_delivered(tmp)
             assert _cli(state, "scope", "archive", "--repo", str(root))[0] == 0
+            self.assertIsNone(StateStore(Path(state)).read()["epic"])
             code, out = _cli(state, "next")
             self.assertEqual(code, 0, out)
             result = json.loads(out)
-            self.assertEqual(result["actions"][0]["action"], "agree_spec")
+            self.assertEqual(result["actions"][0]["action"], "create_epic")
 
     def test_archived_deliverable_command_absent_from_next_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2684,12 +2701,19 @@ class FullLifecycleE2ETest(unittest.TestCase):
             subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
             subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True)
 
+            # --- create_epic: the slug is born at the top of the ladder ------
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "create_epic")
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            epic_dir = wdd / "epics" / "demo"
+
             code, out = _cli(state, "next")
             self.assertEqual(code, 0, out)
             self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_spec")
 
             # --- ladder rung 1: spec approve ---------------------------------
-            (wdd / "spec.md").write_text(
+            (epic_dir / "spec.md").write_text(
                 _spec_text(ac_lines=("- [ ] AC-1: greets the caller by name",)),
                 encoding="utf-8",
             )
@@ -2709,7 +2733,7 @@ class FullLifecycleE2ETest(unittest.TestCase):
             self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_design")
 
             # --- ladder rung 3: design approve with deliverable command ------
-            (wdd / "design.md").write_text(_design_text(), encoding="utf-8")
+            (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
             code, out = _cli(
                 state, "intake", "design", "--approved-by", "t",
                 "--deliverable-command", "true",
@@ -2722,10 +2746,14 @@ class FullLifecycleE2ETest(unittest.TestCase):
             self.assertEqual(json.loads(out)["actions"][0]["action"], "plan")
 
             # --- plan apply --approved-by: the composite approval ------------
-            (wdd / "tasks").mkdir(exist_ok=True)
-            (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            # Scope identity (Task 4, spec Sec1): the scope id is the epic-
+            # derived SCOPE-demo -- v6 rejects any other id.
+            (epic_dir / "tasks").mkdir(parents=True, exist_ok=True)
+            (epic_dir / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
             plan_file = root / "plan.json"
-            plan_file.write_text(json.dumps(_plan_document(["T1"])), encoding="utf-8")
+            plan_file.write_text(
+                json.dumps(_plan_document(["T1"], scope_id="SCOPE-demo")), encoding="utf-8"
+            )
             code, out = _cli(
                 state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
                 "--approved-by", "t",
@@ -2807,13 +2835,23 @@ class FullLifecycleE2ETest(unittest.TestCase):
 
             after_archive = StateStore(Path(state)).read()
             self.assertIsNone(after_archive["scope"])
+            self.assertIsNone(after_archive["epic"])
             self.assertEqual(after_archive["intake"], {})
             self.assertEqual(after_archive["tasks"], {})
             self.assertNotIn("finalize", after_archive)
             # Governance survives the reset.
             self.assertEqual(after_archive["constitution"]["status"], "ratified")
 
-            # --- next says agree_spec again: a fresh ladder for scope #2 -----
+            # --- next says create_epic again: a fresh ladder for scope #2 ----
+            # Task 4: the pre-Task-6 archive verb resets state but does not
+            # move epics/demo/ off disk (that transactional move is Task 6's
+            # concern), so a second epic reuses a fresh slug -- "demo" is
+            # still occupied by round 1's real content, not the crash-orphan
+            # shape `epic new` would adopt.
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "create_epic")
+            assert _cli(state, "epic", "new", "--slug", "demo-2")[0] == 0
             code, out = _cli(state, "next")
             self.assertEqual(code, 0, out)
             self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_spec")

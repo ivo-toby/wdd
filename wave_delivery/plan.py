@@ -55,12 +55,17 @@ def plan_skeleton() -> dict[str, Any]:
     the caller fills them in -- but the document's *shape* is already legal:
     one task carrying every MUTABLE_TASK_FIELDS key, so an agent that just
     overwrites the placeholder values never has to guess a missing field.
+    The scope id placeholder spells out its own derivation (Task 4, spec
+    Sec1): on a v6 state with an active epic, `plan apply` REJECTS any
+    scope.id other than `SCOPE-<the active epic's slug>` -- this is not a
+    free-form name to invent, it is `epic new --slug`'s own slug with a
+    fixed prefix.
     """
     return {
         "schemaVersion": 1,
         "kind": PLAN_KIND,
         "scope": {
-            "id": "SCOPE-your-scope-id",
+            "id": "SCOPE-<your-epic-slug>",
             "baseRef": "wdd/your-scope-id",
             "maxConcurrent": 3,
             "reviewPolicy": "risk_based",
@@ -499,7 +504,9 @@ def _apply_plan_to_state(state: dict[str, Any], plan: dict[str, Any]) -> dict[st
     return state
 
 
-def _validate_context_refs(tasks: list[dict[str, Any]], wdd_dir: Path) -> None:
+def _validate_context_refs(
+    tasks: list[dict[str, Any]], wdd_dir: Path, *, epic: str | None = None
+) -> None:
     """Every task `context` ref must resolve to a regular file inside `.wdd/`.
 
     Ref syntax is `<path>[#anchor]` (spec Sec3); the anchor is advisory
@@ -507,10 +514,12 @@ def _validate_context_refs(tasks: list[dict[str, Any]], wdd_dir: Path) -> None:
     one typed resolver (`wave_delivery/paths.py`'s `resolve_artifact`),
     reached here via `intake.resolve_within_wdd`'s label-preserving
     wrapper (Global Constraints: no site resolves paths its own way).
+    `epic` threads the caller's `state.epic` (Task 4): a v6 state with an
+    active epic resolves every ref under `epics/<epic>/...`, never flat.
     """
     for entry in tasks:
         for ref in entry.get("context") or []:
-            resolved = resolve_within_wdd(wdd_dir, ref, label="context ref")
+            resolved = resolve_within_wdd(wdd_dir, ref, label="context ref", epic=epic)
             if not resolved.exists() or not resolved.is_file():
                 raise ValidationError(
                     f"task {entry['id']} context ref does not resolve to a file "
@@ -518,7 +527,9 @@ def _validate_context_refs(tasks: list[dict[str, Any]], wdd_dir: Path) -> None:
                 )
 
 
-def plan_composite(plan_dict: dict[str, Any], wdd_dir: Path | str) -> str:
+def plan_composite(
+    plan_dict: dict[str, Any], wdd_dir: Path | str, *, epic: str | None = None
+) -> str:
     """SHA-256 composite binding a plan approval to the bytes it was shown.
 
     Covers the canonical normalized plan (key-sorted JSON, so task/field
@@ -529,7 +540,8 @@ def plan_composite(plan_dict: dict[str, Any], wdd_dir: Path | str) -> str:
     `_diff_plan`'s reconstruction) and recomputes this same function to
     detect post-apply drift -- the reason every field this composite must
     see (context/model/reviewModel) is also a MUTABLE_TASK_FIELD persisted
-    into task state.
+    into task state. `epic` threads the caller's `state.epic` (Task 4): every
+    call site here passes the epic of the state dict it just built or read.
     """
     wdd_dir = Path(wdd_dir)
     # sort_keys=True only orders each dict's keys, not the tasks list itself;
@@ -549,9 +561,9 @@ def plan_composite(plan_dict: dict[str, Any], wdd_dir: Path | str) -> str:
         # Cross-reference: wave_delivery/paths.py's `resolve_artifact` is the
         # one typed resolver (spec Sec1, Global Constraints) -- the
         # composite's brief/context reads go through it too, not a raw
-        # `wdd_dir / path` join. `epic=None` is Task 1's transition-mode
-        # fallback (paths.py docstring); Task 4 threads a real epic through.
-        resolved = resolve_artifact(path, wdd_dir=wdd_dir, epic=None)
+        # `wdd_dir / path` join. `epic` threads the caller's `state.epic`
+        # (Task 4).
+        resolved = resolve_artifact(path, wdd_dir=wdd_dir, epic=epic)
         try:
             return artifact_sha256(resolved)
         except FileNotFoundError as error:
@@ -650,7 +662,9 @@ def intake_gate_status(
     if not isinstance(approval, dict) or not approval.get("sha256"):
         return "plan_drift", {"recorded": None, "actual": "never composite-approved"}
     try:
-        recomputed = plan_composite(_reconstruct_plan_from_state(state), wdd_dir)
+        recomputed = plan_composite(
+            _reconstruct_plan_from_state(state), wdd_dir, epic=state.get("epic")
+        )
     except ValidationError as error:
         return "plan_drift", {"recorded": approval["sha256"], "actual": f"missing file: {error}"}
     if approval["sha256"] != recomputed:
@@ -757,7 +771,25 @@ def apply_plan(
     current = store.read()
     legacy = _is_legacy_intake(current)
 
-    _validate_context_refs(plan["tasks"], wdd_dir)
+    # Scope identity (Task 4, spec Sec1): "the slug is the canonical scope
+    # identity" -- a non-legacy v6 state with an active epic REJECTS any
+    # scope.id other than the epic-derived SCOPE-<slug>, naming both. Legacy
+    # scopes are wholesale exempt (their scope.id predates this doctrine and
+    # was never derived from an epic slug); a state with no active epic yet
+    # has nothing to derive against and is left to whatever the plan names
+    # (unreachable in the intended ladder, since `epic new` always precedes
+    # `plan apply`, but permissive rather than assumed).
+    if not legacy and current.get("epic"):
+        expected_scope_id = f"SCOPE-{current['epic']}"
+        if plan["scope"]["id"] != expected_scope_id:
+            raise ValidationError(
+                f"plan.scope.id must be the epic-derived {expected_scope_id!r} "
+                f"(active epic {current['epic']!r}), got {plan['scope']['id']!r}: "
+                "the slug is the canonical scope identity (spec Sec1) -- v6 "
+                "drops any other override"
+            )
+
+    _validate_context_refs(plan["tasks"], wdd_dir, epic=current.get("epic"))
 
     if not legacy:
         if not intake_complete(current):
@@ -815,7 +847,11 @@ def apply_plan(
             # Reconstructing from state_copy after the (no-op, diff-empty)
             # apply keeps both sides symmetric by construction.
             composite = (
-                None if legacy else plan_composite(_reconstruct_plan_from_state(state_copy), wdd_dir)
+                None
+                if legacy
+                else plan_composite(
+                    _reconstruct_plan_from_state(state_copy), wdd_dir, epic=state_copy.get("epic")
+                )
             )
             _stamp_approval(state_copy, approved_by, composite)
             return state_copy
@@ -853,7 +889,9 @@ def apply_plan(
         composite = (
             None
             if legacy or not approved_by
-            else plan_composite(_reconstruct_plan_from_state(updated), wdd_dir)
+            else plan_composite(
+                _reconstruct_plan_from_state(updated), wdd_dir, epic=updated.get("epic")
+            )
         )
         _stamp_approval(updated, approved_by, composite)
         if repo is not None and plan["scope"]["baseRef"]:

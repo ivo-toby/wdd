@@ -925,10 +925,17 @@ class EndToEndSetupTest(unittest.TestCase):
 
             self._cli(state, "constitution", "ratify", "--by", "test")
 
+            # Task 4: create_epic is the ladder's true first rung.
+            payload = self._cli(state, "next")
+            self.assertEqual(payload["actions"][0]["action"], "create_epic")
+
+            self._cli(state, "epic", "new", "--slug", "demo")
+            epic_dir = wdd / "epics" / "demo"
+
             payload = self._cli(state, "next")
             self.assertEqual(payload["actions"][0]["action"], "agree_spec")
 
-            (wdd / "spec.md").write_text(
+            (epic_dir / "spec.md").write_text(
                 "# Spec\n\n## Goal\n\nShip it.\n\n## In scope\n\n- x\n\n"
                 "## Out of scope\n\n- y\n\n## Acceptance criteria\n\n"
                 "- [ ] AC-1: the thing works\n",
@@ -947,7 +954,7 @@ class EndToEndSetupTest(unittest.TestCase):
             payload = self._cli(state, "next")
             self.assertEqual(payload["actions"][0]["action"], "agree_design")
 
-            (wdd / "design.md").write_text(
+            (epic_dir / "design.md").write_text(
                 "# Design\n\n## Components\n\n- core\n\n## Interfaces\n\n"
                 "- core: consumes nothing, produces lib\n\n"
                 "## Integration surfaces\n\n- `src/core.py` — owned by: core task\n\n"
@@ -962,12 +969,14 @@ class EndToEndSetupTest(unittest.TestCase):
             self.assertEqual(payload["actions"][0]["action"], "plan")
             self.assertIn("--approved-by", payload["actions"][0]["command"])
 
+            # _minimal_plan's scope id ("SCOPE-demo") is already the
+            # epic-derived id -- v6 plan apply rejects any other (Task 4).
             plan_file = root / "plan.json"
             plan = _minimal_plan()
             plan["scope"]["baseRef"] = "wdd/demo"
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
-            (wdd / "tasks").mkdir(exist_ok=True)
-            (wdd / "tasks" / "TASK-001-first.md").write_text("# Brief\n", encoding="utf-8")
+            (epic_dir / "tasks").mkdir(parents=True, exist_ok=True)
+            (epic_dir / "tasks" / "TASK-001-first.md").write_text("# Brief\n", encoding="utf-8")
             self._cli(
                 state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
                 "--approved-by", "test",

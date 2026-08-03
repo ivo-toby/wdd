@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,7 +36,8 @@ from wave_delivery.config import (
     set_overlay_value,
     validate_overlay,
 )
-from wave_delivery.errors import ValidationError
+from wave_delivery.doctor import inspect_capabilities
+from wave_delivery.errors import IllegalTransition, ValidationError
 from wave_delivery.intake import artifact_sha256, resolve_within_wdd
 from wave_delivery.migration import (
     SUPPORTED_SOURCE_VERSIONS,
@@ -54,6 +56,7 @@ from wave_delivery.schema import (
     task_state,
     validate_state,
 )
+from wave_delivery.setup import create_epic, epic_orphans, setup_next_actions
 from wave_delivery.store import StateStore
 
 
@@ -1700,6 +1703,473 @@ class MigrateComposedFromEarlierVersionsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ValidationError):
                 convert_v5_to_v6(new_state("SCOPE-x"), wdd_dir=Path(tmp))
+
+
+# --- Task 4: epic lifecycle -- `epic new`, ladder wiring, flat-path -------
+# retirement (spec Sec1 "the slug is born at the top of the ladder").
+# Local helpers below copy the scratch-repo / `_cli` pattern from
+# tests/test_intake.py verbatim (no cross-file imports between test
+# modules, per the plan's Global Constraints).
+
+
+def _git_repo(tmp: str) -> Path:
+    root = Path(tmp) / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=root, check=True)
+    (root / "seed").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+         "-c", "commit.gpgsign=false", "commit", "-qm", "seed"],
+        cwd=root, check=True,
+    )
+    return root
+
+
+def _cli(state: str, *argv: str) -> tuple[int, str]:
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        code = main(["--state", state, *argv])
+    return code, stdout.getvalue()
+
+
+def _cli_full(state: str, *argv: str) -> tuple[int, str, str]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        code = main(["--state", state, *argv])
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+def _ratified_repo(tmp: str) -> tuple[Path, str]:
+    """A fresh git repo with .wdd/ initialized and the constitution ratified
+    -- no epic, no scope. Mirrors test_intake.py's fixture of the same name."""
+    root = _git_repo(tmp)
+    wdd = root / ".wdd"
+    state = str(wdd / "state.json")
+    assert _cli(state, "init", "--repo", str(root))[0] == 0
+    assert _cli(state, "config", "set", "merge.surface", "local")[0] == 0
+    assert _cli(
+        state, "config", "set", "models",
+        '{"planning": null, "implementation": {"default": null, "highRisk": null}, "review": null}',
+    )[0] == 0
+    config = load_config(wdd)
+    if any(q["path"] == "verification.commands" for q in config["openQuestions"]):
+        assert _cli(state, "config", "set", "verification.commands", '["true"]')[0] == 0
+    assert _cli(state, "constitution", "ratify", "--by", "t")[0] == 0
+    return root, state
+
+
+def _epic_repo(tmp: str, slug: str = "demo") -> tuple[Path, str]:
+    """`_ratified_repo` plus one adopted epic -- the fixture most Task 4
+    tests build on."""
+    root, state = _ratified_repo(tmp)
+    assert _cli(state, "epic", "new", "--slug", slug)[0] == 0
+    return root, state
+
+
+def _spec_text(ac_lines: tuple[str, ...] = ("- [ ] AC-1: the thing works",)) -> str:
+    return (
+        "# Spec\n\n## Goal\n\nShip it.\n\n## In scope\n\n- x\n\n"
+        "## Out of scope\n\n- y\n\n## Acceptance criteria\n\n" + "\n".join(ac_lines) + "\n"
+    )
+
+
+def _design_text() -> str:
+    return (
+        "# Design\n\n## Components\n\n- core\n\n## Interfaces\n\n"
+        "- core: consumes nothing, produces lib\n\n## Integration surfaces\n\n"
+        "- `src/core.py` — owned by: core\n\n## Epic deliverable\n\nThe lib imports.\n"
+    )
+
+
+def _plan_document(
+    task_ids: tuple[str, ...] | list[str], *, scope_id: str, base_ref: str | None = None
+) -> dict:
+    scope: dict = {"id": scope_id}
+    if base_ref is not None:
+        scope["baseRef"] = base_ref
+    return {
+        "schemaVersion": 1,
+        "kind": "wdd_plan",
+        "scope": scope,
+        "tasks": [{"id": task_id, "specPath": f"tasks/{task_id}.md"} for task_id in task_ids],
+    }
+
+
+class EpicNewLadderOrderTest(unittest.TestCase):
+    """Test contract: create_epic is emitted post-ratify, pre-agree_spec."""
+
+    def test_next_emits_create_epic_before_any_intake_rung(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            action = json.loads(out)["actions"][0]
+            self.assertEqual(action["action"], "create_epic")
+            self.assertIn("epic new", action["command"])
+
+    def test_next_emits_agree_spec_immediately_after_epic_new(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp)
+            code, out = _cli(state, "next")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_spec")
+
+    def test_epic_new_sets_state_epic_and_creates_sparse_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            code, out = _cli(state, "epic", "new", "--slug", "demo")
+            self.assertEqual(code, 0, out)
+            payload = json.loads(out)
+            self.assertEqual(payload["epic"], "demo")
+            written = StateStore(Path(state)).read()
+            self.assertEqual(written["epic"], "demo")
+            wdd = root / ".wdd"
+            self.assertEqual(load_overlay(wdd, "demo"), {})
+            self.assertTrue((wdd / "epics" / "demo" / "config.json").is_file())
+
+
+class EpicNewUniquenessTest(unittest.TestCase):
+    """Test contract: uniqueness incl. archived slugs."""
+
+    def test_refuses_when_an_epic_is_already_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp, "demo")
+            code, out, err = _cli_full(state, "epic", "new", "--slug", "second")
+            self.assertNotEqual(code, 0)
+            self.assertIn("already active", err)
+            self.assertEqual(StateStore(Path(state)).read()["epic"], "demo")
+
+    def test_refuses_slug_matching_an_archived_epic_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            (wdd / "archive" / "demo").mkdir(parents=True)
+            (wdd / "archive" / "demo" / "record.json").write_text("{}\n", encoding="utf-8")
+            code, out, err = _cli_full(state, "epic", "new", "--slug", "demo")
+            self.assertNotEqual(code, 0)
+            self.assertIn("archived", err)
+            self.assertIsNone(StateStore(Path(state)).read()["epic"])
+
+    def test_refuses_target_dir_containing_record_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            (wdd / "epics" / "demo").mkdir(parents=True)
+            (wdd / "epics" / "demo" / "record.json").write_text("{}\n", encoding="utf-8")
+            code, out, err = _cli_full(state, "epic", "new", "--slug", "demo")
+            self.assertNotEqual(code, 0)
+            self.assertIn("record.json", err)
+            self.assertIsNone(StateStore(Path(state)).read()["epic"])
+
+    def test_refuses_occupied_directory_that_is_not_the_crash_orphan_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            (wdd / "epics" / "demo" / "tasks").mkdir(parents=True)
+            (wdd / "epics" / "demo" / "tasks" / "T1.md").write_text("# T1\n", encoding="utf-8")
+            code, out, err = _cli_full(state, "epic", "new", "--slug", "demo")
+            self.assertNotEqual(code, 0)
+            self.assertIn("demo", err)
+            self.assertIsNone(StateStore(Path(state)).read()["epic"])
+
+
+class EpicNewRefusalCasesTest(unittest.TestCase):
+    """Test contract: refusal cases (active epic, record.json present, bad slug)."""
+
+    def test_refuses_uppercase_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            code, out, err = _cli_full(state, "epic", "new", "--slug", "Demo")
+            self.assertNotEqual(code, 0)
+            self.assertIn("slug", err)
+
+    def test_refuses_single_character_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            code, out, err = _cli_full(state, "epic", "new", "--slug", "d")
+            self.assertNotEqual(code, 0)
+
+    def test_refuses_slug_with_illegal_characters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            code, out, err = _cli_full(state, "epic", "new", "--slug", "demo_epic!")
+            self.assertNotEqual(code, 0)
+
+    def test_valid_slug_boundary_two_chars_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            code, out = _cli(state, "epic", "new", "--slug", "d1")
+            self.assertEqual(code, 0, out)
+
+
+class EpicNewCrashOrphanAdoptionTest(unittest.TestCase):
+    """Test contract: crash-shape adoption idempotency."""
+
+    def test_adopts_a_directory_holding_only_an_empty_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            # Simulate a crash between mkdir+overlay-write and state.epic
+            # adoption: the directory holds ONLY an empty overlay.
+            save_overlay(wdd, "demo", {})
+            self.assertIsNone(StateStore(Path(state)).read()["epic"])
+
+            code, out = _cli(state, "epic", "new", "--slug", "demo")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(StateStore(Path(state)).read()["epic"], "demo")
+
+    def test_adoption_is_re_runnable(self) -> None:
+        """Running `epic new` on an already-adopted epic a second time (the
+        exact command, before archiving) is refused as "already active" --
+        adoption only covers the UNADOPTED crash-orphan shape, not a
+        re-run once state.epic already names it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp, "demo")
+            code, out, err = _cli_full(state, "epic", "new", "--slug", "demo")
+            self.assertNotEqual(code, 0)
+            self.assertIn("already active", err)
+
+
+class EpicScopeIdDerivationTest(unittest.TestCase):
+    """Test contract: scope-id derivation + mismatch rejection."""
+
+    def _walk_to_plan(self, state: str, epic_dir: Path) -> None:
+        (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
+        assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
+        assert _cli(
+            state, "intake", "research", "--skip", "--by", "t", "--reason", "n/a"
+        )[0] == 0
+        (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
+        assert _cli(
+            state, "intake", "design", "--approved-by", "t", "--deliverable-command", "true"
+        )[0] == 0
+
+    def test_plan_apply_rejects_a_scope_id_other_than_scope_dash_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp, "demo")
+            wdd = root / ".wdd"
+            epic_dir = wdd / "epics" / "demo"
+            self._walk_to_plan(state, epic_dir)
+            (epic_dir / "tasks").mkdir(parents=True, exist_ok=True)
+            (epic_dir / "tasks" / "T1.md").write_text("# T1\n", encoding="utf-8")
+            plan_file = root / "plan.json"
+            plan_file.write_text(
+                json.dumps(_plan_document(["T1"], scope_id="SCOPE-wrong", base_ref="wdd/demo")),
+                encoding="utf-8",
+            )
+            code, out, err = _cli_full(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("SCOPE-demo", err)
+            self.assertIn("SCOPE-wrong", err)
+            self.assertIsNone(StateStore(Path(state)).read()["scope"])
+
+    def test_plan_apply_accepts_the_epic_derived_scope_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp, "demo")
+            wdd = root / ".wdd"
+            epic_dir = wdd / "epics" / "demo"
+            self._walk_to_plan(state, epic_dir)
+            (epic_dir / "tasks").mkdir(parents=True, exist_ok=True)
+            (epic_dir / "tasks" / "T1.md").write_text("# T1\n", encoding="utf-8")
+            plan_file = root / "plan.json"
+            plan_file.write_text(
+                json.dumps(_plan_document(["T1"], scope_id="SCOPE-demo", base_ref="wdd/demo")),
+                encoding="utf-8",
+            )
+            code, out, err = _cli_full(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, err)
+            self.assertEqual(StateStore(Path(state)).read()["scope"]["id"], "SCOPE-demo")
+
+
+class EpicV6NoFlatFallbackRegressionTest(unittest.TestCase):
+    """Test contract regression: flat tasks/T.md present but
+    epics/<slug>/tasks/T.md absent -> refusal naming the epic path, no
+    silent fallback (spec Sec1)."""
+
+    def test_resolve_artifact_never_falls_back_to_flat_for_an_active_epic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            (wdd / "tasks").mkdir(parents=True)
+            (wdd / "tasks" / "T1.md").write_text("# flat, decoy\n", encoding="utf-8")
+            # No epics/demo/tasks/T1.md written -- the epic-namespaced path
+            # is absent. Resolution must point AT that (still-missing) path,
+            # never quietly return the flat decoy above.
+            resolved = resolve_artifact("tasks/T1.md", wdd_dir=wdd, epic="demo")
+            self.assertEqual(resolved, (wdd / "epics" / "demo" / "tasks" / "T1.md").resolve())
+            self.assertFalse(resolved.exists())
+
+    def test_intake_spec_refuses_naming_the_epic_path_when_only_flat_spec_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp, "demo")
+            wdd = root / ".wdd"
+            # Only the flat decoy exists; epics/demo/spec.md does not -- the
+            # verb must refuse rather than silently reading the flat file.
+            (wdd / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            code, out, err = _cli_full(state, "intake", "spec", "--approved-by", "t")
+            self.assertNotEqual(code, 0)
+            self.assertIn("spec.md does not exist", err)
+            # Once written to the correctly epic-scoped path, the SAME verb
+            # succeeds -- proving the earlier refusal was resolution, not a
+            # coincidental content/validation failure.
+            (wdd / "epics" / "demo" / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            code, out, err = _cli_full(state, "intake", "spec", "--approved-by", "t")
+            self.assertEqual(code, 0, err)
+
+    def test_handover_input_sources_refuse_flat_fallback_for_an_active_epic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp, "demo")
+            wdd = root / ".wdd"
+            epic_dir = wdd / "epics" / "demo"
+            self._walk_and_plan(state, root, epic_dir)
+            # Delete the epic-scoped brief and leave only a flat decoy --
+            # `start` must refuse (missing brief), not silently pick up the
+            # flat file.
+            (epic_dir / "tasks" / "T1.md").unlink()
+            (wdd / "tasks").mkdir(parents=True, exist_ok=True)
+            (wdd / "tasks" / "T1.md").write_text("# flat decoy\n", encoding="utf-8")
+            code, out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+
+    def _walk_and_plan(self, state: str, root: Path, epic_dir: Path) -> None:
+        (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
+        assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
+        assert _cli(
+            state, "intake", "research", "--skip", "--by", "t", "--reason", "n/a"
+        )[0] == 0
+        (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
+        assert _cli(
+            state, "intake", "design", "--approved-by", "t", "--deliverable-command", "true"
+        )[0] == 0
+        (epic_dir / "tasks").mkdir(parents=True, exist_ok=True)
+        (epic_dir / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+        plan_file = root / "plan.json"
+        plan_file.write_text(
+            json.dumps(_plan_document(["T1"], scope_id="SCOPE-demo", base_ref="wdd/demo")),
+            encoding="utf-8",
+        )
+        assert _cli(
+            state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+            "--approved-by", "t",
+        )[0] == 0
+
+
+class DoctorEpicOrphanTest(unittest.TestCase):
+    """Test contract: doctor reports orphan epic dirs (exists, not
+    state.epic, not archived)."""
+
+    def test_no_orphans_reported_for_a_single_active_epic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp, "demo")
+            report = inspect_capabilities(root / ".wdd", StateStore(Path(state)).read())
+            self.assertEqual(report["epicOrphans"], [])
+
+    def test_reports_a_directory_that_is_not_the_active_epic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp, "demo")
+            wdd = root / ".wdd"
+            # A leftover directory -- e.g. a crashed archive transaction
+            # (Task 6) or an unadopted `epic new` -- left behind under
+            # epics/ while a DIFFERENT epic is active.
+            (wdd / "epics" / "orphaned").mkdir(parents=True)
+            report = inspect_capabilities(wdd, StateStore(Path(state)).read())
+            self.assertEqual(report["epicOrphans"], ["orphaned"])
+
+    def test_reports_every_epic_dir_when_no_epic_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            (wdd / "epics" / "stray").mkdir(parents=True)
+            report = inspect_capabilities(wdd, StateStore(Path(state)).read())
+            self.assertEqual(report["epicOrphans"], ["stray"])
+
+    def test_doctor_never_refuses_on_an_orphan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _epic_repo(tmp, "demo")
+            wdd = root / ".wdd"
+            (wdd / "epics" / "orphaned").mkdir(parents=True)
+            code, out = _cli(state, "doctor")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["epicOrphans"], ["orphaned"])
+
+
+class EpicFullLadderAndPlanApplyE2ETest(unittest.TestCase):
+    """Test contract: existing intake/plan flows work end-to-end against
+    epics/<slug>/ paths (walk a full ladder + plan apply in one test)."""
+
+    def test_full_ladder_then_plan_apply_lands_under_epics_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+
+            code, out = _cli(state, "next")
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "create_epic")
+            assert _cli(state, "epic", "new", "--slug", "checkout-v2")[0] == 0
+            epic_dir = wdd / "epics" / "checkout-v2"
+
+            code, out = _cli(state, "next")
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_spec")
+            (epic_dir / "spec.md").write_text(
+                _spec_text(ac_lines=("- [ ] AC-1: checkout completes",)), encoding="utf-8"
+            )
+            code, out = _cli(state, "intake", "spec", "--approved-by", "t")
+            self.assertEqual(code, 0, out)
+
+            code, out = _cli(state, "next")
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "research")
+            assert _cli(
+                state, "intake", "research", "--skip", "--by", "t", "--reason", "n/a"
+            )[0] == 0
+
+            code, out = _cli(state, "next")
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_design")
+            (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
+            assert _cli(
+                state, "intake", "design", "--approved-by", "t",
+                "--deliverable-command", "true",
+            )[0] == 0
+
+            code, out = _cli(state, "next")
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "plan")
+
+            (epic_dir / "tasks").mkdir(parents=True, exist_ok=True)
+            (epic_dir / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            plan_file = root / "plan.json"
+            plan_file.write_text(
+                json.dumps(
+                    _plan_document(["T1"], scope_id="SCOPE-checkout-v2", base_ref="wdd/checkout-v2")
+                ),
+                encoding="utf-8",
+            )
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+            applied = StateStore(Path(state)).read()
+            self.assertEqual(applied["scope"]["id"], "SCOPE-checkout-v2")
+            self.assertEqual(applied["epic"], "checkout-v2")
+
+            # lint sees the epic-scoped spec/brief/design without complaint.
+            code, out = _cli(state, "plan", "lint", "--plan", str(plan_file))
+            self.assertEqual(code, 0, out)
+            findings = json.loads(out)["findings"]
+            self.assertFalse(
+                [f for f in findings if f["code"] in {"missing_spec", "missing_brief"}]
+            )
+
+            # next now proposes starting the task.
+            code, out = _cli(state, "next", "--repo", str(root))
+            actions = [action["action"] for action in json.loads(out)["actions"]]
+            self.assertIn("start_task", actions)
 
 
 if __name__ == "__main__":

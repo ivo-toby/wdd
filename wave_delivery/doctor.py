@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import config_path, governance_drift, load_config
 from .errors import ValidationError
+from .setup import epic_orphans
 
 
 # A runner command's argv[0] naming one of these is a malformed registration
@@ -99,4 +100,10 @@ def inspect_capabilities(
     runners = _inspect_runners(config)
     if runners:
         payload["runners"] = runners
+    # Orphan epic directories (Task 4, spec Sec1): a dir under epics/ that
+    # is not state.epic -- a crash between `epic new`'s mkdir and its
+    # state.epic adoption, or (Task 6) a crashed archive transaction.
+    # doctor never refuses; this is reported, never gated on.
+    if wdd_dir is not None:
+        payload["epicOrphans"] = epic_orphans(wdd_dir, state)
     return payload
