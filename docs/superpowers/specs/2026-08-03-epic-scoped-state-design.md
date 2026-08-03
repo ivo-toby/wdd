@@ -104,19 +104,44 @@ wddctl epic new --slug <slug> [--title "..."]
 recoverable transaction under the state lock:
 
 1. Write `record.json` (today's archive JSON) **inside** `epics/<slug>/`.
-2. Record `state.archivePending = <slug>` (one durable journal field).
-3. One atomic rename: `epics/<slug>` → `archive/<slug>`. Refuses if the
-   destination exists — no nesting, no overwrite.
+   `record.json` is a **reserved filename**: no other verb may create it,
+   the typed resolver rejects it as an artifact ref, and `epic new`
+   refuses a directory containing one.
+2. Record `state.archivePending = {slug, sourceRevision,
+   recordSha256}` — the journal binds the record's exact bytes.
+3. One atomic rename: `epics/<slug>` → `archive/<slug>`.
 4. Reset state to post-ratification setup, clearing `state.epic` and
    `archivePending`. The ladder restarts at `create_epic`.
 
-Recovery is defined per crash point: `archivePending` set + source dir
-present → retry from step 3; `archivePending` set + source gone +
-destination present → complete step 4; `record.json` present without
-`archivePending` → remove it and restart. Every state-loading command
-performs this recovery before acting, so a crashed archive can never
-leave `state.epic` pointing at a missing directory across more than one
-invocation.
+**Recovery matrix** (exhaustive; any unlisted combination is a hard error
+naming the on-disk facts):
+
+- Journal set, source present, destination absent → verify
+  `record.json` against `recordSha256` (regenerate from the still-live
+  state if missing/corrupt — the state is authoritative until step 4),
+  then retry from step 3.
+- Journal set, source absent, destination present → verify the archived
+  `record.json` against `recordSha256`; regenerate it from the live
+  state on mismatch (the reset has not happened, so the state still
+  holds everything); then complete step 4. Never reset on an unverified
+  record.
+- Journal set, **destination already exists while source also exists**
+  (external collision) → do not retry forever: remove the generated
+  `record.json`, clear the journal, and surface a stable
+  `archive_blocked` blocker in `next` naming the colliding path — a
+  human decision, not a loop.
+- Journal set, neither path present → hard error with diagnostics
+  (nothing is guessed).
+- `record.json` present with no journal → remove it and proceed
+  normally (a step-1 crash left it; the transaction never began).
+
+**Locking layers**: the lock is not reentrant, so recovery has an
+explicit API layering — `read_raw_unlocked()` (no recovery),
+`recover_locked()` (assumes the lock is held), and `load_recovered()`
+(acquires the lock, recovers, reads). `apply_mutation` calls
+`recover_locked()` after acquiring its existing lock; read-only commands
+use `load_recovered()`. Two processes can never both run recovery, and
+no path self-deadlocks.
 
 Nothing is ever overwritten; two epics never collide on a path.
 
@@ -135,6 +160,34 @@ Resolution is per key path (e.g. `models.review` can be overridden while
 `models.implementation` falls through), computed by a single shared
 `resolve_config(state, wdd_dir)` that returns the merged view — no read
 site may consult either file directly.
+
+**One digest function, byte-precise.** `effective_config_digest(view)` is
+the only fingerprint implementation, following the existing governance
+fingerprint idiom (`config.py`): input is the fully parsed,
+default-hydrated merged view with source markers stripped; serialization
+is JSON with recursively sorted object keys, array order preserved,
+UTF-8, fixed separators, `ensure_ascii` fixed by the implementation;
+duplicate keys and non-finite numbers are rejected at parse. Changing any
+of these settings is a breaking change to every recorded approval and is
+therefore forbidden without a migration.
+
+**Purpose-projected digests, not one blob.** Evidence never stores the
+full-config digest; it stores the digest of the **projection** relevant
+to its purpose, each computed by the same function over a named key
+subset: `plan` (models, riskRules, review.policy), `review`
+(models.review, review.policy), `taskVerification` and
+`finalVerification` (verification.*, plus the deliverable command for
+final). Gates compare like with like: a models.planning edit stales
+nothing downstream, a verification.commands edit stales exactly the
+verification evidence. The configure approval record alone carries the
+full-view digest (it approves everything).
+
+**Commands that change the config they run under** (`intake configure`,
+`config set --epic`) do not re-read disk mid-command: a pure
+`derive_effective(snapshot, patch)` produces the post-mutation view from
+the admission snapshot, and the approval records the **derived
+post-mutation digest**. `--use-defaults` is `derive_effective(snapshot,
+empty-overlay)` — its record is never stale on arrival.
 
 **The overlay allowlist is structural, not prose.** The exact dotted
 leaves an overlay may contain: `models.planning`,
@@ -200,15 +253,15 @@ Epic-config drift mirrors governance drift, not the artifact cascade:
   one is. Risk raises are honored immediately; a risk *drop* never
   removes an already-applicable requirement (upward-only at execution,
   matching riskRules doctrine).
-- **Evidence binds to the effective config it ran under.** Every
-  verification and review record (task-level and finalize-level) gains an
-  `effectiveConfig` digest field — the §2 resolved-config digest at
-  recording time. Gates that consume evidence (`merge`, `freshness`,
-  finalize handoff/delivered) compare the recorded digest against the
-  current one: a mismatch on verification-relevant keys makes the
-  evidence stale exactly like a headSha mismatch does today, with the
-  refusal naming the re-run command. Merged evidence remains history, as
-  ever.
+- **Evidence binds to the config projection it ran under.** Every
+  verification and review record (task-level and finalize-level) carries
+  the §2 **purpose-projected** digest at recording time (`review`,
+  `taskVerification`, `finalVerification`). Gates that consume evidence
+  (`merge`, `freshness`, finalize handoff/delivered) recompute the same
+  projection and compare: a mismatch makes the evidence stale exactly
+  like a headSha mismatch does today, with the refusal naming the re-run
+  command — and an edit to an unrelated key (models.planning) stales
+  nothing. Merged evidence remains history, as ever.
 - **Resolve once per invocation.** The CLI resolves the effective config
   and its digest exactly once, at admission, and threads that immutable
   snapshot through the command; no handler re-reads config files
@@ -235,23 +288,33 @@ already — existing behavior, now documented as covering the merged view).
   `wddctl --version` prints `wddctl <version> (<short-sha-if-known>)` via
   argparse's version action; `doctor` includes it in its report.
 - **Semver automation on main:** a GitHub Actions workflow on push to
-  `main`, in a non-cancelling concurrency group (one release run at a
-  time, queued not skipped). It fresh-fetches, recomputes the bump
-  immediately before publishing, and pushes the release commit and tag
-  **atomically in one `git push` of both refs**; if main moved since
-  computation, it recomputes and retries (compare-and-swap loop). Bump
-  classification uses a full-message Conventional Commits parser, not
-  subject-grepping: type and optional scope from the header
-  (`feat(api)!:` counts), `BREAKING CHANGE:`/`BREAKING-CHANGE:` footers
-  scanned in the body, `!` on any type → major; `feat` → minor;
-  everything else → patch. Commit selection is `last-tag..HEAD` with
-  merge commits themselves excluded and their constituent commits
-  classified (full DAG range, not first-parent), so squash and true
-  merges classify identically. No prior tag → bootstrap `v0.1.0`. The
-  release commit is `chore(release): vX.Y.Z [skip ci]`; a parser test
-  matrix (scoped types, footer-only breaks, merge-only pushes, bootstrap)
-  ships with the workflow. No publishing, no changelog generation in this
-  phase — tag + file only.
+  `main`. Concurrency: an explicit group with `cancel-in-progress:
+  false`, accepting GitHub's documented pending-run replacement — safe
+  here because every run recomputes from scratch, so latest-wins loses no
+  information. The publish step is a bounded compare-and-swap loop (max 5
+  attempts, exponential backoff): fresh-fetch, recompute, then `git push
+  --atomic origin main vX.Y.Z` (the `--atomic` flag is required; two
+  refspecs alone are not atomic). Failure triage, in order: the intended
+  tag already exists **and** points at the intended release commit →
+  idempotent success, exit green; main moved → recompute and retry;
+  the tag exists on any other commit (foreign/unreachable) → **fail
+  closed** with a diagnostic naming both commits — never auto-skip a
+  version. Bump classification uses a full-message Conventional Commits
+  parser: type and optional scope from the header (`feat(api)!:`
+  counts), `BREAKING CHANGE:`/`BREAKING-CHANGE:` footers scanned in the
+  body, `!` on any type → major; `feat` → minor; everything else →
+  patch. Commit selection is the full `last-tag..HEAD` DAG range with
+  merge commits themselves excluded and their constituents classified.
+  **Squash merges are classified by the squash commit's own message** —
+  Git cannot recover squashed constituents, so this repo's convention is
+  that squash titles are themselves conventional commits (already house
+  style), and a `Release-Bump: minor|major` trailer on any commit acts
+  as an explicit override for the exceptional case. No prior tag →
+  bootstrap `v0.1.0`. The release commit is `chore(release): vX.Y.Z
+  [skip ci]`; a parser test matrix (scoped types, footer-only breaks,
+  squash titles, foreign-tag collision, bootstrap) ships with the
+  workflow. No publishing, no changelog generation in this phase — tag +
+  file only.
 - The schema version (v6) and the CLI version are independent; `migrate`
   keys off the schema, never the CLI version.
 
@@ -285,10 +348,14 @@ already — existing behavior, now documented as covering the merged view).
     rewritten alongside) and gains `configure: {"legacy": true}` — the
     same migration-artifact doctrine: constructors never mint it, and it
     exempts only the configure gate, nothing else.
-  - Finalize evidence: existing records predate effective-config digests;
-    they are grandfathered valid for the migrated epic only (documented
-    as such in the record), and the first configure re-approval clears
-    them like any config-relevant change.
+  - Finalize and task evidence: existing records predate config digests,
+    so migration **stamps them** with the migration-time projected
+    digests (§2) computed from the then-effective config — for legacy and
+    non-legacy scopes alike. There is no digestless grandfather state:
+    stamped evidence is valid exactly while its projection still matches,
+    and any later change to verification-relevant config stales it
+    through the ordinary gate comparison, no configure re-approval
+    required as the trigger.
 - Flat-layout reads are **not** supported post-migration — one resolver,
   no dual paths. Archived v5 records stay readable where they are.
 - Skills (`wdd-intake`, `wdd-setup`, `wdd-plan`, router) and
