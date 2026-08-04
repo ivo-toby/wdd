@@ -2613,7 +2613,7 @@ class FinalReviewJudgmentTest(unittest.TestCase):
             self.assertEqual(
                 action["judgment"],
                 "dispatch a reviewer against the whole epic branch diff, per wdd-review's "
-                "final-review contract, checked against .wdd/spec.md",
+                "final-review contract, checked against spec.md",
             )
 
 

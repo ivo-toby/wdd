@@ -199,7 +199,7 @@ def _check_spec(wdd_dir: Path | str, epic: str | None = None) -> list[dict[str, 
             "code": "missing_spec",
             "severity": "warning",
             "message": (
-                f".wdd/spec.md {reason} — the finalize phase reviews the epic "
+                f"spec.md {reason} — the finalize phase reviews the epic "
                 "branch against it, and without it there is no agreed record of "
                 "what this scope delivers. Run the intake (wdd-intake) first."
             ),

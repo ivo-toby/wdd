@@ -35,6 +35,7 @@ from .config import (
     effective_config_digest,
     load_layers,
     project,
+    save_overlay,
 )
 from .errors import ValidationError
 from .finalize import _final_verification_projection_digest
@@ -526,6 +527,16 @@ def apply_migration(path: Path | str, *, review_policy: str = "always") -> dict[
         _refuse_reserved_collisions(moves)
         _execute_file_moves(moves)
         _write_attempt_manifests(wdd_dir, migrated)
+        # `create_epic` always mints an empty overlay (`config.json`, `{}`)
+        # alongside a fresh `epics/<slug>/` -- a migrated epic dir had none
+        # (v5 predates the overlay split), so write the identical empty
+        # shape here too, or a migrated epic's directory disagrees with
+        # every other epic's shape for no reason. Semantically inert: a
+        # missing overlay file already reads as `{}` (`load_overlay`'s own
+        # doctrine), which is exactly what `_load_layers_for_migration`
+        # used above to compute `full_digest` -- writing the same `{}` to
+        # disk now changes no digest already stamped into `migrated`.
+        save_overlay(wdd_dir, migrated["epic"], {})
 
         backup = path.with_suffix(path.suffix + ".v2.bak")
         shutil.copy2(path, backup)

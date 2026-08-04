@@ -23,7 +23,7 @@ from .schema import (
     new_state,
     task_state,
 )
-from .store import StateStore
+from .store import StateStore, atomic_write_text
 
 
 PLAN_KIND = "wdd_plan"
@@ -640,6 +640,32 @@ def _reconstruct_plan_from_state(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _write_epic_plan_document(state: dict[str, Any], wdd_dir: Path) -> None:
+    """Mint `epics/<slug>/plan.json` (Task 8 fix-round I6): the spec/docs
+    promise this file lives in the archived unit alongside spec.md/
+    design.md (paths.py reserves the `plan.json` ref; `archive_scope` just
+    renames `epics/<slug>/` wholesale, so whatever exists there rides
+    along) -- nothing wrote it. This is `_reconstruct_plan_from_state`'s
+    dict: the EFFECTIVE plan (post riskRules/config-overlay derivation,
+    the same shape `plan_composite` hashes), not the raw plan file the
+    operator submitted, since that raw file's `baseRef`/`mergeSurface`/
+    `mergeMode` omissions and pre-derivation risk would go stale the
+    moment a re-apply legitimately keeps rather than repeats them.
+    Overwritten on every re-apply -- it mirrors current state, not a
+    point-in-time snapshot. Confirmed by reading `plan_composite` above
+    before writing this: it hashes the reconstructed dict plus every
+    brief/context file's bytes, never this file itself, so rewriting
+    plan.json here changes no recorded composite and trips no drift.
+    A legacy scope (no `state.epic`) has no `epics/<slug>/` to write into.
+    """
+    epic = state.get("epic")
+    if epic is None:
+        return
+    document = _reconstruct_plan_from_state(state)
+    path = resolve_artifact("plan.json", wdd_dir=wdd_dir, epic=epic)
+    atomic_write_text(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+
+
 def intake_gate_status(
     state: dict[str, Any], wdd_dir: Path | str
 ) -> tuple[str, dict[str, Any]] | None:
@@ -880,6 +906,7 @@ def apply_plan(
         result_dict = {**result, "revision": state["revision"], "unchanged": True}
         if not duplicate:
             result_dict["approvedBy"] = approved_by
+            _write_epic_plan_document(state, wdd_dir)
         return result_dict
 
     base: dict[str, Any] | None = None
@@ -922,4 +949,6 @@ def apply_plan(
     result_dict = {**result, "revision": state["revision"], "duplicate": duplicate, "base": base}
     if approved_by and not duplicate:
         result_dict["approvedBy"] = approved_by
+    if not duplicate:
+        _write_epic_plan_document(state, wdd_dir)
     return result_dict

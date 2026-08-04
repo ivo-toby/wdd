@@ -2670,7 +2670,7 @@ execute, finalize, delivered), the same way `wddctl status` always does.
 ### `finalize review record`
 
 Reviews the **whole epic branch** — not one task's diff — against
-`.wdd/spec.md`'s acceptance criteria. Same P1/P2/P3 vocabulary and
+`spec.md`'s acceptance criteria. Same P1/P2/P3 vocabulary and
 `review.blockingSeverities` (default P1/P2) as task-level review, but
 evidence is pinned to the scope's **base-branch head SHA**, not a task
 head — there is no task head left once every task is terminal.
@@ -2983,7 +2983,7 @@ exact scratch session through to a fresh `agree_spec`.
 
 ### Transcript: a blocked final review
 
-A P1 against `.wdd/spec.md`'s acceptance criteria blocks the ladder
+A P1 against `spec.md`'s acceptance criteria blocks the ladder
 exactly like a task-level P1 blocks merge:
 
 ```sh

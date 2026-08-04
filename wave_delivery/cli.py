@@ -457,7 +457,7 @@ def build_parser() -> argparse.ArgumentParser:
     intake_subparsers = intake.add_subparsers(dest="intake_command", required=True)
 
     intake_spec = intake_subparsers.add_parser(
-        "spec", help="record .wdd/spec.md approval (numbered acceptance criteria required)"
+        "spec", help="record spec.md approval (numbered acceptance criteria required)"
     )
     intake_spec.add_argument("--approved-by", dest="approved_by", required=True)
     _add_concurrency_flags(intake_spec)
@@ -481,7 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_concurrency_flags(intake_research)
 
     intake_design = intake_subparsers.add_parser(
-        "design", help="record .wdd/design.md approval and the epic deliverable command"
+        "design", help="record design.md approval and the epic deliverable command"
     )
     intake_design.add_argument("--approved-by", dest="approved_by", required=True)
     # Not argparse-required: omission must refuse with record_design's own

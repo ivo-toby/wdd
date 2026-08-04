@@ -816,7 +816,7 @@ def _final_review_judgment(state: dict[str, Any]) -> str:
     """
     base = (
         "dispatch a reviewer against the whole epic branch diff, per wdd-review's "
-        "final-review contract, checked against .wdd/spec.md"
+        "final-review contract, checked against spec.md"
     )
     if _is_legacy_intake(state):
         return base
@@ -824,7 +824,7 @@ def _final_review_judgment(state: dict[str, Any]) -> str:
     if not criteria:
         return base
     return (
-        f"{base}; walk .wdd/spec.md's acceptance criteria AC-1..AC-{criteria} in order and "
+        f"{base}; walk spec.md's acceptance criteria AC-1..AC-{criteria} in order and "
         "confirm design.md's epic deliverable statement is observably true"
     )
 

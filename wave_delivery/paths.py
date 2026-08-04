@@ -60,8 +60,10 @@ def resolve_artifact(ref: str, *, wdd_dir: Path | str, epic: str | None) -> Path
     it). Raises `ValidationError` naming the offending `ref` for: an empty
     ref or an empty path before `#`, an absolute path, any `..` segment, a
     ref beginning `epics/`, `archive/`, or `dispatch/`, the reserved
-    filename `record.json` anywhere in the ref, or a ref that names no
-    recognized namespace at all.
+    filename `record.json` as the ref's FINAL path segment (basename
+    position only -- `tasks/record.json/notes.md` names no reserved
+    file, since `record.json` there is a directory segment, not the
+    basename), or a ref that names no recognized namespace at all.
 
     `epic=None` resolves `tasks/`, `research/`, `spec.md`, `design.md`,
     `plan.json` refs flat against `wdd_dir` itself -- the Task 1

@@ -379,7 +379,7 @@ def _intake_ladder_action(
             "action": "agree_spec",
             "recordWith": f"{prefix} intake spec --approved-by NAME",
             "judgment": (
-                "agree .wdd/spec.md with the user (goal, in/out of scope, numbered "
+                "agree spec.md with the user (goal, in/out of scope, numbered "
                 "acceptance criteria) per the wdd-intake skill's spec stage, then record it"
             ),
         }
@@ -405,7 +405,7 @@ def _intake_ladder_action(
                 f"{prefix} intake design --approved-by NAME --deliverable-command '...'"
             ),
             "judgment": (
-                "agree .wdd/design.md (components, interfaces, integration surfaces, "
+                "agree design.md (components, interfaces, integration surfaces, "
                 "epic deliverable) with the user per the wdd-intake skill's design stage, "
                 "then record it with the command that proves the epic deliverable"
             ),

@@ -47,28 +47,37 @@ class GitError(RuntimeError):
 def parse_commit(message: str) -> str:
     """Classify one full commit message: 'major', 'minor', or 'patch'.
 
-    Precedence: an explicit `Release-Bump:` trailer wins outright (spec:
-    "acts as an explicit override for the exceptional case"), then a
-    malformed/non-conventional header falls back to 'patch', then `!` on
-    the header or a BREAKING CHANGE/BREAKING-CHANGE footer anywhere in the
-    body is major, then `feat` is minor, everything else patch.
+    Precedence: `!` on the header is major; otherwise a BREAKING CHANGE/
+    BREAKING-CHANGE footer anywhere in the body is major regardless of
+    whether the header is a well-formed conventional header (a plain-
+    subject commit with a BREAKING CHANGE footer still escalates -- the
+    footer scan is not gated on the header having matched); otherwise a
+    malformed/non-conventional header is 'patch'; otherwise `feat` is
+    minor, everything else patch. An explicit `Release-Bump:` trailer is
+    then applied, but only if it would RAISE that base classification --
+    spec: "acts as an explicit override for the exceptional case" is a
+    ratchet, not a downgrade path, so it can never pull a `feat!:` or a
+    BREAKING CHANGE footer back down.
     """
     if not message or not message.strip():
         return "patch"
-    override = _RELEASE_BUMP_RE.search(message)
-    if override:
-        return override.group(1)
     header = message.splitlines()[0].strip()
     match = _HEADER_RE.match(header)
-    if not match:
-        return "patch"
-    if match.group("bang"):
-        return "major"
-    if _BREAKING_FOOTER_RE.search(message):
-        return "major"
-    if match.group("type").lower() == "feat":
-        return "minor"
-    return "patch"
+    if match and match.group("bang"):
+        base = "major"
+    elif _BREAKING_FOOTER_RE.search(message):
+        base = "major"
+    elif match and match.group("type").lower() == "feat":
+        base = "minor"
+    else:
+        base = "patch"
+
+    override = _RELEASE_BUMP_RE.search(message)
+    if override:
+        candidate = override.group(1)
+        if _BUMP_ORDER[candidate] > _BUMP_ORDER[base]:
+            return candidate
+    return base
 
 
 def _is_merge_subject(message: str) -> bool:
@@ -167,11 +176,15 @@ def _tag_commit(run_git: RunGit, tag: str) -> str | None:
     in this same run (created but never pushed, because that push was the
     one that got rejected) would otherwise be misread as an existing
     collision on the next attempt.
+
+    A genuinely absent tag makes `ls-remote` exit 0 with empty output --
+    that is the only case that means "no tag" here. A transport/auth
+    failure raises `GitError` and is deliberately NOT caught: swallowing
+    it and returning None would make a network blip look identical to "tag
+    doesn't exist", and the CAS loop would then push as if it had verified
+    that -- fail closed by letting the caller see the real error instead.
     """
-    try:
-        output = run_git(["ls-remote", "--tags", "origin", f"refs/tags/{tag}"])
-    except GitError:
-        return None
+    output = run_git(["ls-remote", "--tags", "origin", f"refs/tags/{tag}"])
     if not output:
         return None
     return output.split()[0]
@@ -213,23 +226,59 @@ def main(
         version = next_version(last_tag, bump)
         tag = f"v{version}"
 
+        write_version(version)
+        run_git(["add", "VERSION"])
+        # Bootstrap (no prior tag) can compute a version identical to what
+        # VERSION already reads -- nothing staged, so `git commit` would
+        # exit 1 and raise. `git diff --cached --quiet` exits 0 (no
+        # exception) when nothing is staged, non-zero (GitError) when
+        # there is a real diff; skip straight to tagging the current head
+        # in the former case -- v0.1.0 still gets tagged, just without a
+        # release commit to carry it.
+        try:
+            run_git(["diff", "--cached", "--quiet"])
+            release_commit = head
+        except GitError:
+            run_git(["commit", "-m", f"chore(release): v{version} [skip ci]"])
+            release_commit = run_git(["rev-parse", "HEAD"])
+
+        # Triage against the commit the tag would actually be created at
+        # (release_commit), not the pre-bump `head` -- comparing against
+        # `head` made the idempotent arm here unreachable in the normal
+        # (non-bootstrap) case, since the tag is never meant to point at
+        # the parent commit.
         tag_commit = _tag_commit(run_git, tag)
-        action = decide_action(tag_commit, head)
+        action = decide_action(tag_commit, release_commit)
         if action == "idempotent":
-            print(f"{tag} already at {head}; idempotent success")
+            print(f"{tag} already at {release_commit}; idempotent success")
             return 0
         if action == "foreign":
+            # Spec: "main moved -> recompute and retry" -- a concurrent,
+            # legitimate release can land between this attempt's fetch and
+            # this check; `ls-remote` above talks to origin live, so it can
+            # see that push before we do. Re-checking origin/main here
+            # (rather than trusting the `head` this attempt started with)
+            # tells the two cases apart: main really did move under us ->
+            # loop and recompute from scratch; main is exactly where we
+            # left it -> a truly foreign/unreachable tag, fail closed.
+            # `origin/main` is a local tracking ref -- re-fetch before
+            # re-reading it, or this would just echo back the same `head`
+            # this attempt already fetched and never detect the move.
+            run_git(["fetch", "--tags", "origin", "main"])
+            refreshed_head = run_git(["rev-parse", "origin/main"])
+            if refreshed_head != head:
+                print(
+                    f"wddctl release: main moved during attempt {attempt} "
+                    f"({head} -> {refreshed_head}); recomputing"
+                )
+                continue
             print(
                 f"wddctl release: refusing -- {tag} exists at {tag_commit}, "
-                f"expected release commit {head}",
+                f"expected release commit {release_commit}",
                 file=sys.stderr,
             )
             return 1
 
-        write_version(version)
-        run_git(["add", "VERSION"])
-        run_git(["commit", "-m", f"chore(release): v{version} [skip ci]"])
-        release_commit = run_git(["rev-parse", "HEAD"])
         run_git(["tag", "-f", tag, release_commit])
 
         try:

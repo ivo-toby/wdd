@@ -1319,6 +1319,31 @@ class MigrateV5ToV6FileMovesTest(unittest.TestCase):
             apply_migration(path)
             self.assertTrue(stray.exists())
 
+    def test_migration_writes_an_empty_epic_overlay(self) -> None:
+        # M3: `create_epic` always mints epics/<slug>/config.json ({}) for
+        # a fresh epic; a migrated v5 epic dir had none. Write the same
+        # empty shape so a migrated epic dir isn't missing a file every
+        # other epic has -- semantically inert, since a missing overlay
+        # already reads as {} (`load_overlay`'s doctrine), which is what
+        # the migration-time digest was already computed against.
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            state = _v5_state(legacy=False, tasks={})
+            path = wdd / "state.json"
+            _write_v5_state(path, state)
+
+            layers_before = load_layers(wdd, "demo")
+            digest_before = effective_config_digest(layers_before["effective"])
+
+            result = apply_migration(path)
+            overlay_path = wdd / "epics" / "demo" / "config.json"
+            self.assertTrue(overlay_path.exists())
+            self.assertEqual(load_overlay(wdd, "demo"), {})
+
+            migrated_state = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(migrated_state["intake"]["configure"]["sha256"], digest_before)
+            self.assertEqual(result["state"], str(path))
+
 
 class MigrateReservedNameRefusalTest(unittest.TestCase):
     """Migration refuses to move a file onto the reserved 'record.json'
@@ -2335,6 +2360,13 @@ class EpicFullLadderAndPlanApplyE2ETest(unittest.TestCase):
             self.assertEqual(applied["scope"]["id"], "SCOPE-checkout-v2")
             self.assertEqual(applied["epic"], "checkout-v2")
 
+            # I6: apply mints epics/<slug>/plan.json -- the EFFECTIVE plan
+            # (post riskRules/config-overlay derivation), reconstructable
+            # from the just-applied state.
+            minted_plan = json.loads((epic_dir / "plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(minted_plan["scope"]["id"], "SCOPE-checkout-v2")
+            self.assertEqual([task["id"] for task in minted_plan["tasks"]], ["T1"])
+
             # lint sees the epic-scoped spec/brief/design without complaint.
             code, out = _cli(state, "plan", "lint", "--plan", str(plan_file))
             self.assertEqual(code, 0, out)
@@ -3032,6 +3064,11 @@ class ArchiveScopeTransactionalMoveTest(unittest.TestCase):
             self.assertTrue((archive_dir / "spec.md").exists())
             self.assertTrue((archive_dir / "design.md").exists())
             self.assertTrue((archive_dir / "config.json").exists())
+            # I6: the plan.json minted by plan apply rides along with the
+            # rest of epics/<slug>/ in the wholesale rename.
+            self.assertTrue((archive_dir / "plan.json").exists())
+            plan_payload = json.loads((archive_dir / "plan.json").read_text(encoding="utf-8"))
+            self.assertEqual([task["id"] for task in plan_payload["tasks"]], ["T1"])
 
             payload = json.loads(record_path.read_text(encoding="utf-8"))
             self.assertIn("T1", payload["tasks"])
