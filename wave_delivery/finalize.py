@@ -1116,6 +1116,13 @@ def _reset_to_post_ratification(current: dict[str, Any]) -> dict[str, Any]:
     fresh["appliedIdempotencyKeys"] = current["appliedIdempotencyKeys"]
     fresh["telemetry"] = current["telemetry"]
     fresh["revision"] = current["revision"]
+    # Probes are machine observations keyed by runner-command digest, not
+    # scope state (spec Sec1: "nothing scope-specific leaks forward" -- and
+    # probes are exactly NOT scope-specific): they survive the reset, or the
+    # next epic re-probes commands whose evidence never expired (Task 6
+    # review finding; the v5 flat archive shared this bug).
+    if current.get("probes"):
+        fresh["probes"] = current["probes"]
     return fresh
 
 
