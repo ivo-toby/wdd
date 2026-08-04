@@ -42,6 +42,7 @@ from .setup import (
     setup_next_actions,
 )
 from .doctor import inspect_capabilities
+from .version import wddctl_version
 from .engine import (
     ACTIVE_STATUSES,
     admission_schedule,
@@ -205,9 +206,41 @@ def _add_concurrency_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--idempotency-key", default=None)
 
 
+def _short_sha() -> str | None:
+    """Best-effort short commit SHA for the checkout `wave_delivery` lives in.
+
+    Absent (not a git checkout, git missing, or any failure) rather than
+    fatal: version reporting must never refuse. A short timeout keeps a
+    missing/hung git from stalling `--version`.
+    """
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[1]
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
+
+
+def _version_string() -> str:
+    version = wddctl_version()
+    sha = _short_sha()
+    return f"wddctl {version} ({sha})" if sha else f"wddctl {version}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wddctl", description=__doc__)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
+    parser.add_argument("--version", action="version", version=_version_string())
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     plan = subparsers.add_parser("plan", help="create or update a scope from a plan file")

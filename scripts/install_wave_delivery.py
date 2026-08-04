@@ -11,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_SOURCE = ROOT / "wave_delivery"
+VERSION_SOURCE = ROOT / "VERSION"
 
 POSIX_LAUNCHER = """#!/bin/sh
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -33,6 +34,10 @@ def install(prefix: Path) -> dict[str, str]:
         shutil.rmtree(library)
     library.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(PACKAGE_SOURCE, library, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    # Sibling of the installed package dir, mirroring the repo-root/wave_delivery
+    # layout of a source checkout -- wave_delivery/version.py finds VERSION at
+    # `parents[1]` regardless of which layout it's running from.
+    shutil.copyfile(VERSION_SOURCE, library.parent / "VERSION")
     bin_directory.mkdir(parents=True, exist_ok=True)
     for legacy_launcher in (bin_directory / "wdctl", bin_directory / "wdctl.cmd"):
         if legacy_launcher.exists():

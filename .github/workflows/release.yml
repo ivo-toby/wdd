@@ -1,0 +1,35 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  # Every run recomputes from scratch (fresh-fetch + recompute in the CAS
+  # loop), so latest-wins loses no information -- safe to accept GitHub's
+  # documented pending-run replacement instead of cancelling in flight.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Git identity for the release commit
+        run: |
+          git config user.email "wddctl-release@users.noreply.github.com"
+          git config user.name "wddctl release automation"
+
+      - name: Semver automation
+        run: python3 scripts/release.py
