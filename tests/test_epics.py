@@ -3343,5 +3343,402 @@ class RecoveryNeverReadsArchiveTest(unittest.TestCase):
                 other.chmod(0o755)
 
 
+# ---------------------------------------------------------------------------
+# Task 8: E2E -- everything above wired together end to end, per the plan's
+# own test contract (two full epics back to back, plus a v5-fixture
+# migration walked to delivered). Individual mechanisms already have
+# dedicated coverage in the classes above; these are the regression pins for
+# the whole epic-scoped-state lifecycle, mirroring test_intake.py's
+# FullLifecycleE2ETest in shape (checkpoint assertion after every stage) but
+# written locally per this file's no-cross-file-imports convention.
+# ---------------------------------------------------------------------------
+
+
+class TwoEpicsBackToBackFullLifecycleE2ETest(unittest.TestCase):
+    """init -> ratify -> `epic new` -> `intake configure` (an overlay with a
+    `merge.surface` override PROVABLY in effect -- the base fixture keeps
+    the GLOBAL surface at "pr", so a correctly-resolved "local" override is
+    the only thing standing between submit/merge and an unconditional push
+    failure against a repo with no usable remote) -> spec/research/design ->
+    plan apply -> one task through start/submit/review (reviewPolicy
+    "always") -> a mid-epic overlay edit that trips `epic_config_drift`,
+    refusing `verify record` until `intake configure --approved-by`
+    re-records it, which in turn clears `scope.approval` and trips plan
+    drift until `plan apply --approved-by` re-stamps -> verify/freshness/
+    merge -> the finalize ladder -> a real (non-simulated) `git merge` of
+    the epic branch, proved by `finalize delivered` -> `scope archive`.
+
+    Then a SECOND epic, `--use-defaults`, proving total no-leak from the
+    first: a fresh (empty) overlay, no slug/path collision with the now-
+    archived first epic (re-using its slug is refused by name), the first
+    epic's archived record byte-identical before and after the second
+    epic's own activity, and the second epic's ladder walking cleanly to a
+    plan-applied, start-ready state on its own separate `epics/<slug>/`
+    directory.
+    """
+
+    def test_two_epics_back_to_back_with_mid_epic_drift_and_clean_second_epic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # --- init -> ratify (global merge.surface stays "pr") -----------
+            root, state = _ratified_repo_pr_surface(tmp)
+            wdd = root / ".wdd"
+            bare = Path(tmp) / "origin.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+            subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True)
+
+            # === Epic 1: "alpha" ============================================
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "create_epic")
+            assert _cli(state, "epic", "new", "--slug", "alpha")[0] == 0
+            epic1 = wdd / "epics" / "alpha"
+
+            # --- configure: overlay merge.surface override, real digest ----
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "configure_epic")
+            assert _cli(state, "config", "set", "--epic", "merge.surface", "local")[0] == 0
+            code, out = _cli(state, "intake", "configure", "--approved-by", "t")
+            self.assertEqual(code, 0, out)
+            recorded_configure = StateStore(Path(state)).read()["intake"]["configure"]
+            layers = load_layers(wdd, "alpha")
+            self.assertEqual(load_overlay(wdd, "alpha"), {"merge": {"surface": "local"}})
+            self.assertEqual(recorded_configure["sha256"], effective_config_digest(layers["effective"]))
+
+            # --- spec / research / design -----------------------------------
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_spec")
+            (epic1 / "spec.md").write_text(_spec_text(), encoding="utf-8")
+            assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
+            assert _cli(
+                state, "intake", "research", "--skip", "--by", "t", "--reason", "n/a"
+            )[0] == 0
+            (epic1 / "design.md").write_text(_design_text(), encoding="utf-8")
+            assert _cli(
+                state, "intake", "design", "--approved-by", "t", "--deliverable-command", "true"
+            )[0] == 0
+
+            # --- plan apply (reviewPolicy "always" so review is required) --
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "plan")
+            (epic1 / "tasks").mkdir(parents=True, exist_ok=True)
+            (epic1 / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            plan_file = root / "plan.json"
+            plan_file.write_text(
+                json.dumps({
+                    "schemaVersion": 1,
+                    "kind": "wdd_plan",
+                    "scope": {"id": "SCOPE-alpha", "baseRef": "wdd/alpha", "reviewPolicy": "always"},
+                    "tasks": [{"id": "T1", "specPath": "tasks/T1.md", "conflictDomains": []}],
+                }),
+                encoding="utf-8",
+            )
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+
+            # --- start/submit: the overlay override is provably in effect --
+            # If merge.surface resolved to the GLOBAL "pr" here instead of
+            # the epic override, submit's unconditional push (before any PR
+            # attempt) would fail outright against a repo with no `gh`/PR
+            # machinery -- it does not, and there is no "warning" key either
+            # (the sign of a "pr" surface silently degrading), so the
+            # override reached the real surface-branching code.
+            _start_and_commit(state, root)
+            code, out, err = _cli_full(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("warning", json.loads(out))
+
+            assert _cli(
+                state, "review", "record", "--task", "T1", "--reviewer", "t", "--findings", "[]"
+            )[0] == 0
+
+            # --- mid-epic overlay edit: refused, remedied in precedence ----
+            # order (epic config drift -> re-approve -> plan drift -> re-
+            # stamp), exactly EpicConfigDriftTest's pattern, here woven into
+            # the middle of an otherwise-ordinary task loop instead of an
+            # isolated unit test.
+            assert _cli(state, "config", "set", "--epic", "models.planning", "gpt-x")[0] == 0
+            code, _out, err = _cli_full(state, "verify", "record", "--task", "T1", "--status", "passed")
+            self.assertNotEqual(code, 0)
+            self.assertIn("epic config drift", err)
+
+            code, out = _cli(state, "intake", "configure", "--approved-by", "t")
+            self.assertEqual(code, 0, out)
+            # The overlay as re-approved keeps BOTH leaves -- the earlier
+            # merge.surface override survives re-recording untouched.
+            self.assertEqual(
+                load_overlay(wdd, "alpha"),
+                {"merge": {"surface": "local"}, "models": {"planning": "gpt-x"}},
+            )
+            code, _out, err = _cli_full(state, "verify", "record", "--task", "T1", "--status", "passed")
+            self.assertNotEqual(code, 0)
+            self.assertIn("plan drift", err)
+
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+
+            # --- verify/freshness/merge resume cleanly ----------------------
+            code, out = _cli(state, "verify", "record", "--task", "T1", "--status", "passed")
+            self.assertEqual(code, 0, out)
+            assert _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0] == 0
+            code, out, err = _cli_full(state, "merge", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("warning", json.loads(out))
+
+            from wave_delivery.schema import derived_phase
+
+            self.assertEqual(derived_phase(StateStore(Path(state)).read()), "finalize")
+
+            # --- finalize -> a real git merge -> delivered ------------------
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "t", "--findings", "[]",
+                "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            results = json.dumps(
+                [{"command": "true", "status": "passed"}, {"command": "true", "status": "passed"}]
+            )
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--results", results, "--repo", str(root)
+            )
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertIsNone(json.loads(out)["pr"])
+
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+            subprocess.run(["git", "checkout", "-q", "main"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+                 "merge", "--no-ff", "-m", "final merge", base_ref],
+                cwd=root, check=True,
+            )
+            code, out = _cli(state, "finalize", "delivered", "--by", "t", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertEqual(derived_phase(StateStore(Path(state)).read()), "delivered")
+
+            # --- scope archive: the ladder's rollover -----------------------
+            code, out = _cli(state, "scope", "archive", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            archive1_path = Path(json.loads(out)["archived"])
+            self.assertEqual(archive1_path, wdd / "archive" / "alpha" / "record.json")
+            self.assertFalse((wdd / "epics" / "alpha").exists())
+            archive1_bytes = archive1_path.read_bytes()
+
+            # === Epic 2: "beta" -- total no-leak from epic 1 ================
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "create_epic")
+
+            # No path/slug collision with the now-archived first epic.
+            code, _out, err = _cli_full(state, "epic", "new", "--slug", "alpha")
+            self.assertNotEqual(code, 0)
+            self.assertIn("archived", err)
+            self.assertIsNone(StateStore(Path(state)).read()["epic"])
+
+            assert _cli(state, "epic", "new", "--slug", "beta")[0] == 0
+            epic2 = wdd / "epics" / "beta"
+            self.assertNotEqual(epic1, epic2)
+
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "configure_epic")
+            code, out = _cli(state, "intake", "configure", "--use-defaults", "--by", "t")
+            self.assertEqual(code, 0, out)
+            # Fresh ladder: epic 2's overlay starts empty, unaffected by
+            # epic 1's approved merge.surface/models.planning overrides, and
+            # `intake` carries only the just-recorded `configure` -- `scope
+            # archive` reset spec/research/design to nothing (test_intake.py's
+            # FullLifecycleE2ETest pins the same reset), so epic 1's ladder
+            # records cannot leak into epic 2's.
+            self.assertEqual(load_overlay(wdd, "beta"), {})
+            self.assertEqual(set(StateStore(Path(state)).read()["intake"]), {"configure"})
+
+            # Epic 1's archived record is untouched by any epic-2 activity.
+            self.assertEqual(archive1_path.read_bytes(), archive1_bytes)
+
+            # --- epic 2's own ladder, walked to a start-ready plan ---------
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "agree_spec")
+            (epic2 / "spec.md").write_text(
+                _spec_text(ac_lines=("- [ ] AC-1: a second, unrelated epic works",)),
+                encoding="utf-8",
+            )
+            assert _cli(state, "intake", "spec", "--approved-by", "t")[0] == 0
+            assert _cli(
+                state, "intake", "research", "--skip", "--by", "t", "--reason", "n/a"
+            )[0] == 0
+            (epic2 / "design.md").write_text(_design_text(), encoding="utf-8")
+            assert _cli(
+                state, "intake", "design", "--approved-by", "t", "--deliverable-command", "true"
+            )[0] == 0
+
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "plan")
+            (epic2 / "tasks").mkdir(parents=True, exist_ok=True)
+            (epic2 / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            plan2_file = root / "plan2.json"
+            plan2_file.write_text(
+                json.dumps(_plan_document(["T1"], scope_id="SCOPE-beta", base_ref="wdd/beta")),
+                encoding="utf-8",
+            )
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan2_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+            applied2 = StateStore(Path(state)).read()
+            self.assertEqual(applied2["scope"]["id"], "SCOPE-beta")
+            self.assertEqual(applied2["epic"], "beta")
+
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertIn("start_task", [a["action"] for a in json.loads(out)["actions"]])
+
+            # Epic 1's archived record is STILL untouched, after epic 2's
+            # entire ladder + a plan apply -- the "total no-leak" claim.
+            self.assertEqual(archive1_path.read_bytes(), archive1_bytes)
+            self.assertFalse((wdd / "epics" / "alpha").exists())
+            self.assertTrue((wdd / "epics" / "beta").is_dir())
+
+
+def _v5_fixture_repo(tmp: str) -> tuple[Path, str, Path]:
+    """A real git repo carrying a hand-built v5 state.json (schemaVersion 5)
+    -- non-legacy intake already agreed (spec/research/design, flat paths at
+    `.wdd/` root, matching v5's singleton layout) but no scope/plan yet,
+    mirroring the actual ladder order (agree_design precedes any scope).
+    `state["scope"]` is therefore None going into migration, so slug
+    derivation falls back to "legacy" (spec Sec4 / `MigrateSlugDerivation-
+    Test`'s own contract), and the post-migration `plan apply` in the test
+    below takes the ordinary first-apply code path -- the same one every
+    natively-created epic uses -- rather than the update-path a pre-
+    populated `state["scope"]` would force.
+
+    Governance is REALLY ratified (a real `governance_fingerprint` over an
+    actual config.json + constitution.md, per `_migrated_ratified_wdd`'s
+    established pattern above), so nothing here trips governance drift on
+    its own -- migration is the only step under test, not an accidental
+    governance-drift regression.
+    """
+    root = _git_repo(tmp)
+    wdd = root / ".wdd"
+    config = default_config()
+    config["merge"]["surface"] = "local"
+    config["verification"]["commands"] = ["true"]
+    save_config(wdd, config)
+    (wdd / "constitution.md").write_text("# Constitution\n\nBe good.\n", encoding="utf-8")
+    fingerprint = governance_fingerprint(wdd)
+
+    spec_path = wdd / "spec.md"
+    design_path = wdd / "design.md"
+    _write_text(spec_path, _spec_text())
+    _write_text(design_path, _design_text())
+
+    state = _v5_state(scope_id=None, legacy=False, tasks={})
+    state["constitution"]["ratification"]["decisionFingerprint"] = fingerprint
+    state["intake"]["spec"]["sha256"] = artifact_sha256(spec_path)
+    state["intake"]["design"]["sha256"] = artifact_sha256(design_path)
+    state["intake"]["design"]["deliverableCommand"] = "true"
+    path = wdd / "state.json"
+    _write_v5_state(path, state)
+    return root, str(path), wdd
+
+
+class V5FixtureMigrationToDeliveredE2ETest(unittest.TestCase):
+    """The plan's Task 8 "Plus": a v5 fixture, `apply_migration`, then driven
+    through the REMAINING lifecycle (plan apply -> execute -> finalize ->
+    delivered) purely via the CLI. Distinct from the unit-level migration
+    coverage in the Task 3 classes above (per-field table, matrix of task
+    status x legacy x snapshot) -- here migration is one step inside an
+    otherwise ordinary lifecycle, proving a migrated state is
+    indistinguishable from a natively-created one to every downstream verb,
+    not the whole subject under test."""
+
+    def test_migrate_v5_fixture_then_plan_apply_execute_finalize_deliver(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _v5_fixture_repo(tmp)
+            bare = Path(tmp) / "origin.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+            subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True)
+
+            pre_migration = json.loads(Path(state).read_text())
+            self.assertEqual(pre_migration["schemaVersion"], 5)
+
+            result = apply_migration(Path(state))
+            self.assertEqual(result["to"], SCHEMA_VERSION)
+
+            migrated = StateStore(Path(state)).read()  # validates the full v6 shape
+            self.assertEqual(migrated["epic"], "legacy")
+            self.assertIn("spec", migrated["intake"])
+            self.assertIn("design", migrated["intake"])
+            self.assertIs(migrated["intake"]["configure"]["legacy"], True)
+            epic_dir = wdd / "epics" / "legacy"
+            self.assertTrue((epic_dir / "spec.md").exists())
+            self.assertTrue((epic_dir / "design.md").exists())
+            self.assertFalse((wdd / "spec.md").exists())
+            self.assertFalse((wdd / "design.md").exists())
+
+            # The ladder resumes exactly where the v5 fixture left off: spec/
+            # research/design are already agreed, so `next` proposes `plan`.
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "plan")
+
+            (epic_dir / "tasks").mkdir(parents=True, exist_ok=True)
+            (epic_dir / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+            plan_file = root / "plan.json"
+            plan_file.write_text(
+                json.dumps(_plan_document(["T1"], scope_id="SCOPE-legacy", base_ref="wdd/legacy")),
+                encoding="utf-8",
+            )
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+                "--approved-by", "t",
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(StateStore(Path(state)).read()["scope"]["id"], "SCOPE-legacy")
+
+            # --- execute: start/submit/verify/freshness/merge --------------
+            _start_and_commit(state, root)
+            assert _cli(state, "submit", "--task", "T1", "--repo", str(root))[0] == 0
+            assert _cli(state, "verify", "record", "--task", "T1", "--status", "passed")[0] == 0
+            assert _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0] == 0
+            code, out = _cli(state, "merge", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            # --- finalize -> a real git merge -> delivered ------------------
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "t", "--findings", "[]",
+                "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            results = json.dumps(
+                [{"command": "true", "status": "passed"}, {"command": "true", "status": "passed"}]
+            )
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--results", results, "--repo", str(root)
+            )
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+            subprocess.run(["git", "checkout", "-q", "main"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+                 "merge", "--no-ff", "-m", "final merge", base_ref],
+                cwd=root, check=True,
+            )
+            code, out = _cli(state, "finalize", "delivered", "--by", "t", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            from wave_delivery.schema import derived_phase
+
+            delivered_state = StateStore(Path(state)).read()
+            self.assertEqual(derived_phase(delivered_state), "delivered")
+            self.assertEqual(delivered_state["tasks"]["T1"]["status"], "done")
+
+
 if __name__ == "__main__":
     unittest.main()

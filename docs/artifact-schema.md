@@ -1,24 +1,87 @@
 # WDD artifact schema
 
-WDD's durable state lives under `.wdd/` in the target repository:
+WDD's durable state lives under `.wdd/` in the target repository. Since
+schema v6 (the epic-scoped-state plan), an epic's own artifacts —
+spec/design/plan/tasks/research — live in a **named, self-contained
+directory** rather than as global singletons; only genuinely cross-epic
+things (governance, machine config, durable shared context) stay flat at
+the `.wdd/` root:
 
 ```text
 .wdd/
-  constitution.md          # human-authored governance; ratified via wddctl
-  spec.md                  # human-authored; ratified via wddctl intake spec
-  design.md                # human-authored; ratified via wddctl intake design
-  plan.json                # the only planning input
-  state.json               # wddctl-owned; never hand-edit
-  state.md                 # generated projection (wddctl render)
-  tasks/<TASK-ID>.md       # worker briefs, referenced by each task's specPath
-  shared-context/          # durable discoveries, and research-rung artifacts
-  archive/<SCOPE-ID>.json  # wddctl-owned; written by `wddctl scope archive`
-  dispatch/                # wddctl-owned; transient scratch, gitignored, never committed
-  .gitignore                # wddctl-owned; written by init/migrate, and re-ensured whenever dispatch/ is first created, to ignore dispatch/
+  constitution.md          # global; human-authored governance; ratified via wddctl
+  config.json               # global machine config (branching, verification, models, ...)
+  state.json                # wddctl-owned; never hand-edit; schema v6
+  state.md                  # generated projection (wddctl render)
+  shared-context/           # global; durable discoveries, cross-epic by definition
+  epics/<slug>/              # the active epic's own directory (see "Epic directories" below)
+    config.json               # the epic's sparse config overlay; may be {}
+    spec.md                    # human-authored; ratified via wddctl intake spec
+    design.md                  # human-authored; ratified via wddctl intake design
+    plan.json                  # the only planning input for this epic
+    tasks/<TASK-ID>.md        # worker briefs, referenced by each task's specPath
+    research/                  # research-rung artifacts specific to this epic
+  archive/<slug>/            # a delivered epic, moved wholesale by `wddctl scope archive`
+    record.json                # the state record at archive time (see below)
+    ...                         # the rest of the archived epic's own directory content
+  dispatch/                 # wddctl-owned; transient scratch, gitignored, never committed
+  .gitignore                 # wddctl-owned; written by init/migrate, and re-ensured whenever dispatch/ is first created, to ignore dispatch/
 ```
+
+`VERSION` — the CLI's own version identity, unrelated to the schema
+version above — lives at the **repository root**, not under `.wdd/`; see
+"`--version`" in [`docs/wddctl.md`](wddctl.md).
 
 Everything here is either human-authored Markdown/JSON that `wddctl` reads,
 or a `wddctl`-generated file that must not be hand-edited.
+
+## Epic directories
+
+`wddctl epic new --slug SLUG` (see [`docs/wddctl.md`](wddctl.md)) is the
+first action of every epic: it creates `epics/<slug>/` with an empty
+overlay and records `state.epic = <slug>` (a top-level `state.json` field,
+`null` when no epic is active) — one locked mutation, so a crash can never
+leave the directory and `state.epic` disagreeing about whether an epic
+exists, other than the one idempotent crash-orphan shape `epic new`
+adopts on re-run.
+
+- **Slugs are the canonical scope identity.** `[a-z0-9][a-z0-9-]{1,63}`,
+  unique against both `epics/` and `archive/` — immutable; there is no
+  rename verb, and retiring one means archiving it. The scope id is always
+  derived as `SCOPE-<slug>`; `plan apply` rejects any other id on a v6
+  state.
+- **Typed path namespaces, one resolver.** An artifact reference is
+  resolved lexically, never by existence probing: a ref beginning
+  `shared-context/` always means the global directory; `tasks/`,
+  `research/`, `spec.md`, `design.md`, `plan.json` always mean the
+  **active** epic's directory. Absolute paths, `..` segments, and refs
+  beginning `epics/`, `archive/`, or `dispatch/` are rejected outright, as
+  is the reserved name `record.json` (below). Every consumer — plan
+  hashing, intake recording/drift, handover materialization, input
+  binding, snapshot resolution — goes through this one resolver
+  (`wave_delivery/paths.py`); nothing resolves paths its own way. Because
+  refs stay namespace-relative in both `plan.json` and `state.json`, a
+  task brief or plan file is copy-portable between epics without editing a
+  single path.
+- **`epics/<slug>/config.json`** is the epic's sparse config overlay — see
+  "Epic configuration overlay" in [`docs/wddctl.md`](wddctl.md) for
+  resolution order, the digest function, purpose-projected evidence
+  digests, and the drift/cascade story. Only the allowlisted dotted leaves
+  may appear in it: `models.planning`, `models.implementation`,
+  `models.review`, `verification.commands`,
+  `verification.unavailableJustification`, `merge.surface`, `riskRules`,
+  `review.policy`. An overlay with any other key is refused by name at
+  every entry point (load, `config set --epic`, `intake configure`
+  approval) — machine-bound and repository-authority settings (`runners`,
+  `worktrees.root`, branching) stay under constitution approval only.
+- **`record.json` is a reserved filename.** No verb other than `scope
+  archive` may create one; the typed resolver refuses it as an artifact
+  ref; `epic new` refuses to adopt a directory that already contains one
+  (it reads as an in-flight or completed archive transaction, not a fresh
+  or orphaned epic).
+- **`archive/<slug>/`** is where a delivered epic ends up — see "The
+  archive transaction" below for how it gets there and what recovers a
+  crash mid-move.
 
 ## `constitution.md`
 
@@ -56,11 +119,13 @@ commands.
 
 ## The intake ladder: `spec.md` and `design.md`
 
-Between ratification and `plan apply`, two more human-authored Markdown
-files are agreed and recorded via `wddctl intake spec`/`design` (see
-"The intake ladder" in [`docs/wddctl.md`](wddctl.md)). Both are fingerprinted
-at approval time (SHA-256 over the exact bytes), so an edit afterward is
-drift, not a free edit.
+Between `epic new`/`intake configure` and `plan apply`, two more
+human-authored Markdown files — `epics/<slug>/spec.md` and
+`epics/<slug>/design.md` — are agreed and recorded via `wddctl intake
+spec`/`design` (see "The intake ladder" in
+[`docs/wddctl.md`](wddctl.md)). Both are fingerprinted at approval time
+(SHA-256 over the exact bytes), so an edit afterward is drift, not a free
+edit.
 
 ### `spec.md`
 
@@ -137,9 +202,14 @@ succeeds against the merged epic branch.
 
 ## `plan.json`
 
-The single planning input. `wddctl plan apply` reads it and creates or
-updates a scope in `state.json`; re-applying is safe and diffs the new plan
-against the current state.
+The single planning input for the active epic — conventionally staged at
+the repository root and applied against `epics/<slug>/plan.json` inside
+`.wdd/` (`plan apply`'s `--plan` flag takes any path; the file it *writes
+into* `.wdd/` is always the active epic's own `plan.json`). `wddctl plan
+apply` reads it and creates or updates a scope in `state.json`;
+re-applying is safe and diffs the new plan against the current state.
+`scope.id` must be exactly `SCOPE-<slug>` for the active epic — a plan
+naming any other id is rejected at apply.
 
 ```json
 {
@@ -222,22 +292,36 @@ Top-level shape:
 
 ```json
 {
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "revision": 7,
+  "epic": "greeting-demo",
   "scope": { "...": "as in plan.json, plus maxConcurrent/reviewPolicy resolved, plus approval" },
   "constitution": { "status": "ratified", "ratification": { "by": "...", "decisionFingerprint": "...", "at": "..." } },
-  "intake": { "spec": { "...": "..." }, "research": { "...": "..." }, "design": { "...": "..." } },
+  "intake": { "configure": { "...": "..." }, "spec": { "...": "..." }, "research": { "...": "..." }, "design": { "...": "..." } },
   "tasks": { "TASK-001-token-types": { "...": "..." } },
   "finalize": { "review": { "...": "..." }, "verification": { "...": "..." }, "handoff": { "...": "..." }, "delivered": { "...": "..." } },
   "leases": { "TASK-001-token-types": { "...": "worktree bookkeeping" } },
   "reconcile": { "everyNMerges": 3, "mergesSinceCheckpoint": 1, "lastCheckpointAt": null, "pendingNotes": [] },
   "monitoring": { "mode": "manual", "status": "inactive", "observations": {} },
+  "archivePending": null,
+  "archiveBlocked": null,
   "probes": { "sha256:9c962d1...": { "at": "2026-08-01T19:56:10Z", "ok": true } },
   "events": [ { "revision": 7, "type": "task.merged", "task": "TASK-001-token-types", "idempotencyKey": "...", "at": "..." } ],
   "appliedIdempotencyKeys": ["..."],
   "telemetry": { "eventApplications": 12, "renderCount": 3 }
 }
 ```
+
+`epic` (schema v6, required) is the active epic's slug, or `null` when
+none is active — the canonical scope identity source; see "Epic
+directories" above. Written by `wddctl epic new` and cleared by `wddctl
+scope archive`.
+
+`archivePending` and `archiveBlocked` (schema v6, both nullable, `null`
+outside an in-flight or blocked archive transaction) are the archive
+transaction's own journal fields — see "`.wdd/archive/<slug>/`" below for
+their shapes and "The archive transaction and its recovery" in
+[`docs/wddctl.md`](wddctl.md) for what reads and clears them.
 
 `finalize` is absent entirely before the scope reaches the `finalize`
 phase, and removed again by `wddctl scope archive` (see below) — it is
@@ -258,15 +342,17 @@ records nothing); `wddctl dispatch --task ID --role ...` refuses unless the
 RATIFIED runner's exact command digest has an entry here with `"ok": true`
 — see "Runners" in [`docs/wddctl.md`](wddctl.md).
 
-### `intake` (schema v5, required)
+### `intake` (schema v6, required)
 
-Either `{"legacy": true}` — the sole key, minted **only** by `wddctl
-migrate` for a pre-v5 scope, never by `wddctl init`/`plan apply` — or any
-subset of three records, one per ladder rung, each fingerprint-bound to
-the artifact bytes it approved:
+Either `{"legacy": true}` — minted **only** by `wddctl migrate` for a
+pre-v5 scope, never by `wddctl init`/`plan apply` — or any subset of four
+records: `configure` (schema v6, the epic config approval; see below) plus
+the three ladder-rung records, each fingerprint-bound to the artifact
+bytes it approved:
 
 ```json
 {
+  "configure": { "by": "ivo", "at": "2026-08-01T19:56:40Z", "sha256": "sha256:1223d6..." },
   "spec": { "by": "ivo", "at": "2026-08-01T19:56:46Z", "criteria": 2, "sha256": "sha256:d35cc..." },
   "research": {
     "by": "ivo", "at": "2026-08-01T19:56:54Z", "done": true,
@@ -282,11 +368,50 @@ the artifact bytes it approved:
 
 `research`'s `done: true` shape carries `artifacts` (as above); its
 alternative is an attributed skip: `{"by", "at", "skipped": true,
-"reason": "..."}`. `intake_complete(state)` is `True` wholesale for
-`legacy`, else only once all three records are present. A fresh `wddctl
-init` or `wddctl plan apply`'s internal state construction always produces
+"reason": "..."}`. `intake_complete(state)` (the spec/research/design
+trio) is `True` wholesale for `legacy`, else only once all three of those
+records are present; `configure` is validated independently of that
+trio's completeness (see "The configure record" below) and is required for
+every non-legacy scope, `legacy` ones included. A fresh `wddctl init` or
+`wddctl plan apply`'s internal state construction always produces
 `intake: {}` — never `{"legacy": true}` — so a legacy scope only exists
 because `wddctl migrate` produced it from a genuine pre-v5 state.
+
+#### The configure record
+
+`intake.configure`, written by `wddctl intake configure` (see
+[`docs/wddctl.md`](wddctl.md)), has three legal shapes:
+
+```json
+{"by": "ivo", "at": "2026-08-01T19:56:40Z", "sha256": "sha256:1223d6..."}
+```
+
+the real, attributed approval — either form of `intake configure`
+produces this shape; only the overlay bytes differ (the real overlay for
+`--approved-by`, an empty one for `--use-defaults`). The `sha256` is
+`effective_config_digest` over the fully resolved, default-hydrated,
+canonically serialized view (overlay → global → default), never the
+overlay bytes alone — see "Epic configuration overlay" in
+[`docs/wddctl.md`](wddctl.md).
+
+`wddctl migrate` mints the other two shapes — **never** the real one, and
+no ordinary constructor mints either:
+
+```json
+{"legacy": true, "sha256": "sha256:...the migration-time full effective-config digest..."}
+```
+
+for a non-legacy v5 scope gaining epic-config identity for the first
+time — the exemption covers only the missing human attribution; and the
+identical shape again under a wholesale-`legacy` scope's own
+`intake.legacy: true`, since migration stamps `configure` onto both kinds
+of migrated scope alike. In both cases, **drift is still guarded from
+there on**: any later change to the effective config (overlay or global)
+mismatches the stamped digest exactly like an ordinary un-re-approved
+change would, and only a real `intake configure --approved-by`/
+`--use-defaults` remedies it — see `EpicConfigDriftAfterMigrationTest` in
+`tests/test_epics.py` for the regression pin (a since-fixed bug once let
+`legacy: true` disable drift detection wholesale for any migrated scope).
 
 ### `finalize.verification` (v5 vs. legacy shape)
 
@@ -298,18 +423,46 @@ because `wddctl migrate` produced it from a genuine pre-v5 state.
     {"command": "python3 -c \"...\"", "status": "passed"}
   ],
   "status": "passed",
-  "at": "2026-08-01T19:58:27Z"
+  "at": "2026-08-01T19:58:27Z",
+  "configSha256": "sha256:..."
 }
 ```
 
-`commands` is present only for v5 non-legacy scopes: the ratified global
+`commands` is present only for v5+ non-legacy scopes: the ratified global
 `verification.commands` (from `config.json`) followed by the scope's
 `intake.design.deliverableCommand`, in that exact order, recorded in one
 atomic `finalize verify record --results '[...]'` call. Legacy scopes
 instead carry the original singular pair, `{"headSha", "status",
 "command", "justification", "at"}` — no `commands` key. Every read site
 normalizes both shapes via `verification_commands()` to the same
-`[{command, status}, ...]` view.
+`[{command, status}, ...]` view. `configSha256` (schema v6, optional —
+absent on pre-migration evidence, present on everything `finalize verify
+record` writes from Task 5 onward and back-filled onto pre-existing v5
+records by migration) is the `finalVerification` **purpose-projected**
+digest (verification.* plus the deliverable command) at recording time —
+see "evidence digest fields" below.
+
+#### Evidence digest fields (schema v6)
+
+A task's `review` and `verification` objects, and `finalize.review`/
+`finalize.verification`, gain up to three optional fields — optional
+because pre-migration evidence carries none of them, and validation stays
+permissive about their absence while shape-checking whichever ARE
+present:
+
+| Field | On | Meaning |
+|---|---|---|
+| `configSha256` | `review`, `verification`, `finalize.review`, `finalize.verification` | The **purpose-projected** `effective_config_digest` at recording time — `taskReview`'s projection (`models.review`, `review.policy`, `review.blockingSeverities`) for a task review, `finalReview`'s for the final one, `taskVerification`/`finalVerification`'s (`verification.*`, plus the deliverable command for the final one) for the two verification records. The SAME field name on every one of the four objects; which projection it was computed from is implied by which object it's attached to, never encoded in the field name itself. See "Epic configuration overlay" in [`docs/wddctl.md`](wddctl.md) for the projection definitions and why they partition the way they do. |
+| `resolvedRisk` | task `review` only (not `finalize.review`) | The task's derived risk tier (`normal`/`high`) at the moment this review ran — bound alongside the config projection because a task's risk can rise without any config byte moving the projection; the consuming gate re-derives risk from current state and compares, staling the review on a mismatch exactly like a digest mismatch does. |
+| `reviewModel` | task `review` and `finalize.review` | The review model actually selected and run under, for the same reason `resolvedRisk` is bound — a model reassignment between recording and merge is a re-derivable mismatch too, not silently ignored. |
+
+None of the three ever appears on evidence recorded against a schema
+predating this plan (pre-migration v5 records, or archived pre-v6 files)
+— there is no digestless "grandfather" exemption once evidence exists on
+a v6 state: migration stamps all three onto every existing record it
+finds, computed from the then-effective config, and from that point every
+later config change is checked against them through the ordinary gate
+comparison.
 
 Each entry under `tasks` carries: `id`, `title`, `specPath`, `status`
 (`todo` / `in_progress` / `review` / `merge_ready` / `done` / `blocked` /
@@ -406,19 +559,26 @@ came from.
 they're computed live by `wddctl next` and `wddctl status` from the fields
 above. See the gates table in [`docs/wddctl.md`](wddctl.md).
 
-## `.wdd/archive/<SCOPE-ID>.json`
+## `.wdd/archive/<slug>/`
 
-Written once, by `wddctl scope archive` (delivered-phase only — see "The
-intake ladder" in [`docs/wddctl.md`](wddctl.md)). `wddctl` never reads this
-file back; it exists purely as the durable record of a completed scope,
-since `state.json` itself is reset to a fresh setup shape immediately
-after archiving.
+`wddctl scope archive` (delivered-phase only — see "The intake ladder" in
+[`docs/wddctl.md`](wddctl.md)) is a **transaction**, not a single write:
+it writes `record.json` inside the still-active `epics/<slug>/`, then
+atomically renames the whole directory to `archive/<slug>/`, then resets
+`state.json`. `wddctl` never reads `record.json` back; it exists purely as
+the durable record of a completed epic, since `state.json` itself is reset
+to a fresh setup shape immediately after archiving. See "The archive
+transaction and its recovery" in [`docs/wddctl.md`](wddctl.md) for the
+full four-step sequence and its crash-recovery matrix — this section
+covers the file shapes only.
+
+### `record.json`
 
 ```json
 {
   "scope": { "id": "SCOPE-greeting-demo", "baseRef": "wdd/greeting-demo", "...": "the delivered scope object, approval included" },
   "tasks": { "TASK-001-greeting": { "...": "every task's final state" } },
-  "intake": { "spec": { "...": "..." }, "research": { "...": "..." }, "design": { "...": "..." } },
+  "intake": { "configure": { "...": "..." }, "spec": { "...": "..." }, "research": { "...": "..." }, "design": { "...": "..." } },
   "finalize": { "review": { "...": "..." }, "verification": { "...": "..." }, "handoff": { "...": "..." }, "delivered": { "...": "..." } },
   "reconcile": { "everyNMerges": 3, "mergesSinceCheckpoint": 1, "lastCheckpointAt": null, "pendingNotes": [ { "at": "...", "note": "...", "task": null } ] },
   "leases": { "TASK-001-greeting": { "status": "released", "...": "worktree/branch/timestamps history" } },
@@ -427,17 +587,58 @@ after archiving.
 }
 ```
 
-Every field is a snapshot at archive time — `scope`, `tasks`, `intake`,
-`finalize`, `reconcile` (including any still-pending `pendingNotes`), and
-`leases` (a task's full lease history, not just its final released state).
-`eventCount` and `archivedAt` exist only in the archive file, not in
-`state.json` itself. The no-leak guarantee this file's existence enables
-is total: after archiving, `state.json`'s `scope`, `tasks`, `finalize`,
-`intake`, `reconcile`, `monitoring.observations`, and `leases` are all
-reset to the same fresh shape `wddctl init` produces (`intake: {}`, a
-genuine new ladder — never re-marked `legacy`), while `constitution` and
-the audit trail (`events`, `appliedIdempotencyKeys`, `telemetry`) survive
-untouched.
+Every field is a snapshot at `archivePending.sourceRevision` (below) —
+`scope`, `tasks`, `intake`, `finalize`, `reconcile` (including any
+still-pending `pendingNotes`), and `leases` (a task's full lease history,
+not just its final released state). `eventCount` and `archivedAt` exist
+only in `record.json`, not in `state.json` itself; note the shape does
+**not** carry `epic` as a top-level key of its own — the slug lives in
+the archive path itself (`archive/<slug>/record.json`), and in
+`scope.id`'s `SCOPE-<slug>` derivation. `record.json` generation is a
+**pure, deterministic function** of the state at `sourceRevision` (see
+below) plus `archivedAt`, the one nondeterministic input — `wave_delivery/
+finalize.py`'s `generate_archive_record` — so it can always be
+regenerated byte-identically from an uncrashed state; nothing about it is
+unreconstructable, which is what makes the recovery matrix's mid-crash
+rows safe.
+
+The no-leak guarantee this enables is total: after archiving,
+`state.json`'s `scope`, `epic`, `tasks`, `finalize`, `intake`,
+`archivePending`, `archiveBlocked`, `reconcile`, `monitoring.observations`,
+and `leases` are all reset to the same fresh shape `wddctl init` produces
+(`intake: {}`, a genuine new ladder — never re-marked `legacy`), while
+`constitution` and the audit trail (`events`, `appliedIdempotencyKeys`,
+`telemetry`) survive untouched. Two epics never collide on a path: slugs
+are immutable and unique against both `epics/` and `archive/` (see "Epic
+directories" above), so an archived directory's name can never be handed
+to a later `epic new`.
+
+### `state.archivePending` / `state.archiveBlocked` (schema v6, journal fields)
+
+```json
+{
+  "archivePending": {
+    "slug": "greeting-demo",
+    "sourceRevision": 19,
+    "archivedAt": "2026-08-01T19:58:49Z",
+    "recordSha256": "sha256:..."
+  },
+  "archiveBlocked": null
+}
+```
+
+`archivePending` exists only between transaction step 2 (recorded) and
+step 4 (cleared on completion) — a caller reading `state.json` mid-
+transaction is exactly what the recovery matrix exists to make safe.
+`sourceRevision` names the exact state `record.json` was generated from
+(excluding the `archivePending` journal event itself), so `recordSha256`
+is independently reproducible against it. `archiveBlocked`
+(`{slug, collidingPath, at}`) is the durable resting state left behind by
+an **external collision** discovered mid-transaction — see "The archive
+transaction and its recovery" in [`docs/wddctl.md`](wddctl.md) for the
+full six-row recovery matrix, including this row's own remedy. Both
+fields are `null` outside their respective in-flight/blocked windows, and
+never both non-null at once.
 
 ## `.wdd/dispatch/`
 
@@ -493,7 +694,7 @@ this file. A reviewer's successful, contract-valid run additionally writes
 a `-result.json` file beside the log, ready to hand directly to `wddctl
 review collect --result <path>`.
 
-## Task briefs (`.wdd/tasks/<TASK-ID>.md`)
+## Task briefs (`.wdd/epics/<slug>/tasks/<TASK-ID>.md`)
 
 The worker implementation brief for one task, referenced by that task's
 `specPath` in `plan.json`. There is no required frontmatter schema — `wddctl`
