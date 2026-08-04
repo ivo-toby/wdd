@@ -42,18 +42,25 @@ small, self-contained edit — just make the change directly.
 ```
 .wdd/
   constitution.md     # human-authored prose governance
-  config.json         # machine config; edit via wddctl config set
-  spec.md             # intake: agreed goal/scope/numbered acceptance criteria
-  design.md           # intake: components/interfaces/integration surfaces/epic deliverable
-  plan.json           # the only planning input
+  config.json         # global machine config; edit via wddctl config set
   state.json          # wddctl-owned; never hand-edit
   state.md            # generated projection (wddctl render)
-  tasks/<TASK-ID>.md  # worker briefs
-  shared-context/     # durable discoveries
+  epics/<slug>/       # the active epic (wddctl epic new); one at a time
+    config.json       #   sparse per-epic overrides (config set --epic)
+    spec.md           #   intake: agreed goal/scope/numbered acceptance criteria
+    design.md         #   intake: components/interfaces/surfaces/deliverable
+    plan.json         #   the applied plan, mirrored at plan apply
+    tasks/<ID>.md     #   worker briefs
+    research/         #   epic-specific research artifacts
+  shared-context/     # durable cross-epic discoveries
     contract-inventory.md  # intake research: operation -> shape -> citation
-  archive/            # retired scopes (wddctl scope archive)
+  archive/<slug>/     # retired epics, moved wholesale (wddctl scope archive)
   dispatch/           # transient runner-dispatch scratch, gitignored, never committed
 ```
+
+Artifact refs never carry the `epics/` prefix — `spec.md`, `tasks/T1.md`,
+`research/x.md` always mean the active epic; `shared-context/...` is
+always global.
 
 ## Roles
 
@@ -84,9 +91,10 @@ That is the whole engine. Everything else is judgment:
   a resurrected state is stale by definition and may predate the current
   schema.
 - Open config questions or an unratified constitution: use `wdd-setup`.
-- Ladder rungs pending (`agree_spec`/`research`/`agree_design` in `next`):
-  use `wdd-intake`.
-- No `.wdd/plan.json`, or new work to decompose: use `wdd-plan`.
+- Ladder rungs pending (`create_epic`/`configure_epic`/`agree_spec`/
+  `research`/`agree_design` in `next`): use `wdd-intake`.
+- Ladder complete but no applied plan, or new work to decompose: use
+  `wdd-plan`.
 - Plan exists and tasks need dispatching, reviewing, or merging: use
   `wdd-run` (controller), `wdd-worker` (if you are the dispatched worker),
   or `wdd-review` (if you are the dispatched reviewer).

@@ -8,10 +8,14 @@ description: Decompose an agreed WDD scope into plan.json plus per-task briefs, 
 You run every `wddctl` command in this skill yourself. Presenting a command
 to the user instead of executing it is a protocol violation.
 
-Turn an agreed scope — `.wdd/spec.md`, and `.wdd/design.md` when the ladder
-called for one — into a `.wdd/plan.json` plus one brief per task under
-`.wdd/tasks/`, and an applied, approved scope. This is the only planning
-input; `wddctl plan apply` creates or updates the scope from it.
+Turn an agreed epic — its `spec.md`, and `design.md` when the ladder
+called for one — into a plan.json plus one brief per task under the
+epic's `tasks/`, and an applied, approved scope. The scope id is always
+`SCOPE-<epic slug>` (derived; a plan naming anything else is refused),
+and `plan apply` mirrors the applied plan into the epic's directory so
+the archive stays self-contained. Brief and context refs stay
+namespace-relative (`tasks/T1.md`, `shared-context/...`) — never write
+an `epics/` prefix.
 
 ## Entry precondition
 

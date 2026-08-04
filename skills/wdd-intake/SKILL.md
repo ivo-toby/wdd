@@ -24,11 +24,46 @@ and writing the first draft is the engineer's job, not this skill's. Push
 back on gaps, contradictions, and scope ambiguity before agreeing to
 anything — don't write `spec.md` from a vague ask.
 
+## Rung 0: Name the epic (`wddctl next` → `create_epic`)
+
+Every scope is an epic with a name. Agree a short slug with the user
+(lowercase, digits, dashes — it becomes the scope id `SCOPE-<slug>`, the
+branch names, and the artifact directory `.wdd/epics/<slug>/`), then:
+
+```sh
+wddctl epic new --slug <slug> --title "..."
+```
+
+Slugs are immutable and unique — including against archived epics. All
+rung artifacts below (`spec.md`, `design.md`, `tasks/`, `research/`) live
+in the epic's directory; `shared-context/` stays global. You never write
+the `epics/` prefix in refs — `spec.md` or `tasks/T1.md` already mean the
+active epic.
+
+## Rung 0.5: Configure the epic (`wddctl next` → `configure_epic`)
+
+Epics can override parts of the global config — models, verification
+commands, merge surface, risk rules, review policy — a big epic can demand
+PRs and a strong reviewer while a small one merges locally with cheap
+models. Walk the user through what THIS epic needs, in their terms, in ONE
+compact round. Two legal outcomes, both explicit:
+
+```sh
+wddctl config set --epic <key> <value>   # per overridden key, then:
+wddctl intake configure --approved-by NAME
+wddctl intake configure --use-defaults --by NAME   # inherit everything
+```
+
+"Defaults are fine" is a valid answer but must be recorded — silence is
+not an option. The approval fingerprints the whole effective config;
+editing epic or global config later trips `epic_config_drift`, and the
+remedy is re-approval plus a plan re-stamp, exactly like the rungs below.
+
 ## Rung 1: Spec (`wddctl next` → `agree_spec`)
 
-Once the gaps are closed, write the agreed understanding to `.wdd/spec.md`
-with exactly these four sections: Goal, In scope, Out of scope, Acceptance
-criteria. Finalize's `final_review` walks the criteria by number, so each
+Once the gaps are closed, write the agreed understanding to the epic's
+`spec.md` with exactly these four sections: Goal, In scope, Out of scope,
+Acceptance criteria. Finalize's `final_review` walks the criteria by number, so each
 one must be checkable from the diff — not "works well."
 
 Skeleton:
@@ -221,11 +256,13 @@ refuse until you retire the scope:
 wddctl scope archive --repo .
 ```
 
-This moves the delivered scope's records (scope, tasks, intake, finalize)
-into `.wdd/archive/<scope-id>.json` and resets state for the next one:
-governance stays ratified, but the intake ladder restarts from `agree_spec`
-and nothing scope-specific — including the deliverable command — carries
-forward. Each scope earns its own spec, research, and design from scratch.
+This moves the entire epic directory — spec, design, plan, briefs,
+research, plus a `record.json` of the state — to `.wdd/archive/<slug>/`
+and resets state for the next one: governance stays ratified, but the
+ladder restarts from `create_epic` and nothing epic-specific — the config
+overlay and deliverable command included — carries forward. Every
+delivered epic stays browsable in the archive forever; slugs are never
+reused.
 
 ## Done when
 
