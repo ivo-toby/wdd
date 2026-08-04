@@ -6,6 +6,41 @@ enforcement, Git worktree management, evidence tracking, and merging. Skills
 own judgment — what a task should contain, whether a diff is correct — and
 call `wddctl` to record the outcome.
 
+**Contents**
+
+- [Invocation](#invocation), [The loop](#the-loop), [Optional concurrency
+  flags](#optional-concurrency-flags)
+- [Commands](#commands) — setup and planning verbs: [`init`](#init),
+  [`plan apply`](#plan-apply), [`plan preview`](#plan-preview),
+  [`plan lint`](#plan-lint), [`plan template`](#plan-template),
+  [`config`](#config), `config get`/`set --epic`,
+  `constitution probe`/`ratify`/`amend`/`status`
+- [The intake ladder](#the-intake-ladder) — `epic new`, `intake configure`,
+  `intake spec`/`research`/`design`, drift and cascade, the plan-approval
+  composite
+- [Epic configuration overlay](#epic-configuration-overlay) — the epic
+  overlay's drift/remedy story, then the rest of the per-task command
+  reference: `scope archive`, [`next`](#next), [`status`](#status),
+  [`render`](#render), [`start`](#start), [`submit`](#submit),
+  [`review record`](#review-record), [`review run`](#review-run),
+  [`review collect`](#review-collect), [`verify record`](#verify-record),
+  [`verify collect`](#verify-collect), [`freshness check`](#freshness-check),
+  [`freshness record`](#freshness-record), [`refresh`](#refresh),
+  [`merge`](#merge), [`rebind`](#rebind), [`dispatch`](#dispatch),
+  [`release`](#release), `block`/`unblock`/`cancel`, [`note`](#note),
+  `reconcile status`/`reconcile done`, [`migrate`](#migrate),
+  [`monitor`](#monitor), [`event apply`](#event-apply), `--version`,
+  [`doctor`](#doctor)
+- [Merge surfaces and modes](#merge-surfaces-and-modes) — the
+  surface×mode matrix, transcripts, `merge.mode: human`, `monitor` and
+  `record_human_merge`
+- [Runners](#runners) — registering and dispatching an external agent CLI
+- [Gates (what `next` emits per task)](#gates-what-next-emits-per-task)
+- [The finalize phase](#the-finalize-phase) — `finalize review`/`verify`
+  record, `finalize handoff`, `finalize delivered`, the finalize ladder,
+  full transcripts
+- [Guarantees](#guarantees)
+
 ## Invocation
 
 Any of these run the same code:
@@ -2859,7 +2894,7 @@ $ wddctl next --repo .
   "actions": [
     {
       "action": "final_review",
-      "judgment": "dispatch a reviewer against the whole epic branch diff, per wdd-review's final-review contract, checked against .wdd/spec.md; walk .wdd/spec.md's acceptance criteria AC-1..AC-2 in order and confirm design.md's epic deliverable statement is observably true",
+      "judgment": "dispatch a reviewer against the whole epic branch diff, per wdd-review's final-review contract, checked against spec.md; walk spec.md's acceptance criteria AC-1..AC-2 in order and confirm design.md's epic deliverable statement is observably true",
       "recordWith": "wddctl finalize review record --reviewer NAME --findings '[]' --repo .",
       "task": "-"
     }
@@ -2988,7 +3023,7 @@ exactly like a task-level P1 blocks merge:
 
 ```sh
 $ wddctl finalize review record --reviewer "codex-review" --repo . \
-    --findings '[{"severity":"P1","summary":"acceptance criterion missing: no test proves greeting() returns exactly \"hello\"","file":".wdd/spec.md","line":0}]'
+    --findings '[{"severity":"P1","summary":"acceptance criterion missing: no test proves greeting() returns exactly \"hello\"","file":"spec.md","line":0}]'
 {
   "duplicate": false,
   "headSha": "20742a47bb8c834df23247e93aaeffb63f53e0da",
@@ -3002,7 +3037,7 @@ $ wddctl next --repo .
       "action": "assign_final_fixes",
       "findings": [
         {
-          "file": ".wdd/spec.md",
+          "file": "spec.md",
           "line": 0,
           "severity": "P1",
           "summary": "acceptance criterion missing: no test proves greeting() returns exactly \"hello\""

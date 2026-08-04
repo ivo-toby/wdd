@@ -6,6 +6,28 @@ scope. This document does. Every command block below was run for real
 against a scratch repository on this branch; nothing here is paraphrased
 output.
 
+**Contents**
+
+- [Talking to an agent](#talking-to-an-agent) — the normal way to use WDD,
+  and why the rules obligate agents without enforcing them.
+- [The three roles](#the-three-roles) — controller, worker, reviewer, and
+  how they map onto real sessions.
+- [From nothing to merged](#from-nothing-to-merged) — a real run, `wddctl
+  init` through a merged, reconciled scope.
+- [Where you intervene](#where-you-intervene) — reading state, editing a
+  plan mid-flight, reconciliation, blocking, forcing a refresh.
+- [Failure modes and what to do](#failure-modes-and-what-to-do) — refresh
+  conflicts, a blocked worker, a recurring P1, revision conflicts.
+- [What is enforced vs. what is convention](#what-is-enforced-vs-what-is-convention)
+  — the line between what the state machine guarantees and what still
+  depends on the agent reading the skill.
+- [Finishing a scope](#finishing-a-scope) — the finalize ladder: review,
+  verification, handoff, the observed human merge, archive.
+- [Appendix: a local runner, worked](#appendix-a-local-runner-worked) —
+  dispatching a worker through an external agent CLI instead of a subagent.
+- [Appendix: driving `wddctl` yourself](#appendix-driving-wddctl-yourself)
+  — running the same commands from a terminal or a CI step, no agent.
+
 ## Talking to an agent
 
 This is the normal way to use WDD. You open a session with Claude Code (or
@@ -131,25 +153,50 @@ $ wddctl next
 $ wddctl constitution ratify --by ivo
 {"decisionFingerprint": "sha256:dfe31857...", "duplicate": false, "revision": 1}
 $ wddctl next
-{"actions": [{"action": "agree_spec", "task": "-",
-  "recordWith": "wddctl intake spec --approved-by NAME",
-  "judgment": "agree .wdd/spec.md with the user (goal, in/out of scope, numbered acceptance criteria) per the wdd-intake skill's spec stage, then record it"}]}
+{"actions": [{"action": "create_epic", "task": "-",
+  "command": "wddctl epic new --slug SLUG",
+  "judgment": "name the work with the user in ONE short round (a lowercase-dash slug, and optionally a display title) per the wdd-intake skill, then create the epic"}]}
 ```
 
 Governance done, `next` hands off to the intake ladder instead of `wdd-plan`
-directly — that's the v5 front half.
+directly. The ladder is five rungs, not three: **epic → configure → spec →
+research → design**. The first two are quick and mechanical — name the work,
+settle its config overrides — before the real, judgment-heavy conversation
+starts at the spec:
+
+```
+$ wddctl epic new --slug auth-refresh --title "Refresh token support"
+{"duplicate": false, "epic": "auth-refresh", "revision": 2}
+$ wddctl next
+{"actions": [{"action": "configure_epic", "task": "-",
+  "recordWith": "wddctl intake configure --approved-by NAME (or --use-defaults --by NAME)",
+  "judgment": "walk the user through the epic-overridable keys in ONE compact round -- which merge surface, which models, what proves this epic works -- per wdd-intake, then record the decision"}]}
+$ wddctl intake configure --use-defaults --by ivo
+{"duplicate": false, "revision": 3, "sha256": "sha256:1d7a061e..."}
+$ wddctl next
+{"actions": [{"action": "agree_spec", "task": "-",
+  "recordWith": "wddctl intake spec --approved-by NAME",
+  "judgment": "agree spec.md with the user (goal, in/out of scope, numbered acceptance criteria) per the wdd-intake skill's spec stage, then record it"}]}
+```
+
+`spec.md`, `design.md`, and every task brief now live under
+`.wdd/epics/auth-refresh/` — the typed path resolver maps the same relative
+names (`spec.md`, `tasks/TASK-001.md`) into the active epic's directory
+automatically, so nothing above spells out the epic slug by hand. See
+"Epic directories" in [`docs/artifact-schema.md`](artifact-schema.md) for
+the full layout.
 
 ### Intake: the ladder — spec, research, design
 
-`wdd-intake` owns three rungs, one conversation, before any decomposition
-happens: **spec → research → design**. `next` walks them one at a time and
-names the recording verb; the skill supplies the judgment, `wddctl` the
-bookkeeping. For this run: the agreed spec is refresh tokens plus a
-retry-once client, with two numbered acceptance criteria
-(`issueRefreshToken` existing with a typed signature, and a 401 triggering
-exactly one silent refresh-and-retry). `.wdd/spec.md` gets the skill's
-four-section skeleton; recording binds the approval to the file's exact
-bytes:
+The three rungs `wdd-intake` actually spends judgment on, one conversation,
+before any decomposition happens: **spec → research → design**. `next`
+walks them one at a time and names the recording verb; the skill supplies
+the judgment, `wddctl` the bookkeeping. For this run: the agreed spec is
+refresh tokens plus a retry-once client, with two numbered acceptance
+criteria (`issueRefreshToken` existing with a typed signature, and a 401
+triggering exactly one silent refresh-and-retry). `spec.md` gets the
+skill's four-section skeleton; recording binds the approval to the file's
+exact bytes:
 
 ```
 $ wddctl intake spec --approved-by ivo
@@ -170,10 +217,10 @@ $ wddctl intake research --skip --by ivo --reason "no external contract; refresh
 $ wddctl next
 {"actions": [{"action": "agree_design", "task": "-",
   "recordWith": "wddctl intake design --approved-by NAME --deliverable-command '...'",
-  "judgment": "agree .wdd/design.md (components, interfaces, integration surfaces, epic deliverable) with the user per the wdd-intake skill's design stage, then record it with the command that proves the epic deliverable"}]}
+  "judgment": "agree design.md (components, interfaces, integration surfaces, epic deliverable) with the user per the wdd-intake skill's design stage, then record it with the command that proves the epic deliverable"}]}
 ```
 
-`.wdd/design.md` names two components (`TokenService`, `RefreshClient`),
+`design.md` names two components (`TokenService`, `RefreshClient`),
 their Consumes/Produces, the integration surfaces each owns
 (`src/auth/tokens.ts`, `src/auth/client.ts`), and the epic deliverable —
 the command that proves the whole scope works. The deliverable command is
@@ -198,10 +245,11 @@ clean.
 ### Plan: decomposition and a recorded approval
 
 `wdd-plan` no longer agrees anything — the ladder above already did. It
-turns `.wdd/spec.md` and `.wdd/design.md` into `plan.json` plus one brief
-per task, each brief now carrying **Deliverable** and **Interfaces**
-sections and a `context` field pointing at the `.wdd`-relative files the
-worker needs (`spec.md#AC-1`, `design.md`, …). Three tasks: token issuance,
+turns `spec.md` and `design.md` (both under the active epic's directory,
+`.wdd/epics/<slug>/`) into `plan.json` plus one brief per task, each brief
+now carrying **Deliverable** and **Interfaces** sections and a `context`
+field pointing at the files the worker needs (`spec.md#AC-1`, `design.md`,
+…). Three tasks: token issuance,
 the endpoint that wires it in, and the client's retry-once logic — one
 worker, one branch, one diff, one merge each. Before applying, it shows the
 projected admission order and any lint findings:
@@ -261,7 +309,7 @@ need judgment instead (`await_worker`, `run_review`, `run_verification`,
 $ wddctl start --task TASK-001-token-types --repo .
 {"task": "TASK-001-token-types", "action": "create_branch_and_worktree",
  "branch": "task/TASK-001-token-types", "baseRef": "wdd/auth-refresh",
- "worktree": "/.../worktrees/SCOPE-auth-refresh/TASK-001-token-types",
+ "worktree": "/.../.worktrees/SCOPE-auth-refresh/TASK-001-token-types",
  "snapshot": "dispatch/TASK-001-token-types-1", "revision": 6}
 ```
 
@@ -465,6 +513,10 @@ against the base is genuinely different now.
 
 ## Failure modes and what to do
 
+Four things go wrong often enough to name: a refresh conflicts, a worker
+gets stuck, a review finding keeps reappearing, or two controllers race on
+the same state. Each has a specific, mechanical fix below.
+
 **A refresh conflicts.** `TASK-004-session-ui` merges cleanly; while
 `TASK-005-token-rotate` is still in flight, an out-of-band edit lands on
 the base branch touching the same file:
@@ -597,7 +649,7 @@ it used per task. There is no separate command to trigger this — `status`
 and `next` detect the phase and switch shape on their own.
 
 The ladder mirrors a task's own gates, but at the whole-epic-branch level:
-a final review against `.wdd/spec.md`'s acceptance criteria (the same
+a final review against `spec.md`'s acceptance criteria (the same
 document `wdd-intake` wrote at intake — see above), full verification, a
 handoff to the human who performs the actual merge, and `delivered` only
 once that merge is Git-provably real. `wddctl` never merges the epic
@@ -612,7 +664,7 @@ smoke command, and an intake-recorded epic deliverable command:
 $ wddctl next --repo .
 {"actions": [{"action": "final_review", "task": "-",
   "recordWith": "wddctl finalize review record --reviewer NAME --findings '[]' --repo .",
-  "judgment": "dispatch a reviewer against the whole epic branch diff, per wdd-review's final-review contract, checked against .wdd/spec.md"}]}
+  "judgment": "dispatch a reviewer against the whole epic branch diff, per wdd-review's final-review contract, checked against spec.md"}]}
 ```
 
 `final_review` dispatches per `wdd-review`'s final-review contract: review
@@ -692,25 +744,25 @@ its own, because the fix is new commits on the base branch, and any new
 commit re-stales the review and routes back to `final_review` on its own.
 
 **Scope archive, and the ladder restarts.** `delivered` is no longer a dead
-end. `wddctl scope archive` retires the completed scope's records (scope,
-tasks, intake, finalize, plan approval) into `.wdd/archive/<scope-id>.json`
+end. `wddctl scope archive` retires the completed epic's records (scope,
+tasks, intake, finalize, plan approval) into `.wdd/archive/<slug>/record.json`
 and resets state to post-ratification setup — governance stands, but the
-intake ladder starts over for whatever comes next:
+whole five-rung ladder starts over for whatever comes next, epic included:
 
 ```
 $ wddctl scope archive --repo .
-{"archived": ".wdd/archive/SCOPE-finalize-demo.json", "duplicate": false,
+{"archived": ".wdd/archive/finalize-demo/record.json", "duplicate": false,
  "revision": 17, "scope": "SCOPE-finalize-demo"}
 $ wddctl next --repo .
-{"actions": [{"action": "agree_spec", "task": "-",
-  "recordWith": "wddctl intake spec --approved-by NAME",
-  "judgment": "agree .wdd/spec.md with the user (goal, in/out of scope, numbered acceptance criteria) per the wdd-intake skill's spec stage, then record it"}],
+{"actions": [{"action": "create_epic", "task": "-",
+  "command": "wddctl epic new --slug SLUG",
+  "judgment": "name the work with the user in ONE short round (a lowercase-dash slug, and optionally a display title) per the wdd-intake skill, then create the epic"}],
  "blockers": [], "phase": "setup", "revision": 17, "scope": null}
 ```
 
 Nothing scope-specific — the deliverable command included — carries
-forward. One repository, successive scopes, each earning its own spec,
-research, and design from scratch.
+forward. One repository, successive epics, each earning its own name,
+config overrides, spec, research, and design from scratch.
 
 A scope's lifecycle sentence, end to end: a scope starts at `plan apply`
 and ends at an **observed human merge** — `delivered` is never recorded on

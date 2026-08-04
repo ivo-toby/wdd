@@ -1,8 +1,12 @@
 # Worked example: refresh-token support
 
-A complete run of a small, realistic feature from request to merge, using
-real `wddctl` output captured against a scratch repository on this branch.
-Where output is long, it's trimmed with `...`; nothing here is invented.
+A complete run of a small, realistic feature from request to a delivered
+merge into `main`, using real `wddctl` output captured against a scratch
+repository with the current, installed `wddctl` (schema v6). Where output
+is long, it's trimmed with `...`; nothing here is invented. See
+[`docs/why.md`](why.md) for why WDD exists at all, and
+[`docs/workflow.md`](workflow.md) for the mechanics this example leans on
+without re-explaining.
 
 ## The request
 
@@ -12,7 +16,59 @@ The developer says, roughly:
 > tokens so a user's session extends silently instead of dying on them.
 
 That's it — no task breakdown, no file list. Turning this into a plan is
-the judgment `wdd-plan` covers.
+the judgment `wdd-intake` and `wdd-plan` cover.
+
+## Setting up the epic
+
+Before any spec gets written, the work needs a name. `wddctl epic new`
+creates the epic directory and makes it the active one; `wddctl intake
+configure` settles this epic's config overrides (or explicitly inherits
+every default) before anything else is agreed. Both are one-line, low-
+judgment steps — the real conversation starts at the spec:
+
+```
+$ wddctl epic new --slug auth-refresh --title "Refresh token support"
+{"duplicate": false, "epic": "auth-refresh", "revision": 2}
+$ wddctl intake configure --use-defaults --by ivo
+{"duplicate": false, "revision": 3, "sha256": "sha256:1d7a061e..."}
+```
+
+`spec.md`, `design.md`, and the task briefs now live under
+`.wdd/epics/auth-refresh/` — `wddctl` resolves the same relative names
+(`spec.md`, `tasks/TASK-001-token-types.md`) into that directory
+automatically; nothing in `plan.json` or a brief needs the epic slug
+spelled out. `wddctl next` names the spec next:
+
+```
+$ wddctl intake spec --approved-by ivo
+{"criteria": 2, "duplicate": false, "revision": 4}
+```
+
+`spec.md`'s acceptance criteria: AC-1, a 401 recovers silently when a valid
+refresh token exists; AC-2, a reused refresh token revokes every session
+for that user, not just the reused one. Research is skipped, explicitly and
+attributed — refresh tokens are an internal contract this epic defines
+itself, nothing external to reverse-engineer:
+
+```
+$ wddctl intake research --skip --by ivo --reason "no external API to reverse-engineer; refresh tokens are an internal contract this epic defines itself"
+{"duplicate": false, "revision": 5}
+```
+
+`design.md` names the components (token issuance, the refresh endpoint,
+the client retry, the session banner, and the shared event bus that
+connects the last two — see "the part that actually matters" below) and
+the epic deliverable — the command that proves the whole thing works:
+
+```
+$ wddctl intake design --approved-by ivo --deliverable-command "python3 -c \"print('refresh cycle: 401 -> POST /auth/refresh -> retried request succeeds')\""
+{"duplicate": false, "revision": 6}
+```
+
+Every rung is bound to the exact bytes it approved; editing `spec.md` or
+`design.md` after this point reopens that rung and cascades downstream.
+[`docs/wddctl.md`](wddctl.md#the-intake-ladder) has the full ladder
+reference, including drift and cascade.
 
 ## The decomposition judgment
 
@@ -89,7 +145,8 @@ bad merge is expensive to unwind.
       "specPath": "tasks/TASK-001-token-types.md",
       "risk": "high",
       "dependsOn": [],
-      "conflictDomains": ["src/auth/tokens.ts", "src/session/types.ts"]
+      "conflictDomains": ["src/auth/tokens.ts", "src/session/types.ts"],
+      "context": ["spec.md"]
     },
     {
       "id": "TASK-002-refresh-endpoint",
@@ -97,7 +154,8 @@ bad merge is expensive to unwind.
       "specPath": "tasks/TASK-002-refresh-endpoint.md",
       "risk": "high",
       "dependsOn": ["TASK-001-token-types"],
-      "conflictDomains": ["src/api/auth_routes.ts", "src/session/types.ts"]
+      "conflictDomains": ["src/api/auth_routes.ts", "src/session/types.ts"],
+      "context": ["spec.md#AC-2"]
     },
     {
       "id": "TASK-003-client-retry",
@@ -105,7 +163,8 @@ bad merge is expensive to unwind.
       "specPath": "tasks/TASK-003-client-retry.md",
       "risk": "normal",
       "dependsOn": ["TASK-001-token-types"],
-      "conflictDomains": ["src/client/http.ts", "src/client/session-events.ts"]
+      "conflictDomains": ["src/client/http.ts", "src/client/session-events.ts"],
+      "context": ["spec.md#AC-1"]
     },
     {
       "id": "TASK-004-session-ui",
@@ -113,7 +172,8 @@ bad merge is expensive to unwind.
       "specPath": "tasks/TASK-004-session-ui.md",
       "risk": "normal",
       "dependsOn": [],
-      "conflictDomains": ["src/ui/session-banner.ts", "src/client/session-events.ts"]
+      "conflictDomains": ["src/ui/session-banner.ts", "src/client/session-events.ts"],
+      "context": ["spec.md"]
     }
   ]
 }
@@ -125,6 +185,14 @@ write to it, so they're correctly serialized by the domain *and* by the
 `dependsOn` edge. Two independent mechanisms agreeing is fine; it isn't
 redundant, because the domain would still protect a third task that later
 needs the same file with no dependency relationship to either.
+
+Each task's `context` field points at the `spec.md` acceptance criterion it
+discharges, where one applies — machine-carried evidence for handover, not
+something a worker has to remember from the intake conversation. `wddctl
+plan lint --plan plan.json` comes back clean except two advisory
+`missing_criteria` warnings on tasks 1 and 4, which is expected: neither
+implements an acceptance criterion directly, they're the shared contract
+and the supporting UI.
 
 ## Reading `plan preview`
 
@@ -168,8 +236,18 @@ queue. This plan's two rounds of two tasks each is a reasonable middle.
 
 ## The run
 
-Plan applied, constitution ratified (see `wdd-setup` and
-`docs/wddctl.md`), and `wddctl next` opens the loop:
+Plan applied, approved by name — `--approved-by` now records a composite
+fingerprint over the plan and every task brief, not just the plan JSON:
+
+```
+$ wddctl plan apply --plan plan.json --repo . --approved-by ivo
+{"approvedBy": "ivo", "created": true, "revision": 7, "scope": "SCOPE-auth-refresh",
+ "diff": {"added": ["TASK-001-token-types", "TASK-002-refresh-endpoint",
+                     "TASK-003-client-retry", "TASK-004-session-ui"], "removed": [], "updated": []},
+ "base": {"action": "created", "baseRef": "wdd/auth-refresh", "from": "HEAD"}}
+```
+
+`wddctl next` opens the loop:
 
 ```
 $ wddctl next
@@ -191,10 +269,16 @@ The controller starts both round-1 tasks:
 
 ```
 $ wddctl start --task TASK-001-token-types --repo .
-{"branch": "task/TASK-001-token-types", "worktree": ".../TASK-001-token-types", "headSha": "34a4211...", "revision": 2}
+{"branch": "task/TASK-001-token-types", "worktree": ".worktrees/SCOPE-auth-refresh/TASK-001-token-types", "headSha": "03ddd58...", "revision": 8}
 $ wddctl start --task TASK-004-session-ui --repo .
-{"branch": "task/TASK-004-session-ui", "worktree": ".../TASK-004-session-ui", "headSha": "34a4211...", "revision": 3}
+{"branch": "task/TASK-004-session-ui", "worktree": ".worktrees/SCOPE-auth-refresh/TASK-004-session-ui", "headSha": "03ddd58...", "revision": 10}
 ```
+
+The worktree sits *inside* the repository (`worktrees.root` defaults to
+`.worktrees`, gitignored automatically) — a task's checkout never pollutes
+the controller's own working tree, but it isn't a sibling directory either;
+see the `worktree` field in [`docs/artifact-schema.md`](artifact-schema.md)
+for the full resolution rule.
 
 Two workers go to work in their own worktrees. The TASK-001 worker writes
 the token contract:
@@ -214,7 +298,7 @@ export function issueRefreshToken(userId: string): RefreshToken {
 
 ```
 $ wddctl submit --task TASK-001-token-types --repo .
-{"event": "task.pr_recorded", "headSha": "f9cdf2b...", "status": "review", "revision": 4}
+{"event": "task.pr_recorded", "headSha": "4a621a0...", "status": "review", "revision": 12}
 ```
 
 ### The reviewer finds a genuine P1
@@ -230,7 +314,7 @@ high-risk, auth-touching tasks.
 ```
 $ wddctl review record --task TASK-001-token-types --reviewer "codex-review" \
   --findings '[{"severity":"P1","summary":"issueRefreshToken uses Math.random() for the token value; Math.random() is not cryptographically secure and refresh tokens must be unguessable","file":"src/auth/tokens.ts","line":9}]'
-{"duplicate": false, "outcome": "blocking", "revision": 5, "status": "in_progress"}
+{"duplicate": false, "outcome": "blocking", "revision": 13, "status": "in_progress"}
 ```
 
 ```
@@ -256,7 +340,7 @@ import { randomBytes } from "crypto";
 
 ```
 $ wddctl submit --task TASK-001-token-types --repo .
-{"event": "task.head_updated", "headSha": "e6befd7...", "status": "review", "revision": 6}
+{"event": "task.head_updated", "headSha": "ff16b0b...", "status": "review", "revision": 14}
 ```
 
 New head, evidence invalidated, back to `review` automatically — the
@@ -265,9 +349,9 @@ reference. The reviewer looks again at the new diff:
 
 ```
 $ wddctl review record --task TASK-001-token-types --reviewer "codex-review" --findings '[]'
-{"outcome": "passed", "revision": 8}
+{"duplicate": false, "outcome": "passed", "revision": 15}
 $ wddctl verify record --task TASK-001-token-types --status passed --command "tsc --noEmit && vitest run tokens"
-{"status": "merge_ready", "revision": 9}
+{"duplicate": false, "revision": 16, "status": "merge_ready"}
 ```
 
 ### The merge
@@ -289,22 +373,22 @@ export function mountSessionBanner(): void {
 
 ```
 $ wddctl submit --task TASK-004-session-ui --repo .
-{"event": "task.pr_recorded", "status": "in_progress", "revision": 7}
+{"event": "task.pr_recorded", "status": "in_progress", "revision": 17}
 $ wddctl verify record --task TASK-004-session-ui --status passed --command "vitest run session-banner"
-{"status": "merge_ready", "revision": 10}
+{"duplicate": false, "revision": 18, "status": "merge_ready"}
 ```
 
 Both tasks now check freshness and merge:
 
 ```
 $ wddctl freshness record --task TASK-001-token-types --repo .
-{"classification": "current", "revision": 11}
+{"classification": "current", "revision": 19}
 $ wddctl freshness record --task TASK-004-session-ui --repo .
-{"classification": "current", "revision": 12}
+{"classification": "current", "revision": 20}
 $ wddctl merge --task TASK-001-token-types --repo .
-{"action": "merged", "baseSha": "028b572...", "headSha": "e6befd7...", "revision": 13}
+{"action": "merged", "baseSha": "36932ea...", "headSha": "ff16b0b...", "revision": 21}
 $ wddctl merge --task TASK-004-session-ui --repo .
-{"action": "merged", "baseSha": "98dadf3...", "headSha": "f0b1dd1...", "revision": 14}
+{"action": "merged", "baseSha": "fce6232...", "headSha": "ad3031a...", "revision": 22}
 $ wddctl release --task TASK-001-token-types --repo . && wddctl release --task TASK-004-session-ui --repo .
 ```
 
@@ -319,7 +403,7 @@ $ wddctl next
   {"task": "TASK-003-client-retry", "action": "start_task", ...}
 ]}
 $ wddctl reconcile done
-{"duplicate": false, "revision": 17}
+{"duplicate": false, "revision": 25}
 ```
 
 ### Round 2, and the domain paying off
@@ -380,7 +464,7 @@ know and has no way to discover from its own brief. The worker queues it:
 ```
 $ wddctl note --task TASK-002-refresh-endpoint \
   --note "refresh-token reuse now revokes every session for the user, not just the reused token; any future device-list or 'active sessions' feature must treat a 401 from reuse detection as a full sign-out, not a per-device error"
-{"duplicate": false, "revision": 22}
+{"duplicate": false, "revision": 30}
 $ wddctl reconcile status
 {"due": {"code": "pending_notes", "notes": 1}, "mergesSinceCheckpoint": 0, ...}
 ```
@@ -410,10 +494,10 @@ retrievable form — the pending-notes list is cleared, not archived.
 
 ```
 $ wddctl reconcile done
-{"duplicate": false, "revision": 22}
+{"duplicate": false, "revision": 33}
 ```
 
-### Finishing the scope
+### Finishing the tasks
 
 TASK-002's review comes back clean, both tasks verify, both are current
 against the base, both merge:
@@ -435,55 +519,111 @@ One more reconciliation checkpoint fires (two more merges, hitting
 
 ```
 $ wddctl reconcile done
-{"duplicate": false, "revision": 33}
+{"duplicate": false, "revision": 43}
 ```
+
+## Finalize: review, verify, handoff, delivered
+
+Every task is `done`, so the scope itself moves into `finalize` — `wddctl
+next` stops returning empty and starts naming scope-level work, the same
+one-action-at-a-time discipline it used per task. This is not an ordinary
+PR "outside `wddctl`'s scope": the controller drives the whole handoff,
+short of the click that actually merges it.
+
+```
+$ wddctl next
+{"actions": [{"action": "final_review",
+  "judgment": "dispatch a reviewer against the whole epic branch diff, per wdd-review's final-review contract, checked against spec.md; walk spec.md's acceptance criteria AC-1..AC-2 in order and confirm design.md's epic deliverable statement is observably true",
+  "recordWith": "wddctl finalize review record --reviewer NAME --findings '[]' --repo ."}]}
+$ wddctl finalize review record --reviewer "codex-review" --findings '[]' --repo .
+{"duplicate": false, "headSha": "618ebab...", "outcome": "passed", "revision": 44}
+```
+
+Full verification runs every ratified `verification.commands` entry plus
+the epic deliverable command recorded at `intake design`:
+
+```
+$ wddctl finalize verify record --results '[{"command": "npm test", "status": "passed"}, {"command": "python3 -c \"print('"'"'refresh cycle: 401 -> POST /auth/refresh -> retried request succeeds'"'"')\"", "status": "passed"}]' --repo .
+{"duplicate": false, "headSha": "618ebab...", "revision": 45, "status": "passed"}
+```
+
+A clean review and a passed verification, both pinned to the current base
+head, unlock the handoff. On the `local` surface (this run), `wddctl
+finalize handoff` records that handoff happened and returns instructions —
+the push and the PR are the operator's to run; on `pr`, it pushes the base
+branch and opens the epic→target PR itself, the same way task-level
+`submit` opens one:
+
+```
+$ wddctl finalize handoff --repo .
+{"duplicate": false, "headSha": "618ebab...",
+ "instructions": "push wdd/auth-refresh to your remote (e.g. 'git push origin wdd/auth-refresh') and open a pull request into main yourself; wddctl does not perform this on the local surface. Once the human merge lands, run 'wddctl finalize delivered --by NAME --repo .' to record it.",
+ "pr": null, "revision": 46, "targetBranch": "main"}
+```
+
+The merge itself is not a `wddctl` command — an ordinary `git merge` (or
+clicking "Merge" on the handoff PR), performed by whoever owns `main`:
+
+```
+$ git checkout -q main
+$ git merge --no-ff -q wdd/auth-refresh -m "merge scope SCOPE-auth-refresh into main"
+$ wddctl finalize delivered --by ivo --repo .
+{"by": "ivo", "duplicate": false, "headSha": "618ebab...", "revision": 47, "targetBranch": "main"}
+$ wddctl next
+{"actions": [], "blockers": [], "phase": "delivered", "revision": 47, "scope": "SCOPE-auth-refresh"}
+```
+
+`finalize delivered` doesn't take this on trust — it fetches `main`
+best-effort and requires the base branch's head to actually be an ancestor
+of it. Run it before the merge lands and it refuses, naming exactly what
+hasn't happened yet. From here `wddctl scope archive` would retire this
+scope's records into `.wdd/archive/` and reopen a fresh ladder for the next
+epic — see [`docs/workflow.md`](workflow.md#finishing-a-scope) for that
+transcript.
 
 ## What the developer sees at the end
 
 ```
-$ wddctl next
-{"actions": [], "blockers": []}
-
 $ wddctl status
-SCOPE-auth-refresh revision 33
+SCOPE-auth-refresh revision 47
 constitution: ratified
 tasks: done=4, todo=0
-active: 0
-
-$ wddctl render --output .wdd/state.md
+phase: delivered
 ```
 
-And the actual history, on the base branch, as an ordinary `git log`:
+And the actual history, on `main`, as an ordinary `git log`:
 
 ```
-*   merge TASK-003-client-retry into wdd/auth-refresh
+*   0bbf68d merge scope SCOPE-auth-refresh into main
 |\
-| * TASK-003: silent-refresh retry with session-expired event
-* |   merge TASK-002-refresh-endpoint into wdd/auth-refresh
-|\ \
+| *   618ebab wdd: merge TASK-003-client-retry into wdd/auth-refresh
+| |\
+| | * 3ad364e TASK-003: silent-refresh retry with session-expired event
+| * |   0e95f70 wdd: merge TASK-002-refresh-endpoint into wdd/auth-refresh
+| |\ \
+| | |/
+| |/|
+| | * 27789f5 TASK-002: add POST /auth/refresh route with reuse detection
+| |/
+| *   fce6232 wdd: merge TASK-004-session-ui into wdd/auth-refresh
+| |\
+| | * ad3031a TASK-004: session-expiry banner + session-events bus
 | |/
 |/|
-| * TASK-002: add POST /auth/refresh route with reuse detection
-|/
-*   merge TASK-004-session-ui into wdd/auth-refresh
-|\
-| * TASK-004: session-expiry banner + session-events bus
-* |   merge TASK-001-token-types into wdd/auth-refresh
-|\ \
-| |/
+| * 36932ea wdd: merge TASK-001-token-types into wdd/auth-refresh
 |/|
-| * TASK-001: use crypto.randomBytes for refresh token generation (fixes P1)
-| * TASK-001: refresh token type contract
+| * ff16b0b TASK-001: use crypto.randomBytes for refresh token generation (fixes P1)
+| * 4a621a0 TASK-001: refresh token type contract
 |/
-* initial commit
+* 03ddd58 initial commit
 ```
 
 Four tasks, one real security fix caught before merge, one durable
 discovery about session-reuse semantics recorded at a reconciliation
-checkpoint, and a clean, individually-reviewable commit history on
-`wdd/auth-refresh` — which is now an ordinary branch ready for a normal PR
-into `main`, outside `wddctl`'s scope entirely. Nothing about getting here
-required trusting that the token-fix worker, the retry worker, or the
-banner worker remembered a rule from three tasks ago; the state machine
-carried the parts that mattered — evidence, ordering, exclusion — and the
-skills carried the judgment.
+checkpoint, and a clean, individually-reviewable commit history — merged
+into `main` with `wddctl` proving, not assuming, that the human-owned final
+merge actually happened. Nothing about getting here required trusting that
+the token-fix worker, the retry worker, or the banner worker remembered a
+rule from three tasks ago; the state machine carried the parts that
+mattered — evidence, ordering, exclusion — and the skills carried the
+judgment.
