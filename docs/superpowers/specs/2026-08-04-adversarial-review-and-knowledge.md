@@ -178,6 +178,53 @@ The reviewer's charter (embedded verbatim in the dispatch prompt):
   the contract inventory or the design like any other on-disk source.
   Knowledge nobody is instructed to read is knowledge that doesn't exist.
 
+### The behavioral contract (constitution template + repo default)
+
+Trial evidence: the yes-man failure mode appeared three times in three
+shapes (review records stamped in a human's name for reviews that never
+ran; fixes claimed but never made; a contract "helpfully" improvised when
+the real one was inconvenient) — and what changed behavior each time was
+a concrete, checkable rule, never a persona statement. "Be honest and
+rigorous" moves nothing; "never put a human's name on evidence for work
+they didn't do" does. The contract is therefore written as **testable
+obligations, not vibes**:
+
+- **Dissent is a duty, not rudeness.** If you believe a human or agent
+  decision is wrong, say so once — with the reason and what evidence
+  would change your mind — BEFORE executing, not after.
+- **Disagree-then-commit.** After the human decides with your objection
+  on the table, execute their call. Pushback is one round, not
+  obstruction; the human stays the authority.
+- **Claim/observation discipline.** "I did X and verified it by Y" and
+  "I believe X" are different sentences; never use the first without
+  the Y.
+- **Challenge conflicts with recorded doctrine.** An instruction that
+  contradicts the constitution, the spec, or an approved record gets
+  surfaced, not silently obeyed — and not silently ignored either.
+- **No agreement theater.** Don't open by validating a premise you are
+  about to refute; in incidents and reviews, your first job is the hole
+  in the theory.
+- **Evidence names who did the work.** Never record a review,
+  verification, or approval that did not happen; never put a name on
+  evidence for work that person or model did not do. (Already law in
+  `wdd-run`/`wdd-review`; restated here because it is the contract's
+  archetype.)
+
+Placement, two layers:
+
+1. **The constitution template `wddctl init` scaffolds** gains a
+   behavioral-contract section carrying these obligations — making them
+   ratified, fingerprint-bound doctrine for every WDD repo rather than
+   ambient advice. Existing repos pick it up at their next governance
+   amendment; no forced migration. (This is the phase's second small
+   machine touch, alongside the `next` judgment text — a template string
+   in `setup.py`, no verb or schema changes.)
+2. **Repo-level `AGENTS.md`/`CLAUDE.md`** is the right home for the same
+   contract outside WDD sessions — harness-agnostic, read by every
+   agent. The skills and docs recommend it and point at the constitution
+   section as the canonical wording; scaffolding other tools' files is
+   out of scope.
+
 ## 3. Institutional knowledge: the epic retrospective
 
 The knowledge file is a **living draft, not an archive-time memory test**:
@@ -227,9 +274,10 @@ At `delivered`, before `scope archive`:
 ## Non-goals
 
 - No new CLI verbs, no schema changes, no knowledge-graph/RAG machinery —
-  `shared-context/knowledge/` is files, grep, and citations. The single
-  machine touch in this phase is one judgment-text edit: the
-  delivered-phase `next` payload names the retrospective step. External
+  `shared-context/knowledge/` is files, grep, and citations. The only
+  machine touches in this phase are two strings: the delivered-phase
+  `next` judgment names the retrospective step, and `wddctl init`'s
+  constitution template gains the behavioral-contract section. External
   stores (e.g. a personal knowledge base) can mirror it; that is the
   operator's business.
 - No automatic review dispatch — the human confirms the reviewer channel
