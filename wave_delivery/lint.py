@@ -14,7 +14,27 @@ from typing import Any
 
 from .domains import WILDCARDS, domains_overlap, matches_domain
 from .engine import admission_schedule
+from .errors import ValidationError
+from .paths import resolve_artifact
 from .plan import state_from_plan
+
+
+def _resolve_brief(wdd_dir: Path | str, spec_path: str, epic: str | None = None) -> Path | None:
+    """A task's brief file, resolved through the one typed resolver.
+
+    Cross-reference: `wave_delivery/paths.py`'s `resolve_artifact` (spec
+    Sec1, Global Constraints "one resolver"); `epic` threads the caller's
+    `state.epic` (Task 4). Returns None rather than raising for a ref the
+    resolver rejects (absolute, traversal, wrong namespace, ...) -- lint is
+    advisory and must never crash on a malformed plan.json (module
+    docstring: "lint warns; it never blocks"); callers already treat a
+    brief that isn't there as the ordinary `missing_brief` finding, so
+    folding "rejected ref" into that same "not there" path costs nothing.
+    """
+    try:
+        return resolve_artifact(spec_path, wdd_dir=wdd_dir, epic=epic)
+    except ValidationError:
+        return None
 
 
 def _check_serialization(plan_dict: dict[str, Any]) -> list[dict[str, Any]]:
@@ -116,19 +136,22 @@ def _check_coarse_domains(plan_dict: dict[str, Any]) -> list[dict[str, Any]]:
     return findings
 
 
-def _check_briefs(plan_dict: dict[str, Any], wdd_dir: Path | str) -> list[dict[str, Any]]:
+def _check_briefs(
+    plan_dict: dict[str, Any], wdd_dir: Path | str, epic: str | None = None
+) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for entry in plan_dict["tasks"]:
-        brief = Path(wdd_dir) / entry["specPath"]
+        brief = _resolve_brief(wdd_dir, entry["specPath"], epic)
+        brief_is_file = brief is not None and brief.is_file()
         content_lines = 0
-        if brief.is_file():
+        if brief_is_file:
             # Non-blank lines, not raw line count: a file of only blank
             # lines has content-free "length" and must still be flagged.
             content_lines = sum(
                 1 for line in brief.read_text(encoding="utf-8").splitlines() if line.strip()
             )
         if content_lines < 2:
-            reason = "does not exist" if not brief.is_file() else "is effectively empty"
+            reason = "does not exist" if not brief_is_file else "is effectively empty"
             findings.append(
                 {
                     "code": "missing_brief",
@@ -157,8 +180,12 @@ def _check_briefs(plan_dict: dict[str, Any], wdd_dir: Path | str) -> list[dict[s
     return findings
 
 
-def _check_spec(wdd_dir: Path | str) -> list[dict[str, Any]]:
-    spec = Path(wdd_dir) / "spec.md"
+def _check_spec(wdd_dir: Path | str, epic: str | None = None) -> list[dict[str, Any]]:
+    # Cross-reference: wave_delivery/paths.py's `resolve_artifact` (spec
+    # Sec1, Global Constraints "one resolver"); "spec.md" is a fixed
+    # epic-namespace literal, so this can never raise. `epic` threads the
+    # caller's `state.epic` (Task 4).
+    spec = resolve_artifact("spec.md", wdd_dir=wdd_dir, epic=epic)
     content_lines = 0
     if spec.is_file():
         content_lines = sum(
@@ -172,7 +199,7 @@ def _check_spec(wdd_dir: Path | str) -> list[dict[str, Any]]:
             "code": "missing_spec",
             "severity": "warning",
             "message": (
-                f".wdd/spec.md {reason} — the finalize phase reviews the epic "
+                f"spec.md {reason} — the finalize phase reviews the epic "
                 "branch against it, and without it there is no agreed record of "
                 "what this scope delivers. Run the intake (wdd-intake) first."
             ),
@@ -217,7 +244,7 @@ def _section_nonempty(sections: dict[str, list[str]], name: str) -> bool:
 
 
 def _check_deliverable_and_interfaces(
-    plan_dict: dict[str, Any], wdd_dir: Path | str
+    plan_dict: dict[str, Any], wdd_dir: Path | str, epic: str | None = None
 ) -> list[dict[str, Any]]:
     """Brief template's two required, linted sections (spec Sec3).
 
@@ -226,8 +253,8 @@ def _check_deliverable_and_interfaces(
     """
     findings: list[dict[str, Any]] = []
     for entry in plan_dict["tasks"]:
-        brief = Path(wdd_dir) / entry["specPath"]
-        if not brief.is_file():
+        brief = _resolve_brief(wdd_dir, entry["specPath"], epic)
+        if brief is None or not brief.is_file():
             continue
         sections = _sections(brief.read_text(encoding="utf-8"))
         if not _section_nonempty(sections, "deliverable"):
@@ -323,14 +350,18 @@ def _check_missing_context(
     return findings
 
 
-def _integration_surfaces(wdd_dir: Path | str) -> list[str]:
+def _integration_surfaces(wdd_dir: Path | str, epic: str | None = None) -> list[str]:
     """Paths listed under design.md's '## Integration surfaces' section.
 
     Tolerant of an absent file or absent/empty section (both return `[]`,
     never raise) -- design.md is optional at lint time, unlike at intake
     `design` approval where its presence is enforced.
     """
-    design = Path(wdd_dir) / "design.md"
+    # Cross-reference: wave_delivery/paths.py's `resolve_artifact` (spec
+    # Sec1, Global Constraints "one resolver"); "design.md" is a fixed
+    # epic-namespace literal, so this can never raise. `epic` threads the
+    # caller's `state.epic` (Task 4).
+    design = resolve_artifact("design.md", wdd_dir=wdd_dir, epic=epic)
     if not design.is_file():
         return []
     sections = _sections(design.read_text(encoding="utf-8"))
@@ -344,7 +375,7 @@ def _integration_surfaces(wdd_dir: Path | str) -> list[str]:
 
 
 def _check_unowned_surfaces(
-    plan_dict: dict[str, Any], wdd_dir: Path | str
+    plan_dict: dict[str, Any], wdd_dir: Path | str, epic: str | None = None
 ) -> list[dict[str, Any]]:
     """design.md's Integration surfaces vs. the plan's conflictDomains (spec Sec2).
 
@@ -352,7 +383,7 @@ def _check_unowned_surfaces(
     design error caught mechanically: nobody owns writing to it, so multiple
     tasks (or none) will improvise there.
     """
-    surfaces = _integration_surfaces(wdd_dir)
+    surfaces = _integration_surfaces(wdd_dir, epic)
     if not surfaces:
         return []
     all_domains = [
@@ -381,6 +412,11 @@ def lint_plan(
     wdd_dir: Path | str | None = None,
     state: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    # `epic` threads through every file-touching check below (Task 4, spec
+    # Sec1): `state` is the one place lint already receives the real
+    # controller state (cli.py's `_overlaid_plan`), so this is the single
+    # extraction point -- no individual check reads state.epic itself.
+    epic = (state or {}).get("epic")
     findings: list[dict[str, Any]] = []
     findings.extend(_check_serialization(plan_dict))
     findings.extend(_check_risk_distribution(plan_dict))
@@ -389,8 +425,8 @@ def lint_plan(
     findings.extend(_check_missing_criteria(plan_dict))
     findings.extend(_check_missing_context(plan_dict, state))
     if wdd_dir is not None:
-        findings.extend(_check_spec(wdd_dir))
-        findings.extend(_check_briefs(plan_dict, wdd_dir))
-        findings.extend(_check_deliverable_and_interfaces(plan_dict, wdd_dir))
-        findings.extend(_check_unowned_surfaces(plan_dict, wdd_dir))
+        findings.extend(_check_spec(wdd_dir, epic))
+        findings.extend(_check_briefs(plan_dict, wdd_dir, epic))
+        findings.extend(_check_deliverable_and_interfaces(plan_dict, wdd_dir, epic))
+        findings.extend(_check_unowned_surfaces(plan_dict, wdd_dir, epic))
     return findings

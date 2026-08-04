@@ -270,6 +270,20 @@ def transition(
                 ),
             },
         }
+        # Belt and braces (epic-scoped-state plan Task 5, spec Sec2): v5's
+        # amend transition did not touch scope.approval at all -- only
+        # governance_drift (an execute-time gate, not this transition) forced
+        # a re-stamp. v6 additionally clears it HERE, explicitly, on amend --
+        # a plan approved under the old effective config (models, riskRules,
+        # review policy all feed apply-time derivation) must not silently
+        # keep executing once the config/constitution it was approved under
+        # has changed. Ratify never needs this: nothing can have been
+        # approved before the first ratification.
+        if event_type == "constitution.amended":
+            scope = state.get("scope")
+            if isinstance(scope, dict) and "approval" in scope:
+                state["scope"] = {**scope}
+                del state["scope"]["approval"]
         return state
 
     require_ratified(state)
@@ -335,6 +349,17 @@ def transition(
             "findings": findings,
             "reviewer": data.get("reviewer"),
         }
+        # Evidence binding (epic-scoped-state plan Task 5, spec Sec2): the
+        # resolved risk tier + review model the review actually ran under,
+        # plus the taskReview config-projection digest. Engine never reads
+        # config itself (Global Constraints) -- these are computed by the
+        # CALLER (review.py, from an admission-time layered snapshot) and
+        # merely passed through here, same principle as `models`/`task_risk`
+        # already being caller-supplied to `decorate_actions`. Optional: a
+        # caller with no config available (no config.json) omits them.
+        for key in ("resolvedRisk", "reviewModel", "configSha256"):
+            if key in data:
+                task["review"][key] = data[key]
         task["status"] = "in_progress"
         if task_gate(state, task) == "ready_to_merge":
             task["status"] = "merge_ready"
@@ -358,6 +383,11 @@ def transition(
             "status": result,
             "command": data.get("command"),
         }
+        # Evidence binding (Task 5, spec Sec2): the taskVerification config-
+        # projection digest, passed through the same way as review's extras
+        # above -- engine never reads config itself.
+        if "configSha256" in data:
+            task["verification"]["configSha256"] = data["configSha256"]
         if result == "passed" and task_gate(state, task) == "ready_to_merge":
             task["status"] = "merge_ready"
     elif event_type == "task.head_updated":
@@ -471,7 +501,11 @@ def apply_mutation(
     whose event depends on state they must not read outside the lock.
     """
     with store.locked():
-        state = store.read()
+        # Heal any crashed archive transaction (spec Sec1's recovery matrix)
+        # BEFORE this mutation's own precondition checks run, under the same
+        # lock acquisition -- `recover_locked` assumes the lock is already
+        # held and never acquires it itself, so this cannot self-deadlock.
+        state = store.recover_locked()
         if callable(event_type):
             event_type = event_type(state)
         key = idempotency_key or event_id(

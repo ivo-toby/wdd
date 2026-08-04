@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,34 @@ def _require_string_list(value: Any, name: str) -> None:
         isinstance(value, list) and all(isinstance(item, str) and item for item in value),
         f"{name} must be a list of non-empty strings",
     )
+
+
+def _parse_strict_json(text: str, *, context: str) -> Any:
+    """The one JSON parse used for every WDD-authored config file (global
+    `config.json` AND an epic overlay's `config.json`): duplicate object
+    keys and non-finite number literals (NaN/Infinity/-Infinity) are
+    rejected rather than silently accepted by Python's `json` module --
+    the same byte-precision `effective_config_digest` demands of what it
+    hashes. `context` names what is being parsed (typically the file path)
+    so the raised `ValidationError` can name both the file and the
+    offending key/literal. Still raises the stdlib's own
+    `json.JSONDecodeError` for ordinary malformed JSON; callers translate
+    that into a `ValidationError` themselves (they know the right wording
+    for "not valid JSON" in their context).
+    """
+
+    def _reject_duplicate(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        seen: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in seen:
+                raise ValidationError(f"{context}: duplicate JSON key {key!r}")
+            seen[key] = value
+        return seen
+
+    def _reject_constant(name: str) -> Any:
+        raise ValidationError(f"{context}: non-finite number literal {name!r} is not allowed")
+
+    return json.loads(text, object_pairs_hook=_reject_duplicate, parse_constant=_reject_constant)
 
 
 def validate_config(config: dict[str, Any]) -> None:
@@ -196,9 +225,11 @@ def validate_config(config: dict[str, Any]) -> None:
 def load_config(wdd_dir: Path | str) -> dict[str, Any]:
     path = config_path(wdd_dir)
     try:
-        config = json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError as error:
         raise ValidationError(f"config file does not exist: {path}; run 'wddctl init'") from error
+    try:
+        config = _parse_strict_json(text, context=f"config file ({path})")
     except json.JSONDecodeError as error:
         raise ValidationError(f"config file is not valid JSON: {path}: {error}") from error
     validate_config(config)
@@ -327,3 +358,465 @@ def check_ratifiable(wdd_dir: Path | str) -> None:
             f"cannot ratify: {len(open_questions)} open config question(s) remain ({paths}); "
             "resolve them with 'wddctl config set' first"
         )
+
+
+# ---------------------------------------------------------------------------
+# Epic configuration overlay (epic-scoped-state plan, Task 2, spec Sec2).
+#
+# `epics/<slug>/config.json` is a sparse overlay: only overridden dotted
+# LEAVES are present. The allowlist below is the exact granularity of
+# override -- e.g. `models.implementation` is one leaf (the whole
+# {default, highRisk} object), not two ("models.implementation.default"
+# and "models.implementation.highRisk" are NOT independently overridable).
+# Overriding a leaf replaces it atomically; it is not a deep-merge below
+# the leaf boundary. Any key outside this set is rejected BY NAME at every
+# entry point: overlay load, `config set --epic`, and (Task 5) `intake
+# configure` approval -- this module enforces the first two; Task 5 wires
+# the third through `derive_effective`, already exposed here.
+# ---------------------------------------------------------------------------
+
+OVERLAY_ALLOWED_LEAVES: tuple[str, ...] = (
+    "models.planning",
+    "models.implementation",
+    "models.review",
+    "verification.commands",
+    "verification.unavailableJustification",
+    "merge.surface",
+    "riskRules",
+    "review.policy",
+)
+
+_ALLOWED_LEAVES = frozenset(OVERLAY_ALLOWED_LEAVES)
+_ALLOWED_LEAF_PARTS: tuple[tuple[str, ...], ...] = tuple(
+    tuple(leaf.split(".")) for leaf in OVERLAY_ALLOWED_LEAVES
+)
+_ALLOWED_PREFIXES = frozenset(
+    ".".join(parts[:index])
+    for parts in _ALLOWED_LEAF_PARTS
+    for index in range(1, len(parts))
+)
+
+# Purposes `project()` accepts (spec Sec2's named projections).
+PROJECTION_PURPOSES: tuple[str, ...] = (
+    "plan",
+    "taskReview",
+    "finalReview",
+    "taskVerification",
+    "finalVerification",
+)
+
+
+def _collect_leaf_paths(node: Any, prefix: str) -> list[str]:
+    """All dotted leaf paths under `node`, for naming a rejected key by its
+    most specific offending path(s) (e.g. 'worktrees.root', not just
+    'worktrees')."""
+    if isinstance(node, dict) and node:
+        paths: list[str] = []
+        for key in sorted(node):
+            dotted = f"{prefix}.{key}" if prefix else key
+            paths.extend(_collect_leaf_paths(node[key], dotted))
+        return paths
+    return [prefix]
+
+
+def _check_overlay_allowlist(overlay: dict[str, Any], prefix: str = "") -> None:
+    for key in sorted(overlay):
+        value = overlay[key]
+        dotted = f"{prefix}.{key}" if prefix else key
+        if dotted in _ALLOWED_LEAVES:
+            # Reaching an allowed leaf stops the walk here -- keys INSIDE an
+            # object-shaped leaf (e.g. an unknown key nested in
+            # `models.review`) are not further checked by name. This
+            # mirrors `validate_config`'s own documented tolerance for
+            # `models.review`'s object form (see its comment: "unknown
+            # extra keys are not rejected"); deliberate, not an oversight
+            # (pinned by OverlayAllowlistLaxnessInsideObjectLeafTest in
+            # tests/test_epics.py so a future tightening of either
+            # validator is a conscious, visible change).
+            continue
+        if dotted in _ALLOWED_PREFIXES and isinstance(value, dict):
+            _check_overlay_allowlist(value, dotted)
+            continue
+        offending = ", ".join(_collect_leaf_paths(value, dotted))
+        raise ValidationError(
+            f"epic config overlay: key(s) not in the allowed overlay set "
+            f"({', '.join(OVERLAY_ALLOWED_LEAVES)}): {offending}"
+        )
+
+
+def _leaf_present(node: dict[str, Any], parts: tuple[str, ...]) -> bool:
+    for part in parts:
+        if not isinstance(node, dict) or part not in node:
+            return False
+        node = node[part]
+    return True
+
+
+def _leaf_get(node: dict[str, Any], parts: tuple[str, ...]) -> Any:
+    for part in parts:
+        node = node[part]
+    return node
+
+
+def _leaf_set(node: dict[str, Any], parts: tuple[str, ...], value: Any) -> None:
+    for part in parts[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            node[part] = child
+        node = child
+    node[parts[-1]] = value
+
+
+def _apply_leaves(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Leaf-atomic overlay application: every allowed leaf present in
+    `overlay` replaces that whole leaf's value in a copy of `base`; a leaf
+    absent from `overlay` retains `base`'s value untouched. This is what
+    makes override removal derivable (spec Sec2) -- dropping a leaf from
+    the overlay reveals the retained `base` value at the next call.
+    """
+    result = deepcopy(base)
+    for parts in _ALLOWED_LEAF_PARTS:
+        if _leaf_present(overlay, parts):
+            _leaf_set(result, parts, deepcopy(_leaf_get(overlay, parts)))
+    return result
+
+
+# Top-level sections `validate_config` treats as optional for backward
+# compatibility with a config.json written before they existed (see its
+# `runners`/`worktrees` comments) -- never overlay-allowed themselves.
+_OPTIONAL_GLOBAL_SECTIONS: tuple[str, ...] = ("runners", "worktrees")
+
+
+def _hydrate_optional_sections(config: dict[str, Any]) -> dict[str, Any]:
+    """Copy of `config` with any of `_OPTIONAL_GLOBAL_SECTIONS` missing from
+    it filled in from `default_config()`. A legacy config predating one of
+    these sections is a valid `global` layer (`validate_config` allows the
+    omission) -- but `effective` must resolve to a concrete value for every
+    known path, not just carry the name for `resolve_config_source`'s
+    'default' tier to report while crashing on the value lookup (fix-round
+    F1). `global` itself is deliberately left un-hydrated by every caller
+    of this function -- hydrating it too would make `resolve_config_source`
+    find these keys in `global` and report source='global' instead of the
+    correct 'default'.
+    """
+    hydrated = deepcopy(config)
+    defaults = DEFAULT_CONFIG
+    for section in _OPTIONAL_GLOBAL_SECTIONS:
+        if section not in hydrated:
+            hydrated[section] = deepcopy(defaults[section])
+    return hydrated
+
+
+def _effective_view(global_config: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """The ONE place `effective` is computed from a `global` layer and an
+    overlay -- used by both `load_layers` and `derive_effective` so the two
+    can never drift apart. Hydrates missing optional top-level sections
+    (see `_hydrate_optional_sections`) onto `global_config` first, then
+    applies the overlay's leaves on top (fix-round F1).
+    """
+    return _apply_leaves(_hydrate_optional_sections(global_config), overlay)
+
+
+def validate_overlay(overlay: Any) -> None:
+    """The loader's validators for an epic overlay (spec Sec2): allowlist
+    membership by name, then value-shape validity via the same
+    `validate_config` every global config value is held to (hydrated onto
+    the built-in defaults so only the touched leaves are exercised).
+    `derive_effective` runs this same function on every patch, so no
+    overlay can reach approval that loading would reject.
+    """
+    _require(isinstance(overlay, dict), "epic overlay must be an object")
+    _check_overlay_allowlist(overlay)
+    hydrated = _apply_leaves(default_config(), overlay)
+    validate_config(hydrated)
+
+
+def epic_overlay_path(wdd_dir: Path | str, epic: str) -> Path:
+    return Path(wdd_dir) / "epics" / epic / "config.json"
+
+
+def load_overlay(wdd_dir: Path | str, epic: str | None) -> dict[str, Any]:
+    """The sparse overlay for `epic`, or `{}` for no active epic or a
+    missing overlay file (spec Sec2: "Missing overlay file = empty
+    overlay"). Parsed via `_parse_strict_json` -- duplicate JSON object
+    keys and non-finite number literals are rejected at parse, the same
+    byte-precision the digest function demands (spec Sec2); `load_config`
+    parses the global layer through the same helper (fix-round F3).
+    """
+    if epic is None:
+        return {}
+    path = epic_overlay_path(wdd_dir, epic)
+    if not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ValidationError(f"epic overlay could not be read: {path}: {error}") from error
+    try:
+        overlay = _parse_strict_json(text, context=f"epic overlay ({path})")
+    except json.JSONDecodeError as error:
+        raise ValidationError(f"epic overlay is not valid JSON: {path}: {error}") from error
+    validate_overlay(overlay)
+    return overlay
+
+
+def save_overlay(wdd_dir: Path | str, epic: str, overlay: dict[str, Any]) -> None:
+    validate_overlay(overlay)
+    atomic_write_text(
+        epic_overlay_path(wdd_dir, epic),
+        json.dumps(overlay, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def set_overlay_value(
+    overlay: dict[str, Any],
+    dotted: str,
+    value: Any,
+    *,
+    effective: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a new sparse overlay with `dotted` set to `value`, used by
+    `config set --epic`. Unlike `set_value` (which requires the path to
+    already exist in a fully-hydrated config), the overlay is sparse:
+    intermediate objects along `dotted` are created as needed. Allowlist
+    and value-shape validation are NOT done here -- every overlay mutation
+    goes through `derive_effective`, which validates the resulting overlay
+    before it is treated as approved.
+
+    Sub-leaf seeding (fix-round F2): when `dotted` targets a path STRICTLY
+    BELOW one of the allowlisted leaves (e.g. `models.implementation.default`,
+    below the `models.implementation` leaf), the overlay's leaf-atomic apply
+    (`_apply_leaves`) will later replace that WHOLE leaf with whatever this
+    function builds -- so building a bare `{"default": value}` here would
+    silently null out sibling keys (e.g. `highRisk`) the caller never
+    touched. Instead, if the leaf isn't already present in `overlay` (a
+    prior sub-leaf set on the same leaf already seeded it -- don't reseed
+    over it), the new leaf is seeded from a deep copy of `effective`'s
+    CURRENT value at that leaf before the sub-key is set, so untouched
+    siblings are preserved from wherever they were effective (epic, global,
+    or default). `effective` is optional and only consulted for below-leaf
+    paths; callers that only ever set exact-leaf paths (the CLI's normal
+    case for e.g. `merge.surface`) never need it.
+    """
+    updated = deepcopy(overlay)
+    parts = tuple(dotted.split("."))
+    for leaf_parts in _ALLOWED_LEAF_PARTS:
+        depth = len(leaf_parts)
+        if len(parts) > depth and parts[:depth] == leaf_parts and not _leaf_present(
+            updated, leaf_parts
+        ):
+            seed = deepcopy(_leaf_get(effective, leaf_parts)) if effective is not None else {}
+            _leaf_set(updated, leaf_parts, seed)
+            break
+    node = updated
+    for part in parts[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            node[part] = child
+        node = child
+    node[parts[-1]] = value
+    return updated
+
+
+def load_layers(wdd_dir: Path | str, epic: str | None) -> dict[str, Any]:
+    """The admission snapshot (spec Sec2): `{defaults, global, overlay,
+    effective}`, each layer validated at capture. Resolution per key path
+    is `epic overlay -> global config.json -> built-in default`; a legacy
+    `global` missing an optional section (`runners`, `worktrees` -- neither
+    is overlay-allowed) is hydrated onto `effective` from the built-in
+    default by `_effective_view` (fix-round F1), so `resolve_config_source`'s
+    'default' tier has a concrete value to return, not just a name. `global`
+    itself is returned un-hydrated -- that's what lets the 'default' tier
+    be distinguished from 'global' in the first place.
+    """
+    wdd_dir = Path(wdd_dir)
+    defaults = default_config()
+    global_config = load_config(wdd_dir)
+    overlay = load_overlay(wdd_dir, epic)
+    effective = _effective_view(global_config, overlay)
+    validate_config(effective)
+    return {
+        "defaults": defaults,
+        "global": global_config,
+        "overlay": overlay,
+        "effective": effective,
+    }
+
+
+def derive_effective(layers: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """Pure: `patch` is the new overlay layer in full (a replacement, not a
+    merge-patch -- `--use-defaults` is `derive_effective(snapshot, {})`,
+    spec Sec2). Revalidates with `validate_overlay` (the loader's exact
+    validators) and recomputes `effective` from the retained
+    `global`/`defaults` layers -- dropping a previously-overridden leaf
+    from `patch` reveals the retained `global` value (the masking /
+    removal-reveals-global pin). Never touches disk.
+    """
+    validate_overlay(patch)
+    effective = _effective_view(layers["global"], patch)
+    validate_config(effective)
+    return {
+        "defaults": layers["defaults"],
+        "global": layers["global"],
+        "overlay": deepcopy(patch),
+        "effective": effective,
+    }
+
+
+def resolve_config_source(layers: dict[str, Any], dotted: str) -> tuple[Any, str]:
+    """The per-key `source` marker for `config get --epic` (spec Sec2):
+    'epic' when `dotted` is covered by an overlaid leaf (the leaf itself,
+    or a path below it), else 'global' when it resolves in the global
+    config, else 'default'. Source markers are a presentation concern
+    only -- they never enter any digest.
+    """
+    parts = tuple(dotted.split("."))
+    overridden = any(
+        _leaf_present(layers["overlay"], leaf_parts) and parts[: len(leaf_parts)] == leaf_parts
+        for leaf_parts in _ALLOWED_LEAF_PARTS
+    )
+    if overridden:
+        source = "epic"
+    else:
+        try:
+            get_value(layers["global"], dotted)
+            source = "global"
+        except ValidationError:
+            get_value(layers["defaults"], dotted)  # raises if unknown everywhere
+            source = "default"
+    return get_value(layers["effective"], dotted), source
+
+
+def _reject_non_finite(node: Any, path: str = "$") -> None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            _reject_non_finite(value, f"{path}.{key}")
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            _reject_non_finite(value, f"{path}[{index}]")
+    elif isinstance(node, float) and not math.isfinite(node):
+        raise ValidationError(f"config: non-finite number at {path}: {node!r}")
+
+
+def effective_config_digest(view: dict[str, Any]) -> str:
+    """The ONE fingerprint function for config views (spec Sec2), mirroring
+    `governance_fingerprint`'s idiom: recursively sorted object keys (json
+    handles this natively with `sort_keys=True`), array order preserved,
+    UTF-8, fixed separators, non-finite numbers rejected. `view` must
+    already be default-hydrated with source markers stripped -- callers
+    pass a `layers[...]` value or a `project(...)` result, never the
+    CLI's `{value, source}` presentation wrapper. Settings here are
+    frozen: changing any of them is a breaking change to every recorded
+    approval and requires a migration.
+    """
+    _reject_non_finite(view)
+    encoded = json.dumps(
+        view, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def epic_config_drift(state: dict[str, Any], wdd_dir: Path | str) -> dict[str, Any] | None:
+    """Detect an epic overlay (or the global config it layers over) edited
+    since `intake.configure` was approved (epic-scoped-state plan Task 5,
+    spec Sec2: "Editing the overlay mid-epic surfaces an epic_config_drift
+    blocker"). Mirrors `governance_drift`'s shape and no-op cases: None when
+    there is nothing to drift from -- a scope that has not recorded
+    `configure` at all yet (nothing approved to compare against; this
+    happens during setup, before any governed verb -- the only caller of
+    `require_fresh_epic_config` -- could possibly run), or (defensive; should
+    not occur post-migration, see migration.py's `convert_v5_to_v6`) a
+    `configure` record with no `sha256` at all.
+
+    A wholesale-legacy scope (`intake.legacy`) is NOT exempt here: migration
+    stamps its `configure` with the identical `{"legacy": true, "sha256":
+    ...}` shape a migrated non-legacy scope gets (spec Sec4: "the exemption
+    covers only the missing human attribution -- drift is still guarded
+    ordinarily"), so its overlay/global edits are gated exactly like any
+    other scope's. Likewise a migration-stamped `configure` (`legacy: true`)
+    on a non-legacy scope is compared, not skipped -- the exemption only
+    means no human approved the CURRENT digest; a mismatch here still
+    demands a real, attributed `intake configure --approved-by` (which
+    replaces the exemption with a real record).
+
+    The digest recomputed here covers the FULL effective view (matching what
+    `intake configure` itself signs), not a purpose projection: this is a
+    governance-style approval of "everything", the same doctrine as
+    `governance_fingerprint`, not evidence-binding's narrower per-purpose
+    comparison.
+    """
+    intake = state.get("intake") or {}
+    configure = intake.get("configure")
+    if not isinstance(configure, dict):
+        return None
+    recorded = configure.get("sha256")
+    if recorded is None:
+        return None
+    layers = load_layers(wdd_dir, state.get("epic"))
+    actual = effective_config_digest(layers["effective"])
+    if recorded == actual:
+        return None
+    return {"recorded": recorded, "actual": actual}
+
+
+def require_fresh_epic_config(state: dict[str, Any], wdd_dir: Path | str) -> None:
+    """Chokepoint gate (epic-scoped-state plan Task 5): refuse every governed
+    verb once the epic config drifted from what `intake configure` approved.
+    Sits between `require_fresh_governance` and `require_fresh_intake` at the
+    CLI chokepoint (spec Sec2's precedence: governance -> epic config ->
+    intake artifacts -> plan composite).
+    """
+    drift = epic_config_drift(state, wdd_dir)
+    if drift is not None:
+        raise IllegalTransition(
+            "epic config drift: the epic overlay (or the global config it layers "
+            f"over) changed since intake.configure was approved (recorded "
+            f"{drift['recorded']}, current {drift['actual']}); run 'wddctl intake "
+            "configure --approved-by NAME' (or --use-defaults --by NAME) to re-approve"
+        )
+
+
+def project(view: dict[str, Any], purpose: str) -> dict[str, Any]:
+    """The named key-subset projections (spec Sec2). Feed the result to
+    `effective_config_digest` for a purpose-projected digest -- the same
+    function, never a second implementation. Gates compare like with
+    like: a `models.planning` edit changes no projection at all; a
+    `verification.commands` edit changes exactly `taskVerification` and
+    `finalVerification`.
+
+    Spec-alignment note (flagged in the Task 2 report): spec Sec2 says
+    `finalVerification` is "verification.*, plus the deliverable command
+    for final". The deliverable command lives in
+    `state.intake.design.deliverableCommand`, not in the config `view`
+    this function receives -- `project()` has no access to state, so it
+    cannot include it. `taskVerification` and `finalVerification` are
+    therefore identical projections here; combining this projection with
+    the deliverable command's bytes is Task 5's concern (finalize.py's
+    evidence recording), not this function's.
+    """
+    if purpose == "plan":
+        return {
+            "models": deepcopy(view["models"]),
+            "riskRules": deepcopy(view["riskRules"]),
+            "review": {"policy": view["review"]["policy"]},
+        }
+    if purpose == "taskReview":
+        return {
+            "models": {"review": deepcopy(view["models"]["review"])},
+            "review": {
+                "policy": view["review"]["policy"],
+                "blockingSeverities": deepcopy(view["review"]["blockingSeverities"]),
+            },
+        }
+    if purpose == "finalReview":
+        return {
+            "models": {"review": deepcopy(view["models"]["review"])},
+            "review": {"blockingSeverities": deepcopy(view["review"]["blockingSeverities"])},
+        }
+    if purpose in ("taskVerification", "finalVerification"):
+        return {"verification": deepcopy(view["verification"])}
+    raise ValidationError(
+        f"config: unknown projection purpose {purpose!r}; expected one of {PROJECTION_PURPOSES}"
+    )

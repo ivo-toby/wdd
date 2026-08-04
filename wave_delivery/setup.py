@@ -14,13 +14,22 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from .config import config_path, constitution_path, default_config, load_config, save_config
+from .config import (
+    config_path,
+    constitution_path,
+    default_config,
+    load_config,
+    load_overlay,
+    save_config,
+    save_overlay,
+)
 from .constitution import probe_repository
 from .engine import apply_mutation
+from .errors import IllegalTransition, ValidationError
 from .git import ensure_worktrees_gitignore
 from .handover import ensure_dispatch_gitignore
 from .intake import intake_drift, intake_status
-from .schema import copied_state, new_setup_state
+from .schema import EPIC_SLUG_PATTERN, copied_state, new_setup_state
 from .store import StateStore, atomic_write_text
 
 
@@ -192,6 +201,156 @@ def init_repository(wdd_dir: Path | str, repo: Path | str) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Epic lifecycle: `wddctl epic new` (epic-scoped-state plan Task 4, spec Sec1
+# "the slug is born at the top of the ladder"). `epic new` is the SOLE
+# creator of `epics/<slug>/` -- `config.save_overlay`'s own mkdir(parents=True)
+# side effect must never be mistaken for a second creation path. Every OTHER
+# writer of an epic overlay (`config set --epic`) only ever runs once
+# state.epic already names an active epic THIS function created, so it can
+# never independently originate a new epic directory.
+# ---------------------------------------------------------------------------
+
+_EPIC_RECORD_NAME = "record.json"
+_EPIC_OVERLAY_NAME = "config.json"
+
+
+def _epic_dir_shape(wdd_dir: Path, slug: str) -> str:
+    """Classify an `epics/<slug>/` directory for `create_epic`'s uniqueness
+    and crash-orphan-adoption logic (spec Sec1):
+
+    - "absent": the directory does not exist -- ordinary fresh creation.
+    - "has_record": contains the reserved `record.json` -- an in-flight or
+      completed archive transaction, or a hand-placed collision; refused
+      unconditionally regardless of anything else in the directory.
+    - "crash_orphan": contains ONLY an empty overlay `config.json` (`{}`) --
+      a prior `epic new` that mkdir'd + wrote the overlay but crashed before
+      adopting `state.epic`. The identical command re-run adopts it (no
+      error), per the Task 4 interface's crash-shape doctrine.
+    - "occupied": anything else -- a real, non-adoptable collision.
+    """
+    epic_dir = wdd_dir / "epics" / slug
+    if not epic_dir.is_dir():
+        return "absent"
+    entries = list(epic_dir.iterdir())
+    if any(entry.name == _EPIC_RECORD_NAME for entry in entries):
+        return "has_record"
+    if len(entries) == 1 and entries[0].name == _EPIC_OVERLAY_NAME and entries[0].is_file():
+        try:
+            overlay = load_overlay(wdd_dir, slug)
+        except ValidationError:
+            return "occupied"
+        if overlay == {}:
+            return "crash_orphan"
+    return "occupied"
+
+
+def epic_orphans(wdd_dir: Path | str, state: dict[str, Any] | None) -> list[str]:
+    """Epic directories under `epics/` that are not `state.epic` (`doctor`'s
+    orphan report, Task 4 test contract). A directory left behind by a
+    crashed `epic new` (never adopted) or a crashed archive transaction
+    (Task 6) both surface here -- `doctor` never refuses, it only reports.
+    """
+    epics_root = Path(wdd_dir) / "epics"
+    if not epics_root.is_dir():
+        return []
+    active = (state or {}).get("epic")
+    return sorted(
+        entry.name for entry in epics_root.iterdir() if entry.is_dir() and entry.name != active
+    )
+
+
+def create_epic(
+    store: StateStore,
+    wdd_dir: Path | str,
+    *,
+    slug: str,
+    title: str | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """`wddctl epic new --slug SLUG [--title T]` (spec Sec1): the first
+    action of every epic. Refuses when an epic is already active (one at a
+    time), when the slug is malformed, when it collides with `archive/`
+    (slugs are immutable -- there is no rename verb; retiring one means
+    archiving it) or with a non-orphan `epics/<slug>/`, and unconditionally
+    when that directory holds the reserved `record.json`. A directory
+    holding ONLY an empty, unadopted overlay is the crash-orphan shape: the
+    identical command adopts it instead of refusing.
+
+    mkdir + empty overlay + `state.epic` all land in ONE `apply_mutation`
+    (event `epic.created`): the directory write happens INSIDE the mutator,
+    under the state lock, so a crash between "directory exists" and
+    "state.epic recorded" can only ever produce the crash-orphan shape
+    above -- never a directory whose existence and state.epic disagree in
+    any other way. `title`, when given, is recorded only in the event's
+    `data` (state.epic itself is schema v6's plain slug-or-null field, spec
+    Sec1 -- there is no queryable title field to persist it into).
+    """
+    if not isinstance(slug, str) or not EPIC_SLUG_PATTERN.match(slug):
+        raise ValidationError(
+            f"epic slug must match [a-z0-9][a-z0-9-]{{1,63}}: {slug!r}"
+        )
+    wdd_dir = Path(wdd_dir)
+    archive_dir = wdd_dir / "archive" / slug
+
+    def _check_available(current: dict[str, Any]) -> None:
+        if current.get("epic") is not None:
+            raise IllegalTransition(
+                f"an epic is already active ({current['epic']!r}); archive it with "
+                "'wddctl scope archive --repo .' before starting a new one"
+            )
+        if archive_dir.exists():
+            raise ValidationError(
+                f"epic slug {slug!r} is already used by an archived epic "
+                f"({archive_dir}); slugs are immutable and unique across epics/ "
+                "and archive/ -- choose a different slug"
+            )
+        shape = _epic_dir_shape(wdd_dir, slug)
+        if shape == "has_record":
+            raise ValidationError(
+                f"epics/{slug}/ contains a reserved record.json; refusing to adopt "
+                "or overwrite it -- this looks like an in-flight or completed "
+                "archive transaction"
+            )
+        if shape == "occupied":
+            raise ValidationError(
+                f"epics/{slug}/ already exists with content that is not an empty, "
+                "unadopted overlay; slugs are immutable and unique across epics/ "
+                "and archive/ -- choose a different slug"
+            )
+
+    # Fail fast, before the lock -- mirrors intake.py's two-stage guard.
+    if store.exists():
+        _check_available(store.read())
+
+    def mutator(current: dict[str, Any]) -> dict[str, Any]:
+        _check_available(current)
+        updated = copied_state(current)
+        # The directory write happens HERE, inside the locked mutator, not
+        # before it -- "directory creation happens inside the locked
+        # mutation path" (Task 4 interface). save_overlay's own
+        # mkdir(parents=True, exist_ok=True) is what actually creates
+        # epics/<slug>/; this is the ONLY call site in the whole codebase
+        # that may call it with no active epic already naming that slug.
+        save_overlay(wdd_dir, slug, {})
+        updated["epic"] = slug
+        return updated
+
+    data: dict[str, Any] = {"slug": slug}
+    if title:
+        data["title"] = title
+    return apply_mutation(
+        store,
+        event_type="epic.created",
+        task_id=None,
+        data=data,
+        idempotency_key=idempotency_key,
+        expected_revision=expected_revision,
+        mutator=mutator,
+    )
+
+
 def _intake_ladder_action(
     state: dict[str, Any], wdd_dir: Path, prefix: str
 ) -> dict[str, Any] | None:
@@ -220,7 +379,7 @@ def _intake_ladder_action(
             "action": "agree_spec",
             "recordWith": f"{prefix} intake spec --approved-by NAME",
             "judgment": (
-                "agree .wdd/spec.md with the user (goal, in/out of scope, numbered "
+                "agree spec.md with the user (goal, in/out of scope, numbered "
                 "acceptance criteria) per the wdd-intake skill's spec stage, then record it"
             ),
         }
@@ -246,7 +405,7 @@ def _intake_ladder_action(
                 f"{prefix} intake design --approved-by NAME --deliverable-command '...'"
             ),
             "judgment": (
-                "agree .wdd/design.md (components, interfaces, integration surfaces, "
+                "agree design.md (components, interfaces, integration surfaces, "
                 "epic deliverable) with the user per the wdd-intake skill's design stage, "
                 "then record it with the command that proves the epic deliverable"
             ),
@@ -304,6 +463,67 @@ def setup_next_actions(
                 "action": "ratify",
                 "command": f"{prefix} constitution ratify --by NAME",
                 "judgment": "show the user config.json and constitution.md; ratify only after explicit sign-off",
+            }
+        )
+    elif (
+        state.get("scope") is None
+        and state.get("epic") is None
+        and (state.get("intake") or {}).get("legacy") is not True
+        and (state.get("intake") or {}).get("spec") is None
+    ):
+        # The slug is born at the top of the ladder (Task 4, spec Sec1):
+        # `create_epic` is emitted before any intake rung, right after
+        # ratify. The ladder is
+        # create_epic -> configure_epic -> agree_spec -> research ->
+        # agree_design -> plan; `configure_epic` (spec Sec2) is wired in the
+        # branch just below this one. The extra `intake.spec is None` guard
+        # keeps this rung 0 of the SAME first-unset-thing chain
+        # `_intake_ladder_action` walks below: once any ladder progress
+        # already exists (a scope that recorded spec without ever creating
+        # an epic -- unreachable through this ladder going forward, but a
+        # legal pre-Task-4 shape), there is nothing to gain by retroactively
+        # demanding epic creation; the ladder continues from wherever the
+        # recorded intake data says it is.
+        actions.append(
+            {
+                "task": "-",
+                "action": "create_epic",
+                "command": f"{prefix} epic new --slug SLUG",
+                "judgment": (
+                    "name the work with the user in ONE short round (a lowercase-"
+                    "dash slug, and optionally a display title) per the wdd-intake "
+                    "skill, then create the epic. Slugs are immutable -- there is "
+                    "no rename verb; retiring one means archiving it."
+                ),
+            }
+        )
+    elif (
+        state.get("scope") is None
+        and state.get("epic") is not None
+        and (state.get("intake") or {}).get("legacy") is not True
+        and (state.get("intake") or {}).get("configure") is None
+    ):
+        # configure_epic (Task 5, spec Sec2): the middle step of the ladder,
+        # between create_epic and agree_spec. `record_spec` itself also
+        # refuses without a recorded `configure` (belt and braces -- this is
+        # only the surfaced NEXT-ACTION half of that gate).
+        actions.append(
+            {
+                "task": "-",
+                "action": "configure_epic",
+                "recordWith": (
+                    f"{prefix} intake configure --approved-by NAME "
+                    "(or --use-defaults --by NAME)"
+                ),
+                "judgment": (
+                    "walk the user through the epic-overridable keys in ONE compact "
+                    "round, in their own terms -- which merge surface, which models, "
+                    "what proves this epic works -- per wdd-intake, translating their "
+                    "answers into 'wddctl config set --epic PATH VALUE' calls (or none "
+                    "at all if they want every default), then record the decision "
+                    "with recordWith. Silence is not an option: an explicit "
+                    "--use-defaults is required to inherit everything."
+                ),
             }
         )
     elif state.get("scope") is None:

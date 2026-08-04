@@ -174,8 +174,8 @@ class ConfigCliTest(unittest.TestCase):
 
 
 class SetupStateTest(unittest.TestCase):
-    def test_schema_version_is_5(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 5)
+    def test_schema_version_is_6(self) -> None:
+        self.assertEqual(SCHEMA_VERSION, 6)
 
     def test_new_setup_state_validates_with_null_scope(self) -> None:
         state = new_setup_state()
@@ -204,7 +204,7 @@ class SetupStateTest(unittest.TestCase):
 
 
 class MigrationV3Test(unittest.TestCase):
-    def test_v3_state_migrates_to_v5(self) -> None:
+    def test_v3_state_migrates_to_v6(self) -> None:
         from wave_delivery.migration import convert, plan_migration
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -217,11 +217,15 @@ class MigrationV3Test(unittest.TestCase):
             # the converted state itself: {"state", "from", "to", "tasks",
             # "backup", "notes"}. "to" is always SCHEMA_VERSION.
             self.assertEqual(result["from"], 3)
-            self.assertEqual(result["to"], 5)
+            self.assertEqual(result["to"], 6)
             # v3/v4 -> v5 is exempted wholesale via intake.legacy (spec §7);
-            # it never mints itself, only migration does.
-            migrated = convert(state)
-            self.assertEqual(migrated["intake"], {"legacy": True})
+            # it never mints itself, only migration does. v5 -> v6
+            # (epic-scoped-state plan, Task 3) additionally stamps a
+            # migration-time `configure` exemption alongside `legacy` (spec
+            # Sec4) -- it never mints itself either.
+            migrated = convert(state, wdd_dir=Path(tmp))
+            self.assertIs(migrated["intake"]["legacy"], True)
+            self.assertIs(migrated["intake"]["configure"]["legacy"], True)
 
 
 def _write_governance(wdd: Path, *, questions: list | None = None) -> None:
@@ -921,10 +925,24 @@ class EndToEndSetupTest(unittest.TestCase):
 
             self._cli(state, "constitution", "ratify", "--by", "test")
 
+            # Task 4: create_epic is the ladder's true first rung.
+            payload = self._cli(state, "next")
+            self.assertEqual(payload["actions"][0]["action"], "create_epic")
+
+            self._cli(state, "epic", "new", "--slug", "demo")
+            epic_dir = wdd / "epics" / "demo"
+
+            # Task 5: configure_epic is the ladder's middle rung, between
+            # create_epic and agree_spec (spec Sec2).
+            payload = self._cli(state, "next")
+            self.assertEqual(payload["actions"][0]["action"], "configure_epic")
+
+            self._cli(state, "intake", "configure", "--use-defaults", "--by", "test")
+
             payload = self._cli(state, "next")
             self.assertEqual(payload["actions"][0]["action"], "agree_spec")
 
-            (wdd / "spec.md").write_text(
+            (epic_dir / "spec.md").write_text(
                 "# Spec\n\n## Goal\n\nShip it.\n\n## In scope\n\n- x\n\n"
                 "## Out of scope\n\n- y\n\n## Acceptance criteria\n\n"
                 "- [ ] AC-1: the thing works\n",
@@ -943,7 +961,7 @@ class EndToEndSetupTest(unittest.TestCase):
             payload = self._cli(state, "next")
             self.assertEqual(payload["actions"][0]["action"], "agree_design")
 
-            (wdd / "design.md").write_text(
+            (epic_dir / "design.md").write_text(
                 "# Design\n\n## Components\n\n- core\n\n## Interfaces\n\n"
                 "- core: consumes nothing, produces lib\n\n"
                 "## Integration surfaces\n\n- `src/core.py` — owned by: core task\n\n"
@@ -958,12 +976,14 @@ class EndToEndSetupTest(unittest.TestCase):
             self.assertEqual(payload["actions"][0]["action"], "plan")
             self.assertIn("--approved-by", payload["actions"][0]["command"])
 
+            # _minimal_plan's scope id ("SCOPE-demo") is already the
+            # epic-derived id -- v6 plan apply rejects any other (Task 4).
             plan_file = root / "plan.json"
             plan = _minimal_plan()
             plan["scope"]["baseRef"] = "wdd/demo"
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
-            (wdd / "tasks").mkdir(exist_ok=True)
-            (wdd / "tasks" / "TASK-001-first.md").write_text("# Brief\n", encoding="utf-8")
+            (epic_dir / "tasks").mkdir(parents=True, exist_ok=True)
+            (epic_dir / "tasks" / "TASK-001-first.md").write_text("# Brief\n", encoding="utf-8")
             self._cli(
                 state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
                 "--approved-by", "test",

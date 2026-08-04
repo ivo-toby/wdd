@@ -792,8 +792,14 @@ class MigrationTests(BaseTest):
         self.assertTrue(Path(result["backup"]).exists())
 
         migrated = StateStore(path).read()
-        self.assertEqual(migrated["schemaVersion"], 5)
-        self.assertEqual(migrated["intake"], {"legacy": True})
+        self.assertEqual(migrated["schemaVersion"], 6)
+        # v5 -> v6 (epic-scoped-state plan, Task 3) additionally stamps a
+        # migration-time `configure` exemption alongside `legacy` (spec
+        # Sec4); this fixture has no config.json at all, so the digest is
+        # over the built-in default view (see migration.py's
+        # `_load_layers_for_migration`).
+        self.assertIs(migrated["intake"]["legacy"], True)
+        self.assertIs(migrated["intake"]["configure"]["legacy"], True)
         self.assertEqual(migrated["tasks"]["T1"]["risk"], "normal")
         self.assertEqual(migrated["tasks"]["T1"]["title"], "T1")
         # v2 required review for every task; migrating must not drop that.
@@ -1836,7 +1842,17 @@ class CliTests(BaseTest):
             self.assertEqual(run("config", "set", "verification.commands", '["true"]'), 0)
         self.assertEqual(run("constitution", "ratify", "--by", "tester"), 0)
 
-        (wdd / "spec.md").write_text(
+        # Task 4: create_epic is the ladder's true first rung -- the slug is
+        # born at the top of the ladder (spec Sec1). plan_document()'s scope
+        # id ("SCOPE-demo") is already the epic-derived id this slug yields.
+        self.assertEqual(run("epic", "new", "--slug", "demo"), 0)
+        epic_dir = wdd / "epics" / "demo"
+
+        # Task 5: agree_spec refuses until the epic is configured first
+        # (spec Sec2).
+        self.assertEqual(run("intake", "configure", "--use-defaults", "--by", "tester"), 0)
+
+        (epic_dir / "spec.md").write_text(
             "# Spec\n\n## Goal\n\nShip it.\n\n## In scope\n\n- x\n\n"
             "## Out of scope\n\n- y\n\n## Acceptance criteria\n\n"
             "- [ ] AC-1: the thing works\n",
@@ -1850,7 +1866,7 @@ class CliTests(BaseTest):
             ),
             0,
         )
-        (wdd / "design.md").write_text(
+        (epic_dir / "design.md").write_text(
             "# Design\n\n## Components\n\n- core\n\n## Interfaces\n\n"
             "- core: consumes nothing, produces lib\n\n"
             "## Integration surfaces\n\n- `src/core.py` — owned by: core task\n\n"
@@ -1864,9 +1880,9 @@ class CliTests(BaseTest):
         plan_path = wdd / "plan.json"
         plan = self.plan_document()
         plan_path.write_text(json.dumps(plan), encoding="utf-8")
-        (wdd / "tasks").mkdir(exist_ok=True)
+        (epic_dir / "tasks").mkdir(exist_ok=True)
         for task in plan["tasks"]:
-            (wdd / task.get("specPath", f"tasks/{task['id']}.md")).write_text(
+            (epic_dir / task.get("specPath", f"tasks/{task['id']}.md")).write_text(
                 f"# {task['id']}\n\nBrief.\n", encoding="utf-8"
             )
 

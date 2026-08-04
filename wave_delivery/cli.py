@@ -17,18 +17,32 @@ from typing import Any
 from .config import (
     check_ratifiable,
     config_path,
+    derive_effective,
+    epic_config_drift,
     get_value,
     governance_drift,
     governance_fingerprint,
     load_config,
+    load_layers,
     merge_settings,
+    require_fresh_epic_config,
     require_fresh_governance,
+    resolve_config_source,
     save_config,
+    save_overlay,
+    set_overlay_value,
     set_value,
 )
 from .constitution import probe_repository, ratification_status, read_proposal, write_proposal
-from .setup import _intake_ladder_action, init_repository, migrate_governance, setup_next_actions
+from .setup import (
+    _intake_ladder_action,
+    create_epic,
+    init_repository,
+    migrate_governance,
+    setup_next_actions,
+)
 from .doctor import inspect_capabilities
+from .version import wddctl_version
 from .engine import (
     ACTIVE_STATUSES,
     admission_schedule,
@@ -55,6 +69,7 @@ from .github import comment_pr, create_pr, push_branch
 from .handover import inputs_status, materialize_attempt, record_attempt, rebind_attempt
 from .intake import (
     intake_status,
+    record_configure,
     record_design,
     record_research,
     record_spec,
@@ -116,6 +131,12 @@ GOVERNED_VERBS = {
     ("dispatch", None),
     # The escape hatch bypasses transitions, not governance.
     ("event", "apply"),
+    # `epic new` (Task 4, spec Sec1) mutates state.epic and creates
+    # epics/<slug>/ -- governed like plan/intake's OWN mutating verbs are
+    # NOT (they are how governance/ladder progress gets re-signed), but
+    # unlike them epic new has no remedy role of its own to protect, so it
+    # stays governed like start/submit/merge.
+    ("epic", "new"),
 }
 
 # Task-targeted governed verbs additionally gated by input-version binding
@@ -185,9 +206,41 @@ def _add_concurrency_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--idempotency-key", default=None)
 
 
+def _short_sha() -> str | None:
+    """Best-effort short commit SHA for the checkout `wave_delivery` lives in.
+
+    Absent (not a git checkout, git missing, or any failure) rather than
+    fatal: version reporting must never refuse. A short timeout keeps a
+    missing/hung git from stalling `--version`.
+    """
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[1]
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
+
+
+def _version_string() -> str:
+    version = wddctl_version()
+    sha = _short_sha()
+    return f"wddctl {version} ({sha})" if sha else f"wddctl {version}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wddctl", description=__doc__)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
+    parser.add_argument("--version", action="version", version=_version_string())
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     plan = subparsers.add_parser("plan", help="create or update a scope from a plan file")
@@ -380,13 +433,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     finalize_subparsers.add_parser("status", help="show the finalize section and phase")
 
+    epic = subparsers.add_parser("epic", help="epic lifecycle: create and adopt")
+    epic_subparsers = epic.add_subparsers(dest="epic_command", required=True)
+    epic_new = epic_subparsers.add_parser(
+        "new",
+        help=(
+            "create a new epic directory and set it active -- the first action of "
+            "every epic (spec Sec1). Slugs are immutable: there is no rename verb; "
+            "retiring one means archiving it."
+        ),
+    )
+    epic_new.add_argument(
+        "--slug", required=True, help="epic slug: [a-z0-9][a-z0-9-]{1,63}, unique, immutable"
+    )
+    epic_new.add_argument(
+        "--title", default=None, help="optional display title, recorded on the epic.created event"
+    )
+    _add_concurrency_flags(epic_new)
+
     intake = subparsers.add_parser(
         "intake", help="the spec/research/design ladder before plan apply"
     )
     intake_subparsers = intake.add_subparsers(dest="intake_command", required=True)
 
     intake_spec = intake_subparsers.add_parser(
-        "spec", help="record .wdd/spec.md approval (numbered acceptance criteria required)"
+        "spec", help="record spec.md approval (numbered acceptance criteria required)"
     )
     intake_spec.add_argument("--approved-by", dest="approved_by", required=True)
     _add_concurrency_flags(intake_spec)
@@ -410,7 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_concurrency_flags(intake_research)
 
     intake_design = intake_subparsers.add_parser(
-        "design", help="record .wdd/design.md approval and the epic deliverable command"
+        "design", help="record design.md approval and the epic deliverable command"
     )
     intake_design.add_argument("--approved-by", dest="approved_by", required=True)
     # Not argparse-required: omission must refuse with record_design's own
@@ -423,6 +494,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="the command that proves the epic deliverable; recorded and fingerprinted with design",
     )
     _add_concurrency_flags(intake_design)
+
+    intake_configure = intake_subparsers.add_parser(
+        "configure",
+        help="approve the epic overlay (or explicitly inherit every default) -- "
+        "the configure step, spec Sec2; required before 'intake spec'",
+    )
+    intake_configure.add_argument(
+        "--approved-by", dest="approved_by", default=None,
+        help="approve the epic overlay AS CURRENTLY WRITTEN (built up via 'config set --epic')",
+    )
+    intake_configure.add_argument(
+        "--use-defaults", action="store_true",
+        help="explicitly inherit every default; also resets the overlay to empty",
+    )
+    intake_configure.add_argument(
+        "--by", default=None, help="required with --use-defaults",
+    )
+    _add_concurrency_flags(intake_configure)
 
     intake_subparsers.add_parser("status", help="show the intake section and the next rung")
 
@@ -583,11 +672,22 @@ def build_parser() -> argparse.ArgumentParser:
     config_subparsers = config_cmd.add_subparsers(dest="config_command", required=True)
     config_get = config_subparsers.add_parser("get", help="print one value as JSON")
     config_get.add_argument("path", help="dotted path, e.g. merge.surface")
+    config_get.add_argument(
+        "--epic",
+        action="store_true",
+        help="resolve through the active epic's overlay; prints {path, value, source}",
+    )
     config_set = config_subparsers.add_parser(
         "set", help="set one value (JSON literal, or bare string fallback)"
     )
     config_set.add_argument("path", help="dotted path, e.g. merge.surface")
     config_set.add_argument("value", help='e.g. local or \'["pytest -q"]\'')
+    config_set.add_argument(
+        "--epic",
+        action="store_true",
+        help="write to the active epic's overlay instead of the global config "
+        "(allowlist-checked; requires an active epic)",
+    )
     config_subparsers.add_parser("show", help="print the whole config")
     return parser
 
@@ -654,6 +754,23 @@ def _worktrees_root(config: dict[str, Any] | None) -> str | None:
     return (config.get("worktrees") or {}).get("root")
 
 
+def _governed_config(admission_layers: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The config view a GOVERNED_VERBS handler must use once `main()`'s
+    chokepoint has already resolved an admission snapshot for this
+    invocation (spec Sec2 resolve-once, extended by fix-round F2): the
+    epic-overlaid `effective` view, not a second bare `load_config` read
+    that would silently miss an active epic's override (`merge.surface`,
+    `models.*`, ...) -- exactly the bug this closes for merge_settings and
+    dispatch's model resolution. `admission_layers` is None precisely when
+    the chokepoint's own `config_path(...).exists()` check was None too (a
+    legacy scope with no config.json), so this is a drop-in replacement for
+    the old `load_config(...) if config_path(...).exists() else None`
+    pattern at every governed call site, never a behavior change for that
+    no-config case.
+    """
+    return admission_layers["effective"] if admission_layers is not None else None
+
+
 def _overlaid_plan(
     args: argparse.Namespace, store: StateStore
 ) -> tuple[dict[str, Any], Path, dict[str, Any] | None]:
@@ -666,13 +783,22 @@ def _overlaid_plan(
     artifacts are recorded, and this is the one place both callers already
     touch the store, so the state ride-alongs rather than each caller
     re-reading it.
+
+    Uses the EPIC-MERGED effective view (`load_layers(...)["effective"]`),
+    not the bare global config (epic-scoped-state plan Task 5 fix): `models`
+    and `riskRules` are both epic-overlay-allowed leaves (config.py's
+    `OVERLAY_ALLOWED_LEAVES`), so an epic's own overrides -- approved via
+    `intake configure` -- must actually feed risk derivation and the
+    scope-default fallbacks here, or the overlay would have no effect on
+    either. `epic=None` (no active epic, or a legacy scope) degrades to the
+    global-only view, matching prior behavior exactly.
     """
     plan = read_plan(args.plan)
     wdd_dir = store.path.parent
     state = store.read() if store.exists() else None
     if config_path(wdd_dir).exists():
         raw_plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
-        config = load_config(wdd_dir)
+        config = load_layers(wdd_dir, (state or {}).get("epic"))["effective"]
         plan = apply_config_defaults(plan, raw_plan["scope"], config)
         plan = apply_risk_rules(plan, config, state)
     return plan, wdd_dir, state
@@ -739,12 +865,15 @@ def _apply_execution_drift(
     blocker below still applies.
 
     The chokepoint in `main()` (`require_fresh_governance` then
-    `require_fresh_intake`) raises governance drift first when both are
-    present, so this must surface the same blocker at position 0: the
-    intake/plan gate is checked and inserted FIRST, then governance drift is
-    checked and inserted last -- since both insert at position 0, governance
-    (inserted last) ends up leading whenever both fire, matching the raise
-    order, while either single-drift case is unaffected by the reordering.
+    `require_fresh_epic_config` then `require_fresh_intake`) raises
+    governance drift first, then epic config drift, then intake/plan drift,
+    when more than one is present -- spec Sec2's precedence order (governance
+    -> epic config -> intake artifacts -> plan composite). This surfaces the
+    identical order by inserting at position 0 in the REVERSE of that
+    precedence: intake/plan first, then epic config, then governance last --
+    since each insert lands at position 0, the last one in (governance) ends
+    up leading, matching the raise order, while any single-drift case is
+    unaffected by the reordering.
     """
     gate = intake_gate_status(state, wdd_dir)
     if gate is not None:
@@ -791,6 +920,22 @@ def _apply_execution_drift(
                 )
             result["blockers"].insert(0, {"code": code, "message": message, **detail})
 
+    epic_drift = epic_config_drift(state, wdd_dir)
+    if epic_drift is not None:
+        result["actions"] = []
+        result["blockers"].insert(
+            0,
+            {
+                "code": "epic_config_drift",
+                "message": (
+                    "the epic overlay (or the global config it layers over) changed "
+                    "since intake.configure was approved; run 'wddctl intake configure "
+                    "--approved-by NAME' (or --use-defaults --by NAME) to re-approve"
+                ),
+                **epic_drift,
+            },
+        )
+
     drift = governance_drift(state, wdd_dir)
     if drift is not None:
         result["actions"] = []
@@ -800,6 +945,33 @@ def _apply_execution_drift(
                 "code": "governance_drift",
                 "message": "config/constitution changed since ratification; amend before executing",
                 **drift,
+            },
+        )
+
+    # `archiveBlocked` (spec Sec1's recovery matrix, row 5): a durable field
+    # that survives the journal's own removal, precisely so this blocker
+    # keeps showing up even after `recover_archive_transaction` has already
+    # run (state is read via `load_recovered()` above, in `main()`, before
+    # this function ever runs). Highest precedence of everything this
+    # function inserts -- an archive stuck on an external collision is the
+    # most actionable thing to surface, and (being resolved by re-running
+    # `wddctl scope archive`, not by anything intake/config/governance-shaped)
+    # never legitimately co-occurs with the other blockers above in a way
+    # where a different one should win.
+    archive_blocked = state.get("archiveBlocked")
+    if archive_blocked is not None:
+        result["actions"] = []
+        result["blockers"].insert(
+            0,
+            {
+                "code": "archive_blocked",
+                "message": (
+                    f"scope archive is blocked: {archive_blocked['collidingPath']} already "
+                    f"exists, colliding with epic slug {archive_blocked['slug']!r}; move or "
+                    "remove it, then re-run 'wddctl scope archive --repo .' to start a fresh "
+                    "transaction"
+                ),
+                **archive_blocked,
             },
         )
     return result
@@ -884,10 +1056,24 @@ def main(argv: list[str] | None = None) -> int:
             # command the user just typed or approved in conversation, never
             # yet config -- `--probe NAME` and `--task ...` stay governed.
             governed = False
+        # Resolve once per invocation (spec Sec2): the layered config
+        # snapshot every evidence-recording/evidence-consuming handler below
+        # needs (review/verify record+collect, finalize review/verify
+        # record, finalize handoff, merge) is read from disk here, exactly
+        # ONCE, and threaded down as `admission_layers` -- no handler below
+        # re-reads config.json/the epic overlay itself. This is what closes
+        # the check/use race: an overlay edited after this point cannot
+        # influence evidence recorded during the same invocation, and the
+        # digest recorded on evidence is the digest that was gate-checked
+        # just above.
+        admission_layers: dict[str, Any] | None = None
         if governed and store.exists():
             gated_state = store.read()
             require_fresh_governance(gated_state, store.path.parent)
+            require_fresh_epic_config(gated_state, store.path.parent)
             require_fresh_intake(gated_state, store.path.parent)
+            if config_path(store.path.parent).exists():
+                admission_layers = load_layers(store.path.parent, gated_state.get("epic"))
             if verb in TASK_INPUT_GATED_VERBS:
                 gated_task_id = getattr(args, "task", None)
                 gated_task = (gated_state.get("tasks") or {}).get(gated_task_id) if gated_task_id else None
@@ -911,7 +1097,11 @@ def main(argv: list[str] | None = None) -> int:
                         )
 
         if args.command == "doctor":
-            state = store.read() if store.exists() else None
+            # Read-only (spec Sec1 locking layers): heals a crashed archive
+            # transaction before reporting, rather than surfacing it only as
+            # an orphan (`load_recovered` acquires its own lock -- this is
+            # the ONLY state read in this command, so no nesting risk).
+            state = store.load_recovered() if store.exists() else None
             _print_json(inspect_capabilities(store.path.parent, state))
             return 0
 
@@ -998,7 +1188,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "status":
-            state = store.read()
+            # Read-only: heals a crashed archive transaction first (spec
+            # Sec1 locking layers), so a delivered scope stuck mid-archive
+            # reports its true, post-recovery phase rather than a stale one.
+            state = store.load_recovered()
             if derived_phase(state) == "setup" and (state["scope"] is None or config_path(store.path.parent).exists()):
                 config = load_config(store.path.parent)
                 _print_json(
@@ -1018,7 +1211,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "next":
-            state = store.read()
+            # Read-only: same recovery-first doctrine as `status` above --
+            # `next` is what a caller polls to discover the durable
+            # `archive_blocked` resting state (_apply_execution_drift below),
+            # so it must see a healed state, not a stale mid-transaction one.
+            state = store.load_recovered()
             if derived_phase(state) == "setup" and (state["scope"] is None or config_path(store.path.parent).exists()):
                 _print_json(
                     setup_next_actions(
@@ -1035,8 +1232,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 _print_json(result)
                 return 0
+            # `next` is read-only and outside GOVERNED_VERBS (no admission
+            # chokepoint runs for it, so there is no admission_layers to
+            # thread) -- but it must still reflect an epic override the same
+            # as any governed verb would, so it resolves its own layered
+            # view here rather than the bare global config (fix-round F2:
+            # `next` used to report the un-overlaid mode/models, silently
+            # hiding an active epic's `merge.surface`/`models` overrides).
             config = (
-                load_config(store.path.parent)
+                load_layers(store.path.parent, state.get("epic"))["effective"]
                 if config_path(store.path.parent).exists()
                 else None
             )
@@ -1069,11 +1273,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "start":
-            config = (
-                load_config(store.path.parent)
-                if config_path(store.path.parent).exists()
-                else None
-            )
+            config = _governed_config(admission_layers)
             result, duplicate = start_task(
                 store,
                 repo=args.repo,
@@ -1143,11 +1343,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "submit":
             warning = None
             pr = args.pr
-            config = (
-                load_config(store.path.parent)
-                if config_path(store.path.parent).exists()
-                else None
-            )
+            config = _governed_config(admission_layers)
             if pr is None:
                 state = store.read()
                 if merge_settings(state, config)["surface"] == "pr":
@@ -1215,15 +1411,12 @@ def main(argv: list[str] | None = None) -> int:
                 findings=findings,
                 reviewer=args.reviewer,
                 repo=args.repo,
+                layers=admission_layers,
                 **_concurrency(args),
             )
             task = state["tasks"][args.task]
             warning = None
-            config = (
-                load_config(store.path.parent)
-                if config_path(store.path.parent).exists()
-                else None
-            )
+            config = _governed_config(admission_layers)
             pr = task.get("pr")
             if (
                 merge_settings(state, config)["surface"] == "pr"
@@ -1267,7 +1460,8 @@ def main(argv: list[str] | None = None) -> int:
             from .review import collect_review
 
             state, duplicate = collect_review(
-                store, task_id=args.task, result_paths=args.result, repo=args.repo, **_concurrency(args)
+                store, task_id=args.task, result_paths=args.result, repo=args.repo,
+                layers=admission_layers, **_concurrency(args)
             )
             _print_json({"revision": state["revision"], "duplicate": duplicate})
             return 0
@@ -1279,6 +1473,7 @@ def main(argv: list[str] | None = None) -> int:
                 status=args.status,
                 command=args.verify_command_text,
                 repo=args.repo,
+                layers=admission_layers,
                 **_concurrency(args),
             )
             _print_json(
@@ -1294,7 +1489,8 @@ def main(argv: list[str] | None = None) -> int:
             from .review import collect_verification
 
             state, duplicate = collect_verification(
-                store, task_id=args.task, result_path=args.result, repo=args.repo, **_concurrency(args)
+                store, task_id=args.task, result_path=args.result, repo=args.repo,
+                layers=admission_layers, **_concurrency(args)
             )
             _print_json({"revision": state["revision"], "duplicate": duplicate})
             return 0
@@ -1310,6 +1506,7 @@ def main(argv: list[str] | None = None) -> int:
                 findings=findings,
                 reviewer=args.reviewer,
                 repo=args.repo,
+                layers=admission_layers,
                 **_concurrency(args),
             )
             review = (state.get("finalize") or {}).get("review") or {}
@@ -1335,6 +1532,7 @@ def main(argv: list[str] | None = None) -> int:
                 justification=args.justification,
                 results=args.results,
                 repo=args.repo,
+                layers=admission_layers,
                 **_concurrency(args),
             )
             verification = (state.get("finalize") or {}).get("verification") or {}
@@ -1349,17 +1547,37 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "finalize" and args.finalize_command == "handoff":
-            _print_json(prepare_handoff(store, repo=args.repo, **_concurrency(args)))
+            _print_json(
+                prepare_handoff(
+                    store, repo=args.repo, layers=admission_layers, **_concurrency(args)
+                )
+            )
             return 0
 
         if args.command == "finalize" and args.finalize_command == "delivered":
             _print_json(
-                record_delivered(store, by=args.by, repo=args.repo, **_concurrency(args))
+                record_delivered(
+                    store, by=args.by, repo=args.repo, layers=admission_layers,
+                    **_concurrency(args)
+                )
             )
             return 0
 
         if args.command == "finalize" and args.finalize_command == "status":
             _print_json(finalize_status(store.read()))
+            return 0
+
+        if args.command == "epic" and args.epic_command == "new":
+            state, duplicate = create_epic(
+                store,
+                store.path.parent,
+                slug=args.slug,
+                title=args.title,
+                **_concurrency(args),
+            )
+            _print_json(
+                {"epic": state["epic"], "revision": state["revision"], "duplicate": duplicate}
+            )
             return 0
 
         if args.command == "intake" and args.intake_command == "spec":
@@ -1420,6 +1638,24 @@ def main(argv: list[str] | None = None) -> int:
             _print_json({"revision": state["revision"], "duplicate": duplicate})
             return 0
 
+        if args.command == "intake" and args.intake_command == "configure":
+            state, duplicate = record_configure(
+                store,
+                store.path.parent,
+                approved_by=args.approved_by,
+                use_defaults=args.use_defaults,
+                by=args.by,
+                **_concurrency(args),
+            )
+            _print_json(
+                {
+                    "revision": state["revision"],
+                    "duplicate": duplicate,
+                    "sha256": state["intake"]["configure"]["sha256"],
+                }
+            )
+            return 0
+
         if args.command == "intake" and args.intake_command == "status":
             _print_json(intake_status(store.read()))
             return 0
@@ -1453,11 +1689,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "refresh":
-            config = (
-                load_config(store.path.parent)
-                if config_path(store.path.parent).exists()
-                else None
-            )
+            config = _governed_config(admission_layers)
             result = refresh_task(
                 store, repo=args.repo, task_id=args.task,
                 worktrees_root=_worktrees_root(config), **_concurrency(args)
@@ -1484,15 +1716,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "merge":
             if args.observed:
                 _print_json(
-                    observe_merge(store, repo=args.repo, task_id=args.task, **_concurrency(args))
+                    observe_merge(
+                        store, repo=args.repo, task_id=args.task, layers=admission_layers,
+                        **_concurrency(args)
+                    )
                 )
                 return 0
             state = store.read()
-            config = (
-                load_config(store.path.parent)
-                if config_path(store.path.parent).exists()
-                else None
-            )
+            config = _governed_config(admission_layers)
             settings = merge_settings(state, config)
             if settings["mode"] == "human":
                 try:
@@ -1505,7 +1736,10 @@ def main(argv: list[str] | None = None) -> int:
                     "directly; wddctl will not merge it. Once merged, run "
                     f"'wddctl merge --task {args.task} --repo {args.repo} --observed' to record it."
                 )
-            result = merge_task(store, repo=args.repo, task_id=args.task, **_concurrency(args))
+            result = merge_task(
+                store, repo=args.repo, task_id=args.task, layers=admission_layers,
+                **_concurrency(args)
+            )
             if settings["surface"] == "pr":
                 base_ref = store.read()["scope"].get("baseRef")
                 if base_ref:
@@ -1596,11 +1830,12 @@ def main(argv: list[str] | None = None) -> int:
             if not args.role:
                 raise ValidationError("dispatch --task requires --role worker|reviewer")
             state = store.read()
-            config = (
-                load_config(store.path.parent)
-                if config_path(store.path.parent).exists()
-                else None
-            )
+            # fix-round F2: this used to re-read the bare global config,
+            # silently dropping an active epic's models.implementation/
+            # models.review override at the one point that actually execs a
+            # worker/reviewer -- the chokepoint above already resolved the
+            # layered snapshot for this exact invocation.
+            config = _governed_config(admission_layers)
             result = dispatch_task(
                 state,
                 config,
@@ -1720,6 +1955,44 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "config":
             wdd_dir = store.path.parent
+            if getattr(args, "epic", False):
+                # epic overlay resolution (epic-scoped-state plan, Task 2,
+                # spec Sec2) -- state.epic is a v6 field (Task 3); until
+                # then this is always None, so `get --epic` degrades to
+                # the plain global/default view and `set --epic` always
+                # refuses below (correctly -- there is no verb yet to
+                # create an epic; Task 4 adds `wddctl epic new`).
+                state = store.read() if store.exists() else None
+                epic = (state or {}).get("epic")
+                if args.config_command == "get":
+                    layers = load_layers(wdd_dir, epic)
+                    value, source = resolve_config_source(layers, args.path)
+                    _print_json({"path": args.path, "value": value, "source": source})
+                    return 0
+                if args.config_command == "set":
+                    if epic is None:
+                        raise ValidationError(
+                            "config set --epic: no active epic (state.epic is null); "
+                            "run 'wddctl epic new --slug SLUG' first"
+                        )
+                    layers = load_layers(wdd_dir, epic)
+                    try:
+                        value = json.loads(args.value)
+                    except json.JSONDecodeError:
+                        value = args.value
+                    patch = set_overlay_value(
+                        layers["overlay"], args.path, value, effective=layers["effective"]
+                    )
+                    derived = derive_effective(layers, patch)
+                    save_overlay(wdd_dir, epic, derived["overlay"])
+                    _print_json(
+                        {
+                            "path": args.path,
+                            "value": get_value(derived["effective"], args.path),
+                            "epic": epic,
+                        }
+                    )
+                    return 0
             config = load_config(wdd_dir)
             if args.config_command == "get":
                 _print_json(get_value(config, args.path))

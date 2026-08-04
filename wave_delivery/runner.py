@@ -44,10 +44,11 @@ from .schema import copied_state
 from .store import StateStore, atomic_write_text
 
 
-# Same character class as finalize.py's _sanitize_scope_id_for_filename /
-# handover.py's _sanitize_task_id_for_filename (the archive idiom): task ids
-# double as filesystem path components under .wdd/dispatch/, so anything
-# outside [A-Za-z0-9._-] is replaced rather than trusted verbatim.
+# Same character class as handover.py's _sanitize_task_id_for_filename
+# (finalize.py's archive path is slug-governed since Task 6, epic-scoped-state
+# plan, and no longer needs this idiom itself): task ids double as filesystem
+# path components under .wdd/dispatch/, so anything outside [A-Za-z0-9._-] is
+# replaced rather than trusted verbatim.
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 
 _DISPATCH_DIR_MODE = 0o700
@@ -290,6 +291,33 @@ def _extract_section(text: str, heading: str) -> str | None:
     return section or None
 
 
+_SNAPSHOT_MANIFEST_NAME = "manifest.json"
+
+
+def _manifest_brief(snapshot_root: Path) -> Path | None:
+    """The brief file named by a migration-written `manifest.json` (epic-
+    scoped-state plan Task 3, spec Sec4), if the snapshot has one and it
+    names a file that actually exists in the snapshot. `None` for any
+    pre-manifest snapshot (predates migration) or a manifest that fails to
+    parse -- the caller falls back to exact-relative-path, then basename,
+    matching; a missing or unreadable manifest is never fatal.
+    """
+    manifest_path = snapshot_root / _SNAPSHOT_MANIFEST_NAME
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    brief = manifest.get("brief")
+    if not isinstance(brief, str) or not brief:
+        return None
+    candidate = snapshot_root / brief
+    return candidate if candidate.is_file() else None
+
+
 def _snapshot_files(snapshot_root: Path, brief_relative: Path) -> tuple[Path | None, list[Path]]:
     """(brief absolute path, context absolute paths) actually present in a snapshot dir.
 
@@ -298,20 +326,42 @@ def _snapshot_files(snapshot_root: Path, brief_relative: Path) -> tuple[Path | N
     was materialized (spec Sec3 -- "never live controller files"), and this
     works identically for legacy scopes (whose `task["inputs"]` is recorded
     empty on purpose) since it never reads that field at all.
+
+    Brief identification, in order (epic-scoped-state plan Task 3, spec
+    Sec4 -- "the dispatch prompt assembler prefers the manifest and only
+    falls back to basename matching for pre-manifest dirs -- never
+    lexicographic guessing"):
+
+    1. `manifest.json`, if the snapshot has one naming a file that exists.
+    2. The exact namespace-relative match (`brief_relative`, i.e. the
+       task's current `specPath`) against a file's path relative to the
+       snapshot root -- unchanged pre-manifest behavior.
+    3. Basename matching: a file anywhere in the snapshot whose own
+       filename equals `brief_relative.name`. This replaces the OLD
+       "treat the first (lexicographically sorted) file as the brief"
+       fallback, which could silently hand a worker the wrong file.
+
+    `manifest.json` itself is never treated as a context file even when it
+    is not chosen as the brief.
     """
-    files = sorted(path for path in snapshot_root.rglob("*") if path.is_file())
-    brief_path: Path | None = None
-    context_paths: list[Path] = []
-    for path in files:
-        if path.relative_to(snapshot_root) == brief_relative:
-            brief_path = path
-        else:
-            context_paths.append(path)
-    if brief_path is None and files:
-        # Defensive: specPath didn't line up with anything on disk (should
-        # not happen for a well-formed task). Treat the first file as the
-        # brief rather than silently omitting it from the packet.
-        brief_path, context_paths = files[0], files[1:]
+    files = sorted(
+        path
+        for path in snapshot_root.rglob("*")
+        if path.is_file() and path.name != _SNAPSHOT_MANIFEST_NAME
+    )
+    brief_path = _manifest_brief(snapshot_root)
+    if brief_path is None:
+        for path in files:
+            if path.relative_to(snapshot_root) == brief_relative:
+                brief_path = path
+                break
+    if brief_path is None:
+        target_name = brief_relative.name
+        for path in files:
+            if path.name == target_name:
+                brief_path = path
+                break
+    context_paths = [path for path in files if path != brief_path]
     return brief_path, context_paths
 
 
@@ -459,6 +509,15 @@ def dispatch_task(
                 f"task {task_id} has no recorded attempt snapshot; run 'wddctl start' first"
             )
 
+    # Cross-reference: the snapshot's internal layout mirrors
+    # `wave_delivery/paths.py`'s `resolve_artifact` (spec Sec1, Global
+    # Constraints "one resolver") -- `materialize_attempt`/
+    # `_task_input_sources` (handover.py) resolved every source file
+    # through it before copying, so `task["specPath"]`'s relative form is
+    # the same key the snapshot was written under. Task 1's `epic=None`
+    # transition mode keeps that relative form flat (`tasks/<id>.md`);
+    # Task 4, once refs resolve under `epics/<epic>/...`, must update this
+    # comparison in lockstep or a started task's brief lookup would miss.
     snapshot_root = wdd_dir / snapshot
     brief_path, context_paths = _snapshot_files(snapshot_root, Path(task["specPath"]))
     brief_text = brief_path.read_text(encoding="utf-8") if brief_path else ""

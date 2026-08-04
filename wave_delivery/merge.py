@@ -24,6 +24,7 @@ from .git import (
     run_git,
     worktree_branch,
 )
+from .review import review_evidence_stale, verification_evidence_stale
 from .store import StateStore
 
 
@@ -260,6 +261,7 @@ def merge_task(
     *,
     repo: Path | str,
     task_id: str,
+    layers: dict[str, Any] | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
@@ -283,6 +285,23 @@ def merge_task(
             raise IllegalTransition(
                 f"task {task_id} is at gate '{gate}', not 'merge_ready'; "
                 "run 'wddctl next' for the required step"
+            )
+        # Evidence-binding staleness (Task 5, spec Sec2): task_gate's own
+        # dynamic review_required/verification checks above cover a policy
+        # that newly demands review it never had; this catches the
+        # complementary case -- evidence that already satisfies task_gate
+        # (right headSha, passed outcome) but ran under a risk/model/config
+        # projection that no longer holds (e.g. an "always"-policy review
+        # recorded before risk rose, or a config edit after either ran).
+        stale = review_evidence_stale(task, layers) if layers is not None else None
+        stale = stale or (
+            verification_evidence_stale(task, layers) if layers is not None else None
+        )
+        if stale:
+            raise IllegalTransition(
+                f"task {task_id} evidence is stale: {stale}; re-run 'wddctl review record "
+                f"--task {task_id} --reviewer NAME --findings [] --repo .' and/or 'wddctl "
+                f"verify record --task {task_id} --status passed --repo .' before merging"
             )
         head_sha = task.get("headSha")
         if not isinstance(head_sha, str) or not head_sha:
@@ -388,6 +407,7 @@ def observe_merge(
     *,
     repo: Path | str,
     task_id: str,
+    layers: dict[str, Any] | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
@@ -425,6 +445,19 @@ def observe_merge(
             raise IllegalTransition(
                 f"task {task_id} is at gate '{gate}', not 'merge_ready'; "
                 "run 'wddctl next' for the required step"
+            )
+        # Evidence-binding staleness (Task 5, spec Sec2) -- same check as
+        # merge_task's, since an observed human merge is just as much a
+        # merge as a controller-performed one.
+        stale = review_evidence_stale(task, layers) if layers is not None else None
+        stale = stale or (
+            verification_evidence_stale(task, layers) if layers is not None else None
+        )
+        if stale:
+            raise IllegalTransition(
+                f"task {task_id} evidence is stale: {stale}; re-run 'wddctl review record "
+                f"--task {task_id} --reviewer NAME --findings [] --repo .' and/or 'wddctl "
+                f"verify record --task {task_id} --status passed --repo .' before merging"
             )
         current_head = task.get("headSha")
         if current_head != head_sha:

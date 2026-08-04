@@ -230,7 +230,7 @@ Codes:
 | `enumerated_domains` | a task lists 4+ individual files (no wildcard) under the same directory — a candidate for the `dir/**` glob instead, unless another task genuinely needs to write there concurrently (repo-root, top-level files are exempt from this grouping). |
 | `coarse_domain` | a single domain on one task overlaps 3+ other tasks' domains — it will serialize all of them; narrow it to what the task actually writes. |
 | `missing_brief` | a task's `specPath` file doesn't exist, or has fewer than 2 non-blank lines — a worker dispatched on it will improvise. |
-| `missing_spec` | `.wdd/spec.md` is missing or effectively empty — the finalize phase reviews the epic branch against it; run the intake first. |
+| `missing_spec` | the active epic's `spec.md` (`epics/<slug>/spec.md`) is missing or effectively empty — the finalize phase reviews the epic branch against it; run the intake first. |
 | `nonprose_brief` | a task's brief starts with `{` or `[` — it reads as JSON/data, not the Markdown prose (objective, scope, verification) a worker needs. |
 | `missing_deliverable` | a task's brief has no non-empty `## Deliverable` section — the reviewer's first question is whether the diff produces it. |
 | `missing_interfaces` | a task's brief has no non-empty `## Interfaces` section — Consumes/Produces should be consistent with design.md. |
@@ -503,6 +503,63 @@ Prints the whole config object. Useful for showing a user everything before
 `constitution ratify`, since ratifying signs this file's exact contents (see
 below).
 
+### `config get`/`set --epic`
+
+With an active epic, both `get` and `set` accept `--epic` to read or write
+the **epic overlay** (`.wdd/epics/<slug>/config.json`) instead of the
+global config — see "Epic configuration overlay" below for the full
+resolution/digest/drift story; this is the mechanical surface for it.
+
+```sh
+$ wddctl config get --epic merge.surface
+{
+  "path": "merge.surface",
+  "source": "global",
+  "value": "local"
+}
+$ wddctl config set --epic merge.surface pr
+{
+  "epic": "greeting-demo",
+  "path": "merge.surface",
+  "value": "pr"
+}
+$ wddctl config get --epic merge.surface
+{
+  "path": "merge.surface",
+  "source": "epic",
+  "value": "pr"
+}
+```
+
+- `get --epic` prints the **merged view** (epic overlay → global config →
+  built-in default) with a `source` marker naming which layer answered —
+  `"epic"`, `"global"`, or `"default"` — never the raw overlay file alone.
+- `set --epic` writes only the active epic's overlay; the global
+  `config.json` is untouched. `--epic` without an active epic (`state.epic`
+  is `null`) refuses, naming `wddctl epic new` as the remedy.
+- The overlay is a **sparse, allowlisted** set of dotted leaves — the exact
+  set the epic-scoped-state design permits an epic to differ from global
+  on: `models.planning`, `models.implementation`, `models.review`,
+  `verification.commands`, `verification.unavailableJustification`,
+  `merge.surface`, `riskRules`, `review.policy`. Anything else — `runners`,
+  `worktrees.root`, branch settings, anything unlisted — is rejected **by
+  name**, at `set --epic` and at `intake configure` approval alike:
+
+```sh
+$ wddctl config set --epic runners '{}'
+wddctl: epic config overlay: key(s) not in the allowed overlay set (models.planning, models.implementation, models.review, verification.commands, verification.unavailableJustification, merge.surface, riskRules, review.policy): runners
+```
+
+  Machine-bound and repository-authority settings stay under constitution
+  approval only — an epic cannot quietly reroute them.
+- A `set --epic` value is parsed the same way a global `set`'s is (JSON
+  first, falling back to the literal string — see above), and it does
+  **not** by itself record anything: it edits the overlay on disk; `wddctl
+  intake configure` is the separate, explicit approval step (see "The
+  intake ladder" above). Editing the overlay after `configure` has already
+  approved it is epic-config drift — see "Epic configuration overlay"
+  below.
+
 ### `constitution probe` / `ratify` / `amend` / `status`
 
 Execution is blocked until the constitution is explicitly ratified — see
@@ -695,24 +752,37 @@ bypasses transitions, not governance.
 
 ## The intake ladder
 
-Between `constitution ratify` and `plan apply`, `wddctl next` walks three
-more rungs, one at a time: **spec → research → design**. Each rung is
-recorded by its own verb (`wddctl intake spec` / `research` / `design`),
-and each record is bound to the exact bytes it approved — a SHA-256 of the
+Between `constitution ratify` and `plan apply`, `wddctl next` walks five
+rungs, one at a time: **epic → configure → spec → research → design**. The
+first two — `wddctl epic new` and `wddctl intake configure` — name the
+epic and settle its config overlay before any artifact is agreed (see
+"Epic directories" and "Epic configuration overlay" below); the remaining
+three are recorded by their own verbs (`wddctl intake spec` / `research` /
+`design`), each bound to the exact bytes it approved — a SHA-256 of the
 artifact, the same `governance_fingerprint` idiom the constitution uses.
 Editing an already-approved artifact is drift, not a free edit, exactly
 like editing `config.json`/`constitution.md` after ratification is. The
-ladder is also **ordered and cascading**: re-approving a rung clears every
-record after it (a spec re-approval clears research, design, and the
-plan's composite approval; a research re-approval clears design and the
-composite; a design re-approval clears only the composite) — because a
-later record's approval implicitly rests on the upstream bytes that just
-changed underneath it.
+spec/research/design portion of the ladder is also **ordered and
+cascading**: re-approving a rung clears every record after it (a spec
+re-approval clears research, design, and the plan's composite approval; a
+research re-approval clears design and the composite; a design
+re-approval clears only the composite) — because a later record's
+approval implicitly rests on the upstream bytes that just changed
+underneath it. `epic new` and `configure` don't participate in that
+cascade — there is nothing upstream of them to invalidate — but
+`configure` has its own re-approval semantics; see "Epic configuration
+overlay" below.
 
-A migrated (legacy, `intake.legacy`) scope is wholesale exempt from the
-entire ladder — `wddctl next` never emits a rung action for one, and the
-rung verbs themselves refuse outright. Every rung verb also refuses before
-ratification, and once the scope reaches `delivered` (`wddctl scope
+A migrated (legacy, `intake.legacy`) scope is exempt from the
+**spec/research/design** rungs — `wddctl next` never emits one of those
+rung actions for it, and the rung verbs themselves refuse outright — but
+it is **not** exempt from `intake configure`: a legacy scope still gets an
+epic (migration adopts or creates one), still carries an epic config
+overlay, and `intake configure --approved-by` remains the reachable,
+correct remedy for epic-config drift even though the rest of the ladder
+stays permanently skipped (see "Migration" in
+[`artifact-schema.md`](artifact-schema.md)). Every rung verb also refuses
+before ratification, and once the scope reaches `delivered` (`wddctl scope
 archive` is the only way back to a fresh ladder — see below).
 
 Real, unedited output from one continuous scratch repository — `wddctl
@@ -723,9 +793,9 @@ $ wddctl next --repo .
 {
   "actions": [
     {
-      "action": "agree_spec",
-      "judgment": "agree .wdd/spec.md with the user (goal, in/out of scope, numbered acceptance criteria) per the wdd-intake skill's spec stage, then record it",
-      "recordWith": "wddctl intake spec --approved-by NAME",
+      "action": "create_epic",
+      "command": "wddctl epic new --slug SLUG",
+      "judgment": "name the work with the user in ONE short round (a lowercase-dash slug, and optionally a display title) per the wdd-intake skill, then create the epic. Slugs are immutable -- there is no rename verb; retiring one means archiving it.",
       "task": "-"
     }
   ],
@@ -736,9 +806,143 @@ $ wddctl next --repo .
 }
 ```
 
+### `wddctl epic new`
+
+The first action of every epic, per spec Sec1: names the work and creates
+its directory in one governed, locked mutation.
+
+```sh
+wddctl epic new --slug greeting-demo [--title "Greeting helper"]
+```
+
+```json
+{
+  "duplicate": false,
+  "epic": "greeting-demo",
+  "revision": 2
+}
+```
+
+- **Slug**: `[a-z0-9][a-z0-9-]{1,63}`, unique against both `epics/` and
+  `archive/` — slugs are immutable (there is no rename verb; retiring one
+  means archiving it), so a fresh epic never reuses a name a delivered one
+  already carries. `--title` is optional decoration only; the slug alone
+  is the canonical identity.
+- Creates `epics/<slug>/` holding an empty overlay (`config.json: {}`) and
+  records `state.epic = <slug>` — the whole thing is one locked mutation,
+  so a crash can never leave a directory without a matching `state.epic`,
+  or vice versa, in any way other than the idempotent crash-orphan shape
+  below.
+- Refuses when an epic is already active:
+
+```sh
+$ wddctl epic new --slug second-try
+wddctl: an epic is already active ('greeting-demo'); archive it with 'wddctl scope archive --repo .' before starting a new one
+```
+
+  or when the slug collides with an archived epic:
+
+```
+wddctl: epic slug 'greeting-demo' is already used by an archived epic (.wdd/archive/greeting-demo); slugs are immutable and unique across epics/ and archive/ -- choose a different slug
+```
+
+- **Crash-orphan adoption**: if a previous `epic new` crashed after
+  creating `epics/<slug>/` (empty overlay, nothing else) but before the
+  state write landed, re-running the exact same `epic new --slug SLUG`
+  adopts that directory idempotently instead of refusing — `wddctl doctor`
+  additionally reports any such orphan it finds (`"epicOrphans": [...]`),
+  so an operator doesn't have to go looking for the crash by hand. A
+  directory that already holds a reserved `record.json` (an in-flight or
+  completed archive transaction, or a hand-placed collision) is refused
+  outright instead of adopted — see "Transactional archive" below.
+
+Directory layout right after `epic new` (see [`artifact-schema.md`](artifact-schema.md)
+for the full picture, including what `plan apply` and the intake rungs add
+to it):
+
+```text
+.wdd/
+  epics/
+    greeting-demo/
+      config.json    # the sparse overlay -- {} until `config set --epic` writes to it
+```
+
+### `wddctl intake configure`
+
+The second rung, immediately after `epic new` and before `agree_spec`:
+settles the epic's config overlay — merge surface, models, verification
+commands, risk rules, review policy — with one explicit, attributed
+decision. Two legal forms, both required to name a human:
+
+```sh
+wddctl intake configure --approved-by NAME            # overlay as currently written
+wddctl intake configure --use-defaults --by NAME      # empty overlay, inherit everything
+```
+
+Before recording, use `wddctl config set --epic PATH VALUE` to write any
+overlay leaves the epic actually needs (see "`config get`/`set --epic`"
+below) — `configure` records whatever the overlay holds at that moment, it
+does not itself prompt for values.
+
+```sh
+$ wddctl config set --epic merge.surface local
+{
+  "epic": "greeting-demo",
+  "path": "merge.surface",
+  "value": "local"
+}
+$ wddctl intake configure --approved-by ivo
+{
+  "duplicate": false,
+  "revision": 3,
+  "sha256": "sha256:1223d65d5c9ca75d52830c0abd5a6566b08bcc87c3300e78d400494941f25f90"
+}
+```
+
+- The recorded `sha256` is over the **derived, post-mutation, fully
+  resolved effective config** (overlay layered over global layered over
+  built-in defaults, canonically serialized — the same
+  `effective_config_digest` idiom "Epic configuration overlay" below
+  describes) — not the overlay bytes alone, and not a value re-read from
+  disk after the fact. A global config change therefore makes this record
+  stale by construction, with no separate cascade to remember.
+- `--use-defaults` is the explicit decision to inherit everything —
+  silence about epic config is not an option, the same doctrine as
+  research's `--skip --reason`. It also **resets the overlay file to
+  `{}`** as a side effect: a nonempty, unapproved overlay left on disk
+  behind a "defaults" approval would be a lie the next drift check
+  couldn't catch.
+- `agree_spec` refuses until `configure` is recorded:
+
+```
+wddctl: intake configure must be recorded before agree_spec (run 'wddctl intake configure --approved-by NAME' or '--use-defaults --by NAME')
+```
+
+- Re-recording `configure` mid-epic (the remedy for epic-config drift, or
+  simply a genuine change of mind) does **not** clear spec/research/design
+  — their content doesn't depend on config — but **does** clear
+  `scope.approval`, since the plan was approved under the old effective
+  config (models, riskRules, review policy all feed apply-time
+  derivation). See "Epic configuration overlay" below for the full
+  drift/cascade story and a worked mid-epic remedy.
+
+> The worked examples in this subsection through "Plan drift" below
+> predate the epic-scoped-state plan and were captured against a flat
+> `.wdd/spec.md`/`.wdd/design.md`/`.wdd/tasks/<TASK-ID>.md` layout for
+> narrative continuity with their original capture session. Under schema
+> v6 the SAME artifact references — `spec.md`, `design.md`,
+> `tasks/<TASK-ID>.md` — resolve through the typed path resolver into the
+> **active epic's** directory instead (`epics/<slug>/spec.md`, and so on;
+> see "Epic directories" in [`artifact-schema.md`](artifact-schema.md)) —
+> the mechanisms these examples demonstrate (drift, cascade, the plan-
+> approval composite) are otherwise unchanged; only the literal path
+> underneath `.wdd/` moved. The "`wddctl epic new`"/"`wddctl intake
+> configure`" examples above and "The archive transaction and its
+> recovery" below use the current, epic-scoped paths throughout.
+
 ### `wddctl intake spec`
 
-Records `.wdd/spec.md`'s approval. Refuses unless the file exists,
+Records `epics/<slug>/spec.md`'s approval. Refuses unless the file exists,
 non-empty, has all four required `## ` sections (Goal, In scope, Out of
 scope, Acceptance criteria), and its Acceptance criteria section is
 **wholly numbered**: every checklist line matches `- [ ] AC-<n>: ...`, the
@@ -1033,76 +1237,285 @@ re-walking the drifted rung (and everything the cascade re-clears) then
 re-stamping `plan apply --approved-by` — see `ExecutionGateIntakeDriftTest`
 in `tests/test_intake.py` for the full remedy walk.
 
+## Epic configuration overlay
+
+`.wdd/epics/<slug>/config.json` is a **sparse overlay**: only the leaves an
+epic actually needs to differ on are present (an empty file, `{}`, is
+common and legal). Every config-reading site resolves a key path through
+one shared function, per key, never by reading either file directly:
+
+```
+epic overlay → global config.json → built-in default
+```
+
+`models.review` can be overridden while `models.implementation` falls
+through to global, and so on, independently per leaf — see "`config
+get`/`set --epic`" above for the mechanical surface.
+
+**One digest function, byte-precise.** `effective_config_digest(view)` is
+the only fingerprint implementation for the resolved view: input is the
+fully parsed, default-hydrated merged view with source markers stripped;
+serialization is JSON with recursively sorted object keys, array order
+preserved, UTF-8, fixed separators; duplicate keys and non-finite numbers
+are rejected at parse (the same precision `governance_fingerprint` already
+holds constitution/config to). `intake configure`'s recorded `sha256` (see
+above) is this digest over the full resolved view.
+
+**Purpose-projected digests on evidence, not one blob.** A task's review
+or verification record never stores the full-config digest — it stores
+the digest of the **projection** relevant to its own purpose, computed by
+the same function over a named key subset: `plan` (models, riskRules,
+review.policy), `taskReview` (models.review, review.policy,
+review.blockingSeverities), `finalReview` (models.review,
+review.blockingSeverities), `taskVerification`/`finalVerification`
+(verification.*, plus the deliverable command for the final one). A
+`models.planning` edit therefore stales nothing downstream; a
+`verification.commands` edit stales exactly the verification evidence, not
+review. Review evidence additionally binds its **resolved decision
+values** — the risk tier and review model it actually ran under — since a
+task's risk can rise without any config byte moving its projection; the
+consuming gate re-derives both from current state and compares (see
+"evidence digest fields" in [`artifact-schema.md`](artifact-schema.md)).
+
+### Drift and the mid-epic remedy chain
+
+Editing the overlay (or the global config it layers over) after `intake
+configure` approved it is **epic-config drift** — it joins the same
+chokepoint governance drift and intake/plan drift already sit at, in this
+precedence order: **governance → epic config → intake artifacts → plan
+composite**. One blocker at a time; `next` names the current one and its
+own remedy names the next.
+
+Real, unedited output from a fresh scratch repository: `epic new` through
+`plan apply` and `start` (an epic-scoped rerun of the same shape the
+`greeting-demo` example above walks), then an overlay edit mid-epic,
+refused via `start`'s re-attach path, remedied, and the plan drift it
+cascades into, remedied in turn:
+
+```sh
+$ wddctl config set --epic models.planning "gpt-x"
+{
+  "epic": "greeting-demo",
+  "path": "models.planning",
+  "value": "gpt-x"
+}
+$ wddctl start --task TASK-001-greeting --repo .
+wddctl: epic config drift: the epic overlay (or the global config it layers over) changed since intake.configure was approved (recorded sha256:7bd4aac7375f0554beca9b01974a5c1167f23d5fc1374f84bfe0de69a7fe98a1, current sha256:bfaa169ffd3fdacc4479011dddba5b3d4254f37a67b75b656a8a072ebb7b1cc1); run 'wddctl intake configure --approved-by NAME' (or --use-defaults --by NAME) to re-approve
+$ wddctl intake configure --approved-by ivo
+{
+  "duplicate": false,
+  "revision": 10,
+  "sha256": "sha256:bfaa169ffd3fdacc4479011dddba5b3d4254f37a67b75b656a8a072ebb7b1cc1"
+}
+$ wddctl start --task TASK-001-greeting --repo .
+wddctl: plan drift: this scope's plan was never composite-approved; run 'wddctl plan apply --approved-by NAME' to stamp the currently applied plan
+$ wddctl plan apply --plan plan.json --repo . --approved-by ivo
+{"approvedBy": "ivo", "created": false, "diff": {"added": [], "removed": [], "scope": {}, "updated": []}, "dryRun": false, "lint": [...], "revision": 11, "scope": "SCOPE-greeting-demo", "unchanged": true}
+$ wddctl start --task TASK-001-greeting --repo .
+{
+  "action": "reattach:reuse",
+  "branch": "task/TASK-001-greeting",
+  "duplicate": false,
+  "inputsRecorded": 1,
+  "revision": 12,
+  "snapshot": "dispatch/TASK-001-greeting-1",
+  "specPath": "tasks/TASK-001-greeting.md",
+  "status": "in_progress",
+  "task": "TASK-001-greeting",
+  "worktree": "/path/to/repo/.worktrees/SCOPE-greeting-demo/TASK-001-greeting"
+}
+```
+
+(`intake configure`'s re-approval clears `scope.approval`, which is why
+the SECOND `start` names `plan_drift` — "this scope's plan was never
+composite-approved" — rather than repeating `epic_config_drift`: the
+first blocker in precedence order is always the one refused on. The
+re-stamp's `lint` array is elided above for length; see "`plan lint`"
+above for what those specific findings mean.)
+
+Two things worth naming explicitly about that second refusal: re-recording
+`configure` clears `spec`/`research`/`design` **not at all** (their
+content never depended on config) but clears `scope.approval` — the plan
+was approved under the *old* effective config, and models/riskRules/review
+policy all feed apply-time derivation, so execution can only resume after
+a re-stamp. And the re-stamp's **risk re-derivation covers every task**,
+not only `todo` ones: a task already in flight whose risk rises under the
+new effective policy has its review gate recompute at verb time — if the
+new policy now requires a review that was never recorded, `merge` refuses
+until one is. A risk *drop* never removes an already-applicable
+requirement (upward-only, matching `riskRules` doctrine generally).
+
+**Global config changes mid-epic** still trip governance drift exactly as
+before (`constitution amend` is still the remedy) — since resolution is
+dynamic, a re-approved global change flows straight into every epic's
+merged view, and the same plan re-stamp requirement applies. The v6
+`constitution amend` transition also explicitly clears `scope.approval` as
+part of the same belt-and-braces fix (v5's amend only replaced
+`state.constitution`).
+
+**Resolved once per invocation.** The CLI resolves the effective config
+and its digest exactly once, at admission, and threads that snapshot
+through the whole command — no handler re-reads config mid-command. An
+overlay edited after a command starts cannot influence the evidence that
+same invocation records; the digest stamped on evidence is the digest that
+was actually gate-checked.
+
 ### `wddctl scope archive`
 
 `delivered`-phase only: the ladder's final transition, and the only path
-back to a fresh ladder. Writes `.wdd/archive/<scope-id>.json` — the
-scope, tasks, intake, finalize, reconcile (including `pendingNotes`),
-leases, an event count, and an archive timestamp — then resets every
-scope-carrying section of `state.json` in one mutation: `scope: null`,
-`tasks: {}`, `finalize` removed entirely, `intake: {}` (a genuinely fresh
-ladder, never re-marked `legacy`), `reconcile` fully reset (counters and
-pending notes both), `monitoring.observations` cleared, and `leases`
-dropped. Governance (`constitution`) and the audit trail (`events`,
-`telemetry`) are untouched — archiving retires a scope's data, not the
-repository's own history or its ratified process. Refuses outright before
-`delivered`.
+back to a fresh ladder. Since Task 6 of the epic-scoped-state plan, this is
+no longer "write one JSON file" — it **moves the whole epic directory**,
+`epics/<slug>/` (spec, design, plan, tasks, research, and the epic's own
+overlay), to `archive/<slug>/`, with a `record.json` (the old archive
+JSON's shape, unchanged — scope, tasks, intake, finalize, reconcile
+including `pendingNotes`, leases, an event count, an archive timestamp)
+written *inside* it before the move. `wddctl` never reads `record.json`
+back; it is the durable record of a completed epic, since `state.json`
+resets to a fresh setup shape immediately after.
 
 ```sh
-$ wddctl note --note "greeting helper has no i18n; revisit if we add locales"
-{"duplicate": false, "revision": 17}
 $ wddctl scope archive --repo .
 {
-  "archived": ".wdd/archive/SCOPE-greeting-demo.json",
+  "archived": ".wdd/archive/greeting-demo/record.json",
   "duplicate": false,
-  "revision": 18,
+  "revision": 20,
   "scope": "SCOPE-greeting-demo"
 }
 ```
 
-`.wdd/archive/SCOPE-greeting-demo.json` (trimmed to the sections that
-prove the no-leak guarantee — see [`artifact-schema.md`](artifact-schema.md)
-for the full shape):
+```sh
+$ find .wdd/archive -maxdepth 3 | sort
+.wdd/archive
+.wdd/archive/greeting-demo
+.wdd/archive/greeting-demo/config.json
+.wdd/archive/greeting-demo/design.md
+.wdd/archive/greeting-demo/record.json
+.wdd/archive/greeting-demo/spec.md
+.wdd/archive/greeting-demo/tasks
+.wdd/archive/greeting-demo/tasks/TASK-001-greeting.md
+```
+
+`record.json` itself (trimmed to the sections that prove the no-leak
+guarantee — see [`artifact-schema.md`](artifact-schema.md) for the full
+shape, and for `epicOrphans`/reserved-name detail):
 
 ```json
 {
-  "archivedAt": "2026-08-01T19:58:49Z",
-  "eventCount": 17,
-  "scope": {"id": "SCOPE-greeting-demo", "...": "..."},
+  "archivedAt": "2026-08-04T01:23:55Z",
+  "eventCount": 18,
+  "scope": {"id": "SCOPE-greeting-demo", "baseRef": "wdd/greeting-demo", "...": "approval included"},
   "intake": {"spec": {"...": "..."}, "research": {"...": "..."}, "design": {"...": "..."}},
   "finalize": {"review": {"...": "..."}, "verification": {"...": "..."}, "handoff": {"...": "..."}, "delivered": {"...": "..."}},
   "tasks": {"TASK-001-greeting": {"...": "..."}},
   "leases": {"TASK-001-greeting": {"status": "released", "...": "..."}},
-  "reconcile": {
-    "everyNMerges": 3,
-    "mergesSinceCheckpoint": 1,
-    "pendingNotes": [
-      {"at": "2026-08-01T19:58:49Z", "note": "greeting helper has no i18n; revisit if we add locales", "task": null}
-    ]
-  }
+  "reconcile": {"everyNMerges": 3, "mergesSinceCheckpoint": 1, "pendingNotes": []}
 }
 ```
 
 `state.json` afterward — a genuinely fresh setup phase, exactly as if
-`wddctl init` had just been run against an already-ratified repository:
+`wddctl init` had just been run against an already-ratified repository —
+resets `scope: null`, `epic: null`, `tasks: {}`, `finalize` removed
+entirely, `intake: {}` (a genuinely fresh ladder, never re-marked
+`legacy`), `archivePending`/`archiveBlocked` both `null`, `reconcile`
+fully reset (counters and pending notes both), `monitoring.observations`
+cleared, and `leases` dropped. Governance (`constitution`) and the audit
+trail (`events`, `telemetry`) are untouched — archiving retires an epic's
+data, not the repository's own history or its ratified process. Refuses
+outright before `delivered`:
 
 ```sh
 $ wddctl next --repo .
 {
   "actions": [
     {
-      "action": "agree_spec",
-      "judgment": "agree .wdd/spec.md with the user (goal, in/out of scope, numbered acceptance criteria) per the wdd-intake skill's spec stage, then record it",
-      "recordWith": "wddctl intake spec --approved-by NAME",
+      "action": "create_epic",
+      "command": "wddctl epic new --slug SLUG",
+      "judgment": "...",
       "task": "-"
     }
   ],
   "blockers": [],
   "phase": "setup",
-  "revision": 18,
+  "revision": 20,
   "scope": null
 }
 ```
+
+Slugs are immutable and unique against both `epics/` and `archive/` (see
+"`wddctl epic new`" above), so this archived epic's name can never be
+reused, and a fresh `epic new --slug greeting-demo` right after refuses
+exactly the same way it would against a still-active epic of that name.
+
+#### The archive transaction and its recovery
+
+The move is a **recoverable transaction under the state lock**, per spec
+Sec1 — not a single filesystem call the whole command hopes completes:
+
+1. Write `record.json` **inside** `epics/<slug>/` — a reserved filename no
+   other verb may create; the typed path resolver rejects it as an
+   artifact ref outright, and `epic new` refuses a directory that already
+   contains one.
+2. Record `state.archivePending = {slug, sourceRevision, archivedAt,
+   recordSha256}`. The record is a **deterministic function** of the state
+   at `sourceRevision` (excluding the `archivePending` event itself) plus
+   the one nondeterministic input, `archivedAt` — so regenerating it from
+   an uncrashed state reproduces the exact bytes behind `recordSha256`;
+   nothing here is unreconstructable.
+3. One atomic rename: `epics/<slug>` → `archive/<slug>`.
+4. Reset state to post-ratification setup (above), clearing `state.epic`
+   and `archivePending`.
+
+Every governed command and every read-only status command recovers from an
+interrupted transaction automatically — there is no separate "resume
+archive" verb to remember. A crash between any two steps leaves the
+on-disk facts self-describing enough to finish or safely roll back: if
+`record.json` exists but the rename never happened, it's re-verified (or
+regenerated from the still-live state on a corrupt/missing hash) and the
+rename retried; if the rename happened but the reset didn't, the *archived*
+copy is re-verified and the reset completes; if a step-1 crash left a
+`record.json` sitting in the still-active epic's own directory, it's
+removed and nothing else happens (the transaction never began). Recovery
+**never reads or touches anything under `archive/`** beyond the exact slug
+named by the pending journal — a completed archive with no journal is the
+success state, and pre-v6 archive files are never recovery's business
+either. The full six-row matrix (including the durable
+`archiveBlocked`/`archive_blocked` resting state below) is pinned row by
+row in `tests/test_epics.py` — `ArchiveRecoveryRowOneTest`,
+`ArchiveRecoveryRowTwoTest`, `ArchiveRecoveryHardErrorTest`,
+`ArchiveRecoveryStrayRecordCleanupTest`, `RecoveryNeverReadsArchiveTest` —
+each simulating the crash at the exact step it names.
+
+**External collision** (something other than `wddctl` itself already
+occupies `archive/<slug>/` when the rename is attempted) is the one row
+that doesn't retry forever. Caught *before* the transaction ever starts,
+it's a hard, immediate refusal — real, unedited output:
+
+```sh
+$ mkdir -p .wdd/archive/second-epic && echo "not ours" > .wdd/archive/second-epic/unrelated.txt
+$ wddctl scope archive --repo .
+wddctl: archive/second-epic/ already exists; slugs are unique across epics/ and archive/ -- this should be unreachable
+$ rm -rf .wdd/archive/second-epic
+$ wddctl scope archive --repo .
+{
+  "archived": ".wdd/archive/second-epic/record.json",
+  "duplicate": false,
+  "revision": 38,
+  "scope": "SCOPE-second-epic"
+}
+```
+
+If the SAME collision instead appears *mid-transaction* — after
+`archivePending` was already journaled but before the rename lands, the
+scenario `ArchiveCollisionBlockedResolutionE2ETest` exercises by crash-
+injecting `os.rename` — recovery does not retry forever either: it removes
+the generated `record.json`, clears the journal, and writes a durable
+`state.archiveBlocked = {slug, collidingPath, at}`. `next` derives a
+stable `archive_blocked` blocker from that field (so the promise survives
+the journal's removal), `scope archive` itself refuses while it's set
+(naming the colliding path), and re-running `scope archive` once the
+collision is resolved clears the block and starts a clean transaction —
+exactly the remedy shown above, just entered from a durable rather than an
+immediate refusal.
 
 ### `next`
 
@@ -1674,6 +2087,28 @@ is a thin wrapper over this; use it only when nothing else fits.
 wddctl event apply --event task.blocked --task TASK-001-token-types --data '{"reason":"..."}'
 ```
 
+### `--version`
+
+A global flag (works anywhere, before or independent of a subcommand),
+backed by the `VERSION` file at the repository root — the single source of
+truth `scripts/install_wave_delivery.py` copies next to the installed
+package:
+
+```sh
+$ wddctl --version
+wddctl 0.1.0 (b88d6d9)
+```
+
+`<version> (<short-sha-if-known>)`, via argparse's built-in version action.
+The short SHA is best-effort (present when the installed copy can resolve
+its own Git history; absent, not fabricated, otherwise). The schema
+version (currently v6) and the CLI version are independent numbers —
+`migrate` keys off the schema, never off `--version`'s output. `VERSION`
+itself is bumped and tagged by a GitHub Actions workflow on push to
+`main` (Conventional Commits classify the bump; `scripts/release.py`
+carries the parser and the compare-and-swap tag logic) — no manual
+version-bump step in the normal contribution flow.
+
 ### `doctor`
 
 Optional capability report: Python version, and whether `git`, `gh`, `acli`,
@@ -1682,7 +2117,12 @@ optional ones present. Also reports governance health —
 `governance.configPresent`, `governance.configValid` (with an `error` string
 on failure), and `governance.drift` (`null`, or the same shape `next` emits
 in its `governance_drift` blocker) — computed from `.wdd/config.json` and
-the current state if one exists. Doctor only reports; it never refuses.
+the current state if one exists. The report also carries `"version"` (the
+same string `--version` prints, sha suffix excluded) and `"epicOrphans"` —
+a list of epic slugs whose directory exists but whose crash left
+`state.epic` unset (see "`wddctl epic new`" above for the idempotent
+`epic new`-again remedy); empty when there's nothing to report. Doctor
+only reports; it never refuses.
 
 ```sh
 wddctl doctor [--json]
@@ -2230,7 +2670,7 @@ execute, finalize, delivered), the same way `wddctl status` always does.
 ### `finalize review record`
 
 Reviews the **whole epic branch** — not one task's diff — against
-`.wdd/spec.md`'s acceptance criteria. Same P1/P2/P3 vocabulary and
+`spec.md`'s acceptance criteria. Same P1/P2/P3 vocabulary and
 `review.blockingSeverities` (default P1/P2) as task-level review, but
 evidence is pinned to the scope's **base-branch head SHA**, not a task
 head — there is no task head left once every task is terminal.
@@ -2543,7 +2983,7 @@ exact scratch session through to a fresh `agree_spec`.
 
 ### Transcript: a blocked final review
 
-A P1 against `.wdd/spec.md`'s acceptance criteria blocks the ladder
+A P1 against `spec.md`'s acceptance criteria blocks the ladder
 exactly like a task-level P1 blocks merge:
 
 ```sh
@@ -2652,3 +3092,8 @@ $ wddctl next --repo .
   `task.started` transition itself (`admission_blocker`), not only
   advertised by `next`. A caller that starts a task directly, bypassing
   `next`, gets the same refusal.
+- **Archive is a crash-safe transaction, never a partial move.** `scope
+  archive`'s directory move (`epics/<slug>` → `archive/<slug>`) is
+  recoverable at every step, verified by re-derivable byte-identical
+  record generation rather than trust, and two epics never collide on a
+  path — see "The archive transaction and its recovery" above.

@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from typing import Any
 
 from .errors import ValidationError
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+# Epic slug shape (spec Sec1, epic-scoped-state plan): `[a-z0-9][a-z0-9-]{1,63}`.
+# Exported so Task 4's `wddctl epic new` and migration.py's slug derivation
+# both validate against the exact same pattern -- one definition, not two.
+EPIC_SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
 TASK_STATUSES = {
     "todo",
     "in_progress",
@@ -105,6 +110,13 @@ def new_state(
             "reviewPolicy": review_policy,
         },
         "constitution": {"status": "draft", "ratification": None},
+        # v6 (epic-scoped-state plan, spec Sec1/Sec4): null until `epic new`
+        # (Task 4) adopts a slug. Constructors never mint `archivePending`/
+        # `archiveBlocked` either -- those are Task 6's archive transaction's
+        # sole writers.
+        "epic": None,
+        "archivePending": None,
+        "archiveBlocked": None,
         "tasks": {},
         "reconcile": {
             "everyNMerges": reconcile_every_n_merges,
@@ -174,6 +186,52 @@ def _require_string(value: Any, name: str, *, nullable: bool = False) -> None:
         raise ValidationError(f"{name} must be a non-empty string")
 
 
+def validate_epic_slug(value: Any, *, name: str = "epic") -> None:
+    """Slug-or-null shape for `state.epic` (spec Sec1): `None` means no
+    active epic; a non-null value must match `EPIC_SLUG_PATTERN`. Exported
+    so migration.py's slug derivation can validate its own output against
+    the identical rule `epic new` (Task 4) will enforce at creation time."""
+    if value is None:
+        return
+    if not isinstance(value, str) or not EPIC_SLUG_PATTERN.match(value):
+        raise ValidationError(f"{name} must match [a-z0-9][a-z0-9-]{{1,63}} or be null: {value!r}")
+
+
+# Evidence-binding fields (epic-scoped-state plan Task 3, spec Sec2): a review
+# record additionally binds the resolved risk tier and review model it ran
+# under, and every review/verification record (task- and finalize-level)
+# carries the purpose-projected config digest at recording time under
+# `configSha256`. All three are OPTIONAL here on purpose -- validation stays
+# permissive for legacy-stamped records (pre-migration evidence has none of
+# these keys at all) but shape-checks whichever of them IS present. Task 5
+# is the first real writer for freshly-recorded evidence; migration.py is the
+# only writer that back-fills them onto pre-existing v5 records. Field names
+# (`resolvedRisk`, `reviewModel`, `configSha256`) are this task's own choice
+# -- the spec names the concepts, not the wire keys -- so any consumer added
+# later (Task 5's gates) must read/write these same names.
+def _validate_review_evidence_extras(
+    review: Any, name: str, *, allow_resolved_risk: bool
+) -> None:
+    if review is None or not isinstance(review, dict):
+        return
+    if "resolvedRisk" in review:
+        if not allow_resolved_risk:
+            raise ValidationError(f"{name}.resolvedRisk is not recognized here")
+        if review["resolvedRisk"] not in RISK_LEVELS:
+            raise ValidationError(f"{name}.resolvedRisk must be one of {sorted(RISK_LEVELS)}")
+    if "reviewModel" in review:
+        _require_string(review.get("reviewModel"), f"{name}.reviewModel", nullable=True)
+    if "configSha256" in review:
+        _require_string(review.get("configSha256"), f"{name}.configSha256")
+
+
+def _validate_verification_evidence_extras(verification: Any, name: str) -> None:
+    if verification is None or not isinstance(verification, dict):
+        return
+    if "configSha256" in verification:
+        _require_string(verification.get("configSha256"), f"{name}.configSha256")
+
+
 def validate_state(state: dict[str, Any]) -> None:
     if not isinstance(state, dict):
         raise ValidationError("controller state must be an object")
@@ -181,7 +239,7 @@ def validate_state(state: dict[str, Any]) -> None:
         found = state.get("schemaVersion")
         hint = (
             " run 'wddctl --state <path> migrate --dry-run' to convert it"
-            if found in {2, 3, 4}
+            if found in {2, 3, 4, 5}
             else ""
         )
         raise ValidationError(
@@ -190,6 +248,29 @@ def validate_state(state: dict[str, Any]) -> None:
     revision = state.get("revision")
     if not isinstance(revision, int) or revision < 0:
         raise ValidationError("revision must be a non-negative integer")
+
+    validate_epic_slug(state.get("epic"))
+
+    archive_pending = state.get("archivePending")
+    if archive_pending is not None:
+        archive_pending = _require_mapping(archive_pending, "archivePending")
+        _require_string(archive_pending.get("slug"), "archivePending.slug")
+        source_revision = archive_pending.get("sourceRevision")
+        if (
+            not isinstance(source_revision, int)
+            or isinstance(source_revision, bool)
+            or source_revision < 0
+        ):
+            raise ValidationError("archivePending.sourceRevision must be a non-negative integer")
+        _require_string(archive_pending.get("archivedAt"), "archivePending.archivedAt")
+        _require_string(archive_pending.get("recordSha256"), "archivePending.recordSha256")
+
+    archive_blocked = state.get("archiveBlocked")
+    if archive_blocked is not None:
+        archive_blocked = _require_mapping(archive_blocked, "archiveBlocked")
+        _require_string(archive_blocked.get("slug"), "archiveBlocked.slug")
+        _require_string(archive_blocked.get("collidingPath"), "archiveBlocked.collidingPath")
+        _require_string(archive_blocked.get("at"), "archiveBlocked.at")
 
     scope = state.get("scope")
     if scope is None:
@@ -264,6 +345,12 @@ def validate_state(state: dict[str, Any]) -> None:
             value = task.get(field)
             if value is not None and not isinstance(value, dict):
                 raise ValidationError(f"tasks.{task_id}.{field} must be an object or null")
+        _validate_review_evidence_extras(
+            task.get("review"), f"tasks.{task_id}.review", allow_resolved_risk=True
+        )
+        _validate_verification_evidence_extras(
+            task.get("verification"), f"tasks.{task_id}.verification"
+        )
         freshness = task.get("freshness")
         if freshness is not None and not isinstance(freshness, dict):
             raise ValidationError(f"tasks.{task_id}.freshness must be an object or null")
@@ -314,6 +401,11 @@ def validate_state(state: dict[str, Any]) -> None:
             value = finalize.get(field)
             if value is not None and not isinstance(value, dict):
                 raise ValidationError(f"finalize.{field} must be an object or null")
+        # finalReview evidence binds a model but no per-task risk tier (spec
+        # Sec2: "final review records its selected model").
+        _validate_review_evidence_extras(
+            finalize.get("review"), "finalize.review", allow_resolved_risk=False
+        )
         _validate_finalize_verification(finalize.get("verification"))
         # Optional key: delivered (dict with non-empty-string at, by, headSha when present).
         delivered = finalize.get("delivered")
@@ -387,27 +479,58 @@ def _validate_finalize_verification(verification: Any) -> None:
         _require_string(
             verification.get("justification"), "finalize.verification.justification", nullable=True
         )
+    _validate_verification_evidence_extras(verification, "finalize.verification")
 
 
-_INTAKE_RECORD_KEYS = {"spec", "research", "design"}
+_INTAKE_RECORD_KEYS = {"spec", "research", "design", "configure"}
+
+
+def _validate_configure(configure: Any, *, name: str = "intake.configure") -> None:
+    """Shape for `intake.configure` (epic-scoped-state plan Task 3, spec
+    Sec2/Sec4): either the real attributed approval `{by, at, sha256}`
+    (Task 5's `intake configure` verb) or migration's exemption shape
+    `{"legacy": true, "sha256": ...}` -- the full effective-config digest at
+    MIGRATION time, standing in for a human's attribution. Constructors never
+    mint either shape; only `intake configure` (Task 5) and migration.py do.
+    """
+    if configure is None:
+        return
+    configure = _require_mapping(configure, name)
+    if configure.get("legacy") is True:
+        extra = set(configure) - {"legacy", "sha256"}
+        if extra:
+            raise ValidationError(f"{name} legacy exemption has unknown keys: {sorted(extra)}")
+        _require_string(configure.get("sha256"), f"{name}.sha256")
+        return
+    _require_string(configure.get("by"), f"{name}.by")
+    _require_string(configure.get("at"), f"{name}.at")
+    _require_string(configure.get("sha256"), f"{name}.sha256")
 
 
 def _validate_intake(intake: dict[str, Any]) -> None:
-    """Validate the required `intake` section (schema v5).
+    """Validate the required `intake` section (schema v6).
 
-    Valid shapes: `{"legacy": True}` (migration-only exemption, see
-    migration.py) or any subset of `{spec, research, design}` records, each
-    bound to the artifact bytes that were approved (governance_fingerprint
-    idiom).
+    Valid shapes: `{"legacy": True}`, optionally with a sibling `configure`
+    (v6, epic-scoped-state plan: a v5-legacy scope migrated to v6 "keeps
+    intake.legacy but likewise gains the same migration-time full-config
+    digest" per spec Sec4) -- or any subset of `{spec, research, design,
+    configure}` records, each bound to the artifact bytes (or, for
+    `configure`, the config view) that were approved
+    (governance_fingerprint idiom).
     """
     if "legacy" in intake:
-        if intake.get("legacy") is not True or intake.keys() != {"legacy"}:
-            raise ValidationError("intake.legacy must be the sole key, set to true")
+        if intake.get("legacy") is not True:
+            raise ValidationError("intake.legacy must be true when present")
+        extra = set(intake) - {"legacy", "configure"}
+        if extra:
+            raise ValidationError(f"intake has unknown keys: {sorted(extra)}")
+        _validate_configure(intake.get("configure"))
         return
 
     unknown = set(intake) - _INTAKE_RECORD_KEYS
     if unknown:
         raise ValidationError(f"intake has unknown keys: {sorted(unknown)}")
+    _validate_configure(intake.get("configure"))
 
     spec = intake.get("spec")
     if spec is not None:

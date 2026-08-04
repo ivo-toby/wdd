@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .config import effective_config_digest, project
 from .engine import apply_event
 from .errors import IllegalTransition, ValidationError
 from .git import is_ancestor, require_repository, resolve_ref, run_git
@@ -99,6 +100,102 @@ def evidence_shas(
     return base_sha, head_sha
 
 
+def resolved_review_model(task: dict[str, Any], models: dict[str, Any] | None) -> str | None:
+    """The review model a task's evidence binds to (spec Sec2: "the selected
+    review model it actually ran under"). Hand-synced twin of
+    `engine._resolve_model`'s run_review branch / `runner._resolve_dispatch_model`
+    / `migration._resolve_review_model_for_stamp` -- all four implement the
+    identical precedence (task override -> risk-tiered `models.review` ->
+    None); keep them in step if it ever changes. A task-level `reviewModel`
+    override always wins; otherwise `models.review`, tiered by the task's own
+    risk when given in object form (a plain string means both tiers).
+    """
+    override = task.get("reviewModel")
+    if isinstance(override, str) and override:
+        return override
+    if not models:
+        return None
+    review = models.get("review")
+    if isinstance(review, dict):
+        tier = "highRisk" if task.get("risk") == "high" else "default"
+        value = review.get(tier)
+    else:
+        value = review
+    return value if isinstance(value, str) and value else None
+
+
+def _evidence_binding(task: dict[str, Any], layers: dict[str, Any] | None) -> dict[str, Any]:
+    """The resolved-decision + projection-digest fields a fresh task review
+    record binds to (spec Sec2), or `{}` with no config available at all
+    (legacy repos predating config.json -- optional per schema.py)."""
+    if layers is None:
+        return {}
+    return {
+        "resolvedRisk": task.get("risk"),
+        "reviewModel": resolved_review_model(task, layers["effective"].get("models")),
+        "configSha256": effective_config_digest(project(layers["effective"], "taskReview")),
+    }
+
+
+def _verification_evidence_binding(layers: dict[str, Any] | None) -> dict[str, Any]:
+    if layers is None:
+        return {}
+    return {
+        "configSha256": effective_config_digest(project(layers["effective"], "taskVerification")),
+    }
+
+
+def review_evidence_stale(task: dict[str, Any], layers: dict[str, Any]) -> str | None:
+    """None if a task's recorded review evidence still matches what the
+    CURRENT effective config + task state would produce; else a message
+    naming the mismatch (spec Sec2: "Config projections alone are not
+    sufficient for review evidence... review records additionally bind their
+    resolved decision values"). Consulted by merge's gate (Task 5) in
+    addition to `engine.task_gate`'s own dynamic `review_required` check --
+    the two are complementary: a policy that already required review
+    (`always`) does not newly demand one when risk rises, so only comparing
+    the BOUND resolvedRisk/reviewModel/digest against fresh values catches a
+    review that ran under decisions that no longer hold.
+    """
+    review = task.get("review")
+    if not isinstance(review, dict):
+        return None
+    current_risk = task.get("risk")
+    if "resolvedRisk" in review and review["resolvedRisk"] != current_risk:
+        return (
+            f"recorded review resolvedRisk {review['resolvedRisk']!r} no longer matches "
+            f"the task's current risk {current_risk!r}"
+        )
+    if "reviewModel" in review:
+        current_model = resolved_review_model(task, layers["effective"].get("models"))
+        if review["reviewModel"] != current_model:
+            return (
+                f"recorded review reviewModel {review['reviewModel']!r} no longer matches "
+                f"the currently resolved model {current_model!r}"
+            )
+    if "configSha256" in review:
+        current_digest = effective_config_digest(project(layers["effective"], "taskReview"))
+        if review["configSha256"] != current_digest:
+            return "recorded review's config projection no longer matches the current config"
+    return None
+
+
+def verification_evidence_stale(task: dict[str, Any], layers: dict[str, Any]) -> str | None:
+    """`review_evidence_stale`'s verification-evidence counterpart (Task 5,
+    spec Sec2): compares the recorded `taskVerification` projection digest
+    against a freshly recomputed one."""
+    verification = task.get("verification")
+    if not isinstance(verification, dict):
+        return None
+    if "configSha256" in verification:
+        current_digest = effective_config_digest(project(layers["effective"], "taskVerification"))
+        if verification["configSha256"] != current_digest:
+            return (
+                "recorded verification's config projection no longer matches the current config"
+            )
+    return None
+
+
 def record_review(
     store: StateStore,
     *,
@@ -106,21 +203,24 @@ def record_review(
     findings: list[dict[str, Any]],
     reviewer: str,
     repo: Path | str | None = None,
+    layers: dict[str, Any] | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     state = store.read()
     base_sha, head_sha = evidence_shas(state, task_id, repo=repo)
+    data = {
+        "baseSha": base_sha,
+        "headSha": head_sha,
+        "findings": validate_findings(findings),
+        "reviewer": _required_string(reviewer, "reviewer"),
+    }
+    data.update(_evidence_binding(state["tasks"][task_id], layers))
     return apply_event(
         store,
         event_type="review.recorded",
         task_id=task_id,
-        data={
-            "baseSha": base_sha,
-            "headSha": head_sha,
-            "findings": validate_findings(findings),
-            "reviewer": _required_string(reviewer, "reviewer"),
-        },
+        data=data,
         idempotency_key=idempotency_key,
         expected_revision=expected_revision,
     )
@@ -133,6 +233,7 @@ def record_verification(
     status: str,
     command: str | None = None,
     repo: Path | str | None = None,
+    layers: dict[str, Any] | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
@@ -140,16 +241,18 @@ def record_verification(
         raise ValidationError("verification status must be passed, failed, or unavailable")
     state = store.read()
     base_sha, head_sha = evidence_shas(state, task_id, repo=repo)
+    data = {
+        "baseSha": base_sha,
+        "headSha": head_sha,
+        "status": status,
+        "command": command,
+    }
+    data.update(_verification_evidence_binding(layers))
     return apply_event(
         store,
         event_type="verification.recorded",
         task_id=task_id,
-        data={
-            "baseSha": base_sha,
-            "headSha": head_sha,
-            "status": status,
-            "command": command,
-        },
+        data=data,
         idempotency_key=idempotency_key,
         expected_revision=expected_revision,
     )
@@ -333,11 +436,14 @@ def collect_review(
     task_id: str,
     result_paths: list[Path | str],
     repo: Path | str | None = None,
+    layers: dict[str, Any] | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
+    state = store.read()
     result = normalize_review_results(result_paths, task_id=task_id)
-    verify_external_shas(store.read(), task_id, result, repo)
+    verify_external_shas(state, task_id, result, repo)
+    result.update(_evidence_binding(state["tasks"][task_id], layers))
     return apply_event(
         store,
         event_type="review.recorded",
@@ -354,11 +460,13 @@ def collect_verification(
     task_id: str,
     result_path: Path | str,
     repo: Path | str | None = None,
+    layers: dict[str, Any] | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     result = normalize_verification_result(result_path, task_id=task_id)
     verify_external_shas(store.read(), task_id, result, repo)
+    result.update(_verification_evidence_binding(layers))
     return apply_event(
         store,
         event_type="verification.recorded",

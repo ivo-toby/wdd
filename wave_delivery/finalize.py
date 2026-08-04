@@ -25,16 +25,17 @@ supplies the revisioned/idempotent/locked envelope" pattern
 
 from __future__ import annotations
 
+import hashlib
 import json
-import re
+import os
 import shlex
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .config import config_path, load_config, merge_settings
-from .engine import apply_mutation, utc_now
-from .errors import IllegalTransition, ValidationError
+from .config import config_path, effective_config_digest, load_config, merge_settings, project
+from .engine import apply_mutation, event_id, utc_now
+from .errors import IllegalTransition, RevisionConflict, ValidationError
 from .git import is_ancestor, require_repository, resolve_ref, run_git
 from .github import create_pr, push_branch
 from .merge import _fetched_base_refs
@@ -45,23 +46,68 @@ from .store import StateStore, atomic_write_text
 
 FINALIZE_PHASES = {"finalize", "delivered"}
 
-# validate_plan places no character restriction on scope.id (only non-empty
-# str), so it lands in archive_scope's filename unsanitized -- the one write
-# in this module without a StateStore lock guarding it, and the one place a
-# scope id doubles as a filesystem path component. Same character class as
-# the dispatch-log filename idiom (docs/superpowers/specs's dispatch design):
-# keep [A-Za-z0-9._-], replace everything else (including path separators
-# and "..") with "_", so no scope id can escape .wdd/archive/.
-_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+# `epics/<slug>/` -> `archive/<slug>/` (spec Sec1): the slug -- not
+# scope.id -- has governed archive's on-disk path since Task 6. Slugs are
+# validated against EPIC_SLUG_PATTERN at `epic new` time (setup.create_epic),
+# so no traversal/sanitization concern exists here the way it did for the
+# pre-Task-6 flat `archive/<scope-id>.json` layout (scope.id, by contrast,
+# carries no character restriction at all -- it only ever appears as JSON
+# payload data below, never as a path component).
 
 
-def _sanitize_scope_id_for_filename(scope_id: str) -> str:
-    sanitized = _UNSAFE_FILENAME_CHARS.sub("_", scope_id)
-    if not sanitized:
-        raise ValidationError(
-            f"scope id sanitizes to an empty archive filename: {scope_id!r}"
-        )
-    return sanitized
+def _final_review_model(effective: dict[str, Any]) -> str | None:
+    """The model finalize review's evidence binds to (spec Sec2: "final
+    review records its selected model"). No per-task risk tier exists at
+    scope granularity, so unlike task review this does not tier by risk --
+    matching `finalize_next_actions`'s existing (pre-Task-5) model-decoration
+    behavior exactly: `models.review` is used only when it is a plain,
+    non-empty string; a tiered object form yields no model at either site.
+    """
+    review_model = (effective.get("models") or {}).get("review")
+    return review_model if isinstance(review_model, str) and review_model else None
+
+
+def _final_review_evidence_binding(layers: dict[str, Any] | None) -> dict[str, Any]:
+    if layers is None:
+        return {}
+    effective = layers["effective"]
+    return {
+        "reviewModel": _final_review_model(effective),
+        "configSha256": effective_config_digest(project(effective, "finalReview")),
+    }
+
+
+def _final_verification_projection_digest(
+    effective: dict[str, Any], deliverable_command: str | None
+) -> str:
+    """finalVerification's projection digest additionally covers the epic
+    deliverable command (spec Sec2: "verification.*, plus the deliverable
+    command for final"). `config.project()` has no access to state, so it
+    cannot include this itself (see its own docstring, which explicitly
+    defers this to Task 5/finalize.py). Folds the command in as an extra key
+    alongside the projection before hashing with the same
+    `effective_config_digest` -- still the one fingerprint implementation,
+    just fed a slightly larger view for this one purpose. `migration.py`'s
+    v5->v6 stamp uses this same helper so the migration-time digest and a
+    freshly recomputed one are never two different implementations.
+    """
+    projection = project(effective, "finalVerification")
+    return effective_config_digest({**projection, "deliverableCommand": deliverable_command})
+
+
+def _final_verification_evidence_binding(
+    layers: dict[str, Any] | None, state: dict[str, Any]
+) -> dict[str, Any]:
+    if layers is None:
+        return {}
+    deliverable_command = ((state.get("intake") or {}).get("design") or {}).get(
+        "deliverableCommand"
+    )
+    return {
+        "configSha256": _final_verification_projection_digest(
+            layers["effective"], deliverable_command
+        ),
+    }
 
 
 def _require_finalize_phase(state: dict[str, Any]) -> None:
@@ -143,18 +189,38 @@ def _require_handoff_recorded(state: dict[str, Any]) -> None:
         )
 
 
-def _require_target_branch(wdd_dir: Path) -> tuple[str, dict[str, Any]]:
+def _require_target_branch(
+    wdd_dir: Path, layers: dict[str, Any] | None = None
+) -> tuple[str, dict[str, Any]]:
+    """`branching.targetBranch` plus the config view callers pass on to
+    `merge_settings` for the handoff surface. `layers`, when given, is the
+    caller's already-resolved admission snapshot (spec Sec2 resolve-once,
+    fix-round F2): its `effective` view is used instead of a second bare
+    `load_config` read, so an active epic's `merge.surface` override
+    (`branching.targetBranch` itself is not epic-overlay-allowed, so it is
+    identical either way) actually reaches the handoff/delivered surface
+    computation. Callers with no snapshot fall back to a fresh global read.
+    """
     if not config_path(wdd_dir).exists():
         raise IllegalTransition(
             "this scope predates config.json, so it has no configured "
             "branching.targetBranch; run 'wddctl migrate --governance' to adopt "
             "config.json (preserving any legacy model settings), then re-run this command"
         )
-    config = load_config(wdd_dir)
+    config = layers["effective"] if layers is not None else load_config(wdd_dir)
     return config["branching"]["targetBranch"], config
 
 
-def _blocking_severities(wdd_dir: Path) -> set[str]:
+def _blocking_severities(wdd_dir: Path, effective: dict[str, Any] | None = None) -> set[str]:
+    """`review.blockingSeverities`. `effective`, when given, is an already-
+    resolved admission snapshot's merged view (spec Sec2 resolve-once) --
+    this key is NOT epic-overlay-allowed (config.py's OVERLAY_ALLOWED_LEAVES),
+    so passing it only avoids a second config.json read within the same
+    command, not a missed override. Callers with no snapshot (`next`'s
+    read-only rendering) still get a fresh global read.
+    """
+    if effective is not None:
+        return set(effective["review"]["blockingSeverities"])
     if not config_path(wdd_dir).exists():
         return {"P1", "P2"}
     return set(load_config(wdd_dir)["review"]["blockingSeverities"])
@@ -170,6 +236,7 @@ def record_final_review(
     findings: list[dict[str, Any]],
     reviewer: str,
     repo: Path | str,
+    layers: dict[str, Any] | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
@@ -183,7 +250,7 @@ def record_final_review(
         raise ValidationError("reviewer must be a non-empty string")
     validated = validate_findings(findings)
     repo_path = require_repository(repo)
-    blocking = _blocking_severities(store.path.parent)
+    blocking = _blocking_severities(store.path.parent, layers["effective"] if layers else None)
 
     # Fail fast, before any (currently cheap, but not guaranteed to stay so)
     # work below runs -- mirrors the pre-lock check prepare_handoff and
@@ -205,6 +272,7 @@ def record_final_review(
             "findings": validated,
             "reviewer": reviewer,
             "at": utc_now(),
+            **_final_review_evidence_binding(layers),
         }
         return updated
 
@@ -223,14 +291,31 @@ def _is_legacy_intake(state: dict[str, Any]) -> bool:
     return (state.get("intake") or {}).get("legacy") is True
 
 
-def _required_verification_commands(state: dict[str, Any], wdd_dir: Path) -> list[str]:
+def _required_verification_commands(
+    state: dict[str, Any], wdd_dir: Path, effective: dict[str, Any] | None = None
+) -> list[str]:
     """The v5 non-legacy required command list, in order (spec Sec2/Sec5):
-    the ratified global ``verification.commands`` then the scope's epic
+    the epic-effective ``verification.commands`` then the scope's epic
     deliverable command (``intake.design.deliverableCommand`` -- always
     present on a v5 non-legacy scope that reached finalize, since the intake
     ladder must be complete before `plan apply` and the ladder never clears
-    without re-recording design)."""
-    commands = list(load_config(wdd_dir)["verification"]["commands"]) if config_path(wdd_dir).exists() else []
+    without re-recording design).
+
+    ``verification.commands`` IS epic-overlay-allowed (config.py's
+    OVERLAY_ALLOWED_LEAVES): `effective`, when given, is an already-resolved
+    admission snapshot's merged view (spec Sec2 resolve-once) and MUST be
+    consulted instead of the bare global config, or an epic's own override
+    would be silently ignored here while still feeding the
+    finalVerification digest this same evidence recording stamps. Callers
+    with no snapshot (`next`'s read-only rendering) fall back to a fresh
+    global-only read, matching this function's behavior before Task 5.
+    """
+    if effective is not None:
+        commands = list(effective["verification"]["commands"])
+    elif config_path(wdd_dir).exists():
+        commands = list(load_config(wdd_dir)["verification"]["commands"])
+    else:
+        commands = []
     design = (state.get("intake") or {}).get("design") or {}
     deliverable = design.get("deliverableCommand")
     if deliverable:
@@ -328,6 +413,7 @@ def record_final_verification(
     justification: str | None = None,
     results: list[dict[str, Any]] | None = None,
     repo: Path | str,
+    layers: dict[str, Any] | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
@@ -361,8 +447,19 @@ def record_final_verification(
         if status not in {"passed", "failed", "unavailable"}:
             raise ValidationError("verification status must be passed, failed, or unavailable")
         if status == "unavailable":
-            if not justification and config_path(wdd_dir).exists():
-                justification = load_config(wdd_dir)["verification"].get("unavailableJustification")
+            if not justification:
+                # verification.unavailableJustification IS epic-overlay-
+                # allowed: prefer the already-resolved admission snapshot
+                # (spec Sec2 resolve-once) over a second, non-epic-aware
+                # config.json read.
+                if layers is not None:
+                    justification = layers["effective"]["verification"].get(
+                        "unavailableJustification"
+                    )
+                elif config_path(wdd_dir).exists():
+                    justification = load_config(wdd_dir)["verification"].get(
+                        "unavailableJustification"
+                    )
             if not justification:
                 raise ValidationError(
                     "verification status 'unavailable' requires --justification (or a "
@@ -383,7 +480,10 @@ def record_final_verification(
         # Validated pre-lock so a bad --results refuses before any side effects;
         # re-validated inside the mutator below against the locked state, same
         # two-stage pattern as every other finalize verb in this module.
-        _validate_verification_results(results, _required_verification_commands(state, wdd_dir))
+        _validate_verification_results(
+            results,
+            _required_verification_commands(state, wdd_dir, layers["effective"] if layers else None),
+        )
 
     repo_path = require_repository(repo)
 
@@ -398,6 +498,7 @@ def record_final_verification(
         base_sha = resolve_ref(repo_path, _base_ref(state))
         updated = copied_state(state)
         updated.setdefault("finalize", {})
+        binding = _final_verification_evidence_binding(layers, state)
         if legacy:
             updated["finalize"]["verification"] = {
                 "headSha": base_sha,
@@ -405,16 +506,21 @@ def record_final_verification(
                 "command": command,
                 "justification": justification,
                 "at": utc_now(),
+                **binding,
             }
         else:
             entries = _validate_verification_results(
-                results, _required_verification_commands(state, wdd_dir)
+                results,
+                _required_verification_commands(
+                    state, wdd_dir, layers["effective"] if layers else None
+                ),
             )
             updated["finalize"]["verification"] = {
                 "headSha": base_sha,
                 "commands": entries,
                 "status": _overall_verification_status(entries),
                 "at": utc_now(),
+                **binding,
             }
         return updated
 
@@ -447,7 +553,9 @@ def _handoff_summary(state: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _require_current_finalize_evidence(state: dict[str, Any], base_sha: str) -> None:
+def _require_current_finalize_evidence(
+    state: dict[str, Any], base_sha: str, layers: dict[str, Any] | None = None
+) -> None:
     """Handoff's precondition: clean review + passed verification, both fresh.
 
     Named after what to redo, not just that evidence is missing or stale --
@@ -456,6 +564,13 @@ def _require_current_finalize_evidence(state: dict[str, Any], base_sha: str) -> 
     `finalize verify record` refuses the legacy `--status/--command`
     invocation outright (it wants `--results`), so naming the wrong contract
     here would send the operator down a dead end.
+
+    `layers`, when given, additionally re-derives the finalReview/
+    finalVerification config projections (+ finalReview's bound model) and
+    refuses if either no longer matches what the recorded evidence bound to
+    (spec Sec2, epic-scoped-state plan Task 5): a config edit after the
+    review/verification ran stales it exactly like a moved headSha does,
+    even though headSha itself did not move.
     """
     legacy = _is_legacy_intake(state)
     verify_hint = (
@@ -463,18 +578,17 @@ def _require_current_finalize_evidence(state: dict[str, Any], base_sha: str) -> 
         if legacy
         else "wddctl finalize verify record --results '[{\"command\":...,\"status\":...}, ...]' --repo ."
     )
+    review_hint = "wddctl finalize review record --reviewer NAME --findings '[]' --repo ."
     finalize = state.get("finalize") or {}
     review = finalize.get("review")
     if not isinstance(review, dict) or review.get("outcome") != "passed":
         raise IllegalTransition(
-            "handoff requires a clean final review; run 'wddctl finalize review record "
-            "--reviewer NAME --findings [] --repo .'"
+            f"handoff requires a clean final review; run '{review_hint}'"
         )
     if review.get("headSha") != base_sha:
         raise IllegalTransition(
             f"final review evidence is stale (pinned to {review.get('headSha')}, base is now "
-            f"at {base_sha}); re-run 'wddctl finalize review record --reviewer NAME "
-            "--findings [] --repo .'"
+            f"at {base_sha}); re-run '{review_hint}'"
         )
     verification = finalize.get("verification")
     if not isinstance(verification, dict) or verification.get("status") != "passed":
@@ -484,12 +598,36 @@ def _require_current_finalize_evidence(state: dict[str, Any], base_sha: str) -> 
             f"final verification evidence is stale (pinned to {verification.get('headSha')}, "
             f"base is now at {base_sha}); re-run '{verify_hint}'"
         )
+    if layers is not None:
+        expected_review = _final_review_evidence_binding(layers)
+        if "reviewModel" in review and review.get("reviewModel") != expected_review["reviewModel"]:
+            raise IllegalTransition(
+                f"final review evidence is stale (recorded reviewModel "
+                f"{review.get('reviewModel')!r} no longer matches the currently resolved "
+                f"{expected_review['reviewModel']!r}); re-run '{review_hint}'"
+            )
+        if "configSha256" in review and review.get("configSha256") != expected_review["configSha256"]:
+            raise IllegalTransition(
+                "final review evidence is stale (its config projection no longer matches "
+                f"the current config); re-run '{review_hint}'"
+            )
+        expected_verification = _final_verification_evidence_binding(layers, state)
+        if (
+            "configSha256" in verification
+            and verification.get("configSha256") != expected_verification["configSha256"]
+        ):
+            raise IllegalTransition(
+                "final verification evidence is stale (its config projection -- including "
+                f"the epic deliverable command -- no longer matches the current config); "
+                f"re-run '{verify_hint}'"
+            )
 
 
 def prepare_handoff(
     store: StateStore,
     *,
     repo: Path | str,
+    layers: dict[str, Any] | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
@@ -509,7 +647,7 @@ def prepare_handoff(
     _require_not_delivered(state, what="hand off")
     base_ref = _base_ref(state)
     base_sha = resolve_ref(repo_path, base_ref)
-    target_branch, config = _require_target_branch(wdd_dir)
+    target_branch, config = _require_target_branch(wdd_dir, layers)
     # Checked before the review/verification evidence gate: there is no
     # point asking for a clean review of a branch that has nothing to
     # deliver, and this is the guard that closes the vacuous-ancestry
@@ -517,7 +655,7 @@ def prepare_handoff(
     # with no merged work hits, not something masked by a missing-evidence
     # message that would send the operator down the wrong path.
     _require_something_to_deliver(repo_path, base_sha, target_branch)
-    _require_current_finalize_evidence(state, base_sha)
+    _require_current_finalize_evidence(state, base_sha, layers)
     surface = merge_settings(state, config)["surface"]
 
     pr_url: str | None = None
@@ -558,7 +696,7 @@ def prepare_handoff(
                 f"{current_base_sha}); re-run 'wddctl finalize handoff --repo .'"
             )
         _require_something_to_deliver(repo_path, base_sha, target_branch)
-        _require_current_finalize_evidence(current, base_sha)
+        _require_current_finalize_evidence(current, base_sha, layers)
         updated = copied_state(current)
         updated.setdefault("finalize", {})
         updated["finalize"]["handoff"] = {
@@ -590,6 +728,7 @@ def record_delivered(
     *,
     by: str,
     repo: Path | str,
+    layers: dict[str, Any] | None = None,
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
@@ -625,7 +764,7 @@ def record_delivered(
     _require_not_delivered(state, what="deliver")
     _require_handoff_recorded(state)
     base_ref = _base_ref(state)
-    target_branch, _config = _require_target_branch(wdd_dir)
+    target_branch, _config = _require_target_branch(wdd_dir, layers)
 
     run_git(repo_path, "fetch", "origin", target_branch, check=False)
 
@@ -677,7 +816,7 @@ def _final_review_judgment(state: dict[str, Any]) -> str:
     """
     base = (
         "dispatch a reviewer against the whole epic branch diff, per wdd-review's "
-        "final-review contract, checked against .wdd/spec.md"
+        "final-review contract, checked against spec.md"
     )
     if _is_legacy_intake(state):
         return base
@@ -685,7 +824,7 @@ def _final_review_judgment(state: dict[str, Any]) -> str:
     if not criteria:
         return base
     return (
-        f"{base}; walk .wdd/spec.md's acceptance criteria AC-1..AC-{criteria} in order and "
+        f"{base}; walk spec.md's acceptance criteria AC-1..AC-{criteria} in order and "
         "confirm design.md's epic deliverable statement is observably true"
     )
 
@@ -862,6 +1001,280 @@ def finalize_next_actions(
     }
 
 
+# ---------------------------------------------------------------------------
+# `wddctl scope archive`: spec Sec1's four-step recoverable transaction, plus
+# the exhaustive recovery matrix that makes crashing at any step safe. Every
+# state write below happens while `store.locked()` is held for the whole
+# transaction (never released and re-acquired mid-way -- `apply_mutation`
+# cannot be called from in here: its own `store.locked()` would deadlock
+# against the lock this code already holds, since it is not reentrant), so
+# the manual envelope-writing in `_apply_locked_event` mirrors
+# `apply_mutation`'s own bookkeeping (revision bump, one event, idempotency
+# key, telemetry) by hand -- the same "handwritten mutator, apply_mutation's
+# envelope semantics without apply_mutation itself" idiom `setup.init_repository`
+# already uses for its own locked-but-not-apply_mutation write.
+# ---------------------------------------------------------------------------
+
+
+def generate_archive_record(state: dict[str, Any], archived_at: str) -> dict[str, Any]:
+    """The archive record's contents: a pure, deterministic function of
+    `state` plus the one nondeterministic input, `archived_at` (spec Sec1
+    "record generation is a deterministic function of the state at
+    sourceRevision -- excluding the archivePending journal event itself --
+    plus the journal's archivedAt"). Same shape as the pre-Task-6 flat
+    archive payload (scope/tasks/intake/finalize/reconcile/leases/
+    eventCount/archivedAt); only WHERE it is written changed (inside
+    `epics/<slug>/`, then moved wholesale by the step-3 rename).
+
+    `state["archivePending"]`, when present, means the journal event (step
+    2) has already been appended and revision already bumped once beyond
+    what generated the ORIGINAL record -- so `eventCount` here excludes that
+    one trailing event, making a post-step-2 (or later) regeneration from
+    live state byte-identical to what step 1 wrote before that event ever
+    existed. This is what makes `recordSha256` always reproducible: nothing
+    about the record is unreconstructable.
+    """
+    events = state.get("events") or []
+    if state.get("archivePending") is not None:
+        events = events[:-1]
+    return {
+        "scope": state.get("scope"),
+        "tasks": state.get("tasks"),
+        "intake": state.get("intake"),
+        "finalize": state.get("finalize"),
+        "reconcile": state.get("reconcile"),
+        "leases": state.get("leases") or {},
+        "eventCount": len(events),
+        "archivedAt": archived_at,
+    }
+
+
+def _canonical_record_bytes(record: dict[str, Any]) -> bytes:
+    """Byte-stable serialization shared by the on-disk `record.json` write
+    and the `recordSha256` hash, so "the bytes we hashed" and "the bytes we
+    wrote" can never drift apart. Pretty-printed (indent=2) like every other
+    `.wdd/` JSON file; `sort_keys=True` recurses into every nested object, so
+    key order never affects the digest -- `generate_archive_record` twice
+    from the same inputs always yields identical bytes here.
+    """
+    return (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _record_sha256(record_bytes: bytes) -> str:
+    return f"sha256:{hashlib.sha256(record_bytes).hexdigest()}"
+
+
+def _verify_or_regenerate_record(
+    state: dict[str, Any], record_path: Path, archive_pending: dict[str, Any]
+) -> None:
+    """Recovery's "verify record.json against recordSha256 (regenerate from
+    the still-live state if missing/corrupt)" step, shared by recovery rows
+    A and B -- both verify/regenerate the SAME way, only the path (still
+    inside `epics/<slug>/`, or already moved to `archive/<slug>/`) differs.
+    The state itself is authoritative in both rows (the reset has not
+    happened yet either way), so `generate_archive_record` is called
+    against it unconditionally when regeneration is needed.
+    """
+    expected_sha = archive_pending["recordSha256"]
+    valid = False
+    if record_path.exists():
+        try:
+            valid = _record_sha256(record_path.read_bytes()) == expected_sha
+        except OSError:
+            valid = False
+    if valid:
+        return
+    record = generate_archive_record(state, archive_pending["archivedAt"])
+    record_bytes = _canonical_record_bytes(record)
+    if _record_sha256(record_bytes) != expected_sha:
+        raise ValidationError(
+            f"regenerated archive record for slug {archive_pending['slug']!r} does not "
+            f"match the journaled recordSha256 ({expected_sha}); the live state no longer "
+            "reproduces the record it originally journaled -- this should be unreachable "
+            "(archivePending is only ever journaled from the exact state that generated the "
+            "record) and needs manual inspection of .wdd/state.json"
+        )
+    atomic_write_text(record_path, record_bytes.decode("utf-8"))
+
+
+def _reset_to_post_ratification(current: dict[str, Any]) -> dict[str, Any]:
+    """Step 4's reset target (spec Sec1): every scope-carrying section wiped
+    to `new_setup_state()`'s fresh shape (scope null, tasks empty, `finalize`
+    absent, intake reset to `{}` -- a fresh ladder, NOT re-marked legacy --
+    reconcile and monitoring fresh, `epic`/`archivePending`/`archiveBlocked`
+    all null/absent), governance and the audit trail (constitution, events,
+    appliedIdempotencyKeys, telemetry) carried over untouched. `leases` is
+    archived into the record above, then dropped entirely -- `new_setup_state`
+    produces no `leases` key at all, not a zeroed `{}`. Shared by the
+    ordinary (uncrashed) step 4 and recovery rows A/B's completion, which
+    reset to this exact same shape; `revision` is left as `current`'s own
+    (unbumped) so the caller's own `_apply_locked_event` bump lands on top.
+    """
+    fresh = new_setup_state()
+    fresh["constitution"] = current["constitution"]
+    fresh["events"] = current["events"]
+    fresh["appliedIdempotencyKeys"] = current["appliedIdempotencyKeys"]
+    fresh["telemetry"] = current["telemetry"]
+    fresh["revision"] = current["revision"]
+    # Probes are machine observations keyed by runner-command digest, not
+    # scope state (spec Sec1: "nothing scope-specific leaks forward" -- and
+    # probes are exactly NOT scope-specific): they survive the reset, or the
+    # next epic re-probes commands whose evidence never expired (Task 6
+    # review finding; the v5 flat archive shared this bug).
+    if current.get("probes"):
+        fresh["probes"] = current["probes"]
+    return fresh
+
+
+def _apply_locked_event(
+    state: dict[str, Any],
+    event_type: str,
+    data: dict[str, Any],
+    *,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Hand-roll `apply_mutation`'s write envelope (revision bump, one
+    event, idempotency-key bookkeeping, telemetry) for a state mutation that
+    runs OUTSIDE `apply_mutation` itself. `archive_scope`'s steps 2 and 4,
+    plus recovery's row completions, all need this: none of them may call
+    `apply_mutation` (it acquires `store.locked()`, and the lock this code
+    already runs under is not reentrant -- nesting it would deadlock).
+    """
+    updated = copied_state(state)
+    updated["revision"] = state["revision"] + 1
+    key = idempotency_key or event_id(updated["revision"], event_type, None, data)
+    updated["events"].append(
+        {
+            "revision": updated["revision"],
+            "type": event_type,
+            "task": None,
+            "idempotencyKey": key,
+            "at": utc_now(),
+        }
+    )
+    updated["appliedIdempotencyKeys"].append(key)
+    updated["telemetry"]["eventApplications"] += 1
+    return updated
+
+
+def recover_archive_transaction(state: dict[str, Any], wdd_dir: Path | str) -> dict[str, Any]:
+    """The archive-transaction recovery matrix (spec Sec1), run under the
+    state lock -- assumed already held by the caller (`StateStore.
+    recover_locked`, itself called by `apply_mutation` and `load_recovered`).
+    Returns `state` completely unchanged (the SAME object, checked by
+    identity) when nothing needs recovering, so the caller knows not to
+    persist anything; otherwise returns a freshly built state the caller
+    must write.
+
+    NEVER scans, reads, or otherwise touches anything under `archive/`
+    beyond the exact path named by `archivePending.slug` or `archiveBlocked.
+    slug` -- a completed archive's own `record.json` with no journal is the
+    *success* state, not recovery's business, and pre-v6 archive files (or
+    any other epic's archived directory) are never looked at.
+
+    Six recoverable/terminal rows, exhaustively, any other on-disk
+    combination is a hard `ValidationError` naming the observed facts:
+
+    1. journal set, source (`epics/<slug>/`) present, destination
+       (`archive/<slug>/`) absent -> verify/regenerate `record.json`, retry
+       the rename, complete the reset.
+    2. journal set, destination present, source absent -> verify/regenerate
+       the ARCHIVED `record.json` (the reset has not happened -- state is
+       still authoritative), complete the reset only.
+    3. journal set, BOTH present (external collision) -> remove the
+       generated record.json, clear the journal, write a durable
+       `archiveBlocked` (event `scope.archive_blocked`).
+    4. journal set, neither present -> hard error (nothing guessed).
+    5. no journal, `archiveBlocked` set, both directories present -> the
+       legal post-rollback resting state; nothing is touched (`next`
+       surfaces the blocker from the durable field).
+    6. no journal, no block: a stray `record.json` inside the ACTIVE epic's
+       own directory (`epics/<state.epic>/`) is a step-1 crash (the
+       transaction never reached step 2) -- remove it and proceed. Scoped to
+       `state.epic` only, never any other directory under `epics/`.
+    """
+    wdd_dir = Path(wdd_dir)
+    archive_pending = state.get("archivePending")
+
+    if archive_pending is not None:
+        slug = archive_pending["slug"]
+        epic_dir = wdd_dir / "epics" / slug
+        archive_dir = wdd_dir / "archive" / slug
+        source_exists = epic_dir.is_dir()
+        dest_exists = archive_dir.exists()
+
+        if source_exists and not dest_exists:
+            # Row 1.
+            _verify_or_regenerate_record(state, epic_dir / "record.json", archive_pending)
+            # os.rename requires the destination's PARENT to already exist;
+            # `archive/` itself is never otherwise created (unlike the old
+            # flat-file layout, whose atomic_write_text implicitly mkdir'd
+            # it) since nothing under it is ever written directly.
+            archive_dir.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(epic_dir, archive_dir)
+            return _apply_locked_event(
+                _reset_to_post_ratification(state), "scope.archived", {"slug": slug}
+            )
+
+        if dest_exists and not source_exists:
+            # Row 2.
+            _verify_or_regenerate_record(state, archive_dir / "record.json", archive_pending)
+            return _apply_locked_event(
+                _reset_to_post_ratification(state), "scope.archived", {"slug": slug}
+            )
+
+        if source_exists and dest_exists:
+            # Row 3: external collision -- do not retry forever.
+            generated_record = epic_dir / "record.json"
+            if generated_record.exists():
+                generated_record.unlink()
+            blocked = copied_state(state)
+            blocked["archivePending"] = None
+            blocked["archiveBlocked"] = {
+                "slug": slug,
+                "collidingPath": str(archive_dir),
+                "at": utc_now(),
+            }
+            return _apply_locked_event(blocked, "scope.archive_blocked", {"slug": slug})
+
+        # Row 4: neither path exists -- nothing to verify, nothing to guess.
+        raise ValidationError(
+            f"scope archive is journaled (slug {slug!r}, recorded at "
+            f"{archive_pending.get('archivedAt')!r}) but neither epics/{slug}/ nor "
+            f"archive/{slug}/ exists on disk; this cannot be recovered automatically -- "
+            "inspect .wdd/ by hand"
+        )
+
+    archive_blocked = state.get("archiveBlocked")
+    if archive_blocked is not None:
+        # Row 5: the legal resting state -- untouched regardless of whether
+        # the collision is still there or has since been resolved (a human
+        # can remove `collidingPath` at any time; recovery itself does not
+        # act on that -- `scope archive`'s own re-run logic is what clears
+        # `archiveBlocked` and starts fresh, per spec Sec1). The one
+        # invariant recovery actually cares about is that the epic's own
+        # content (the transaction's SOURCE) is still there to resume from.
+        slug = archive_blocked["slug"]
+        epic_dir = wdd_dir / "epics" / slug
+        if epic_dir.is_dir():
+            return state
+        colliding = archive_blocked["collidingPath"]
+        raise ValidationError(
+            f"state.archiveBlocked names slug {slug!r}, but epics/{slug}/ no longer exists "
+            f"on disk (recorded colliding path: {colliding}); this cannot be recovered "
+            "automatically -- inspect .wdd/ by hand"
+        )
+
+    # Row 6: no journal, no durable block -- the only remaining recoverable
+    # shape is a step-1 crash, scoped to the ACTIVE epic only.
+    active_epic = state.get("epic")
+    if active_epic is not None:
+        stray_record = wdd_dir / "epics" / active_epic / "record.json"
+        if stray_record.exists():
+            stray_record.unlink()
+    return state
+
+
 def archive_scope(
     store: StateStore,
     *,
@@ -869,87 +1282,113 @@ def archive_scope(
     expected_revision: int | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
-    """`wddctl scope archive`: the ladder's final transition (spec Sec1's rollover).
+    """`wddctl scope archive`: the ladder's final transition (spec Sec1's
+    rollover), now a recoverable transaction under the state lock:
 
-    Delivered-phase only: moves the completed scope's records (scope, tasks,
-    intake, finalize, reconcile incl. pendingNotes, leases -- every task's
-    lease history, worktree/branch/timestamps included -- an event count, and
-    an archived-at timestamp) to ``.wdd/archive/<scope-id>.json`` via
-    ``atomic_write_text``, then resets every scope-carrying section of state
-    to ``new_setup_state()``'s fresh shape in ONE ``apply_mutation``: scope
-    null, tasks empty, ``finalize`` removed entirely, intake reset to ``{}``
-    (a fresh ladder -- NOT re-marked legacy; the next scope walks the ladder
-    for real), reconcile fully fresh (counters and pendingNotes both),
-    monitoring observations cleared, and ``leases`` absent (``new_setup_state``
-    produces no ``leases`` key at all -- it is archived above, then dropped,
-    not preserved and not zeroed to ``{}``). Governance (constitution/
-    ratification) and the audit trail (events, appliedIdempotencyKeys,
-    telemetry) are deliberately left untouched -- archiving retires a scope's
-    data, not the repository's own history or its ratified process.
+    1. Write `record.json` (deterministic, `generate_archive_record`)
+       INSIDE `epics/<slug>/` -- the reserved filename `epic new` and the
+       typed resolver both already refuse.
+    2. Journal `state.archivePending = {slug, sourceRevision, archivedAt,
+       recordSha256}`.
+    3. One atomic `os.rename(epics/<slug>, archive/<slug>)`.
+    4. Reset state to `_reset_to_post_ratification`'s fresh setup shape,
+       clearing `archivePending` (and `epic`) along with everything else
+       scope-carrying. `next` emits `agree_spec` (by way of `create_epic`)
+       immediately afterward, same as any other ratified-but-scope-null
+       state -- no bespoke rollover logic is needed in setup.py.
 
-    The no-leak guarantee is total, not counters-only: nothing scope-specific
-    (the deliverable command included, since it lives only in ``intake.design``
-    and ``finalize``, both wiped) survives into the next scope. `next` emits
-    `agree_spec` immediately afterward, same as any other ratified-but-scope-
-    null state -- no bespoke rollover logic is needed in setup.py.
+    The whole transaction runs inside ONE `store.locked()` block (never
+    released between steps) -- crash-recovery for every step is
+    `recover_archive_transaction`'s job, invoked here too (via
+    `store.recover_locked()`) so a call that finds a PRIOR crash first heals
+    it transparently before doing anything else. A durable `archiveBlocked`
+    left by a prior collision (recovery row 3) is resolved here, not by
+    recovery itself: if the colliding path is gone, the block is lifted and
+    a fresh transaction starts in the same call; if it is still there, this
+    refuses, naming it.
     """
     wdd_dir = store.path.parent
     require_repository(repo)
-    state = store.read()
-    phase = derived_phase(state)
-    if phase != "delivered":
-        raise IllegalTransition(
-            f"scope archive requires the scope to be delivered (it is {phase}); finish the "
-            "finalize ladder through 'wddctl finalize delivered --by NAME --repo .' first"
-        )
-    scope_id = state["scope"]["id"]
+    with store.locked():
+        state = store.recover_locked()
 
-    archive_path = wdd_dir / "archive" / f"{_sanitize_scope_id_for_filename(scope_id)}.json"
-    payload = {
-        "scope": state.get("scope"),
-        "tasks": state.get("tasks"),
-        "intake": state.get("intake"),
-        "finalize": state.get("finalize"),
-        "reconcile": state.get("reconcile"),
-        "leases": state.get("leases") or {},
-        "eventCount": len(state.get("events") or []),
-        "archivedAt": utc_now(),
-    }
-    atomic_write_text(archive_path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        clear_archive_blocked = False
+        archive_blocked = state.get("archiveBlocked")
+        if archive_blocked is not None:
+            colliding_path = Path(archive_blocked["collidingPath"])
+            if colliding_path.exists():
+                raise IllegalTransition(
+                    f"scope archive is blocked: {colliding_path} already exists, colliding "
+                    f"with epic slug {archive_blocked['slug']!r}; move or remove it, then "
+                    "re-run 'wddctl scope archive --repo .' to start a fresh transaction"
+                )
+            clear_archive_blocked = True
 
-    def mutator(current: dict[str, Any]) -> dict[str, Any]:
-        current_phase = derived_phase(current)
-        if current_phase != "delivered":
+        phase = derived_phase(state)
+        if phase != "delivered":
             raise IllegalTransition(
-                f"scope archive requires the scope to be delivered (it is {current_phase}); "
-                "finish the finalize ladder through 'wddctl finalize delivered --by NAME "
-                "--repo .' first"
+                f"scope archive requires the scope to be delivered (it is {phase}); finish "
+                "the finalize ladder through 'wddctl finalize delivered --by NAME --repo .' "
+                "first"
             )
-        fresh = new_setup_state()
-        # Governance and the audit trail survive the reset -- only the
-        # scope-carrying sections new_setup_state() already produces fresh
-        # (scope, tasks, intake, reconcile, monitoring; finalize absent) are
-        # actually new here. Leases are archived above (in `payload`) then
-        # dropped, not preserved: new_setup_state() produces no "leases" key
-        # at all, so the reset state has none, matching that fresh shape.
-        fresh["constitution"] = current["constitution"]
-        fresh["events"] = current["events"]
-        fresh["appliedIdempotencyKeys"] = current["appliedIdempotencyKeys"]
-        fresh["telemetry"] = current["telemetry"]
-        return fresh
 
-    state, duplicate = apply_mutation(
-        store,
-        event_type="scope.archived",
-        task_id=None,
-        data={"scopeId": scope_id},
-        idempotency_key=idempotency_key,
-        expected_revision=expected_revision,
-        mutator=mutator,
-    )
+        if idempotency_key and idempotency_key in state["appliedIdempotencyKeys"]:
+            return {"revision": state["revision"], "duplicate": True}
+        if expected_revision is not None and state["revision"] != expected_revision:
+            raise RevisionConflict(
+                f"expected revision {expected_revision}, found {state['revision']}"
+            )
+
+        slug = state.get("epic")
+        if slug is None:
+            raise IllegalTransition(
+                "scope archive requires an active epic (state.epic is unset); this scope "
+                "predates the epic-scoped-state migration and has no epics/<slug>/ directory "
+                "to archive"
+            )
+        scope_id = state["scope"]["id"]
+        epic_dir = wdd_dir / "epics" / slug
+        archive_dir = wdd_dir / "archive" / slug
+        if not epic_dir.is_dir():
+            raise ValidationError(f"epics/{slug}/ does not exist; cannot archive")
+        if archive_dir.exists():
+            raise ValidationError(
+                f"archive/{slug}/ already exists; slugs are unique across epics/ and "
+                "archive/ -- this should be unreachable"
+            )
+
+        archived_at = utc_now()
+        record = generate_archive_record(state, archived_at)
+        record_bytes = _canonical_record_bytes(record)
+        record_sha256 = _record_sha256(record_bytes)
+        atomic_write_text(epic_dir / "record.json", record_bytes.decode("utf-8"))  # Step 1
+
+        source_revision = state["revision"]
+        pending_state = copied_state(state)
+        pending_state["archivePending"] = {
+            "slug": slug,
+            "sourceRevision": source_revision,
+            "archivedAt": archived_at,
+            "recordSha256": record_sha256,
+        }
+        if clear_archive_blocked:
+            pending_state["archiveBlocked"] = None
+        pending_state = _apply_locked_event(
+            pending_state, "scope.archive_pending", {"slug": slug}, idempotency_key=idempotency_key
+        )
+        store.write(pending_state)  # Step 2
+
+        archive_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(epic_dir, archive_dir)  # Step 3
+
+        final_state = _apply_locked_event(
+            _reset_to_post_ratification(pending_state), "scope.archived", {"slug": slug}
+        )
+        store.write(final_state)  # Step 4
+
     return {
-        "archived": str(archive_path),
+        "archived": str(archive_dir / "record.json"),
         "scope": scope_id,
-        "revision": state["revision"],
-        "duplicate": duplicate,
+        "revision": final_state["revision"],
+        "duplicate": False,
     }

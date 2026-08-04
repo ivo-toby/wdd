@@ -20,12 +20,14 @@ from typing import Any
 from .engine import apply_mutation, utc_now
 from .errors import IllegalTransition, ValidationError
 from .intake import artifact_sha256, resolve_within_wdd
+from .paths import resolve_artifact
 from .schema import copied_state
 from .store import StateStore, atomic_write_text
 
 
-# Same character class as finalize.py's _sanitize_scope_id_for_filename (the
-# archive idiom, per Global Constraints): task ids double as filesystem path
+# Same character class runner.py's own _UNSAFE_FILENAME_CHARS uses (finalize.py's
+# archive path is slug-governed since Task 6, epic-scoped-state plan, and no
+# longer needs this idiom itself): task ids double as filesystem path
 # components under .wdd/dispatch/, so anything outside [A-Za-z0-9._-] is
 # replaced rather than trusted verbatim.
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
@@ -86,37 +88,49 @@ def _next_attempt_number(dispatch_dir: Path, sanitized_task_id: str) -> int:
 
 def _task_input_sources(
     state: dict[str, Any], wdd_dir: Path, task_id: str
-) -> list[Path]:
-    """Resolve a task's brief + context-ref files to absolute paths, deduped.
+) -> list[tuple[str, Path]]:
+    """Resolve a task's brief + context-ref files, deduped, as
+    ``(namespace-relative ref, resolved absolute path)`` pairs.
 
     Shared by `materialize_attempt` (copies them into a snapshot) and
     `rebind_attempt` (Task 3: re-hashes them in place against current bytes)
     -- both need the identical source-file resolution, so a re-approval that
     adds or removes a context ref is picked up the same way by either path.
-    Anchors (`#...`) are stripped for file resolution; a file referenced
-    twice (brief == a context ref, or a duplicate context ref) appears once,
-    in first-seen order (brief first, then context refs in plan order).
+    Anchors (`#...`) are stripped for file resolution -- centrally, inside
+    the one typed resolver (`wave_delivery/paths.py`'s `resolve_artifact`,
+    spec Sec1, Global Constraints), reached here via
+    `intake.resolve_within_wdd`'s label-preserving wrapper, threading
+    `state["epic"]` (Task 4). The ref is returned ALONGSIDE the resolved
+    path -- not just the resolved path alone -- because callers must record
+    and copy-destination-key by the namespace-relative ref itself, never a
+    path derived from the resolved physical location: once epic is real,
+    the resolved location lives under `epics/<epic>/...`, and a recorded
+    "path" of that shape would be rejected by `resolve_artifact` (it refuses
+    any ref beginning `epics/`) the next time it is read back. A file
+    referenced twice (brief == a context ref, or a duplicate context ref)
+    appears once, in first-seen order (brief first, then context refs in
+    plan order).
     """
     try:
         task = state["tasks"][task_id]
     except KeyError as error:
         raise ValidationError(f"unknown task: {task_id}") from error
 
-    sources: list[Path] = []
+    epic = state.get("epic")
+    sources: list[tuple[str, Path]] = []
     seen: set[Path] = set()
 
     def _add(raw_path: str, *, label: str) -> None:
-        resolved = resolve_within_wdd(wdd_dir, raw_path, label=label)
+        resolved = resolve_within_wdd(wdd_dir, raw_path, label=label, epic=epic)
         if not resolved.exists() or not resolved.is_file():
             raise ValidationError(f"{label} does not exist or is not a regular file: {raw_path}")
         if resolved not in seen:
             seen.add(resolved)
-            sources.append(resolved)
+            sources.append((raw_path.split("#", 1)[0], resolved))
 
     _add(task["specPath"], label="task brief")
     for ref in task.get("context") or []:
-        path_part = ref.split("#", 1)[0]
-        _add(path_part, label="context ref")
+        _add(ref, label="context ref")
     return sources
 
 
@@ -127,10 +141,13 @@ def materialize_attempt(
 
     Returns ``{"snapshot": <.wdd-relative dir path>, "inputs": [{"path", "sha256"}, ...]}``.
     ``inputs`` digests are of the SOURCE files (the live `.wdd` copies), not
-    the snapshot copies, and paths are `.wdd`-relative -- the same doctrine
-    `plan_composite`/research artifacts already use. Anchors (`#...`) are
-    stripped for file resolution; a file referenced twice (brief == a context
-    ref, or a duplicate context ref) copies once and appears once in `inputs`.
+    the snapshot copies, and `"path"` is the namespace-relative REF itself
+    (Task 4) -- the same doctrine `plan_composite`/research artifacts already
+    use, and what keeps the snapshot's internal layout matching
+    `task["specPath"]` exactly (runner.py's `_snapshot_files` looks up the
+    brief by that same relative form). Anchors (`#...`) are stripped for file
+    resolution; a file referenced twice (brief == a context ref, or a
+    duplicate context ref) copies once and appears once in `inputs`.
     """
     wdd_dir = Path(wdd_dir)
     wdd_resolved = wdd_dir.resolve()
@@ -179,13 +196,17 @@ def materialize_attempt(
     os.chmod(attempt_dir, _ATTEMPT_DIR_MODE)
 
     inputs: list[dict[str, str]] = []
-    for resolved in sources:
-        relative = resolved.relative_to(wdd_resolved)
-        destination = attempt_dir / relative
+    for raw_ref, resolved in sources:
+        # Destination is keyed by the namespace-relative ref, NOT
+        # `resolved.relative_to(wdd_resolved)`: once epic is real the latter
+        # would nest the snapshot under an `epics/<epic>/...` subpath that
+        # `task["specPath"]`'s own (still-flat) namespace-relative form no
+        # longer matches -- see this function's docstring.
+        destination = attempt_dir / raw_ref
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(resolved, destination)
         os.chmod(destination, _ATTEMPT_FILE_MODE)
-        inputs.append({"path": str(relative), "sha256": artifact_sha256(resolved)})
+        inputs.append({"path": raw_ref, "sha256": artifact_sha256(resolved)})
 
     snapshot = str(attempt_dir.relative_to(wdd_resolved))
     return {"snapshot": snapshot, "inputs": inputs}
@@ -276,11 +297,19 @@ def inputs_status(
     if not recorded:
         return None
 
-    wdd_resolved = wdd_dir.resolve()
+    # Cross-reference: recorded input paths are namespace-relative refs and
+    # MUST resolve through the one typed resolver (wave_delivery/paths.py,
+    # spec Sec1) — a raw join here reads flat paths and false-flags every
+    # started task after the v6 migration moves artifacts under
+    # epics/<slug>/ (caught empirically in Task 3 review).
+    epic = state.get("epic")
     for entry in recorded:
         path = entry["path"]
         recorded_sha = entry["sha256"]
-        candidate = wdd_resolved / path
+        try:
+            candidate = resolve_artifact(path, wdd_dir=wdd_dir, epic=epic)
+        except ValidationError:
+            return {"path": path, "recorded": recorded_sha, "actual": f"missing:{path}"}
         if not candidate.exists() or not candidate.is_file():
             return {"path": path, "recorded": recorded_sha, "actual": f"missing:{path}"}
         actual_sha = artifact_sha256(candidate)
@@ -327,10 +356,9 @@ def rebind_attempt(
                 "recorded digests already match the current bytes"
             )
         sources = _task_input_sources(state, wdd_dir, task_id)
-        wdd_resolved = wdd_dir.resolve()
         new_inputs = [
-            {"path": str(source.relative_to(wdd_resolved)), "sha256": artifact_sha256(source)}
-            for source in sources
+            {"path": raw_ref, "sha256": artifact_sha256(resolved)}
+            for raw_ref, resolved in sources
         ]
         updated = copied_state(state)
         updated["tasks"][task_id]["inputs"] = new_inputs

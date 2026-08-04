@@ -13,6 +13,7 @@ from .engine import apply_mutation, utc_now
 from .errors import IllegalTransition, ValidationError
 from .git import branch_exists, require_repository, resolve_ref, run_git, validate_ref_name
 from .intake import artifact_sha256, intake_drift, resolve_within_wdd
+from .paths import resolve_artifact
 from .schema import (
     REVIEW_POLICIES,
     RISK_LEVELS,
@@ -22,7 +23,7 @@ from .schema import (
     new_state,
     task_state,
 )
-from .store import StateStore
+from .store import StateStore, atomic_write_text
 
 
 PLAN_KIND = "wdd_plan"
@@ -54,12 +55,17 @@ def plan_skeleton() -> dict[str, Any]:
     the caller fills them in -- but the document's *shape* is already legal:
     one task carrying every MUTABLE_TASK_FIELDS key, so an agent that just
     overwrites the placeholder values never has to guess a missing field.
+    The scope id placeholder spells out its own derivation (Task 4, spec
+    Sec1): on a v6 state with an active epic, `plan apply` REJECTS any
+    scope.id other than `SCOPE-<the active epic's slug>` -- this is not a
+    free-form name to invent, it is `epic new --slug`'s own slug with a
+    fixed prefix.
     """
     return {
         "schemaVersion": 1,
         "kind": PLAN_KIND,
         "scope": {
-            "id": "SCOPE-your-scope-id",
+            "id": "SCOPE-<your-epic-slug>",
             "baseRef": "wdd/your-scope-id",
             "maxConcurrent": 3,
             "reviewPolicy": "risk_based",
@@ -311,33 +317,36 @@ def apply_risk_rules(
     domain might cover the same file, the answer is "they overlap" — a task
     wrongly reviewed costs a review, a task wrongly unreviewed costs a merge.
 
-    A newly ratified riskRule can match a task that already left "todo".
-    Re-deriving its risk would make `_apply_plan_to_state`'s immutability
-    check refuse the (identical, otherwise-unrelated) re-apply of the plan
-    file forever after, since risk is a MUTABLE_TASK_FIELD only while a task
-    is still todo. When `state` is given, tasks it already tracks with a
-    non-todo status keep their stored risk instead of the freshly derived
-    one — derivation still applies in full to todo tasks and to tasks new
-    to the plan.
+    Epic-scoped-state plan Task 5 (spec Sec2 "Risk re-derivation covers
+    started tasks") supersedes the earlier v5 doctrine here: a plan re-stamp
+    now re-derives risk for EVERY task, not only ones still `todo` -- a
+    riskRule ratified (or an epic overlay re-approved) mid-scope must be
+    honored immediately, even for a task that already started. What stays
+    upward-only is per-task, not status-gated: once a task's risk has ever
+    been "high" (explicitly in the plan, matched by a rule, or already
+    stored in state from an earlier apply), it never drops back to "normal"
+    just because a rule was loosened or removed -- a risk *drop* never
+    removes an already-applicable requirement (matching the existing
+    explicit-high-never-lowered doctrine, extended across re-applies).
+    `_apply_plan_to_state` is the enforcement counterpart: it allows the
+    `risk` field alone to change on a non-todo task, exactly because this
+    function may now legitimately raise it there.
     """
     high_patterns = [
         rule["pattern"] for rule in config.get("riskRules", []) if rule["risk"] == "high"
     ]
-    if not high_patterns:
-        return plan_dict
     state_tasks = state["tasks"] if state is not None else {}
     tasks = []
     for entry in plan_dict["tasks"]:
-        existing = state_tasks.get(entry["id"])
-        if existing is not None and existing["status"] != "todo":
-            tasks.append({**entry, "risk": existing["risk"]})
-            continue
         derived = entry["risk"]
-        if derived != "high" and any(
+        if high_patterns and derived != "high" and any(
             domains_overlap(pattern, domain)
             for pattern in high_patterns
             for domain in entry["conflictDomains"]
         ):
+            derived = "high"
+        existing = state_tasks.get(entry["id"])
+        if existing is not None and existing.get("risk") == "high":
             derived = "high"
         tasks.append({**entry, "risk": derived})
     return {**plan_dict, "tasks": tasks}
@@ -464,12 +473,21 @@ def _apply_plan_to_state(state: dict[str, Any], plan: dict[str, Any]) -> dict[st
         changed = [field for field in MUTABLE_TASK_FIELDS if task.get(field) != entry[field]]
         if not changed:
             continue
-        if task["status"] != "todo":
+        # "risk" is exempt from the todo-only immutability rule below (epic-
+        # scoped-state plan Task 5, spec Sec2): apply_risk_rules now
+        # re-derives it for every task, including ones already started, so a
+        # legitimate risk change on a non-todo task must land here rather
+        # than refuse. Every OTHER mutable field is still frozen the moment
+        # a task leaves todo.
+        frozen_changed = [field for field in changed if field != "risk"]
+        if frozen_changed and task["status"] != "todo":
             raise IllegalTransition(
-                f"cannot change {', '.join(changed)} on {task_id}; it is {task['status']}, not todo"
+                f"cannot change {', '.join(frozen_changed)} on {task_id}; "
+                f"it is {task['status']}, not todo"
             )
         for field in MUTABLE_TASK_FIELDS:
-            task[field] = entry[field]
+            if field == "risk" or task["status"] == "todo":
+                task[field] = entry[field]
 
     scope = plan["scope"]
     if state["scope"]["baseRef"] and scope["baseRef"] != state["scope"]["baseRef"]:
@@ -498,17 +516,22 @@ def _apply_plan_to_state(state: dict[str, Any], plan: dict[str, Any]) -> dict[st
     return state
 
 
-def _validate_context_refs(tasks: list[dict[str, Any]], wdd_dir: Path) -> None:
+def _validate_context_refs(
+    tasks: list[dict[str, Any]], wdd_dir: Path, *, epic: str | None = None
+) -> None:
     """Every task `context` ref must resolve to a regular file inside `.wdd/`.
 
     Ref syntax is `<path>[#anchor]` (spec Sec3); the anchor is advisory
-    reading guidance, never resolved mechanically. Mirrors intake.py's
-    research-artifact containment doctrine (`resolve_within_wdd`).
+    reading guidance, stripped before resolution -- centrally, inside the
+    one typed resolver (`wave_delivery/paths.py`'s `resolve_artifact`),
+    reached here via `intake.resolve_within_wdd`'s label-preserving
+    wrapper (Global Constraints: no site resolves paths its own way).
+    `epic` threads the caller's `state.epic` (Task 4): a v6 state with an
+    active epic resolves every ref under `epics/<epic>/...`, never flat.
     """
     for entry in tasks:
         for ref in entry.get("context") or []:
-            path_part = ref.split("#", 1)[0]
-            resolved = resolve_within_wdd(wdd_dir, path_part, label="context ref")
+            resolved = resolve_within_wdd(wdd_dir, ref, label="context ref", epic=epic)
             if not resolved.exists() or not resolved.is_file():
                 raise ValidationError(
                     f"task {entry['id']} context ref does not resolve to a file "
@@ -516,7 +539,9 @@ def _validate_context_refs(tasks: list[dict[str, Any]], wdd_dir: Path) -> None:
                 )
 
 
-def plan_composite(plan_dict: dict[str, Any], wdd_dir: Path | str) -> str:
+def plan_composite(
+    plan_dict: dict[str, Any], wdd_dir: Path | str, *, epic: str | None = None
+) -> str:
     """SHA-256 composite binding a plan approval to the bytes it was shown.
 
     Covers the canonical normalized plan (key-sorted JSON, so task/field
@@ -527,7 +552,8 @@ def plan_composite(plan_dict: dict[str, Any], wdd_dir: Path | str) -> str:
     `_diff_plan`'s reconstruction) and recomputes this same function to
     detect post-apply drift -- the reason every field this composite must
     see (context/model/reviewModel) is also a MUTABLE_TASK_FIELD persisted
-    into task state.
+    into task state. `epic` threads the caller's `state.epic` (Task 4): every
+    call site here passes the epic of the state dict it just built or read.
     """
     wdd_dir = Path(wdd_dir)
     # sort_keys=True only orders each dict's keys, not the tasks list itself;
@@ -544,7 +570,12 @@ def plan_composite(plan_dict: dict[str, Any], wdd_dir: Path | str) -> str:
             paths.add(ref.split("#", 1)[0])
 
     def _hash_or_refuse(path: str) -> str:
-        resolved = wdd_dir / path
+        # Cross-reference: wave_delivery/paths.py's `resolve_artifact` is the
+        # one typed resolver (spec Sec1, Global Constraints) -- the
+        # composite's brief/context reads go through it too, not a raw
+        # `wdd_dir / path` join. `epic` threads the caller's `state.epic`
+        # (Task 4).
+        resolved = resolve_artifact(path, wdd_dir=wdd_dir, epic=epic)
         try:
             return artifact_sha256(resolved)
         except FileNotFoundError as error:
@@ -609,6 +640,32 @@ def _reconstruct_plan_from_state(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _write_epic_plan_document(state: dict[str, Any], wdd_dir: Path) -> None:
+    """Mint `epics/<slug>/plan.json` (Task 8 fix-round I6): the spec/docs
+    promise this file lives in the archived unit alongside spec.md/
+    design.md (paths.py reserves the `plan.json` ref; `archive_scope` just
+    renames `epics/<slug>/` wholesale, so whatever exists there rides
+    along) -- nothing wrote it. This is `_reconstruct_plan_from_state`'s
+    dict: the EFFECTIVE plan (post riskRules/config-overlay derivation,
+    the same shape `plan_composite` hashes), not the raw plan file the
+    operator submitted, since that raw file's `baseRef`/`mergeSurface`/
+    `mergeMode` omissions and pre-derivation risk would go stale the
+    moment a re-apply legitimately keeps rather than repeats them.
+    Overwritten on every re-apply -- it mirrors current state, not a
+    point-in-time snapshot. Confirmed by reading `plan_composite` above
+    before writing this: it hashes the reconstructed dict plus every
+    brief/context file's bytes, never this file itself, so rewriting
+    plan.json here changes no recorded composite and trips no drift.
+    A legacy scope (no `state.epic`) has no `epics/<slug>/` to write into.
+    """
+    epic = state.get("epic")
+    if epic is None:
+        return
+    document = _reconstruct_plan_from_state(state)
+    path = resolve_artifact("plan.json", wdd_dir=wdd_dir, epic=epic)
+    atomic_write_text(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+
+
 def intake_gate_status(
     state: dict[str, Any], wdd_dir: Path | str
 ) -> tuple[str, dict[str, Any]] | None:
@@ -643,7 +700,9 @@ def intake_gate_status(
     if not isinstance(approval, dict) or not approval.get("sha256"):
         return "plan_drift", {"recorded": None, "actual": "never composite-approved"}
     try:
-        recomputed = plan_composite(_reconstruct_plan_from_state(state), wdd_dir)
+        recomputed = plan_composite(
+            _reconstruct_plan_from_state(state), wdd_dir, epic=state.get("epic")
+        )
     except ValidationError as error:
         return "plan_drift", {"recorded": approval["sha256"], "actual": f"missing file: {error}"}
     if approval["sha256"] != recomputed:
@@ -750,7 +809,25 @@ def apply_plan(
     current = store.read()
     legacy = _is_legacy_intake(current)
 
-    _validate_context_refs(plan["tasks"], wdd_dir)
+    # Scope identity (Task 4, spec Sec1): "the slug is the canonical scope
+    # identity" -- a non-legacy v6 state with an active epic REJECTS any
+    # scope.id other than the epic-derived SCOPE-<slug>, naming both. Legacy
+    # scopes are wholesale exempt (their scope.id predates this doctrine and
+    # was never derived from an epic slug); a state with no active epic yet
+    # has nothing to derive against and is left to whatever the plan names
+    # (unreachable in the intended ladder, since `epic new` always precedes
+    # `plan apply`, but permissive rather than assumed).
+    if not legacy and current.get("epic"):
+        expected_scope_id = f"SCOPE-{current['epic']}"
+        if plan["scope"]["id"] != expected_scope_id:
+            raise ValidationError(
+                f"plan.scope.id must be the epic-derived {expected_scope_id!r} "
+                f"(active epic {current['epic']!r}), got {plan['scope']['id']!r}: "
+                "the slug is the canonical scope identity (spec Sec1) -- v6 "
+                "drops any other override"
+            )
+
+    _validate_context_refs(plan["tasks"], wdd_dir, epic=current.get("epic"))
 
     if not legacy:
         if not intake_complete(current):
@@ -808,7 +885,11 @@ def apply_plan(
             # Reconstructing from state_copy after the (no-op, diff-empty)
             # apply keeps both sides symmetric by construction.
             composite = (
-                None if legacy else plan_composite(_reconstruct_plan_from_state(state_copy), wdd_dir)
+                None
+                if legacy
+                else plan_composite(
+                    _reconstruct_plan_from_state(state_copy), wdd_dir, epic=state_copy.get("epic")
+                )
             )
             _stamp_approval(state_copy, approved_by, composite)
             return state_copy
@@ -825,6 +906,7 @@ def apply_plan(
         result_dict = {**result, "revision": state["revision"], "unchanged": True}
         if not duplicate:
             result_dict["approvedBy"] = approved_by
+            _write_epic_plan_document(state, wdd_dir)
         return result_dict
 
     base: dict[str, Any] | None = None
@@ -846,7 +928,9 @@ def apply_plan(
         composite = (
             None
             if legacy or not approved_by
-            else plan_composite(_reconstruct_plan_from_state(updated), wdd_dir)
+            else plan_composite(
+                _reconstruct_plan_from_state(updated), wdd_dir, epic=updated.get("epic")
+            )
         )
         _stamp_approval(updated, approved_by, composite)
         if repo is not None and plan["scope"]["baseRef"]:
@@ -865,4 +949,6 @@ def apply_plan(
     result_dict = {**result, "revision": state["revision"], "duplicate": duplicate, "base": base}
     if approved_by and not duplicate:
         result_dict["approvedBy"] = approved_by
+    if not duplicate:
+        _write_epic_plan_document(state, wdd_dir)
     return result_dict

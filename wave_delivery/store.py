@@ -63,6 +63,49 @@ class StateStore:
         validate_state(state)
         return state
 
+    # `read_raw_unlocked` / `recover_locked` / `load_recovered` (spec Sec1's
+    # "locking layers"): the archive transaction (finalize.archive_scope) is
+    # a multi-step, crash-recoverable mutation, and the lock this class hands
+    # out via `locked()` is NOT reentrant -- so recovery needs its own,
+    # explicit layering rather than happening inside plain `read()`:
+    #
+    #   - `read_raw_unlocked()`: parse + validate only, no recovery pass --
+    #     the exact `read()` behavior above, under the explicit name that
+    #     documents "no recovery happened here" at call sites that care.
+    #   - `recover_locked()`: run the archive-recovery matrix, ASSUMING the
+    #     caller already holds `locked()` (e.g. `apply_mutation`, right after
+    #     acquiring its own lock, before running its mutator). Never
+    #     acquires the lock itself -- doing so would deadlock.
+    #   - `load_recovered()`: the read-only caller's layer -- acquires the
+    #     lock itself, recovers, and returns the (possibly healed) state.
+    #
+    # Read-only commands (`status`/`next`/`doctor`) use `load_recovered()`;
+    # every governed mutation goes through `apply_mutation`, which already
+    # calls `recover_locked()` under its own lock. `read()` itself is left
+    # unchanged (still recovery-free) since most call sites read state for
+    # reasons that have nothing to do with the archive transaction.
+    def read_raw_unlocked(self) -> dict[str, Any]:
+        return self.read()
+
+    def recover_locked(self) -> dict[str, Any]:
+        # Local import: finalize.py already imports StateStore from this
+        # module at its own top level, so importing finalize.py back from
+        # here at module scope would cycle. Deferring the import into this
+        # method body is safe -- by the time any caller actually invokes
+        # `recover_locked()`, both modules have long since finished loading.
+        from .finalize import recover_archive_transaction
+
+        state = self.read_raw_unlocked()
+        recovered = recover_archive_transaction(state, self.path.parent)
+        if recovered is state:
+            return state
+        self.write(recovered)
+        return recovered
+
+    def load_recovered(self) -> dict[str, Any]:
+        with self.locked():
+            return self.recover_locked()
+
     def write(self, state: dict[str, Any]) -> None:
         validate_state(state)
         atomic_write_text(self.path, json.dumps(state, indent=2, sort_keys=True) + "\n")
