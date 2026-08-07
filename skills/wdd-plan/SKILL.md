@@ -229,6 +229,14 @@ file surfaces as `plan_drift` during execution; the remedy is a fresh
 pure re-stamp, one command, not a re-plan. Never apply an unapproved plan;
 `<name>` is the human who approved it, not the agent.
 
+The **independent-oracle rule**: every task's verification must include
+at least one check whose assertion content the implementing worker did
+not author — a startup smoke, a golden fixture frozen from a
+human-confirmed run, a conformance test pinned to a cited contract. A
+gate made solely of worker-authored tests is the cheating-agent loop:
+broken code validated by broken tests. Name the independent check
+explicitly in each brief's Verification section.
+
 While presenting, reconcile the spec's acceptance criteria with the scope's
 `verification.commands` (`wddctl config get verification.commands`): any
 criterion a command can check — the build passes, the binary starts, a

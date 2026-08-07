@@ -508,6 +508,22 @@ only `TASK-003` fell outside `src/auth/**` and kept the plan's declared
 `normal`. An empty `riskRules` list (the default) is a no-op: risk stays
 exactly what the plan file says.
 
+`models.specReview` (default `null`) names the default reviewer candidate
+the `wdd-spec-review` skill pre-fills its offer with for spec/design/plan
+review rounds — a plain string like `models.planning`, never an object:
+spec review is not risk-tiered. It joins the epic overlay allowlist like
+every other `models.*` leaf, but it is a **default candidate, never an
+autopilot** — the skill still confirms the reviewer channel with the human
+every round, and the key is deliberately excluded from every evidence
+projection (including `plan`), since spec-review artifacts are
+conversation-gated, not machine-gated; see "Epic configuration overlay"
+below for what that means for staleness. It is still covered by the
+`configure`/governance full-view digest like any other config byte.
+
+```sh
+wddctl config set models.specReview codex
+```
+
 `worktrees.root` (default `.worktrees`) is where `start` creates task
 worktrees: a relative value resolves against the repository root (the
 default lands at `<repo>/.worktrees/<scope>/<task>`); an absolute value is
@@ -575,14 +591,15 @@ $ wddctl config get --epic merge.surface
 - The overlay is a **sparse, allowlisted** set of dotted leaves — the exact
   set the epic-scoped-state design permits an epic to differ from global
   on: `models.planning`, `models.implementation`, `models.review`,
-  `verification.commands`, `verification.unavailableJustification`,
-  `merge.surface`, `riskRules`, `review.policy`. Anything else — `runners`,
-  `worktrees.root`, branch settings, anything unlisted — is rejected **by
-  name**, at `set --epic` and at `intake configure` approval alike:
+  `models.specReview`, `verification.commands`,
+  `verification.unavailableJustification`, `merge.surface`, `riskRules`,
+  `review.policy`. Anything else — `runners`, `worktrees.root`, branch
+  settings, anything unlisted — is rejected **by name**, at `set --epic`
+  and at `intake configure` approval alike:
 
 ```sh
 $ wddctl config set --epic runners '{}'
-wddctl: epic config overlay: key(s) not in the allowed overlay set (models.planning, models.implementation, models.review, verification.commands, verification.unavailableJustification, merge.surface, riskRules, review.policy): runners
+wddctl: epic config overlay: key(s) not in the allowed overlay set (models.planning, models.implementation, models.review, models.specReview, verification.commands, verification.unavailableJustification, merge.surface, riskRules, review.policy): runners
 ```
 
   Machine-bound and repository-authority settings stay under constitution
@@ -2863,7 +2880,9 @@ final_review              (no review yet, or stale against the current base head
   -> final_verification     (review passed+fresh; verification missing/stale/not passed)
     -> prepare_handoff        (review + verification both passed+fresh; no handoff yet)
       -> await_delivery         (handoff recorded and fresh)
-        -> delivered                (next returns empty actions, "phase": "delivered")
+        -> delivered                (archive: judgment names the epic retrospective
+                                     step alongside the archive command — an offer,
+                                     not a gate; "phase": "delivered")
 ```
 
 `assign_final_fixes` carries no `command`/`recordWith` deliberately: the
@@ -2976,7 +2995,20 @@ $ wddctl finalize delivered --by ivo --repo .
   "targetBranch": "main"
 }
 $ wddctl next --repo .
-{"actions": [], "blockers": [], "phase": "delivered", "revision": 16, "scope": "SCOPE-greeting-demo"}
+{
+  "actions": [
+    {
+      "action": "archive",
+      "command": "wddctl scope archive --repo .",
+      "judgment": "before archiving, offer the epic retrospective per wdd-intake: distill the decisions, root causes, and quirks captured during the epic into shared-context/knowledge/greeting-demo.md, get the human's sign-off recorded in the file, and commit it -- then run 'scope archive'. This is standing guidance, not a gate: running scope archive directly, skipping the offer, is legal operator behavior, and the living draft survives either way.",
+      "task": "-"
+    }
+  ],
+  "blockers": [],
+  "phase": "delivered",
+  "revision": 16,
+  "scope": "SCOPE-greeting-demo"
+}
 ```
 
 `finalize status`'s verification carries the v5 `commands` list instead of

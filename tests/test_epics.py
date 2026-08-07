@@ -608,6 +608,35 @@ class ProjectionPartitioningTest(unittest.TestCase):
             plan_after = effective_config_digest(project(derived["effective"], "plan"))
             self.assertNotEqual(plan_before, plan_after)
 
+    def test_models_spec_review_edit_changes_no_projection_but_changes_full_view(self) -> None:
+        """spec Sec1: models.specReview is a default reviewer CANDIDATE for
+        conversation-gated spec/design/plan review rounds, never machine-
+        gated evidence -- it must appear in NO named projection (including
+        `plan`, which otherwise copies the whole `models` object wholesale),
+        while still being covered by the full-view digest every `configure`/
+        governance approval signs (spec: "It IS covered by the configure
+        approval's full-view digest, like every config byte")."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            layers = load_layers(wdd, "my-epic")
+            purposes = ("plan", "taskReview", "finalReview", "taskVerification", "finalVerification")
+            before = {
+                purpose: effective_config_digest(project(layers["effective"], purpose))
+                for purpose in purposes
+            }
+            derived = derive_effective(layers, {"models": {"specReview": "codex"}})
+            after = {
+                purpose: effective_config_digest(project(derived["effective"], purpose))
+                for purpose in purposes
+            }
+            self.assertEqual(before, after)
+            # The full-view digest (what `intake configure`/governance sign)
+            # DOES move -- specReview is a real config byte, just not one any
+            # evidence projection is gated on.
+            full_before = effective_config_digest(layers["effective"])
+            full_after = effective_config_digest(derived["effective"])
+            self.assertNotEqual(full_before, full_after)
+
     def test_verification_commands_edit_changes_exactly_the_two_verification_projections(
         self,
     ) -> None:
@@ -738,6 +767,7 @@ class ResolveConfigSourceTest(unittest.TestCase):
                 "models.planning",
                 "models.implementation",
                 "models.review",
+                "models.specReview",
                 "verification.commands",
                 "verification.unavailableJustification",
                 "merge.surface",

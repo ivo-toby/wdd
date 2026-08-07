@@ -70,6 +70,11 @@ controller already created for you.
   that turned out false, a gotcha the next worker needs) in your final
   message. The controller queues it with `wddctl note`; that is what makes
   reconciliation due.
+- Include a **Decisions** section: one line per choice the brief did not
+  dictate (library, data shape, algorithm, workaround) — the decision and
+  why. Every entry gets captured by the controller; none of them is too
+  small to list. "I did X and verified it by Y" and "I believe X" are
+  different sentences — never write the first without the Y.
 - Do not merge your own work — that's the controller's job.
 
 ## Final status

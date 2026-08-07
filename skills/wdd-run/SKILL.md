@@ -90,10 +90,16 @@ task's model names one, it's already registered and probed.
   back, you run `recordWith` — workers never run `wddctl` themselves,
   because it resolves `--state` and `--repo` from the working directory and
   theirs is the worktree, not your checkout. Queue anything durable they
-  reported with `wddctl note`.
+  reported with `wddctl note` — and copy EVERY entry from their report's
+  Decisions section into the epic's knowledge draft
+  (`shared-context/knowledge/<slug>.md`), tagged with the task id. No
+  notability triage at capture time; triage happens once, at the
+  retrospective, where dropping a row is a visible act.
 - **`run_review`** → dispatch a reviewer per the Dispatch packet section
-  below and `wdd-review`. Their findings go into `recordWith` in place of
-  `'[]'`.
+  below and `wdd-review`. Name the worker's Decisions section as a review
+  target in the packet — a wrong decision reviewed early is a P2; the same
+  decision discovered at final review is a rewrite. Their findings go into
+  `recordWith` in place of `'[]'`.
 - **`run_verification`** → run the constitution's verification command, then
   record the real result. Never record `passed` you didn't observe.
 - **`assign_fix_writer`** → unresolved P1/P2. Dispatch a fix worker with the
@@ -117,6 +123,14 @@ task's model names one, it's already registered and probed.
   not yet started, then record with `recordWith`.
 
 ## Finishing a scope
+
+When the scope reaches `delivered`, `next`'s judgment names two closing
+moves in order: the **retrospective** — distill the epic's knowledge draft
+(`shared-context/knowledge/<slug>.md`, which you have been appending to
+all along) into tight, cited rows, get the human's sign-off, append the
+`Signed-off-by` trailer, commit the file — then `wddctl scope archive
+--repo .`. Offer the retrospective, don't just archive past it; the human
+may decline, and the draft survives either way.
 
 Once every task is `done` or `cancelled`, `next` stops emitting per-task
 actions and starts driving the finalize ladder instead — same one-action,

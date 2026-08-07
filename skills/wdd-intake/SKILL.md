@@ -34,6 +34,13 @@ branch names, and the artifact directory `.wdd/epics/<slug>/`), then:
 wddctl epic new --slug <slug> --title "..."
 ```
 
+Right after creating the epic, start its **knowledge draft**:
+`shared-context/knowledge/<slug>.md` with the four empty sections (Root
+causes / Quirks / Decisions / Review catches). It is a living file — the
+controller appends to it throughout execution, and the retrospective at
+delivery is triage of rows that already exist, never reconstruction from
+memory.
+
 Slugs are immutable and unique — including against archived epics. All
 rung artifacts below (`spec.md`, `design.md`, `tasks/`, `research/`) live
 in the epic's directory; `shared-context/` stays global. You never write
@@ -65,6 +72,16 @@ Once the gaps are closed, write the agreed understanding to the epic's
 `spec.md` with exactly these four sections: Goal, In scope, Out of scope,
 Acceptance criteria. Finalize's `final_review` walks the criteria by number, so each
 one must be checkable from the diff — not "works well."
+
+Two writing rules before you present a draft:
+
+- **Stateful behavior gets a table, not prose.** More than two states or
+  any transition rules described in sentences → include a state machine
+  or decision table in the spec. Models fill unspecified transitions with
+  guesses; tables make the gaps visible.
+- **Self-check against the ambiguity lexicon**: every "should", "handle",
+  "appropriate", "properly", "as needed" in your draft is a gap unless
+  the sentence survives a hostile reading. Rewrite before presenting.
 
 Skeleton:
 
@@ -98,10 +115,22 @@ from 1. Get the user's explicit sign-off on the text, then record:
 wddctl intake spec --approved-by NAME
 ```
 
+At sign-off, offer the adversarial round — one sentence, the human
+decides, every time: "Want an adversarial review of this spec before you
+approve? (`wdd-spec-review` — a different model, or you, tries to break
+it; a security-focused pass is an option.)" Record their answer either
+way in the review log.
+
 Close the rung with sign-off and the offer to continue: "Spec's agreed.
 Should I start research, or go straight to design?"
 
 ## Rung 2: Research (`wddctl next` → `research`)
+
+Before anything external: read `shared-context/knowledge/` — the
+distilled root causes, quirks, and decisions from every delivered epic in
+this repo. Cite applicable rows into the inventory or design like any
+other on-disk source. Knowledge nobody reads is knowledge that doesn't
+exist.
 
 Research applies when the scope depends on something you'd otherwise
 fabricate from memory: an external contract, an unfamiliar API, a named
@@ -213,6 +242,10 @@ wddctl intake design --approved-by NAME --deliverable-command "npm test && npm s
 That command is fingerprinted with the design record and later runs inside
 finalize's `final_verification`, alongside the ratified global
 `verification.commands` — never mutate global config to smuggle it in.
+
+At sign-off, make the same adversarial-review offer as at the spec rung
+(`wdd-spec-review`); designs with integration surfaces or security
+boundaries are where it earns the most.
 
 Close the rung with sign-off, then hand off to decomposition: "Design's
 approved. Want me to decompose it into tasks?" — that's `wdd-plan`.

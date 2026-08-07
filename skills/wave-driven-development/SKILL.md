@@ -1,6 +1,6 @@
 ---
 name: wave-driven-development
-description: Overview and router for Wave-Driven Development (WDD) — running coding agents on work larger than one prompt via the wddctl controller. Use this first to decide whether WDD applies, to learn the .wdd/ artifact layout and controller/worker/reviewer roles, and to find the right WDD skill (wdd-setup, wdd-intake, wdd-plan, wdd-run, wdd-worker, wdd-review, wdd-status, wdd-runners).
+description: Overview and router for Wave-Driven Development (WDD) — running coding agents on work larger than one prompt via the wddctl controller. Use this first to decide whether WDD applies, to learn the .wdd/ artifact layout and controller/worker/reviewer roles, and to find the right WDD skill (wdd-setup, wdd-intake, wdd-spec-review, wdd-plan, wdd-run, wdd-worker, wdd-review, wdd-status, wdd-runners).
 ---
 
 # Wave-Driven Development
@@ -101,6 +101,10 @@ That is the whole engine. Everything else is judgment:
 - Scope already `delivered` and there's more work to bring: `wddctl scope
   archive --repo .` first, then `wdd-intake` to start the next scope's
   ladder.
+- A spec, design, plan, or brief needs breaking before someone builds on
+  it ("review this spec", "poke holes", a security pass): use
+  `wdd-spec-review` — a different model (or the human) as the adversary,
+  confirmed with the human every time.
 - Just want to know where things stand: use `wdd-status`.
 - Registering an external agent CLI as a worker or reviewer ("add a
   runner", "use qwen/codex as a worker", a model value naming a local CLI):
