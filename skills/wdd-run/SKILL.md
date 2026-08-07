@@ -128,6 +128,14 @@ task's model names one, it's already registered and probed.
   via `wddctl note`, resolve conflicting discoveries, update briefs for tasks
   not yet started, then record with `recordWith`.
 
+## Resuming a parked epic
+
+After `wddctl epic resume`, run `wddctl next` and treat whatever drift
+blockers appear (`epic_config_drift`, `intake_drift`, stale freshness)
+as the normal remedy chain — re-approvals and re-stamps, in the order
+the blockers name them. They are the gates re-trusting elapsed time,
+never a corruption signal.
+
 ## Finishing a scope
 
 When the scope reaches `delivered`, `next`'s judgment names two closing

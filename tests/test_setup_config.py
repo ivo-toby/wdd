@@ -212,8 +212,8 @@ class ConfigCliTest(unittest.TestCase):
 
 
 class SetupStateTest(unittest.TestCase):
-    def test_schema_version_is_6(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 6)
+    def test_schema_version_is_current(self) -> None:
+        self.assertEqual(SCHEMA_VERSION, 7)
 
     def test_new_setup_state_validates_with_null_scope(self) -> None:
         state = new_setup_state()
@@ -242,7 +242,7 @@ class SetupStateTest(unittest.TestCase):
 
 
 class MigrationV3Test(unittest.TestCase):
-    def test_v3_state_migrates_to_v6(self) -> None:
+    def test_v3_state_migrates_to_current_schema(self) -> None:
         from wave_delivery.migration import convert, plan_migration
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -255,7 +255,7 @@ class MigrationV3Test(unittest.TestCase):
             # the converted state itself: {"state", "from", "to", "tasks",
             # "backup", "notes"}. "to" is always SCHEMA_VERSION.
             self.assertEqual(result["from"], 3)
-            self.assertEqual(result["to"], 6)
+            self.assertEqual(result["to"], 7)
             # v3/v4 -> v5 is exempted wholesale via intake.legacy (spec §7);
             # it never mints itself, only migration does. v5 -> v6
             # (epic-scoped-state plan, Task 3) additionally stamps a

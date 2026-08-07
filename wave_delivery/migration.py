@@ -44,9 +44,10 @@ from .schema import SCHEMA_VERSION, EPIC_SLUG_PATTERN, validate_state
 from .store import StateStore, atomic_write_text
 
 
-SUPPORTED_SOURCE_VERSIONS = {2, 3, 4, 5}
+SUPPORTED_SOURCE_VERSIONS = {2, 3, 4, 5, 6}
 _V4_SCHEMA_VERSION = 4
 _V5_SCHEMA_VERSION = 5
+_V6_SCHEMA_VERSION = 6
 
 # The reserved filename the typed resolver (paths.py) and the future archive
 # transaction (Task 6) both refuse anywhere in an artifact ref -- migration
@@ -82,22 +83,29 @@ def read_source(path: Path | str) -> dict[str, Any]:
 def convert(
     state: dict[str, Any], *, review_policy: str = "always", wdd_dir: Path | str
 ) -> dict[str, Any]:
-    """Return the current-schema (v6) equivalent of a v2, v3, v4, or v5 state.
+    """Return the current-schema (v7) equivalent of a v2..v6 state.
 
-    Conversion always lands on an intermediate v5-shaped dict first (the
-    v2/v3/v4 remap is untouched from before schema v6 existed; a v5 SOURCE
-    skips straight past it), then the v5 -> v6 step (`convert_v5_to_v6`)
-    moves epic-owned artifact files under `wdd_dir` and stamps
-    migration-time evidence -- migration is the only producer of the v6
-    `intake.configure` exemption (see schema.py's `_validate_configure`);
-    constructors never mint it.
+    Conversion always lands on an intermediate v6-shaped dict first: a v6
+    SOURCE skips straight to it (no artifact files to move -- they already
+    live under `epics/<slug>/`); a v5 source runs the v5 -> v6 step
+    (`convert_v5_to_v6`, moving epic-owned artifact files under `wdd_dir`
+    and stamping migration-time evidence -- migration is the only producer
+    of the v6 `intake.configure` exemption, see schema.py's
+    `_validate_configure`); anything older (v2/v3/v4) is remapped up to v5
+    first, unchanged from before schema v6 existed. The final v6 -> v7 step
+    (`convert_v6_to_v7`) is a pure version bump plus `parked: {}` (spec
+    "Schema v7") -- no file moves, applied uniformly regardless of which
+    branch produced the v6-shaped intermediate.
     """
-    if state.get("schemaVersion") == _V5_SCHEMA_VERSION:
-        v5 = deepcopy(state)
+    if state.get("schemaVersion") == _V6_SCHEMA_VERSION:
+        v6 = deepcopy(state)
+    elif state.get("schemaVersion") == _V5_SCHEMA_VERSION:
+        v6 = convert_v5_to_v6(deepcopy(state), wdd_dir=wdd_dir)
     else:
         v4 = _convert_to_v4(state, review_policy=review_policy)
         v5 = _convert_v4_to_v5(v4)
-    return convert_v5_to_v6(v5, wdd_dir=wdd_dir)
+        v6 = convert_v5_to_v6(v5, wdd_dir=wdd_dir)
+    return convert_v6_to_v7(v6)
 
 
 def _convert_v4_to_v5(v4: dict[str, Any]) -> dict[str, Any]:
@@ -404,7 +412,7 @@ def convert_v5_to_v6(state: dict[str, Any], *, wdd_dir: Path | str) -> dict[str,
         )
     wdd_dir = Path(wdd_dir)
     migrated = deepcopy(state)
-    migrated["schemaVersion"] = SCHEMA_VERSION
+    migrated["schemaVersion"] = _V6_SCHEMA_VERSION
 
     slug = _epic_slug_for_migration(migrated)
     migrated["epic"] = slug
@@ -465,11 +473,44 @@ def convert_v5_to_v6(state: dict[str, Any], *, wdd_dir: Path | str) -> dict[str,
                 effective, deliverable_command
             )
 
+    # `migrated` is intentionally v6-shaped here (an intermediate this
+    # function's own callers may inspect before the v6 -> v7 bump runs --
+    # see `MigrateComposedFromEarlierVersionsTest`), but `validate_state`
+    # only ever accepts the CURRENT schema version. Validate the shape by
+    # checking it against the exact dict `convert_v6_to_v7` would produce
+    # from it (current version + the pure-bump `parked: {}`) without
+    # mutating or returning that bumped copy -- everything BUT the version
+    # bump and `parked` is checked for real.
+    validate_state({**migrated, "schemaVersion": SCHEMA_VERSION, "parked": {}})
+    return migrated
+
+
+def convert_v6_to_v7(state: dict[str, Any]) -> dict[str, Any]:
+    """v6 -> v7 (spec "Schema v7"): a pure version bump plus `parked: {}` --
+    no file moves, mirroring the v3 -> v4 and v4 -> v5 pure-bump steps
+    above. Constructors never mint parked entries (schema.py); migration's
+    only contribution here is the empty map every v6 source predates.
+    """
+    if state.get("schemaVersion") != _V6_SCHEMA_VERSION:
+        raise ValidationError(
+            f"convert_v6_to_v7 requires a v{_V6_SCHEMA_VERSION}-shaped state, got "
+            f"{state.get('schemaVersion')!r}"
+        )
+    migrated = deepcopy(state)
+    migrated["schemaVersion"] = SCHEMA_VERSION
+    migrated.setdefault("parked", {})
     validate_state(migrated)
     return migrated
 
 
-def _migration_notes(migrated: dict[str, Any], *, review_policy: str) -> list[str]:
+def _migration_notes(
+    migrated: dict[str, Any], *, review_policy: str, source_version: int | None = None
+) -> list[str]:
+    if source_version == _V6_SCHEMA_VERSION:
+        # v6 -> v7 is a pure version bump (spec "Schema v7"): no waves/risk/
+        # worktree/artifact remap ever applied to a source this recent, and
+        # no files move -- the only real note is the schema bump itself.
+        return ["schemaVersion bumped to 7 with an empty parked map; no files moved"]
     return [
         "waves are dropped; scheduling is derived from dependencies and conflict domains",
         "every task defaults to risk 'normal' — mark high-risk tasks in plan.json",
@@ -499,7 +540,9 @@ def plan_migration(path: Path | str, *, review_policy: str = "always") -> dict[s
         "to": SCHEMA_VERSION,
         "tasks": sorted(migrated["tasks"]),
         "backup": str(path.with_suffix(path.suffix + ".v2.bak")),
-        "notes": _migration_notes(migrated, review_policy=review_policy),
+        "notes": _migration_notes(
+            migrated, review_policy=review_policy, source_version=source.get("schemaVersion")
+        ),
     }
 
 
@@ -521,22 +564,32 @@ def apply_migration(path: Path | str, *, review_policy: str = "always") -> dict[
     # schema state on read.
     with StateStore(path).locked():
         source = read_source(path)
+        source_version = source.get("schemaVersion")
         migrated = convert(source, review_policy=review_policy, wdd_dir=wdd_dir)
 
-        moves = plan_v6_file_moves(wdd_dir, migrated["epic"], migrated)
-        _refuse_reserved_collisions(moves)
-        _execute_file_moves(moves)
-        _write_attempt_manifests(wdd_dir, migrated)
-        # `create_epic` always mints an empty overlay (`config.json`, `{}`)
-        # alongside a fresh `epics/<slug>/` -- a migrated epic dir had none
-        # (v5 predates the overlay split), so write the identical empty
-        # shape here too, or a migrated epic's directory disagrees with
-        # every other epic's shape for no reason. Semantically inert: a
-        # missing overlay file already reads as `{}` (`load_overlay`'s own
-        # doctrine), which is exactly what `_load_layers_for_migration`
-        # used above to compute `full_digest` -- writing the same `{}` to
-        # disk now changes no digest already stamped into `migrated`.
-        save_overlay(wdd_dir, migrated["epic"], {})
+        # The v5 -> v6 physical side effects (file moves, attempt-snapshot
+        # manifests, a fresh empty overlay) apply ONLY to a source that
+        # actually predates the epics/<slug>/ layout (v2..v5) -- a v6
+        # SOURCE already has its artifacts under epics/<slug>/ and a real
+        # overlay (possibly non-empty) that a blind `save_overlay(..., {})`
+        # here would silently destroy. The v6 -> v7 step is a pure version
+        # bump (spec "Schema v7": "no file moves"), so a v6 source takes
+        # none of these side effects.
+        if source_version != _V6_SCHEMA_VERSION:
+            moves = plan_v6_file_moves(wdd_dir, migrated["epic"], migrated)
+            _refuse_reserved_collisions(moves)
+            _execute_file_moves(moves)
+            _write_attempt_manifests(wdd_dir, migrated)
+            # `create_epic` always mints an empty overlay (`config.json`, `{}`)
+            # alongside a fresh `epics/<slug>/` -- a migrated epic dir had none
+            # (v5 predates the overlay split), so write the identical empty
+            # shape here too, or a migrated epic's directory disagrees with
+            # every other epic's shape for no reason. Semantically inert: a
+            # missing overlay file already reads as `{}` (`load_overlay`'s own
+            # doctrine), which is exactly what `_load_layers_for_migration`
+            # used above to compute `full_digest` -- writing the same `{}` to
+            # disk now changes no digest already stamped into `migrated`.
+            save_overlay(wdd_dir, migrated["epic"], {})
 
         backup = path.with_suffix(path.suffix + ".v2.bak")
         shutil.copy2(path, backup)
@@ -547,6 +600,8 @@ def apply_migration(path: Path | str, *, review_policy: str = "always") -> dict[
         "to": SCHEMA_VERSION,
         "tasks": sorted(migrated["tasks"]),
         "backup": str(backup),
-        "notes": _migration_notes(migrated, review_policy=review_policy),
+        "notes": _migration_notes(
+            migrated, review_policy=review_policy, source_version=source_version
+        ),
         "applied": True,
     }

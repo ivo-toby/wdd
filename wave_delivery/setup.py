@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -24,9 +25,15 @@ from .config import (
     save_overlay,
 )
 from .constitution import probe_repository
-from .engine import apply_mutation
+from .engine import apply_mutation, utc_now
 from .errors import IllegalTransition, ValidationError
-from .git import ensure_worktrees_gitignore
+from .git import (
+    ensure_worktrees_gitignore,
+    require_repository,
+    run_git,
+    worktree_at,
+    worktree_for,
+)
 from .handover import ensure_dispatch_gitignore
 from .intake import intake_drift, intake_status
 from .schema import EPIC_SLUG_PATTERN, copied_state, new_setup_state
@@ -273,13 +280,23 @@ def epic_orphans(wdd_dir: Path | str, state: dict[str, Any] | None) -> list[str]
     orphan report, Task 4 test contract). A directory left behind by a
     crashed `epic new` (never adopted) or a crashed archive transaction
     (Task 6) both surface here -- `doctor` never refuses, it only reports.
+
+    A PARKED epic's directory is excluded too (epic park/resume, spec
+    "doctor... epic_orphans() excludes parked slugs"): its state lives in
+    `state.parked[<slug>]`, not on disk, but `epics/<slug>/` staying in
+    place is exactly what park promises ("no epic-directory moves") -- an
+    accounted-for suspension, not a crash candidate. Without this exclusion
+    every parked epic would misreport as an orphan the moment it parked.
     """
     epics_root = Path(wdd_dir) / "epics"
     if not epics_root.is_dir():
         return []
     active = (state or {}).get("epic")
+    parked = set((state or {}).get("parked") or {})
     return sorted(
-        entry.name for entry in epics_root.iterdir() if entry.is_dir() and entry.name != active
+        entry.name
+        for entry in epics_root.iterdir()
+        if entry.is_dir() and entry.name != active and entry.name not in parked
     )
 
 
@@ -329,6 +346,22 @@ def create_epic(
                 f"({archive_dir}); slugs are immutable and unique across epics/ "
                 "and archive/ -- choose a different slug"
             )
+        if slug in (current.get("parked") or {}):
+            # Belt-and-braces (epic park/resume spec, "Interactions, pinned":
+            # "Add state.parked keys to the check anyway... for a
+            # hand-deleted directory"): `epics/<slug>/` staying in place is
+            # what park promises, so `_epic_dir_shape` below would normally
+            # already refuse via "occupied" -- but an operator who manually
+            # deleted that directory out from under a parked epic must not
+            # be able to silently mint a FRESH epic under the same slug,
+            # only reachable in this repo's parked map. Named as its own
+            # branch (not folded into the shape checks) since state, not
+            # the filesystem, is the source of truth for this one.
+            raise ValidationError(
+                f"epic slug {slug!r} is a parked epic; slugs are immutable and unique "
+                "across epics/, archive/, and state.parked -- resume it with 'wddctl "
+                f"epic resume --slug {slug}' or choose a different slug"
+            )
         shape = _epic_dir_shape(wdd_dir, slug)
         if shape == "has_record":
             raise ValidationError(
@@ -368,6 +401,233 @@ def create_epic(
         event_type="epic.created",
         task_id=None,
         data=data,
+        idempotency_key=idempotency_key,
+        expected_revision=expected_revision,
+        mutator=mutator,
+    )
+
+
+# ---------------------------------------------------------------------------
+# `wddctl epic park` / `wddctl epic resume --slug S` (epic park/resume spec,
+# 2026-08-07): suspension, not concurrency -- see the spec's "Design
+# principle". Park moves the scope-carrying sections into
+# `state.parked[<slug>]` and resets them to a fresh setup shape, exactly the
+# same swap `finalize._reset_to_post_ratification` performs for archive
+# (governance/events/telemetry/probes untouched, `appliedIdempotencyKeys`
+# preserved) -- except park keeps the sections instead of writing them to an
+# archive record, and additionally carries `leases`/`monitoring` (archive
+# resets monitoring; park's own reason is identical: it is scope-specific).
+# Resume moves them back verbatim. No epic-directory move happens for
+# either verb (spec: "epics/<slug>/ stays in place").
+# ---------------------------------------------------------------------------
+
+_PARKED_BUNDLE_SECTIONS = ("scope", "tasks", "intake", "reconcile", "monitoring")
+
+
+def park_epic(
+    store: StateStore,
+    *,
+    repo: Path | str,
+    worktrees_root: str | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """`wddctl epic park` (spec "epic park"): suspend the active epic.
+
+    Refuses when there is no active epic, when an archive transaction is
+    pending, or when one is durably blocked (finish or resolve it first --
+    park is not a way to route around an in-flight archive). Legal in ANY
+    phase from post-configure through delivered, including a scope that has
+    not reached `plan apply` yet (`scope` is `None`, `tasks` is `{}`): the
+    only precondition is an active epic.
+
+    Worktrees are released BEFORE the state swap, all-or-nothing: every
+    active-lease task's worktree is checked for uncommitted changes FIRST
+    (before any worktree is actually removed or any state mutated) -- one
+    dirty worktree refuses the WHOLE park, naming the path, with nothing
+    released and nothing swapped. Branches are left alone; resume's own
+    `start` reattach path re-creates worktrees from them.
+    """
+    repo = require_repository(repo)
+
+    def mutator(state: dict[str, Any]) -> dict[str, Any]:
+        slug = state.get("epic")
+        if slug is None:
+            raise IllegalTransition("epic park requires an active epic (state.epic is unset)")
+        if state.get("archivePending") is not None:
+            raise IllegalTransition(
+                "epic park: an archive transaction is pending for this epic; finish it "
+                "with 'wddctl scope archive --repo .' before parking"
+            )
+        archive_blocked = state.get("archiveBlocked")
+        if archive_blocked is not None:
+            raise IllegalTransition(
+                f"epic park: archive is blocked on {archive_blocked['collidingPath']!r}; "
+                "resolve the collision and re-run 'wddctl scope archive --repo .' before parking"
+            )
+
+        # --- Step 1: plan every worktree release, refusing on ANY dirty
+        # worktree BEFORE removing anything (all-or-nothing) -------------
+        leases = state.get("leases") or {}
+        scope_id = (state.get("scope") or {}).get("id")
+        to_release: list[tuple[str, Path]] = []
+        for task_id in sorted(leases):
+            lease = leases[task_id]
+            if not isinstance(lease, dict) or lease.get("status") != "active":
+                continue
+            task = state.get("tasks", {}).get(task_id, {})
+            path = worktree_for(
+                repo, scope_id, task_id, task.get("worktree"), worktrees_root=worktrees_root
+            )
+            entry = worktree_at(repo, path)
+            if entry is None:
+                if path.exists():
+                    raise ValidationError(f"worktree is not registered with Git: {path}")
+                # Already gone (a crash between a prior removal and its state
+                # write) -- nothing to check or remove for this task.
+                continue
+            expected_branch = f"refs/heads/{lease.get('branch')}"
+            if entry.get("branch") != expected_branch:
+                raise ValidationError(
+                    f"refusing to park: worktree {path} is on {entry.get('branch')}, "
+                    f"expected {expected_branch}"
+                )
+            if run_git(path, "status", "--porcelain").stdout.strip():
+                raise IllegalTransition(
+                    f"epic park refuses: task {task_id} has uncommitted changes in "
+                    f"{path}; commit or stash them before parking (branches are kept -- "
+                    "only worktrees are released)"
+                )
+            to_release.append((task_id, path))
+
+        # --- Step 2: only now, remove the worktrees checked above --------
+        for _task_id, path in to_release:
+            run_git(repo, "worktree", "remove", str(path))
+        if to_release:
+            run_git(repo, "worktree", "prune")
+
+        # --- Step 3: build the parked bundle and swap in a fresh setup ---
+        updated = copied_state(state)
+        for task_id, _path in to_release:
+            released = deepcopy(updated["leases"][task_id])
+            released["status"] = "released"
+            released["releasedAt"] = utc_now()
+            released["cleanup"] = "cleaned_up"
+            updated["leases"][task_id] = released
+            updated["tasks"][task_id]["worktree"] = None
+
+        bundle: dict[str, Any] = {"at": utc_now()}
+        for section in _PARKED_BUNDLE_SECTIONS:
+            bundle[section] = updated.get(section)
+        if updated.get("finalize") is not None:
+            bundle["finalize"] = updated["finalize"]
+        if updated.get("leases") is not None:
+            bundle["leases"] = updated["leases"]
+
+        parked = dict(updated.get("parked") or {})
+        parked[slug] = bundle
+
+        fresh = new_setup_state()
+        fresh["constitution"] = updated["constitution"]
+        fresh["events"] = updated["events"]
+        fresh["appliedIdempotencyKeys"] = updated["appliedIdempotencyKeys"]
+        fresh["telemetry"] = updated["telemetry"]
+        fresh["revision"] = updated["revision"]
+        # Probes are machine observations keyed by runner-command digest, not
+        # scope state (archive's identical precedent, finalize.py's
+        # `_reset_to_post_ratification`): they survive the reset.
+        if updated.get("probes"):
+            fresh["probes"] = updated["probes"]
+        fresh["parked"] = parked
+        return fresh
+
+    slug_hint = store.read().get("epic") if store.exists() else None
+    return apply_mutation(
+        store,
+        event_type="epic.parked",
+        task_id=None,
+        data={"slug": slug_hint} if slug_hint else {},
+        idempotency_key=idempotency_key,
+        expected_revision=expected_revision,
+        mutator=mutator,
+    )
+
+
+def resume_epic(
+    store: StateStore,
+    *,
+    slug: str,
+    wdd_dir: Path | str,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """`wddctl epic resume --slug S` (spec "epic resume"): reactivate a
+    parked epic.
+
+    Refuses when an epic is already active (park or archive it first), when
+    `slug` is not in `state.parked`, or when `epics/<slug>/` is missing on
+    disk (a hard error naming the path -- never guessed or silently
+    recreated).
+
+    Resume and the chokepoint, pinned (spec "Resume and the chokepoint,
+    pinned"): this verb is governed like any mutating verb, but its OWN
+    admission question is answered entirely by `require_fresh_governance`
+    against the CURRENT (pre-swap) state -- constitution/config still
+    ratified is right and sufficient. The epic-level gates
+    (`require_fresh_epic_config`/`require_fresh_intake`) run at the same CLI
+    chokepoint as every governed verb, but evaluate the pre-swap state,
+    where `state.epic`/`intake.configure`/`scope` are all null/absent --
+    structurally no-ops. This is deliberate, not accidental: staleness is
+    the EXISTING gates' job, re-evaluated on the NEXT governed verb against
+    the just-restored POST-resume state, which is the only state where
+    "has this epic's config/intake/plan drifted" is a meaningful question.
+    No re-validation of the restored sections happens here beyond schema
+    validation of the swapped-in state (`StateStore.write`'s own check).
+    """
+    wdd_dir = Path(wdd_dir)
+
+    def mutator(state: dict[str, Any]) -> dict[str, Any]:
+        if state.get("epic") is not None:
+            raise IllegalTransition(
+                f"epic resume requires no active epic (currently {state['epic']!r}); "
+                "park or archive it first"
+            )
+        parked = state.get("parked") or {}
+        if slug not in parked:
+            raise ValidationError(
+                f"no parked epic named {slug!r}; parked slugs: {sorted(parked)}"
+            )
+        epic_dir = wdd_dir / "epics" / slug
+        if not epic_dir.is_dir():
+            raise ValidationError(
+                f"epics/{slug}/ does not exist on disk; cannot resume a parked epic whose "
+                "directory is missing -- restore it (from version control or backup) before "
+                "retrying"
+            )
+
+        bundle = parked[slug]
+        updated = copied_state(state)
+        updated["epic"] = slug
+        for section in _PARKED_BUNDLE_SECTIONS:
+            updated[section] = bundle.get(section)
+        if "finalize" in bundle:
+            updated["finalize"] = bundle["finalize"]
+        else:
+            updated.pop("finalize", None)
+        if "leases" in bundle:
+            updated["leases"] = bundle["leases"]
+        else:
+            updated.pop("leases", None)
+        remaining = dict(parked)
+        del remaining[slug]
+        updated["parked"] = remaining
+        return updated
+
+    return apply_mutation(
+        store,
+        event_type="epic.resumed",
+        task_id=None,
+        data={"slug": slug},
         idempotency_key=idempotency_key,
         expected_revision=expected_revision,
         mutator=mutator,
@@ -507,17 +767,30 @@ def setup_next_actions(
         # legal pre-Task-4 shape), there is nothing to gain by retroactively
         # demanding epic creation; the ladder continues from wherever the
         # recorded intake data says it is.
+        judgment = (
+            "name the work with the user in ONE short round (a lowercase-"
+            "dash slug, and optionally a display title) per the wdd-intake "
+            "skill, then create the epic. Slugs are immutable -- there is "
+            "no rename verb; retiring one means archiving it."
+        )
+        parked = state.get("parked") or {}
+        if parked:
+            # Named, not acted on (epic park/resume spec, "status and
+            # setup-phase next name parked epics in judgment text without
+            # emitting actions for them"): a new epic here might actually be
+            # a pivot BACK to suspended work, and the operator should be
+            # told that option exists before creating a genuinely new slug.
+            judgment += (
+                f" Parked epic(s) exist ({', '.join(sorted(parked))}) -- if the new work "
+                "is actually one of these resuming, use 'wddctl epic resume --slug SLUG' "
+                "instead of creating a new epic."
+            )
         actions.append(
             {
                 "task": "-",
                 "action": "create_epic",
                 "command": f"{prefix} epic new --slug SLUG",
-                "judgment": (
-                    "name the work with the user in ONE short round (a lowercase-"
-                    "dash slug, and optionally a display title) per the wdd-intake "
-                    "skill, then create the epic. Slugs are immutable -- there is "
-                    "no rename verb; retiring one means archiving it."
-                ),
+                "judgment": judgment,
             }
         )
     elif (

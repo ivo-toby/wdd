@@ -101,6 +101,9 @@ That is the whole engine. Everything else is judgment:
 - Scope already `delivered` and there's more work to bring: `wddctl scope
   archive --repo .` first, then `wdd-intake` to start the next scope's
   ladder.
+- Mid-epic pivot to genuinely different work: `wddctl epic park` (see
+  `wdd-intake`'s "Parking an epic" — pivot-in-place when it's the same
+  epic with a new approach).
 - A spec, design, plan, or brief needs breaking before someone builds on
   it ("review this spec", "poke holes", a security pass): use
   `wdd-spec-review` — a different model (or the human) as the adversary,

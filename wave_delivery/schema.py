@@ -9,7 +9,7 @@ from typing import Any
 from .errors import ValidationError
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 # Epic slug shape (spec Sec1, epic-scoped-state plan): `[a-z0-9][a-z0-9-]{1,63}`.
 # Exported so Task 4's `wddctl epic new` and migration.py's slug derivation
 # both validate against the exact same pattern -- one definition, not two.
@@ -135,6 +135,11 @@ def new_state(
         "appliedIdempotencyKeys": [],
         "telemetry": {"eventApplications": 0, "renderCount": 0},
         "intake": {},
+        # v7 (epic park/resume, spec "Schema v7"): required-but-defaulting --
+        # a slug -> parked-bundle map. Constructors never mint an entry;
+        # `setup.park_epic` is the sole writer, `setup.resume_epic` the sole
+        # remover.
+        "parked": {},
     }
 
 
@@ -232,6 +237,181 @@ def _validate_verification_evidence_extras(verification: Any, name: str) -> None
         _require_string(verification.get("configSha256"), f"{name}.configSha256")
 
 
+def _validate_scope(scope: Any, *, tasks_present: bool, label: str = "scope") -> None:
+    """Validate one `scope` section (nullable), shared by top-level state and
+    each `state.parked[<slug>]` bundle (schema v7) -- same shape, same
+    invariant ("scope must exist before tasks do"), only the error-message
+    label differs so a parked entry's refusal names the slug it belongs to.
+    """
+    if scope is None:
+        if tasks_present:
+            raise ValidationError(f"{label} must exist before tasks do; run 'wddctl plan apply'")
+        return
+    scope = _require_mapping(scope, label)
+    _require_string(scope.get("id"), f"{label}.id")
+    _require_string(scope.get("baseRef"), f"{label}.baseRef", nullable=True)
+    if scope.get("reviewPolicy") not in REVIEW_POLICIES:
+        raise ValidationError(f"{label}.reviewPolicy must be one of {sorted(REVIEW_POLICIES)}")
+    max_concurrent = scope.get("maxConcurrent")
+    if max_concurrent is not None and (
+        not isinstance(max_concurrent, int) or max_concurrent < 1
+    ):
+        raise ValidationError(f"{label}.maxConcurrent must be a positive integer or null")
+    approval = scope.get("approval")
+    if approval is not None:
+        approval = _require_mapping(approval, f"{label}.approval")
+        _require_string(approval.get("by"), f"{label}.approval.by")
+        _require_string(approval.get("at"), f"{label}.approval.at")
+    merge_surface = scope.get("mergeSurface")
+    if merge_surface is not None and merge_surface not in MERGE_SURFACES:
+        raise ValidationError(f"{label}.mergeSurface must be one of {sorted(MERGE_SURFACES)}")
+    merge_mode = scope.get("mergeMode")
+    if merge_mode is not None and merge_mode not in MERGE_MODES:
+        raise ValidationError(f"{label}.mergeMode must be one of {sorted(MERGE_MODES)}")
+
+
+def _validate_tasks(tasks: Any, *, label: str = "tasks") -> dict[str, Any]:
+    """Validate one `tasks` section, shared by top-level state and each
+    `state.parked[<slug>]` bundle (schema v7). Returns the validated mapping
+    so callers can derive `tasks_present` for `_validate_scope` without a
+    second, differently-labeled `_require_mapping` call.
+    """
+    tasks = _require_mapping(tasks, label)
+    for task_id, task in tasks.items():
+        _require_string(task_id, f"{label} key")
+        task = _require_mapping(task, f"{label}.{task_id}")
+        if task.get("id") != task_id:
+            raise ValidationError(f"{label}.{task_id}.id must match its object key")
+        _require_string(task.get("specPath"), f"{label}.{task_id}.specPath")
+        _require_string(task.get("title"), f"{label}.{task_id}.title")
+        if task.get("status") not in TASK_STATUSES:
+            raise ValidationError(f"{label}.{task_id}.status is invalid")
+        if task.get("risk") not in RISK_LEVELS:
+            raise ValidationError(f"{label}.{task_id}.risk must be 'normal' or 'high'")
+        for field in ("dependsOn", "conflictDomains", "context"):
+            value = task.get(field)
+            if not isinstance(value, list) or not all(
+                isinstance(item, str) and item for item in value
+            ):
+                raise ValidationError(f"{label}.{task_id}.{field} must be a string list")
+        for field in ("model", "reviewModel"):
+            _require_string(task.get(field), f"{label}.{task_id}.{field}", nullable=True)
+        if task_id in task["dependsOn"]:
+            raise ValidationError(f"{label}.{task_id} cannot depend on itself")
+        for dependency in task["dependsOn"]:
+            if dependency not in tasks:
+                raise ValidationError(
+                    f"{label}.{task_id}.dependsOn references unknown task {dependency}"
+                )
+        for field in ("branch", "worktree", "headSha", "pr", "blocker"):
+            _require_string(task.get(field), f"{label}.{task_id}.{field}", nullable=True)
+        for field in ("review", "verification", "merge"):
+            value = task.get(field)
+            if value is not None and not isinstance(value, dict):
+                raise ValidationError(f"{label}.{task_id}.{field} must be an object or null")
+        _validate_review_evidence_extras(
+            task.get("review"), f"{label}.{task_id}.review", allow_resolved_risk=True
+        )
+        _validate_verification_evidence_extras(
+            task.get("verification"), f"{label}.{task_id}.verification"
+        )
+        freshness = task.get("freshness")
+        if freshness is not None and not isinstance(freshness, dict):
+            raise ValidationError(f"{label}.{task_id}.freshness must be an object or null")
+        _require_string(task.get("snapshot"), f"{label}.{task_id}.snapshot", nullable=True)
+        inputs = task.get("inputs", [])
+        if not isinstance(inputs, list):
+            raise ValidationError(f"{label}.{task_id}.inputs must be a list")
+        for entry in inputs:
+            entry = _require_mapping(entry, f"{label}.{task_id}.inputs[]")
+            _require_string(entry.get("path"), f"{label}.{task_id}.inputs[].path")
+            _require_string(entry.get("sha256"), f"{label}.{task_id}.inputs[].sha256")
+        rebound = task.get("rebound")
+        if rebound is not None:
+            rebound = _require_mapping(rebound, f"{label}.{task_id}.rebound")
+            _require_string(rebound.get("by"), f"{label}.{task_id}.rebound.by")
+            _require_string(rebound.get("at"), f"{label}.{task_id}.rebound.at")
+
+    detect_dependency_cycle(tasks)
+    return tasks
+
+
+def _validate_reconcile(reconcile: Any, *, label: str = "reconcile") -> None:
+    reconcile = _require_mapping(reconcile, label)
+    every = reconcile.get("everyNMerges")
+    if every is not None and (not isinstance(every, int) or every < 1):
+        raise ValidationError(f"{label}.everyNMerges must be a positive integer or null")
+    if not isinstance(reconcile.get("mergesSinceCheckpoint"), int):
+        raise ValidationError(f"{label}.mergesSinceCheckpoint must be an integer")
+    if not isinstance(reconcile.get("pendingNotes"), list):
+        raise ValidationError(f"{label}.pendingNotes must be a list")
+
+
+def _validate_finalize(finalize: Any, *, label: str = "finalize") -> None:
+    if finalize is None:
+        return
+    finalize = _require_mapping(finalize, label)
+    # Optional keys: review, handoff (each must be dict or absent). verification
+    # gets its own deeper check below (Task 5: multi-command evidence shape).
+    for field in ("review", "handoff"):
+        value = finalize.get(field)
+        if value is not None and not isinstance(value, dict):
+            raise ValidationError(f"{label}.{field} must be an object or null")
+    # finalReview evidence binds a model but no per-task risk tier (spec
+    # Sec2: "final review records its selected model").
+    _validate_review_evidence_extras(
+        finalize.get("review"), f"{label}.review", allow_resolved_risk=False
+    )
+    _validate_finalize_verification(finalize.get("verification"), label=f"{label}.verification")
+    # Optional key: delivered (dict with non-empty-string at, by, headSha when present).
+    delivered = finalize.get("delivered")
+    if delivered is not None:
+        delivered = _require_mapping(delivered, f"{label}.delivered")
+        for field in ("at", "by", "headSha"):
+            _require_string(delivered.get(field), f"{label}.delivered.{field}")
+
+
+_PARKED_ENTRY_KEYS = {"at", "scope", "tasks", "intake", "finalize", "reconcile", "monitoring", "leases"}
+_PARKED_ENTRY_REQUIRED_KEYS = {"at", "scope", "tasks", "intake", "reconcile", "monitoring"}
+
+
+def _validate_parked_entry(slug: str, entry: Any) -> None:
+    """One `state.parked[<slug>]` bundle (schema v7, spec "Schema v7"): `at`
+    plus the scope-carrying sections `epic.parked` moved out of top-level
+    state -- `scope`/`tasks`/`intake`/`reconcile`/`monitoring` always
+    present (a fresh setup-phase epic still HAS these sections, just empty/
+    null), `finalize`/`leases` present only when the parked epic had reached
+    that far. Validated with the exact same per-field rules as top-level
+    state, just re-labeled so a violation names the parked slug it lives
+    under, not a bare top-level field name that would misdirect an operator.
+    """
+    label = f"parked.{slug}"
+    entry = _require_mapping(entry, label)
+    missing = _PARKED_ENTRY_REQUIRED_KEYS - set(entry)
+    if missing:
+        raise ValidationError(f"{label} is missing required key(s): {sorted(missing)}")
+    unknown = set(entry) - _PARKED_ENTRY_KEYS
+    if unknown:
+        raise ValidationError(f"{label} has unknown keys: {sorted(unknown)}")
+    _require_string(entry.get("at"), f"{label}.at")
+    tasks = _validate_tasks(entry.get("tasks"), label=f"{label}.tasks")
+    _validate_scope(entry.get("scope"), tasks_present=bool(tasks), label=f"{label}.scope")
+    _validate_reconcile(entry.get("reconcile"), label=f"{label}.reconcile")
+    _require_mapping(entry.get("monitoring"), f"{label}.monitoring")
+    _validate_finalize(entry.get("finalize"), label=f"{label}.finalize")
+    leases = entry.get("leases")
+    if leases is not None and not isinstance(leases, dict):
+        raise ValidationError(f"{label}.leases must be an object when present")
+    _validate_intake(_require_mapping(entry.get("intake"), f"{label}.intake"), name=f"{label}.intake")
+
+
+def _validate_parked(parked: Any) -> None:
+    parked = _require_mapping(parked, "parked")
+    for slug, entry in parked.items():
+        validate_epic_slug(slug, name="parked key")
+        _validate_parked_entry(slug, entry)
+
+
 def validate_state(state: dict[str, Any]) -> None:
     if not isinstance(state, dict):
         raise ValidationError("controller state must be an object")
@@ -239,7 +419,7 @@ def validate_state(state: dict[str, Any]) -> None:
         found = state.get("schemaVersion")
         hint = (
             " run 'wddctl --state <path> migrate --dry-run' to convert it"
-            if found in {2, 3, 4, 5}
+            if found in {2, 3, 4, 5, 6}
             else ""
         )
         raise ValidationError(
@@ -272,32 +452,7 @@ def validate_state(state: dict[str, Any]) -> None:
         _require_string(archive_blocked.get("collidingPath"), "archiveBlocked.collidingPath")
         _require_string(archive_blocked.get("at"), "archiveBlocked.at")
 
-    scope = state.get("scope")
-    if scope is None:
-        if state.get("tasks"):
-            raise ValidationError("scope must exist before tasks do; run 'wddctl plan apply'")
-    else:
-        scope = _require_mapping(scope, "scope")
-        _require_string(scope.get("id"), "scope.id")
-        _require_string(scope.get("baseRef"), "scope.baseRef", nullable=True)
-        if scope.get("reviewPolicy") not in REVIEW_POLICIES:
-            raise ValidationError(f"scope.reviewPolicy must be one of {sorted(REVIEW_POLICIES)}")
-        max_concurrent = scope.get("maxConcurrent")
-        if max_concurrent is not None and (
-            not isinstance(max_concurrent, int) or max_concurrent < 1
-        ):
-            raise ValidationError("scope.maxConcurrent must be a positive integer or null")
-        approval = scope.get("approval")
-        if approval is not None:
-            approval = _require_mapping(approval, "scope.approval")
-            _require_string(approval.get("by"), "scope.approval.by")
-            _require_string(approval.get("at"), "scope.approval.at")
-        merge_surface = scope.get("mergeSurface")
-        if merge_surface is not None and merge_surface not in MERGE_SURFACES:
-            raise ValidationError(f"scope.mergeSurface must be one of {sorted(MERGE_SURFACES)}")
-        merge_mode = scope.get("mergeMode")
-        if merge_mode is not None and merge_mode not in MERGE_MODES:
-            raise ValidationError(f"scope.mergeMode must be one of {sorted(MERGE_MODES)}")
+    _validate_scope(state.get("scope"), tasks_present=bool(state.get("tasks")), label="scope")
 
     constitution = _require_mapping(state.get("constitution"), "constitution")
     constitution_status = constitution.get("status")
@@ -312,72 +467,8 @@ def validate_state(state: dict[str, Any]) -> None:
             "constitution.ratification.decisionFingerprint",
         )
 
-    tasks = _require_mapping(state.get("tasks"), "tasks")
-    for task_id, task in tasks.items():
-        _require_string(task_id, "tasks key")
-        task = _require_mapping(task, f"tasks.{task_id}")
-        if task.get("id") != task_id:
-            raise ValidationError(f"tasks.{task_id}.id must match its object key")
-        _require_string(task.get("specPath"), f"tasks.{task_id}.specPath")
-        _require_string(task.get("title"), f"tasks.{task_id}.title")
-        if task.get("status") not in TASK_STATUSES:
-            raise ValidationError(f"tasks.{task_id}.status is invalid")
-        if task.get("risk") not in RISK_LEVELS:
-            raise ValidationError(f"tasks.{task_id}.risk must be 'normal' or 'high'")
-        for field in ("dependsOn", "conflictDomains", "context"):
-            value = task.get(field)
-            if not isinstance(value, list) or not all(
-                isinstance(item, str) and item for item in value
-            ):
-                raise ValidationError(f"tasks.{task_id}.{field} must be a string list")
-        for field in ("model", "reviewModel"):
-            _require_string(task.get(field), f"tasks.{task_id}.{field}", nullable=True)
-        if task_id in task["dependsOn"]:
-            raise ValidationError(f"tasks.{task_id} cannot depend on itself")
-        for dependency in task["dependsOn"]:
-            if dependency not in tasks:
-                raise ValidationError(
-                    f"tasks.{task_id}.dependsOn references unknown task {dependency}"
-                )
-        for field in ("branch", "worktree", "headSha", "pr", "blocker"):
-            _require_string(task.get(field), f"tasks.{task_id}.{field}", nullable=True)
-        for field in ("review", "verification", "merge"):
-            value = task.get(field)
-            if value is not None and not isinstance(value, dict):
-                raise ValidationError(f"tasks.{task_id}.{field} must be an object or null")
-        _validate_review_evidence_extras(
-            task.get("review"), f"tasks.{task_id}.review", allow_resolved_risk=True
-        )
-        _validate_verification_evidence_extras(
-            task.get("verification"), f"tasks.{task_id}.verification"
-        )
-        freshness = task.get("freshness")
-        if freshness is not None and not isinstance(freshness, dict):
-            raise ValidationError(f"tasks.{task_id}.freshness must be an object or null")
-        _require_string(task.get("snapshot"), f"tasks.{task_id}.snapshot", nullable=True)
-        inputs = task.get("inputs", [])
-        if not isinstance(inputs, list):
-            raise ValidationError(f"tasks.{task_id}.inputs must be a list")
-        for entry in inputs:
-            entry = _require_mapping(entry, f"tasks.{task_id}.inputs[]")
-            _require_string(entry.get("path"), f"tasks.{task_id}.inputs[].path")
-            _require_string(entry.get("sha256"), f"tasks.{task_id}.inputs[].sha256")
-        rebound = task.get("rebound")
-        if rebound is not None:
-            rebound = _require_mapping(rebound, f"tasks.{task_id}.rebound")
-            _require_string(rebound.get("by"), f"tasks.{task_id}.rebound.by")
-            _require_string(rebound.get("at"), f"tasks.{task_id}.rebound.at")
-
-    detect_dependency_cycle(tasks)
-
-    reconcile = _require_mapping(state.get("reconcile"), "reconcile")
-    every = reconcile.get("everyNMerges")
-    if every is not None and (not isinstance(every, int) or every < 1):
-        raise ValidationError("reconcile.everyNMerges must be a positive integer or null")
-    if not isinstance(reconcile.get("mergesSinceCheckpoint"), int):
-        raise ValidationError("reconcile.mergesSinceCheckpoint must be an integer")
-    if not isinstance(reconcile.get("pendingNotes"), list):
-        raise ValidationError("reconcile.pendingNotes must be a list")
+    _validate_tasks(state.get("tasks"), label="tasks")
+    _validate_reconcile(state.get("reconcile"), label="reconcile")
 
     for field in ("monitoring", "telemetry"):
         _require_mapping(state.get(field), field)
@@ -391,30 +482,9 @@ def validate_state(state: dict[str, Any]) -> None:
     if not isinstance(keys, list) or not all(isinstance(key, str) and key for key in keys):
         raise ValidationError("appliedIdempotencyKeys must be a non-empty-string list")
 
-    # Validate optional finalize section.
-    finalize = state.get("finalize")
-    if finalize is not None:
-        finalize = _require_mapping(finalize, "finalize")
-        # Optional keys: review, handoff (each must be dict or absent). verification
-        # gets its own deeper check below (Task 5: multi-command evidence shape).
-        for field in ("review", "handoff"):
-            value = finalize.get(field)
-            if value is not None and not isinstance(value, dict):
-                raise ValidationError(f"finalize.{field} must be an object or null")
-        # finalReview evidence binds a model but no per-task risk tier (spec
-        # Sec2: "final review records its selected model").
-        _validate_review_evidence_extras(
-            finalize.get("review"), "finalize.review", allow_resolved_risk=False
-        )
-        _validate_finalize_verification(finalize.get("verification"))
-        # Optional key: delivered (dict with non-empty-string at, by, headSha when present).
-        delivered = finalize.get("delivered")
-        if delivered is not None:
-            delivered = _require_mapping(delivered, "finalize.delivered")
-            for field in ("at", "by", "headSha"):
-                _require_string(delivered.get(field), f"finalize.delivered.{field}")
-
-    _validate_intake(_require_mapping(state.get("intake"), "intake"))
+    _validate_finalize(state.get("finalize"), label="finalize")
+    _validate_intake(_require_mapping(state.get("intake"), "intake"), name="intake")
+    _validate_parked(state.get("parked"))
 
     # Optional (spec Sec6): absent on any state that predates the runner
     # registry, or that has never recorded a passing probe. digest ->
@@ -436,7 +506,7 @@ def validate_state(state: dict[str, Any]) -> None:
 _VERIFICATION_STATUSES = {"passed", "failed", "unavailable"}
 
 
-def _validate_finalize_verification(verification: Any) -> None:
+def _validate_finalize_verification(verification: Any, *, label: str = "finalize.verification") -> None:
     """Validate `finalize.verification` (Task 5: spec Sec5's multi-command evidence).
 
     Two shapes are both legal, distinguished by the presence of `commands`:
@@ -448,10 +518,14 @@ def _validate_finalize_verification(verification: Any) -> None:
       -- a single command/status pair. Read sites treat this as the one-entry
       list it always was (`finalize.verification_commands`); this validator
       does not itself normalize the shape, only accepts both.
+
+    `label` (schema v7): re-labeled to `parked.<slug>.finalize.verification`
+    when validating a parked bundle, so a violation names the parked slug it
+    lives under.
     """
     if verification is None:
         return
-    verification = _require_mapping(verification, "finalize.verification")
+    verification = _require_mapping(verification, label)
     # headSha/at/status are not required here (mirrors review/handoff's own
     # dict-or-null looseness above -- pre-phase-6a fixtures build partial
     # verification stubs); `status`, when present, must still be one of the
@@ -460,26 +534,26 @@ def _validate_finalize_verification(verification: Any) -> None:
     status = verification.get("status")
     if status is not None and status not in _VERIFICATION_STATUSES:
         raise ValidationError(
-            f"finalize.verification.status must be one of {sorted(_VERIFICATION_STATUSES)}"
+            f"{label}.status must be one of {sorted(_VERIFICATION_STATUSES)}"
         )
     if "commands" in verification:
         commands = verification["commands"]
         if not isinstance(commands, list) or not commands:
-            raise ValidationError("finalize.verification.commands must be a non-empty list")
+            raise ValidationError(f"{label}.commands must be a non-empty list")
         for entry in commands:
-            entry = _require_mapping(entry, "finalize.verification.commands[]")
-            _require_string(entry.get("command"), "finalize.verification.commands[].command")
+            entry = _require_mapping(entry, f"{label}.commands[]")
+            _require_string(entry.get("command"), f"{label}.commands[].command")
             if entry.get("status") not in _VERIFICATION_STATUSES:
                 raise ValidationError(
-                    "finalize.verification.commands[].status must be one of "
+                    f"{label}.commands[].status must be one of "
                     f"{sorted(_VERIFICATION_STATUSES)}"
                 )
     else:
-        _require_string(verification.get("command"), "finalize.verification.command", nullable=True)
+        _require_string(verification.get("command"), f"{label}.command", nullable=True)
         _require_string(
-            verification.get("justification"), "finalize.verification.justification", nullable=True
+            verification.get("justification"), f"{label}.justification", nullable=True
         )
-    _validate_verification_evidence_extras(verification, "finalize.verification")
+    _validate_verification_evidence_extras(verification, label)
 
 
 _INTAKE_RECORD_KEYS = {"spec", "research", "design", "configure"}
@@ -507,7 +581,7 @@ def _validate_configure(configure: Any, *, name: str = "intake.configure") -> No
     _require_string(configure.get("sha256"), f"{name}.sha256")
 
 
-def _validate_intake(intake: dict[str, Any]) -> None:
+def _validate_intake(intake: dict[str, Any], *, name: str = "intake") -> None:
     """Validate the required `intake` section (schema v6).
 
     Valid shapes: `{"legacy": True}`, optionally with a sibling `configure`
@@ -517,60 +591,63 @@ def _validate_intake(intake: dict[str, Any]) -> None:
     configure}` records, each bound to the artifact bytes (or, for
     `configure`, the config view) that were approved
     (governance_fingerprint idiom).
+
+    `name` (schema v7): re-labeled to `parked.<slug>.intake` when validating
+    a parked bundle, so a violation names the parked slug it lives under.
     """
     if "legacy" in intake:
         if intake.get("legacy") is not True:
-            raise ValidationError("intake.legacy must be true when present")
+            raise ValidationError(f"{name}.legacy must be true when present")
         extra = set(intake) - {"legacy", "configure"}
         if extra:
-            raise ValidationError(f"intake has unknown keys: {sorted(extra)}")
-        _validate_configure(intake.get("configure"))
+            raise ValidationError(f"{name} has unknown keys: {sorted(extra)}")
+        _validate_configure(intake.get("configure"), name=f"{name}.configure")
         return
 
     unknown = set(intake) - _INTAKE_RECORD_KEYS
     if unknown:
-        raise ValidationError(f"intake has unknown keys: {sorted(unknown)}")
-    _validate_configure(intake.get("configure"))
+        raise ValidationError(f"{name} has unknown keys: {sorted(unknown)}")
+    _validate_configure(intake.get("configure"), name=f"{name}.configure")
 
     spec = intake.get("spec")
     if spec is not None:
-        spec = _require_mapping(spec, "intake.spec")
-        _require_string(spec.get("by"), "intake.spec.by")
-        _require_string(spec.get("at"), "intake.spec.at")
-        _require_string(spec.get("sha256"), "intake.spec.sha256")
+        spec = _require_mapping(spec, f"{name}.spec")
+        _require_string(spec.get("by"), f"{name}.spec.by")
+        _require_string(spec.get("at"), f"{name}.spec.at")
+        _require_string(spec.get("sha256"), f"{name}.spec.sha256")
         criteria = spec.get("criteria")
         if not isinstance(criteria, int) or isinstance(criteria, bool) or criteria < 1:
-            raise ValidationError("intake.spec.criteria must be a positive integer")
+            raise ValidationError(f"{name}.spec.criteria must be a positive integer")
 
     research = intake.get("research")
     if research is not None:
-        research = _require_mapping(research, "intake.research")
-        _require_string(research.get("by"), "intake.research.by")
-        _require_string(research.get("at"), "intake.research.at")
+        research = _require_mapping(research, f"{name}.research")
+        _require_string(research.get("by"), f"{name}.research.by")
+        _require_string(research.get("at"), f"{name}.research.at")
         done = research.get("done")
         skipped = research.get("skipped")
         if (done is True) == (skipped is True):
             raise ValidationError(
-                "intake.research must be exactly one of done=true or skipped=true"
+                f"{name}.research must be exactly one of done=true or skipped=true"
             )
         if done is True:
             artifacts = research.get("artifacts")
             if not isinstance(artifacts, list):
-                raise ValidationError("intake.research.artifacts must be a list")
+                raise ValidationError(f"{name}.research.artifacts must be a list")
             for artifact in artifacts:
-                artifact = _require_mapping(artifact, "intake.research.artifacts[]")
-                _require_string(artifact.get("path"), "intake.research.artifacts[].path")
-                _require_string(artifact.get("sha256"), "intake.research.artifacts[].sha256")
+                artifact = _require_mapping(artifact, f"{name}.research.artifacts[]")
+                _require_string(artifact.get("path"), f"{name}.research.artifacts[].path")
+                _require_string(artifact.get("sha256"), f"{name}.research.artifacts[].sha256")
         else:
-            _require_string(research.get("reason"), "intake.research.reason")
+            _require_string(research.get("reason"), f"{name}.research.reason")
 
     design = intake.get("design")
     if design is not None:
-        design = _require_mapping(design, "intake.design")
-        _require_string(design.get("by"), "intake.design.by")
-        _require_string(design.get("at"), "intake.design.at")
-        _require_string(design.get("sha256"), "intake.design.sha256")
-        _require_string(design.get("deliverableCommand"), "intake.design.deliverableCommand")
+        design = _require_mapping(design, f"{name}.design")
+        _require_string(design.get("by"), f"{name}.design.by")
+        _require_string(design.get("at"), f"{name}.design.at")
+        _require_string(design.get("sha256"), f"{name}.design.sha256")
+        _require_string(design.get("deliverableCommand"), f"{name}.design.deliverableCommand")
 
 
 def intake_complete(state: dict[str, Any]) -> bool:

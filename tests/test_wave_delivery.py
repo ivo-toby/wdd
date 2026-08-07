@@ -67,7 +67,7 @@ from wave_delivery.review import (
     record_verification,
     run_review,
 )
-from wave_delivery.schema import new_setup_state, new_state, task_state, validate_state
+from wave_delivery.schema import SCHEMA_VERSION, new_setup_state, new_state, task_state, validate_state
 from wave_delivery.store import StateStore
 
 
@@ -792,7 +792,7 @@ class MigrationTests(BaseTest):
         self.assertTrue(Path(result["backup"]).exists())
 
         migrated = StateStore(path).read()
-        self.assertEqual(migrated["schemaVersion"], 6)
+        self.assertEqual(migrated["schemaVersion"], SCHEMA_VERSION)
         # v5 -> v6 (epic-scoped-state plan, Task 3) additionally stamps a
         # migration-time `configure` exemption alongside `legacy` (spec
         # Sec4); this fixture has no config.json at all, so the digest is
