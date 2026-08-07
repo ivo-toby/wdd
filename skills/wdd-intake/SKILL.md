@@ -280,6 +280,27 @@ Never treat the cascade or the drift blocker as an error to route around.
 It's the system refusing to run on foundations nobody re-approved; the fix
 is always sign-off, not a workaround.
 
+## Parking an epic
+
+A mid-epic pivot has two shapes, and they take different verbs:
+
+- **Same epic, new approach** → pivot in place: re-approve the affected
+  rungs (the cascade exists for this) and reshape the plan — done tasks
+  stay done, obsolete in-flight tasks get cancelled, the branch keeps
+  every merged diff.
+- **Genuinely different epic that must run now** → park:
+
+```sh
+wddctl epic park                # suspend; worktrees released, branches kept
+wddctl epic resume --slug <s>   # later, with no other epic active
+```
+
+Park refuses if any worktree has uncommitted changes (commit or stash
+first — all-or-nothing, nothing is lost silently). At resume, expect
+freshness and config gates to ask for re-approvals — that is the system
+re-trusting the world after time passed, not an error. Don't park while
+a dispatch is running.
+
 ## Scope rollover
 
 Once a scope reaches `delivered`, the ladder is closed — intake verbs
