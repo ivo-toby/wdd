@@ -39,6 +39,11 @@ Initialize from scratch.
      {"default": "haiku", "highRisk": "sonnet"}, "review": "sonnet"}'` —
      and "harness defaults are fine" is a valid answer: record it as all
      nulls so the question resolves and dispatchers use their own default.
+     Model values are opaque dispatcher identifiers — wddctl never parses
+     them. Use whatever the dispatching harness accepts (effort variants
+     like "gpt-5.6-luna high" included) or a runner's registered name;
+     harness-agnostic setups that need exact runtime control belong in
+     runners, not in the string.
      If an answer instead names a local or CLI agent (qwen, codex, some
      other local model) rather than a harness-known alias, that value only
      resolves once it's registered and probed as a runner — mention this

@@ -26,12 +26,18 @@ Each action carries the exact command to use:
   verify). Do that, then run this to record the outcome.
 - **`model`** — when present, this field is **binding**, not metadata: set
   it explicitly as the subagent's model on the spawn call (worker or
-  reviewer). Spawning on your harness's default when the payload names a
-  model is a routing violation — the user configured that routing at setup.
-  If your harness cannot set a per-subagent model, stop and tell the user;
-  the remedy is registering the model as a runner (`wdd-runners`), not
-  dispatching on the wrong model. When the field is absent, the
-  dispatcher's default is correct.
+  reviewer). The value is an **opaque dispatcher identifier** — whatever
+  the configured dispatcher understands: a harness model spec (including
+  effort variants like `gpt-5.6-luna high`, if your harness accepts
+  them), or a configured runner's name (then the route is `wddctl
+  dispatch`, not a spawn). Pass it verbatim; never parse, normalize, or
+  "fix" it. Spawning on your harness's default when the payload names a
+  model is a routing violation — the user configured that routing at
+  setup. If your harness cannot honor the value (unknown model, no
+  per-subagent effort), stop and tell the user; the remedy is adjusting
+  config or registering a runner (`wdd-runners`), never dispatching on
+  the wrong model. When the field is absent, the dispatcher's default is
+  correct.
 
 Repeat until `next` is empty. Don't translate action names into commands
 yourself; the payload already did that. When you narrate progress, follow
@@ -262,8 +268,15 @@ and stop; recording a pass is not a fallback.
 
 The loop only runs if you keep running it. A controller that dispatches a
 worker and then ends its turn has not delegated the work — it has halted
-the scope. Dispatch is step one of a watch, and how you watch depends on
-what your harness gives you. In order of preference:
+the scope. And a controller that spawns an agent to do the watching has
+done something worse: **never spawn a monitor subagent**. Watching is the
+controller role itself, and the controller role is never dispatched — a
+"monitor agent" is a second controller with no state authority, and the
+one observed in the wild failed exactly the way that predicts. If you
+cannot watch synchronously or via wake-ups, poll yourself between
+actions; if you can't do that either, say so and stop. Dispatch is step
+one of a watch, and how you watch depends on what your harness gives
+you. In order of preference:
 
 1. **Synchronous dispatch.** If your harness can wait for a subagent's
    result inside your turn, use that: dispatch, block, handle the report,

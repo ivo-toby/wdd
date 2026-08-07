@@ -1304,6 +1304,16 @@ epic overlay → global config.json → built-in default
 through to global, and so on, independently per leaf — see "`config
 get`/`set --epic`" above for the mechanical surface.
 
+Model values are **opaque dispatcher identifiers**: `wddctl` never
+parses them. It performs exactly one mechanical check — a value naming a
+configured runner routes the dispatch through that runner — and
+otherwise passes the string verbatim into `next`'s action payloads for
+the controller's harness to interpret. Effort variants
+(`"gpt-5.6-luna high"`), provider prefixes, and harness-specific aliases
+are all legal because they are all meaningless to `wddctl`; when a
+harness cannot honor a value, the remedy is config or a runner, never
+parsing.
+
 **One digest function, byte-precise.** `effective_config_digest(view)` is
 the only fingerprint implementation for the resolved view: input is the
 fully parsed, default-hydrated merged view with source markers stripped;
