@@ -87,6 +87,44 @@ class ConfigValidationTest(unittest.TestCase):
         del config["worktrees"]
         validate_config(config)
 
+    def test_default_config_has_null_spec_review(self) -> None:
+        # models.specReview (spec Sec1): a default reviewer candidate for
+        # spec/design/plan review rounds, mirroring models.planning's shape
+        # exactly -- string or null, no risk tiering (spec review is not
+        # risk-tiered).
+        self.assertIsNone(default_config()["models"]["specReview"])
+
+    def test_spec_review_accepts_null_or_non_empty_string(self) -> None:
+        config = default_config()
+        config["models"]["specReview"] = "codex"
+        validate_config(config)
+        config["models"]["specReview"] = None
+        validate_config(config)
+
+    def test_rejects_empty_string_spec_review(self) -> None:
+        config = default_config()
+        config["models"]["specReview"] = ""
+        with self.assertRaises(ValidationError):
+            validate_config(config)
+
+    def test_rejects_non_string_spec_review(self) -> None:
+        config = default_config()
+        config["models"]["specReview"] = 123
+        with self.assertRaises(ValidationError):
+            validate_config(config)
+
+    def test_rejects_tiered_spec_review_object(self) -> None:
+        # Unlike models.review, models.specReview has no tier object form --
+        # spec review is not risk-tiered (spec Sec1, explicit non-goal).
+        config = default_config()
+        config["models"]["specReview"] = {"default": "codex", "highRisk": "codex"}
+        with self.assertRaises(ValidationError):
+            validate_config(config)
+
+    def test_set_value_models_spec_review(self) -> None:
+        updated = set_value(default_config(), "models.specReview", "codex")
+        self.assertEqual(updated["models"]["specReview"], "codex")
+
 
 class ConfigStorageTest(unittest.TestCase):
     def test_save_and_load_round_trip(self) -> None:
@@ -323,6 +361,55 @@ class InitTest(unittest.TestCase):
     def test_template_has_no_placeholders_or_json(self) -> None:
         for banned in ("```json", "TBD", "TODO", "<", "state which"):
             self.assertNotIn(banned, CONSTITUTION_TEMPLATE)
+
+    def test_template_has_behavioral_contract_section(self) -> None:
+        # spec Sec2 "The behavioral contract": the six testable obligations,
+        # carried verbatim-in-spirit into the template `wddctl init`
+        # scaffolds (the phase's second small machine touch -- a template
+        # string, no verb or schema change). Existing repos pick this up at
+        # their next governance amendment; there is no forced migration.
+        self.assertIn("## Behavioral contract", CONSTITUTION_TEMPLATE)
+        for phrase in (
+            "Dissent is a duty",
+            "Disagree-then-commit",
+            "Claim/observation discipline",
+            "Challenge conflicts with recorded doctrine",
+            "No agreement theater",
+            "Evidence names who did the work",
+        ):
+            self.assertIn(phrase, CONSTITUTION_TEMPLATE)
+
+    def test_init_constitution_contains_behavioral_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            init_repository(wdd, root)
+            text = (wdd / "constitution.md").read_text(encoding="utf-8")
+            self.assertIn("## Behavioral contract", text)
+
+    def test_ratification_fingerprint_covers_behavioral_contract_section(self) -> None:
+        # governance_fingerprint hashes config.json + the constitution's
+        # exact prose (config.py's own docstring: "signs the exact config
+        # values AND the exact constitution prose"). Editing the behavioral
+        # contract section must move the fingerprint like editing any other
+        # ratified prose does -- proving ratification actually covers it,
+        # not just that init wrote it once.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            init_repository(wdd, root)
+            config = load_config(wdd)
+            config = set_value(config, "merge.surface", "local")
+            config = set_value(config, "verification.commands", ["true"])
+            save_config(wdd, config)
+            before = governance_fingerprint(wdd)
+            constitution_file = wdd / "constitution.md"
+            text = constitution_file.read_text(encoding="utf-8")
+            self.assertIn("Dissent is a duty", text)
+            edited = text.replace("Dissent is a duty", "Dissent is discouraged")
+            constitution_file.write_text(edited, encoding="utf-8")
+            after = governance_fingerprint(wdd)
+            self.assertNotEqual(before, after)
 
     def test_init_scaffolds_worktrees_gitignore_at_repo_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

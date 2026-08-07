@@ -40,6 +40,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "planning": None,
         "implementation": {"default": None, "highRisk": None},
         "review": None,
+        "specReview": None,
     },
     "riskRules": [],
     "taskProvider": {"type": "local"},
@@ -166,6 +167,16 @@ def validate_config(config: dict[str, Any]) -> None:
     else:
         _require(review is None or (isinstance(review, str) and review),
                  "models.review must be null, a non-empty string, or an object")
+
+    # models.specReview (spec Sec1 "`models.specReview` -- routing the
+    # reviewer"): a default reviewer CANDIDATE for spec/design/plan review
+    # rounds, mirroring models.planning's shape exactly -- string or null,
+    # no tier object. Unlike models.review, spec review is explicitly never
+    # risk-tiered (there is no per-task risk at spec-review time), so no
+    # object form is accepted here.
+    spec_review = models.get("specReview")
+    _require(spec_review is None or (isinstance(spec_review, str) and spec_review),
+             "models.specReview must be null or a non-empty string")
 
     rules = config.get("riskRules")
     _require(isinstance(rules, list), "riskRules must be a list")
@@ -379,6 +390,7 @@ OVERLAY_ALLOWED_LEAVES: tuple[str, ...] = (
     "models.planning",
     "models.implementation",
     "models.review",
+    "models.specReview",
     "verification.commands",
     "verification.unavailableJustification",
     "merge.surface",
@@ -797,8 +809,16 @@ def project(view: dict[str, Any], purpose: str) -> dict[str, Any]:
     evidence recording), not this function's.
     """
     if purpose == "plan":
+        # models.specReview is excluded here too, not just from the
+        # taskReview/finalReview projections below: spec review is
+        # conversation-gated, never machine-gated (spec Sec1), so it must
+        # appear in NO evidence projection at all -- "plan" is the one
+        # projection that otherwise copies the whole `models` object
+        # wholesale, so it is the one place that copy must be pruned.
+        models = deepcopy(view["models"])
+        models.pop("specReview", None)
         return {
-            "models": deepcopy(view["models"]),
+            "models": models,
             "riskRules": deepcopy(view["riskRules"]),
             "review": {"policy": view["review"]["policy"]},
         }

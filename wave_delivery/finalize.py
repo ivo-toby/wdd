@@ -829,6 +829,32 @@ def _final_review_judgment(state: dict[str, Any]) -> str:
     )
 
 
+def _delivered_judgment(state: dict[str, Any]) -> str:
+    """The `archive` action's judgment text (spec Sec3): names the epic
+    retrospective step alongside the archive command. The knowledge file
+    lives at `shared-context/knowledge/<slug>.md`, keyed by the epic slug
+    when one exists (`state.epic`, cleared only once archiving itself
+    resets state) -- a legacy or pre-epic scope has no slug, so its own
+    scope id names the file instead, the closest stable identifier such a
+    scope has.
+
+    This is standing guidance, not a gate (spec Non-goals: "No retrospective
+    hard gate -- `scope archive` never refuses for a missing retrospective,
+    and running it directly (skipping the offer) is legal operator
+    behavior"): the judgment names the step, but `archive`'s own `command`
+    below runs unconditionally either way.
+    """
+    slug = state.get("epic") or (state.get("scope") or {}).get("id") or "SLUG"
+    return (
+        "before archiving, offer the epic retrospective per wdd-intake: distill the "
+        f"decisions, root causes, and quirks captured during the epic into "
+        f"shared-context/knowledge/{slug}.md, get the human's sign-off recorded in the "
+        "file, and commit it -- then run 'scope archive'. This is standing guidance, not "
+        "a gate: running scope archive directly, skipping the offer, is legal operator "
+        "behavior, and the living draft survives either way."
+    )
+
+
 def finalize_next_actions(
     state: dict[str, Any],
     wdd_dir: Path | str,
@@ -871,6 +897,10 @@ def finalize_next_actions(
       5. await_delivery    -- handoff recorded and fresh: nothing left to
                               run, only the human-owned final merge to wait
                               on (Spec Sec6: wddctl never performs it).
+      6. archive           -- delivered: the human-owned merge already
+                              landed. `next`'s judgment names the epic
+                              retrospective step alongside the archive
+                              command (spec Sec3) -- an offer, not a gate.
 
     Unlike engine.py, this module already reads config.json directly
     (record_final_review, prepare_handoff, ...) -- it lives outside
@@ -882,17 +912,24 @@ def finalize_next_actions(
     wdd_dir = Path(wdd_dir)
     scope_id = (state.get("scope") or {}).get("id")
     phase = derived_phase(state)
+    prefix = "wddctl" + (f" --state {shlex.quote(state_path)}" if state_path else "")
+    repo_arg = shlex.quote(str(repo))
     if phase == "delivered":
         return {
             "scope": scope_id,
             "revision": state["revision"],
             "phase": "delivered",
-            "actions": [],
+            "actions": [
+                {
+                    "task": "-",
+                    "action": "archive",
+                    "command": f"{prefix} scope archive --repo {repo_arg}",
+                    "judgment": _delivered_judgment(state),
+                }
+            ],
             "blockers": [],
         }
 
-    prefix = "wddctl" + (f" --state {shlex.quote(state_path)}" if state_path else "")
-    repo_arg = shlex.quote(str(repo))
     repo_path = require_repository(repo)
     base_sha = resolve_ref(repo_path, _base_ref(state))
 

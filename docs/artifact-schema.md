@@ -68,7 +68,7 @@ adopts on re-run.
   resolution order, the digest function, purpose-projected evidence
   digests, and the drift/cascade story. Only the allowlisted dotted leaves
   may appear in it: `models.planning`, `models.implementation`,
-  `models.review`, `verification.commands`,
+  `models.review`, `models.specReview`, `verification.commands`,
   `verification.unavailableJustification`, `merge.surface`, `riskRules`,
   `review.policy`. An overlay with any other key is refused by name at
   every entry point (load, `config set --epic`, `intake configure`

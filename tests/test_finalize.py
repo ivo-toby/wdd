@@ -1299,7 +1299,8 @@ class FinalizeNextActionsLadderTest(unittest.TestCase):
     """Task 4: `finalize_next_actions` drives the finalize ladder one rung at
     a time (mirroring setup_next_actions' one-action-at-a-time shape):
     final_review -> assign_final_fixes -> final_verification ->
-    prepare_handoff -> await_delivery -> delivered (empty)."""
+    prepare_handoff -> await_delivery -> delivered (archive, naming the
+    retrospective step)."""
 
     def _actions(self, state_path: str, root: Path) -> dict:
         from wave_delivery.finalize import finalize_next_actions
@@ -1468,13 +1469,22 @@ class FinalizeNextActionsLadderTest(unittest.TestCase):
             result = self._actions(state, root)
             self.assertEqual(result["actions"][0]["action"], "prepare_handoff")
 
-    def test_delivered_phase_yields_empty_actions(self) -> None:
+    def test_delivered_phase_yields_archive_action_naming_the_retrospective(self) -> None:
+        # spec Sec3: "next's delivered-phase judgment text names the
+        # retrospective step alongside the archive command (machine
+        # surfaces the offer; the skills carry the conversation)". This is
+        # standing guidance, not a gate (see Non-goals) -- 'scope archive'
+        # run directly, bypassing the offer, is still legal.
         with tempfile.TemporaryDirectory() as tmp:
             root, state, bare = _scope_in_finalize(tmp, surface="local")
             _deliver_scope(state, root)
             result = self._actions(state, root)
             self.assertEqual(result["phase"], "delivered")
-            self.assertEqual(result["actions"], [])
+            self.assertEqual(len(result["actions"]), 1)
+            action = result["actions"][0]
+            self.assertEqual(action["action"], "archive")
+            self.assertIn("scope archive", action["command"])
+            self.assertIn("shared-context/knowledge/", action["judgment"])
 
 
 class FinalizeNextLadderE2ETest(unittest.TestCase):
@@ -1529,7 +1539,8 @@ class FinalizeNextLadderE2ETest(unittest.TestCase):
             self.assertEqual(code, 0, out)
             result = json.loads(out)
             self.assertEqual(result["phase"], "delivered")
-            self.assertEqual(result["actions"], [])
+            self.assertEqual(result["actions"][0]["action"], "archive")
+            self.assertIn("shared-context/knowledge/", result["actions"][0]["judgment"])
 
             code, out = _cli(state, "status")
             self.assertEqual(code, 0, out)
