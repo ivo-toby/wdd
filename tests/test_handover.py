@@ -2007,7 +2007,11 @@ class RunnerDispatchEndToEndTest(unittest.TestCase):
             self.assertEqual(code, 0, out)
             result = json.loads(out)
             self.assertEqual(result["phase"], "delivered")
-            self.assertEqual(result["actions"], [])
+            # Delivered-phase next now surfaces the archive action with the
+            # retrospective judgment (adversarial-review-and-knowledge spec).
+            self.assertEqual(len(result["actions"]), 1)
+            self.assertEqual(result["actions"][0]["action"], "archive")
+            self.assertIn("shared-context/knowledge/", result["actions"][0]["judgment"])
             self.assertEqual(result["blockers"], [])
 
 
