@@ -116,6 +116,55 @@ The reviewer's charter (embedded verbatim in the dispatch prompt):
    failure path? Unwritten error handling is a decision delegated to the
    least-informed party (the implementing model).
 
+### The security profile (optional lens, same round machinery)
+
+At the same confirmation moment where the human picks the reviewer, they
+pick the profile: **general**, **security**, or **both** (both = one
+round, both checklists). The security lens hunts:
+
+1. **AuthN/AuthZ per operation**: for every endpoint/verb/tool the spec
+   describes — who may call it, and where does the text say that is
+   checked? An operation with no stated caller boundary is a P1.
+2. **Injection surfaces**: anything concatenated into a query, shell
+   command, file path, URL, or prompt. The spec must say how it is
+   escaped/parameterized, or the reviewer flags it.
+3. **Secrets and logging**: where credentials/tokens live at rest and in
+   transit, and what the spec says may NEVER appear in logs, errors, or
+   evidence records.
+4. **Isolation boundaries**: tenant/user/workspace data separation —
+   what enforces it, and what happens on the boundary's failure path.
+5. **Unsafe input handling**: file uploads, deserialization, redirects,
+   path traversal, SSRF-shaped fetches — bounded by what?
+6. **Dependency and supply-chain posture**: new dependencies the spec
+   introduces — pinned how, vetted how, and what runs at install time.
+
+Security findings use the same P1/P2 + failure-scenario + disposition
+machinery; the profile changes what the reviewer hunts, never the
+protocol.
+
+### `models.specReview` — routing the reviewer
+
+A new optional config key, `models.specReview` (string or null; no risk
+tiering — spec review is not risk-tiered), names the default reviewer
+candidate for spec/design/plan review rounds. It joins the epic overlay
+allowlist like the other `models.*` leaves, so an epic can override it.
+
+Doctrine boundaries, explicit:
+
+- The key is a **default candidate, never an autopilot**: the skill
+  pre-fills the offer with it ("config names <X> for spec reviews — use
+  it for this round?") and the human still confirms the channel every
+  round. All reviewer-selection rules above (different model identity
+  than the author, decline honored, log line per offer) apply unchanged.
+- The value is an identifier the skill interprets at offer time — a
+  harness model, an agent CLI on the box, or a configured runner name;
+  the invocation channel remains the skill's judgment per the rules
+  above (`wddctl dispatch` stays excluded).
+- The key appears in **no evidence projection**: spec-review artifacts
+  are conversation-gated, not machine-gated, so changing the reviewer
+  default must not stale any recorded evidence. (It IS covered by the
+  configure approval's full-view digest, like every config byte.)
+
 ### Round protocol
 
 - Every round = one **full pass** over the whole artifact (never "only
