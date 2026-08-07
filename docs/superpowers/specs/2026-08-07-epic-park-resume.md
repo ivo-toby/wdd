@@ -38,14 +38,35 @@ wddctl epic resume --slug S      # reactivate a parked epic
   at resume).
 - One locked `apply_mutation` (event `epic.parked`): moves the
   scope-carrying sections — `scope`, `tasks`, `intake`, `finalize`,
-  `reconcile`, `leases` (when present) — into
+  `reconcile`, `monitoring`, `leases` (when present) — into
   `state.parked[<slug>]`, records `{at}` alongside them, and resets
   those sections to their `new_setup_state()` shapes with `state.epic`
-  cleared. Governance, events, telemetry, `probes`, and
-  `appliedIdempotencyKeys` are global and untouched.
-- **No file moves.** `epics/<slug>/` stays in place; worktrees and
-  branches stay on disk. Parked state references them by the same
-  recorded values; nothing re-derives while parked.
+  cleared. `monitoring` IS scope-specific (archive resets it for the
+  same reason) and travels with the park. Governance, events, telemetry,
+  `probes`, and `appliedIdempotencyKeys` are global and untouched.
+- **Worktrees are released at park; branches stay.** Before the state
+  swap, park removes each active task's worktree (the existing `release`
+  mechanics), refusing the whole park if any worktree has uncommitted
+  changes — named path, no force option; commit or stash first. Branches
+  keep the work; resume re-creates worktrees through `start`'s existing
+  reattach path. This is what makes parking safe against Git itself: a
+  parked epic holds no checkout claims.
+- **Branch names are not scope-qualified** (`task/<TASK-ID>`), so a new
+  epic reusing a task id would collide with the parked epic's branch.
+  Guard at worktree creation (this phase): creating a branch for a task
+  with no recorded lease REFUSES when the branch already exists —
+  message names the branch and, when it belongs to a parked epic's
+  recorded task, names that epic and `epic resume`. Silent adoption of
+  another scope's branch is the failure mode this kills.
+- Park does not interrupt an in-flight external dispatch — a runner
+  mid-exec keeps running and burns its tokens; bounded by construction:
+  every recording verb it would feed (`submit`, `review collect`, ...)
+  is task-targeted and refuses post-park ("unknown task"), so no
+  evidence can land in the wrong epic. The skill says: don't park while
+  dispatches are running; the machine says: nothing breaks if you do.
+- **No epic-directory moves.** `epics/<slug>/` stays in place; parked
+  state references artifacts by the same recorded values; nothing
+  re-derives while parked.
 - After park, the ladder restarts at `create_epic` for the next epic.
 
 ### `epic resume --slug S`
@@ -83,15 +104,31 @@ wddctl epic resume --slug S      # reactivate a parked epic
   merges work that the parked epic's branches will conflict with,
   `refresh` finds out at resume — same as any long-lived branch.
 - **`doctor`** reports parked epics (slug, parked-at, task counts) so
-  they are never invisible; `status` and setup-phase `next` name them in
-  judgment text ("1 parked epic: provider-catalog-core — resume with
-  ...") without emitting actions for them.
-- **`migrate`**: `parked` is a new optional state field, absent = none;
-  v6→v7 is additive (nullable), no file migration. Schema bump only if
-  validation requires it — prefer additive-optional on v6 if the
-  validator tolerates it cleanly; otherwise v7 with a trivial bump.
-  (Implementation decides, documented; constructors never mint parked
-  entries.)
+  they are never invisible — and `epic_orphans()` excludes parked slugs
+  (a parked epic's directory is accounted-for state, not a crash
+  candidate; without this exclusion doctor would report every parked
+  epic as an orphan). `status` and setup-phase `next` name parked epics
+  in judgment text without emitting actions for them.
+- **`config get/set --epic` with no active epic** refuses (it already
+  does for set) — and the refusal names any parked slugs and
+  `epic resume`, so an operator inspecting a parked epic's overlay is
+  told the real path instead of silently reading the global layer.
+- **Resume and the chokepoint, pinned**: `epic resume` is governed and
+  passes the GOVERNANCE freshness check against the current state
+  (constitution/config still ratified — right and sufficient). The
+  epic-level gates (epic config, intake, plan) evaluate the pre-swap
+  setup state, where they are structurally no-ops — this is
+  deliberate, not accidental: those gates judge the restored epic on
+  the NEXT verb against post-resume state, which is the only state
+  where their question is meaningful. Pinned by test, stated in the
+  verb's docstring.
+- **Schema v7.** `validate_state` accepts only the exact current
+  version, so "additive on v6" is not a real option: SCHEMA_VERSION
+  bumps to 7, `parked` is a required-but-defaulting `{}` map validated
+  per entry (each value shape-checked as the parked section bundle +
+  `{at}`), and `migrate` gains the v6→v7 step — a pure version bump
+  plus `parked: {}`, no file moves; the migration hint recognizes v6.
+  Constructors never mint parked entries.
 - **Archive of a parked epic**: not directly — resume first, then
   archive from `delivered`. Archive's own gates are untouched.
 - **Knowledge draft**: lives in `shared-context/` (global), untouched by
