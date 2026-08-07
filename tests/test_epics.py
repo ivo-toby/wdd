@@ -55,7 +55,9 @@ from wave_delivery.migration import (
     SUPPORTED_SOURCE_VERSIONS,
     _slugify_scope_id,
     apply_migration,
+    convert,
     convert_v5_to_v6,
+    convert_v6_to_v7,
     plan_migration,
     read_source,
 )
@@ -689,14 +691,52 @@ class ConfigEpicCliTest(unittest.TestCase):
             self.assertNotEqual(code, 0)
             self.assertIn("wddctl epic new", stderr.getvalue())
 
-    def test_get_epic_without_active_epic_reports_global_source(self) -> None:
+    def test_get_epic_without_active_epic_refuses(self) -> None:
+        """epic park/resume spec: `config get --epic` with no active epic
+        now refuses (aligned with `set --epic`'s pre-existing refusal) --
+        it must never silently degrade to the global layer, which would
+        hide a PARKED epic's real overlay state from an operator."""
         with tempfile.TemporaryDirectory() as tmp:
             _wdd_with_config(tmp)
-            code, out = self._run(tmp, "config", "get", "--epic", "merge.surface")
-            self.assertEqual(code, 0)
-            payload = json.loads(out)
-            self.assertEqual(payload["value"], "pr")
-            self.assertEqual(payload["source"], "global")
+            stderr = io.StringIO()
+            state = str(Path(tmp) / ".wdd" / "state.json")
+            with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                code = main(["--state", state, "config", "get", "--epic", "merge.surface"])
+            self.assertNotEqual(code, 0)
+            self.assertIn("no active epic", stderr.getvalue())
+
+    def test_get_epic_without_active_epic_names_parked_slugs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _wdd_with_config(tmp)
+            wdd = Path(tmp) / ".wdd"
+            state_store = StateStore(wdd / "state.json")
+            state = new_setup_state()
+            state["parked"] = {
+                "alpha": {
+                    "at": "2026-08-01T00:00:00Z",
+                    "scope": None,
+                    "tasks": {},
+                    "intake": {},
+                    "reconcile": {
+                        "everyNMerges": 3, "mergesSinceCheckpoint": 0,
+                        "lastCheckpointAt": None, "pendingNotes": [],
+                    },
+                    "monitoring": {
+                        "mode": "manual", "status": "inactive", "lastCheckedAt": None,
+                        "nextCheckDueAt": None, "observations": {},
+                    },
+                }
+            }
+            state_store.write(state)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                code = main(
+                    ["--state", str(wdd / "state.json"), "config", "get", "--epic",
+                     "merge.surface"]
+                )
+            self.assertNotEqual(code, 0)
+            self.assertIn("alpha", stderr.getvalue())
+            self.assertIn("epic resume", stderr.getvalue())
 
     def _write_state_with_epic(self, tmp: str, epic: str) -> None:
         wdd = Path(tmp) / ".wdd"
@@ -1256,6 +1296,26 @@ def _write_v5_state(path: Path, state: dict) -> None:
     path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _v6_state(*, slug: str = "demo", tasks: dict | None = None) -> dict:
+    """A hand-built v6-shaped state (schemaVersion 6): v5's shape plus the
+    v6 fields (`epic`, `archivePending`, `archiveBlocked`) that `epic park`/
+    `resume`'s schema v7 work migrates FROM as a pure bump (spec "Schema
+    v7") -- unlike a v5 source, no epics/<slug>/ file moves are needed or
+    permitted here (the v6 -> v7 step is documented as "no file moves")."""
+    base = _v5_state(scope_id=f"SCOPE-{slug}", legacy=True, tasks=tasks)
+    base["schemaVersion"] = 6
+    base["epic"] = slug
+    base["archivePending"] = None
+    base["archiveBlocked"] = None
+    base["intake"] = {"legacy": True, "configure": {"legacy": True, "sha256": "sha256:" + "d" * 64}}
+    return base
+
+
+def _write_v6_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 class MigrateSlugDerivationTest(unittest.TestCase):
     """slug from the active scope id, or 'legacy' when no scope (spec
     Sec4); a scope id that cannot be turned into a valid slug also falls
@@ -1292,7 +1352,7 @@ class MigrateV5ToV6FileMovesTest(unittest.TestCase):
             _write_v5_state(path, state)
 
             result = apply_migration(path)
-            self.assertEqual(result["to"], 6)
+            self.assertEqual(result["to"], SCHEMA_VERSION)
 
             epic_dir = wdd / "epics" / "demo"
             self.assertEqual((epic_dir / "spec.md").read_text(), "spec\n")
@@ -1756,7 +1816,7 @@ class MigratePlanIsPureTest(unittest.TestCase):
             original = path.read_text()
 
             result = plan_migration(path)
-            self.assertEqual(result["to"], 6)
+            self.assertEqual(result["to"], SCHEMA_VERSION)
             self.assertEqual(path.read_text(), original)
             self.assertTrue((wdd / "tasks" / "TASK-001.md").exists())
             self.assertFalse((wdd / "epics").exists())
@@ -1859,12 +1919,13 @@ class MigrateTaskStatusMatrixTest(unittest.TestCase):
 
 
 class MigrateComposedFromEarlierVersionsTest(unittest.TestCase):
-    """v2/v3/v4 sources still chain all the way through to v6 in one
+    """v2/v3/v4 sources still chain all the way through to v7 in one
     `migrate` call (Global Constraints: composing the whole chain, mirrored
-    from the pre-existing v4 -> v5 composition in migration.py)."""
+    from the pre-existing v4 -> v5 composition in migration.py). v6 sources
+    (schema v7's own predecessor) are supported too -- a pure bump."""
 
     def test_supported_source_versions_include_v5(self) -> None:
-        self.assertEqual(SUPPORTED_SOURCE_VERSIONS, {2, 3, 4, 5})
+        self.assertEqual(SUPPORTED_SOURCE_VERSIONS, {2, 3, 4, 5, 6})
 
     def test_v5_source_reaches_v6_directly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1875,12 +1936,81 @@ class MigrateComposedFromEarlierVersionsTest(unittest.TestCase):
             source = read_source(path)
             migrated = convert_v5_to_v6(source, wdd_dir=wdd)
             self.assertEqual(migrated["schemaVersion"], 6)
-            validate_state(migrated)
+            # `convert_v5_to_v6` returns the intermediate v6 shape, one step
+            # short of the current schema (v7) -- the v6 -> v7 pure bump
+            # (parked: {}) is what makes it fully current-valid.
+            validate_state(convert_v6_to_v7(migrated))
 
     def test_v5_to_v6_conversion_refuses_a_non_v5_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ValidationError):
                 convert_v5_to_v6(new_state("SCOPE-x"), wdd_dir=Path(tmp))
+
+
+class MigrateV6ToV7Test(unittest.TestCase):
+    """Schema v7 (spec "Schema v7"): the v6 -> v7 step is a pure version
+    bump plus `parked: {}` -- no file moves -- and a v6 source chains
+    through it exactly like a v5 source chains through v5 -> v6 -> v7."""
+
+    def test_pure_bump_adds_empty_parked_map(self) -> None:
+        migrated = convert_v6_to_v7(_v6_state())
+        self.assertEqual(migrated["schemaVersion"], SCHEMA_VERSION)
+        self.assertEqual(migrated["parked"], {})
+        validate_state(migrated)
+
+    def test_refuses_a_non_v6_source(self) -> None:
+        with self.assertRaises(ValidationError):
+            convert_v6_to_v7(_v5_state())
+
+    def test_v5_source_chains_through_v6_to_v7_in_one_convert_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            state = _v5_state(legacy=True, tasks={})
+            migrated = convert(state, wdd_dir=wdd)
+            self.assertEqual(migrated["schemaVersion"], SCHEMA_VERSION)
+            self.assertEqual(migrated["parked"], {})
+            validate_state(migrated)
+
+    def test_apply_migration_on_a_v6_source_is_a_pure_bump_with_no_file_moves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            slug = "demo"
+            (wdd / "epics" / slug).mkdir(parents=True)
+            # A real, NON-empty overlay -- the regression this guards against:
+            # apply_migration must never blindly reset an existing v6 epic's
+            # overlay to {} the way the genuine v5-origin path does for a
+            # freshly-moved (previously nonexistent) epic dir.
+            save_overlay(wdd, slug, {"merge": {"surface": "local"}})
+            (wdd / "epics" / slug / "spec.md").write_text("kept in place\n", encoding="utf-8")
+            state = _v6_state(slug=slug)
+            path = wdd / "state.json"
+            _write_v6_state(path, state)
+
+            result = apply_migration(path)
+            self.assertEqual(result["from"], 6)
+            self.assertEqual(result["to"], SCHEMA_VERSION)
+
+            self.assertEqual(load_overlay(wdd, slug), {"merge": {"surface": "local"}})
+            self.assertEqual(
+                (wdd / "epics" / slug / "spec.md").read_text(encoding="utf-8"), "kept in place\n"
+            )
+            migrated = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(migrated["schemaVersion"], SCHEMA_VERSION)
+            self.assertEqual(migrated["parked"], {})
+
+    def test_rerunning_migrate_on_an_already_current_state_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_root(tmp)
+            slug = "demo"
+            (wdd / "epics" / slug).mkdir(parents=True)
+            save_overlay(wdd, slug, {})
+            state = _v6_state(slug=slug)
+            path = wdd / "state.json"
+            _write_v6_state(path, state)
+            apply_migration(path)
+            with self.assertRaises(ValidationError) as ctx:
+                apply_migration(path)
+            self.assertIn(f"already schema v{SCHEMA_VERSION}", str(ctx.exception))
 
 
 # --- Task 4: epic lifecycle -- `epic new`, ladder wiring, flat-path -------
@@ -2483,17 +2613,21 @@ def _epic_ladder_to_plan(
     assert code == 0, out
 
 
-def _start_and_commit(state: str, root: Path, task_id: str = "T1", message: str = "do work") -> None:
+def _start_and_commit(
+    state: str, root: Path, task_id: str = "T1", message: str = "do work",
+    filename: str = "change.txt",
+) -> Path:
     code, out = _cli(state, "start", "--task", task_id, "--repo", str(root))
     assert code == 0, out
     worktree = Path(json.loads(out)["worktree"])
-    (worktree / "change.txt").write_text(f"{message}\n", encoding="utf-8")
+    (worktree / filename).write_text(f"{message}\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=worktree, check=True)
     subprocess.run(
         ["git", "-c", "user.email=t@t", "-c", "user.name=t",
          "-c", "commit.gpgsign=false", "commit", "-qm", message],
         cwd=worktree, check=True,
     )
+    return worktree
 
 
 class IntakeConfigureVerbTest(unittest.TestCase):
@@ -2942,19 +3076,20 @@ class EpicOverrideReachesMergeAndDispatchTest(unittest.TestCase):
 
 class NoBareLoadConfigInGovernedMergeSettingsSitesTest(unittest.TestCase):
     """F2 audit: every `merge_settings`-feeding site in cli.py, plus
-    dispatch --task's model resolution, must read the admission snapshot's
+    dispatch --task's model resolution and (epic park/resume spec) `epic
+    park`'s worktrees.root resolution, must read the admission snapshot's
     `effective` view via `_governed_config`, never a second bare
     `load_config` (spec Sec2 resolve-once, extended by this fix-round).
     A textual check, not a functional one -- the functional regressions
     above are what actually prove the behavior; this pins the count so a
-    future edit cannot silently reintroduce a bare read at one of these six
-    sites without also updating this test."""
+    future edit cannot silently reintroduce a bare read at one of these
+    seven sites without also updating this test."""
 
-    def test_six_governed_call_sites_use_the_layered_snapshot_helper(self) -> None:
+    def test_seven_governed_call_sites_use_the_layered_snapshot_helper(self) -> None:
         import wave_delivery.cli as cli_module
 
         source = Path(cli_module.__file__).read_text(encoding="utf-8")
-        self.assertEqual(source.count("config = _governed_config(admission_layers)"), 6)
+        self.assertEqual(source.count("config = _governed_config(admission_layers)"), 7)
 
 
 # ---------------------------------------------------------------------------
@@ -3805,6 +3940,579 @@ class V5FixtureMigrationToDeliveredE2ETest(unittest.TestCase):
             delivered_state = StateStore(Path(state)).read()
             self.assertEqual(derived_phase(delivered_state), "delivered")
             self.assertEqual(delivered_state["tasks"]["T1"]["status"], "done")
+
+
+# ---------------------------------------------------------------------------
+# Epic park/resume (2026-08-07 spec): suspension, not concurrency. Local
+# helpers below extend this file's existing `_epic_ladder_to_plan`/
+# `_start_and_commit` fixtures, per the no-cross-file-imports convention.
+# ---------------------------------------------------------------------------
+
+
+def _epic_ladder_to_plan_multi_task(
+    state: str, wdd: Path, root: Path, *, slug: str = "demo", approver: str = "t",
+    task_specs: list[dict] | None = None, review_policy: str = "risk_based",
+) -> None:
+    """Like `_epic_ladder_to_plan`, but with an arbitrary task list (each
+    `{"id": ..., "conflictDomains": [...]}`) -- the dirty-worktree
+    all-or-nothing park test needs two concurrently-admissible tasks, which
+    the single-T1-task shared helper cannot express."""
+    assert _cli(state, "epic", "new", "--slug", slug)[0] == 0
+    assert _cli(state, "intake", "configure", "--use-defaults", "--by", approver)[0] == 0
+    epic_dir = wdd / "epics" / slug
+    (epic_dir / "spec.md").write_text(_spec_text(), encoding="utf-8")
+    assert _cli(state, "intake", "spec", "--approved-by", approver)[0] == 0
+    assert _cli(
+        state, "intake", "research", "--skip", "--by", approver, "--reason", "n/a"
+    )[0] == 0
+    (epic_dir / "design.md").write_text(_design_text(), encoding="utf-8")
+    assert _cli(
+        state, "intake", "design", "--approved-by", approver, "--deliverable-command", "true"
+    )[0] == 0
+    (epic_dir / "tasks").mkdir(parents=True, exist_ok=True)
+    specs = task_specs or [{"id": "T1", "conflictDomains": []}]
+    plan_tasks = []
+    for spec in specs:
+        (epic_dir / "tasks" / f"{spec['id']}.md").write_text(
+            f"# {spec['id']}\n\nBrief.\n", encoding="utf-8"
+        )
+        plan_tasks.append(
+            {
+                "id": spec["id"],
+                "specPath": f"tasks/{spec['id']}.md",
+                "conflictDomains": spec.get("conflictDomains", []),
+            }
+        )
+    plan = {
+        "schemaVersion": 1,
+        "kind": "wdd_plan",
+        "scope": {"id": f"SCOPE-{slug}", "baseRef": f"wdd/{slug}", "reviewPolicy": review_policy},
+        "tasks": plan_tasks,
+    }
+    plan_file = root / "plan.json"
+    plan_file.write_text(json.dumps(plan), encoding="utf-8")
+    code, out = _cli(
+        state, "plan", "apply", "--plan", str(plan_file), "--repo", str(root),
+        "--approved-by", approver,
+    )
+    assert code == 0, out
+
+
+def _git_worktree_list(root: Path) -> str:
+    return subprocess.run(
+        ["git", "worktree", "list", "--porcelain"], cwd=root,
+        capture_output=True, text=True, check=True,
+    ).stdout
+
+
+def _git_branch_exists(root: Path, branch: str) -> bool:
+    return subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=root
+    ).returncode == 0
+
+
+class EpicParkHappyPathTest(unittest.TestCase):
+    """Park releases the active-lease worktree, keeps the branch, and swaps
+    every scope-carrying section (including monitoring/leases) into
+    `state.parked[<slug>]` -- then the ladder restarts at `create_epic`."""
+
+    def test_park_releases_worktree_keeps_branch_swaps_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root, slug="demo")
+            t1_worktree = _start_and_commit(state, root)
+
+            # A distinctive monitoring value written directly (no CLI verb
+            # mutates it deterministically for this test's purposes) --
+            # proves park CARRIES monitoring rather than resetting it, the
+            # same reason archive resets it (it IS scope-specific).
+            pre_park = StateStore(Path(state)).read()
+            pre_park["monitoring"]["status"] = "active"
+            pre_park["monitoring"]["observations"] = {"custom": "signal"}
+            StateStore(Path(state)).write(pre_park)
+
+            code, out = _cli(state, "epic", "park", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            # Worktree gone...
+            self.assertFalse(t1_worktree.exists())
+            self.assertNotIn(str(t1_worktree), _git_worktree_list(root))
+            # ...branch kept.
+            self.assertTrue(_git_branch_exists(root, "task/T1"))
+
+            after = StateStore(Path(state)).read()
+            self.assertIsNone(after["epic"])
+            self.assertIsNone(after["scope"])
+            self.assertEqual(after["tasks"], {})
+            self.assertNotIn("leases", after)
+            self.assertEqual(after["intake"], {})
+            self.assertIn("demo", after["parked"])
+
+            bundle = after["parked"]["demo"]
+            self.assertEqual(bundle["scope"]["id"], "SCOPE-demo")
+            self.assertEqual(bundle["tasks"]["T1"]["status"], "in_progress")
+            self.assertEqual(bundle["tasks"]["T1"]["branch"], "task/T1")
+            self.assertIsNone(bundle["tasks"]["T1"]["worktree"])
+            self.assertEqual(bundle["leases"]["T1"]["status"], "released")
+            self.assertEqual(bundle["monitoring"]["status"], "active")
+            self.assertEqual(bundle["monitoring"]["observations"], {"custom": "signal"})
+
+            # Ladder restarts at create_epic, naming the parked slug.
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            action = json.loads(out)["actions"][0]
+            self.assertEqual(action["action"], "create_epic")
+            self.assertIn("demo", action["judgment"])
+
+
+class EpicParkDirtyWorktreeAllOrNothingTest(unittest.TestCase):
+    """One dirty worktree refuses the WHOLE park -- nothing released,
+    nothing swapped -- naming the dirty path."""
+
+    def test_one_dirty_worktree_refuses_the_whole_park(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan_multi_task(
+                state, wdd, root, slug="demo",
+                task_specs=[
+                    {"id": "T1", "conflictDomains": ["a"]},
+                    {"id": "T2", "conflictDomains": ["b"]},
+                ],
+            )
+            _start_and_commit(state, root, task_id="T1", message="t1 clean")
+            code, out = _cli(state, "start", "--task", "T2", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            t2_worktree = Path(json.loads(out)["worktree"])
+            (t2_worktree / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+            before_worktrees = _git_worktree_list(root)
+            before_state = StateStore(Path(state)).read()
+
+            code, out, err = _cli_full(state, "epic", "park", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn(str(t2_worktree), err)
+
+            # Nothing released, nothing swapped.
+            self.assertEqual(_git_worktree_list(root), before_worktrees)
+            after_state = StateStore(Path(state)).read()
+            self.assertEqual(after_state["epic"], "demo")
+            self.assertEqual(after_state["parked"], {})
+            self.assertEqual(after_state["leases"]["T1"]["status"], "active")
+            self.assertEqual(after_state["leases"]["T2"]["status"], "active")
+            self.assertEqual(after_state, before_state)
+
+
+class EpicParkBeforePlanApplyTest(unittest.TestCase):
+    """Park is legal in ANY phase from post-configure through delivered
+    (spec "epic park"), including an epic that has not reached `plan apply`
+    yet -- `scope` is still None and `tasks` is `{}`, so there is nothing to
+    release, but the swap and ladder restart still happen normally."""
+
+    def test_park_before_plan_apply_is_legal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            assert _cli(state, "epic", "new", "--slug", "demo")[0] == 0
+            assert _cli(state, "intake", "configure", "--use-defaults", "--by", "t")[0] == 0
+
+            code, out = _cli(state, "epic", "park", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            after = StateStore(Path(state)).read()
+            self.assertIsNone(after["epic"])
+            bundle = after["parked"]["demo"]
+            self.assertIsNone(bundle["scope"])
+            self.assertEqual(bundle["tasks"], {})
+            self.assertNotIn("leases", bundle)
+
+            code, out = _cli(state, "next", "--repo", str(root))
+            self.assertEqual(json.loads(out)["actions"][0]["action"], "create_epic")
+
+
+class EpicParkRefusalsTest(unittest.TestCase):
+    """Park refuses: no active epic, an archive transaction pending, or a
+    durably blocked one."""
+
+    def test_refuses_with_no_active_epic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            code, out, err = _cli_full(state, "epic", "park", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("active epic", err)
+
+    def test_refuses_while_archive_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _delivered_repo(tmp, slug="demo")
+            current = StateStore(Path(state)).read()
+            current["archivePending"] = {
+                "slug": "demo", "sourceRevision": current["revision"],
+                "archivedAt": "2026-08-01T00:00:00Z", "recordSha256": "sha256:" + "a" * 64,
+            }
+            StateStore(Path(state)).write(current)
+            code, out, err = _cli_full(state, "epic", "park", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("archive", err.lower())
+
+    def test_refuses_while_archive_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, wdd = _delivered_repo(tmp, slug="demo")
+            current = StateStore(Path(state)).read()
+            current["archiveBlocked"] = {
+                "slug": "demo", "collidingPath": str(wdd / "archive" / "demo"),
+                "at": "2026-08-01T00:00:00Z",
+            }
+            StateStore(Path(state)).write(current)
+            code, out, err = _cli_full(state, "epic", "park", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("blocked", err.lower())
+
+
+class EpicResumeHappyPathTest(unittest.TestCase):
+    """Resume moves the parked sections back verbatim, sets state.epic, and
+    removes the parked entry; the resumed task's worktree re-creates
+    through start's existing reattach path."""
+
+    def test_resume_restores_sections_verbatim_and_removes_parked_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root, slug="demo")
+            _start_and_commit(state, root)
+            assert _cli(state, "epic", "park", "--repo", str(root))[0] == 0
+            parked_bundle = StateStore(Path(state)).read()["parked"]["demo"]
+
+            code, out = _cli(state, "epic", "resume", "--slug", "demo")
+            self.assertEqual(code, 0, out)
+
+            after = StateStore(Path(state)).read()
+            self.assertEqual(after["epic"], "demo")
+            self.assertNotIn("demo", after["parked"])
+            for section in ("scope", "tasks", "intake", "reconcile", "monitoring"):
+                self.assertEqual(after[section], parked_bundle[section])
+            self.assertEqual(after.get("leases"), parked_bundle.get("leases"))
+
+            # Reattach: worktree re-created through start's existing path.
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertTrue(json.loads(out)["action"].startswith("reattach"))
+            self.assertTrue(Path(json.loads(out)["worktree"]).exists())
+
+
+class EpicResumeRefusalsTest(unittest.TestCase):
+    """Resume refuses: an epic already active, an unknown slug, or a
+    missing epic directory (hard error naming the path)."""
+
+    def test_refuses_when_an_epic_is_already_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root, slug="alpha")
+            _start_and_commit(state, root)
+            assert _cli(state, "epic", "park", "--repo", str(root))[0] == 0
+            assert _cli(state, "epic", "new", "--slug", "beta")[0] == 0
+
+            code, out, err = _cli_full(state, "epic", "resume", "--slug", "alpha")
+            self.assertNotEqual(code, 0)
+            self.assertIn("active epic", err)
+
+    def test_refuses_unknown_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            code, out, err = _cli_full(state, "epic", "resume", "--slug", "ghost")
+            self.assertNotEqual(code, 0)
+            self.assertIn("no parked epic", err)
+
+    def test_refuses_when_epic_directory_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root, slug="demo")
+            _start_and_commit(state, root)
+            assert _cli(state, "epic", "park", "--repo", str(root))[0] == 0
+            shutil.rmtree(wdd / "epics" / "demo")
+
+            code, out, err = _cli_full(state, "epic", "resume", "--slug", "demo")
+            self.assertNotEqual(code, 0)
+            self.assertIn("epics/demo", err)
+            # Refusal, not silent recreation or adoption.
+            self.assertFalse((wdd / "epics" / "demo").exists())
+            self.assertIn("demo", StateStore(Path(state)).read()["parked"])
+
+
+class EpicResumePostResumeGatesFireTest(unittest.TestCase):
+    """Codex round-1 finding 6 pin: resume's OWN gate is governance only
+    (spec "Resume and the chokepoint, pinned"); a drift introduced WHILE
+    parked surfaces as epic_config_drift on the epic's OWN first governed
+    verb AFTER resume, not at resume itself.
+
+    The edit must land on the epic's OWN overlay (`epics/<slug>/config.json`
+    on disk -- park moves no epic directories, spec "no epic-directory
+    moves"), not the GLOBAL config: a global edit would also retrip plain
+    governance drift (its ratified fingerprint covers the whole
+    config.json), which fires FIRST at the chokepoint and would mask the
+    epic_config_drift this test targets (see `ChokepointPrecedenceTest`'s
+    identical precedence pin). While parked, `config set --epic` itself
+    refuses (state.epic is null, closing review finding 5) -- so the only
+    way this drift can happen for real is exactly what this test does: a
+    hand/out-of-band edit of the overlay file while it sits inert."""
+
+    def test_overlay_edit_while_parked_trips_drift_after_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root, slug="demo")
+            _start_and_commit(state, root)
+            assert _cli(state, "epic", "park", "--repo", str(root))[0] == 0
+
+            # `merge.surface` alone would be a no-op overlay (the base
+            # fixture's GLOBAL surface is already "local" -- an identical
+            # override changes no digest); `verification.commands` actually
+            # differs from the fixture's global `["true"]`.
+            save_overlay(wdd, "demo", {"verification": {"commands": ["false"]}})
+
+            code, out = _cli(state, "epic", "resume", "--slug", "demo")
+            self.assertEqual(code, 0, out)  # resume itself succeeds
+
+            code, out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("epic config drift", err)
+
+
+class BranchExistsWithoutLeaseGuardTest(unittest.TestCase):
+    """Branch names are not scope-qualified (`task/<TASK-ID>`): a new epic
+    reusing a task id refuses when the branch already exists, naming the
+    parked owner when there is one -- and REATTACH (a recorded lease) is
+    unaffected."""
+
+    def test_new_epic_reusing_task_id_refuses_naming_parked_epic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root, slug="alpha")
+            _start_and_commit(state, root)  # creates branch task/T1 under alpha
+            assert _cli(state, "epic", "park", "--repo", str(root))[0] == 0
+
+            _epic_ladder_to_plan(state, wdd, root, slug="beta")  # also has task T1
+            code, out, err = _cli_full(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("alpha", err)
+            self.assertIn("epic resume", err)
+
+            # Nothing was mutated: T1 stays todo, no branch/worktree recorded.
+            after = StateStore(Path(state)).read()
+            self.assertEqual(after["tasks"]["T1"]["status"], "todo")
+            self.assertIsNone(after["tasks"]["T1"]["branch"])
+
+    def test_reattach_of_an_active_task_is_unaffected_by_the_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root, slug="demo")
+            t1_worktree = _start_and_commit(state, root)
+            # Simulate a local-to-cloud handoff: the worktree is gone, but
+            # the branch and in_progress status (and lease) remain -- this
+            # must take the REATTACH path, never the fresh-start guard.
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(t1_worktree)],
+                cwd=root, check=True,
+            )
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertTrue(json.loads(out)["action"].startswith("reattach"))
+
+
+class PostParkRecordingVerbsRefuseTest(unittest.TestCase):
+    """Codex round-1 finding 3 pin: park does not interrupt an in-flight
+    dispatch -- but every recording verb aimed at that task refuses
+    post-park with 'unknown task', so no evidence can land in the wrong
+    epic."""
+
+    def test_submit_after_park_refuses_unknown_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root, slug="demo")
+            _start_and_commit(state, root)
+            assert _cli(state, "epic", "park", "--repo", str(root))[0] == 0
+
+            code, out, err = _cli_full(state, "submit", "--task", "T1", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("unknown task", err)
+
+    def test_review_collect_after_park_refuses_unknown_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root, slug="demo")
+            _start_and_commit(state, root)
+            assert _cli(state, "submit", "--task", "T1", "--repo", str(root))[0] == 0
+            assert _cli(state, "epic", "park", "--repo", str(root))[0] == 0
+
+            code, out, err = _cli_full(
+                state, "review", "record", "--task", "T1", "--reviewer", "t", "--findings", "[]"
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("unknown task", err)
+
+
+class DoctorParkedReportTest(unittest.TestCase):
+    """doctor reports parked epics (slug, parked-at, task counts) and never
+    reports a parked epic's directory as an orphan."""
+
+    def test_parked_report_and_no_orphan_false_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root, slug="demo")
+            _start_and_commit(state, root)
+            assert _cli(state, "epic", "park", "--repo", str(root))[0] == 0
+
+            code, out = _cli(state, "doctor")
+            self.assertEqual(code, 0, out)
+            payload = json.loads(out)
+            self.assertEqual(payload["epicOrphans"], [])
+            self.assertEqual(len(payload["parked"]), 1)
+            self.assertEqual(payload["parked"][0]["slug"], "demo")
+            self.assertEqual(payload["parked"][0]["taskCount"], 1)
+            self.assertIsInstance(payload["parked"][0]["at"], str)
+
+
+class EpicSlugUniquenessVsParkedTest(unittest.TestCase):
+    """`epic new` refuses a slug that names a parked entry -- even when the
+    epic's own directory was hand-deleted out from under it (belt-and-
+    braces, spec "Interactions, pinned")."""
+
+    def test_refuses_slug_matching_a_parked_entry_with_hand_deleted_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            _epic_ladder_to_plan(state, wdd, root, slug="demo")
+            _start_and_commit(state, root)
+            assert _cli(state, "epic", "park", "--repo", str(root))[0] == 0
+            shutil.rmtree(wdd / "epics" / "demo")
+
+            code, out, err = _cli_full(state, "epic", "new", "--slug", "demo")
+            self.assertNotEqual(code, 0)
+            self.assertIn("parked", err)
+            self.assertIn("epic resume", err)
+            self.assertIsNone(StateStore(Path(state)).read()["epic"])
+
+
+class EpicParkResumeFullLifecycleE2ETest(unittest.TestCase):
+    """Epic A mid-execution -> park -> epic B's full mini-lifecycle
+    (through delivered and archive) -> resume A -> finish A to delivered.
+    Proves total non-interference between a parked epic and an unrelated
+    one running its whole lifecycle in between."""
+
+    def test_epic_a_parked_epic_b_full_mini_lifecycle_then_resume_a_to_delivered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _ratified_repo(tmp)
+            wdd = root / ".wdd"
+            bare = Path(tmp) / "origin.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+            subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True)
+
+            # --- Epic A: mid-execution -------------------------------------
+            _epic_ladder_to_plan(state, wdd, root, slug="epic-a")
+            _start_and_commit(state, root, message="a work", filename="a-change.txt")
+            code, out = _cli(state, "epic", "park", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertIsNone(StateStore(Path(state)).read()["epic"])
+
+            # --- Epic B: full mini-lifecycle to delivered, then archived ---
+            # A DIFFERENT task id (TB1, not T1) on purpose: branch names are
+            # not scope-qualified (task/<TASK-ID>), so reusing "T1" here
+            # would collide with parked epic-a's own task/T1 branch -- that
+            # collision is exactly what the branch-exists-without-lease
+            # guard refuses (its own dedicated test covers that scenario);
+            # this e2e proves park/resume/archive non-interference for an
+            # UNRELATED epic, not the guard.
+            _epic_ladder_to_plan_multi_task(
+                state, wdd, root, slug="epic-b", task_specs=[{"id": "TB1", "conflictDomains": []}],
+            )
+            _start_and_commit(state, root, task_id="TB1", message="b work", filename="b-change.txt")
+            assert _cli(state, "submit", "--task", "TB1", "--repo", str(root))[0] == 0
+            assert _cli(state, "verify", "record", "--task", "TB1", "--status", "passed")[0] == 0
+            assert _cli(state, "freshness", "record", "--task", "TB1", "--repo", str(root))[0] == 0
+            code, out = _cli(state, "merge", "--task", "TB1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "t", "--findings", "[]",
+                "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            results = json.dumps(
+                [{"command": "true", "status": "passed"}, {"command": "true", "status": "passed"}]
+            )
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--results", results, "--repo", str(root)
+            )
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            base_ref_b = StateStore(Path(state)).read()["scope"]["baseRef"]
+            subprocess.run(["git", "checkout", "-q", "main"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+                 "merge", "--no-ff", "-m", "final merge b", base_ref_b],
+                cwd=root, check=True,
+            )
+            code, out = _cli(state, "finalize", "delivered", "--by", "t", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            code, out = _cli(state, "scope", "archive", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertTrue((wdd / "archive" / "epic-b").exists())
+            self.assertIsNone(StateStore(Path(state)).read()["epic"])
+            self.assertIn("epic-a", StateStore(Path(state)).read()["parked"])
+
+            # --- Resume epic A, finish it to delivered ----------------------
+            code, out = _cli(state, "epic", "resume", "--slug", "epic-a")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(StateStore(Path(state)).read()["epic"], "epic-a")
+            self.assertNotIn("epic-a", StateStore(Path(state)).read()["parked"])
+
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertTrue(json.loads(out)["action"].startswith("reattach"))
+
+            assert _cli(state, "submit", "--task", "T1", "--repo", str(root))[0] == 0
+            assert _cli(state, "verify", "record", "--task", "T1", "--status", "passed")[0] == 0
+            assert _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0] == 0
+            code, out = _cli(state, "merge", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            code, out = _cli(
+                state, "finalize", "review", "record", "--reviewer", "t", "--findings", "[]",
+                "--repo", str(root),
+            )
+            self.assertEqual(code, 0, out)
+            results = json.dumps(
+                [{"command": "true", "status": "passed"}, {"command": "true", "status": "passed"}]
+            )
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--results", results, "--repo", str(root)
+            )
+            self.assertEqual(code, 0, out)
+            code, out = _cli(state, "finalize", "handoff", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            base_ref = StateStore(Path(state)).read()["scope"]["baseRef"]
+            subprocess.run(["git", "checkout", "-q", "main"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+                 "merge", "--no-ff", "-m", "final merge a", base_ref],
+                cwd=root, check=True,
+            )
+            code, out = _cli(state, "finalize", "delivered", "--by", "t", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            from wave_delivery.schema import derived_phase as _derived_phase
+
+            final_state = StateStore(Path(state)).read()
+            self.assertEqual(_derived_phase(final_state), "delivered")
+            self.assertEqual(final_state["tasks"]["T1"]["status"], "done")
 
 
 if __name__ == "__main__":

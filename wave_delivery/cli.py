@@ -39,6 +39,8 @@ from .setup import (
     create_epic,
     init_repository,
     migrate_governance,
+    park_epic,
+    resume_epic,
     setup_next_actions,
 )
 from .doctor import inspect_capabilities
@@ -137,6 +139,16 @@ GOVERNED_VERBS = {
     # unlike them epic new has no remedy role of its own to protect, so it
     # stays governed like start/submit/merge.
     ("epic", "new"),
+    # `epic park`/`epic resume` (epic park/resume spec, "Verbs"): both
+    # mutate state.epic and the scope-carrying sections, same governed
+    # footing as `epic new`. `resume`'s OWN admission question is answered
+    # by `require_fresh_governance` alone against the pre-swap state (spec
+    # "Resume and the chokepoint, pinned") -- it stays in this set (not a
+    # separate one) because the epic-level gates below are structural
+    # no-ops on that pre-swap state by construction, not because resume is
+    # exempted from the chokepoint.
+    ("epic", "park"),
+    ("epic", "resume"),
 }
 
 # Task-targeted governed verbs additionally gated by input-version binding
@@ -450,6 +462,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--title", default=None, help="optional display title, recorded on the epic.created event"
     )
     _add_concurrency_flags(epic_new)
+
+    epic_park = epic_subparsers.add_parser(
+        "park",
+        help=(
+            "suspend the active epic: release its worktrees (refusing on any dirty "
+            "one), keep its branches, and move its state under state.parked -- "
+            "'wddctl epic resume --slug SLUG' reactivates it later."
+        ),
+    )
+    epic_park.add_argument("--repo", type=Path, default=Path("."))
+    _add_concurrency_flags(epic_park)
+
+    epic_resume = epic_subparsers.add_parser(
+        "resume",
+        help="reactivate a parked epic -- refuses if an epic is already active.",
+    )
+    epic_resume.add_argument("--slug", required=True, help="the parked epic's slug")
+    _add_concurrency_flags(epic_resume)
 
     intake = subparsers.add_parser(
         "intake", help="the spec/research/design ladder before plan apply"
@@ -1192,21 +1222,32 @@ def main(argv: list[str] | None = None) -> int:
             # Sec1 locking layers), so a delivered scope stuck mid-archive
             # reports its true, post-recovery phase rather than a stale one.
             state = store.load_recovered()
+            # Named, never actioned (epic park/resume spec: "status ... name
+            # parked epics ... without emitting actions for them") -- an
+            # operator asking "what's going on" should see a parked epic
+            # exists even while a different one is active (or none is).
+            parked_epics = sorted(state.get("parked") or {})
             if derived_phase(state) == "setup" and (state["scope"] is None or config_path(store.path.parent).exists()):
                 config = load_config(store.path.parent)
-                _print_json(
-                    {
-                        "phase": "setup",
-                        "openQuestions": len(config["openQuestions"]),
-                        "constitution": state["constitution"]["status"],
-                        "scope": (state.get("scope") or {}).get("id"),
-                    }
-                )
+                payload = {
+                    "phase": "setup",
+                    "openQuestions": len(config["openQuestions"]),
+                    "constitution": state["constitution"]["status"],
+                    "scope": (state.get("scope") or {}).get("id"),
+                }
+                if parked_epics:
+                    payload["parkedEpics"] = parked_epics
+                _print_json(payload)
                 return 0
             if derived_phase(state) in {"finalize", "delivered"}:
-                _print_json(finalize_status(state))
+                result = finalize_status(state)
+                if parked_epics:
+                    result["parkedEpics"] = parked_epics
+                _print_json(result)
                 return 0
             summary = status_summary(state)
+            if parked_epics:
+                summary["parkedEpics"] = parked_epics
             _print_json(summary) if args.json else print(_brief(summary))
             return 0
 
@@ -1573,6 +1614,29 @@ def main(argv: list[str] | None = None) -> int:
                 store.path.parent,
                 slug=args.slug,
                 title=args.title,
+                **_concurrency(args),
+            )
+            _print_json(
+                {"epic": state["epic"], "revision": state["revision"], "duplicate": duplicate}
+            )
+            return 0
+
+        if args.command == "epic" and args.epic_command == "park":
+            config = _governed_config(admission_layers)
+            state, duplicate = park_epic(
+                store,
+                repo=args.repo,
+                worktrees_root=_worktrees_root(config),
+                **_concurrency(args),
+            )
+            _print_json({"revision": state["revision"], "duplicate": duplicate})
+            return 0
+
+        if args.command == "epic" and args.epic_command == "resume":
+            state, duplicate = resume_epic(
+                store,
+                slug=args.slug,
+                wdd_dir=store.path.parent,
                 **_concurrency(args),
             )
             _print_json(
@@ -1957,24 +2021,35 @@ def main(argv: list[str] | None = None) -> int:
             wdd_dir = store.path.parent
             if getattr(args, "epic", False):
                 # epic overlay resolution (epic-scoped-state plan, Task 2,
-                # spec Sec2) -- state.epic is a v6 field (Task 3); until
-                # then this is always None, so `get --epic` degrades to
-                # the plain global/default view and `set --epic` always
-                # refuses below (correctly -- there is no verb yet to
-                # create an epic; Task 4 adds `wddctl epic new`).
+                # spec Sec2) -- state.epic is a v6 field (Task 3).
                 state = store.read() if store.exists() else None
                 epic = (state or {}).get("epic")
+                if epic is None:
+                    # Refuses for BOTH get and set (epic park/resume spec:
+                    # "config get/set --epic with no active epic refuses --
+                    # and the refusal names any parked slugs and 'epic
+                    # resume'"). Without this, `get --epic` on a PARKED
+                    # epic silently read the global layer, telling an
+                    # operator inspecting the epic's own overlay nothing
+                    # about the real (parked) state.
+                    parked = sorted((state or {}).get("parked") or {})
+                    hint = (
+                        f"; parked epic(s): {parked} -- resume one with 'wddctl epic "
+                        "resume --slug SLUG', or start a new one with 'wddctl epic new "
+                        "--slug SLUG'"
+                        if parked
+                        else "; run 'wddctl epic new --slug SLUG' first"
+                    )
+                    raise ValidationError(
+                        f"config {args.config_command} --epic: no active epic "
+                        f"(state.epic is null){hint}"
+                    )
                 if args.config_command == "get":
                     layers = load_layers(wdd_dir, epic)
                     value, source = resolve_config_source(layers, args.path)
                     _print_json({"path": args.path, "value": value, "source": source})
                     return 0
                 if args.config_command == "set":
-                    if epic is None:
-                        raise ValidationError(
-                            "config set --epic: no active epic (state.epic is null); "
-                            "run 'wddctl epic new --slug SLUG' first"
-                        )
                     layers = load_layers(wdd_dir, epic)
                     try:
                         value = json.loads(args.value)

@@ -104,8 +104,22 @@ def inspect_capabilities(
         payload["runners"] = runners
     # Orphan epic directories (Task 4, spec Sec1): a dir under epics/ that
     # is not state.epic -- a crash between `epic new`'s mkdir and its
-    # state.epic adoption, or (Task 6) a crashed archive transaction.
-    # doctor never refuses; this is reported, never gated on.
+    # state.epic adoption, or (Task 6) a crashed archive transaction. A
+    # PARKED epic's directory is excluded from this report too (see
+    # `setup.epic_orphans`'s own docstring) -- doctor never refuses; both
+    # this and the parked report below are reported, never gated on.
     if wdd_dir is not None:
         payload["epicOrphans"] = epic_orphans(wdd_dir, state)
+    # Parked epics (epic park/resume spec, "doctor reports parked epics
+    # (slug, parked-at, task counts) so they are never invisible"): sorted
+    # by slug for deterministic output, one entry per `state.parked` key.
+    if state is not None and state.get("parked"):
+        payload["parked"] = [
+            {
+                "slug": slug,
+                "at": bundle.get("at"),
+                "taskCount": len(bundle.get("tasks") or {}),
+            }
+            for slug, bundle in sorted((state.get("parked") or {}).items())
+        ]
     return payload

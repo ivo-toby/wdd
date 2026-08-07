@@ -1160,6 +1160,13 @@ def _reset_to_post_ratification(current: dict[str, Any]) -> dict[str, Any]:
     # review finding; the v5 flat archive shared this bug).
     if current.get("probes"):
         fresh["probes"] = current["probes"]
+    # Parked epics (epic park/resume spec): a DIFFERENT epic's `state.parked`
+    # entries are not this epic's scope-carrying state -- archiving (or
+    # crash-recovering) the ACTIVE epic must never wipe out an unrelated
+    # epic parked earlier. `new_setup_state()` already defaults `parked` to
+    # `{}`; only override it when there is something to carry forward.
+    if current.get("parked"):
+        fresh["parked"] = current["parked"]
     return fresh
 
 

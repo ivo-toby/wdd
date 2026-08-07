@@ -40,6 +40,22 @@ def _task(state: dict[str, Any], task_id: str) -> dict[str, Any]:
         raise ValidationError(f"unknown task: {task_id}") from error
 
 
+def _parked_branch_owner(state: dict[str, Any], branch: str) -> tuple[str, str] | None:
+    """The (slug, task_id) of a PARKED epic's task whose recorded branch
+    matches `branch`, or None (epic park/resume spec: "Branch names are
+    not scope-qualified... Guard at worktree creation... names that epic
+    and 'epic resume'"). Branch names are `task/<TASK-ID>` with no scope
+    prefix, so a fresh epic reusing a task id derives the exact same branch
+    name a parked epic already owns -- this is what lets the branch-exists
+    guard below name the real owner instead of a bare "branch exists".
+    """
+    for slug, bundle in (state.get("parked") or {}).items():
+        for owned_task_id, task in (bundle.get("tasks") or {}).items():
+            if task.get("branch") == branch:
+                return slug, owned_task_id
+    return None
+
+
 def _is_pr_upgrade(current_pr: Any, new_pr: str | None) -> bool:
     """True when ``new_pr`` is a real URL replacing a ``branch:<sha>`` fallback."""
     return (
@@ -172,6 +188,33 @@ def start_task(
         if not base_ref:
             raise IllegalTransition("this scope has no configured base ref")
         task_branch = branch or task.get("branch") or f"task/{task_id}"
+        # Branch-exists-without-lease guard (epic park/resume spec, closing
+        # Codex round-1 finding 1): `task.get("branch")` is None here EXACTLY
+        # when this task has no recorded lease at all -- a task that was
+        # started, then blocked/unblocked back to "todo" before ever
+        # submitting, keeps its ORIGINAL recorded branch (task.unblocked
+        # never clears it), so this never misfires on that legitimate
+        # re-start. A genuinely fresh task whose derived (or explicitly
+        # passed) branch name already exists in Git is refused outright --
+        # silent adoption of another scope's branch (most commonly a PARKED
+        # epic's own `task/<TASK-ID>`, since branch names are not
+        # scope-qualified) is the failure mode this closes. No force option:
+        # investigate the branch, or start under a different id/branch.
+        if task.get("branch") is None and branch_exists(repo, task_branch):
+            owner = _parked_branch_owner(state, task_branch)
+            if owner is not None:
+                owner_slug, owner_task_id = owner
+                raise IllegalTransition(
+                    f"branch {task_branch!r} already exists and belongs to parked epic "
+                    f"{owner_slug!r}'s task {owner_task_id!r}; resume it with 'wddctl epic "
+                    f"resume --slug {owner_slug}' instead, or start task {task_id} on a "
+                    "different branch (--branch)"
+                )
+            raise IllegalTransition(
+                f"branch {task_branch!r} already exists but task {task_id} has no recorded "
+                "lease; refusing to silently adopt it -- investigate the stale branch, or "
+                "start this task on a different branch (--branch)"
+            )
         task_worktree = Path(
             worktree
             or worktree_for(
