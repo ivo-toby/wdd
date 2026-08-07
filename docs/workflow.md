@@ -420,6 +420,30 @@ $ wddctl next
 
 ## Where you intervene
 
+Two optional layers thread through everything above; both are offers the
+agent makes and you accept or decline, never silent defaults.
+
+**Adversarial review** (`wdd-spec-review`): at spec and design sign-off —
+or whenever you ask ("poke holes in this", "give this a security pass") —
+a *different model than the author* makes a full refute-first pass over
+the document: numbered P1/P2 findings, each with a concrete failure
+scenario, dispositions tracked across rounds. `models.specReview` in
+config names the default reviewer candidate; you confirm the channel
+every round, and you can be the reviewer yourself when no second agent is
+available. A security profile adds authn/authz, injection, secrets,
+isolation, and supply-chain probes to the hunt. Round artifacts live in
+the epic's `research/` (`spec-review-log.md`, `spec-review-<n>.md`) and
+travel into the archive with it.
+
+**Institutional knowledge**: every epic keeps a living draft at
+`shared-context/knowledge/<slug>.md` — worker decisions, diagnosed root
+causes, and quirks are appended as they happen, tagged by task. When the
+scope is delivered, the agent offers a retrospective: distill the draft
+into tight rows cited by task id and review round, get your sign-off
+(recorded in the file), commit it. Because `shared-context/` survives
+archiving, the next epic's research rung reads it before anything
+external — that is how "the senior engineer just knows" becomes a file.
+
 The loop runs itself; your job is to notice when it shouldn't.
 
 **Reading state.** `wddctl status` gives a one-line brief; `status --json`
@@ -647,6 +671,12 @@ the scope into `finalize`, and `wddctl next` stops returning empty: it
 starts naming scope-level work, one action at a time, the same discipline
 it used per task. There is no separate command to trigger this — `status`
 and `next` detect the phase and switch shape on their own.
+
+Once `delivered` is recorded, `next` surfaces one last action: the
+retrospective offer (distill the epic's knowledge draft, sign it off,
+commit it — see "Where you intervene") followed by `wddctl scope
+archive`, which moves the whole epic directory into `archive/<slug>/`
+and restarts the ladder for the next one.
 
 The ladder mirrors a task's own gates, but at the whole-epic-branch level:
 a final review against `spec.md`'s acceptance criteria (the same

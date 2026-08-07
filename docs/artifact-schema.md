@@ -21,6 +21,9 @@ the `.wdd/` root:
     plan.json                  # the only planning input for this epic
     tasks/<TASK-ID>.md        # worker briefs, referenced by each task's specPath
     research/                  # research-rung artifacts specific to this epic
+                               #   incl. spec-review-log.md + spec-review-<n>.md
+                               #   (adversarial review rounds; NOT recorded as
+                               #   intake artifacts -- cited by round number)
   archive/<slug>/            # a delivered epic, moved wholesale by `wddctl scope archive`
     record.json                # the state record at archive time (see below)
     ...                         # the rest of the archived epic's own directory content
@@ -102,6 +105,13 @@ Conventional body sections:
 - **Review policy** — which `reviewPolicy` this repo defaults to
   (`always` / `risk_based` / `none`), and which task categories should be
   marked `"risk": "high"` under `risk_based`.
+- **Behavioral contract** — scaffolded by `wddctl init` since v0.3:
+  testable obligations for every agent working the repo (dissent is a
+  duty, one round then commit; "I did X verified by Y" never without the
+  Y; conflicts with recorded doctrine get surfaced, not silently obeyed
+  or ignored; no agreement theater; evidence names who actually did the
+  work; never record what didn't happen). Ratified and fingerprint-bound
+  like the rest of the constitution — doctrine, not ambient advice.
 - **Model aliases** — any model choices the user wants remembered, so later
   agents don't have to re-infer them.
 - **Merge policy** — whether the controller merges automatically or a human

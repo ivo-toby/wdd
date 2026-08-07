@@ -123,8 +123,11 @@ agent session in the target repository, and drive it with prose:
    the epic into tasks with dependencies and conflict domains, lints the
    plan for the classic failure modes (serialized chains, everything
    high-risk, per-file domain lists), and presents the plan plus the
-   projected schedule. Nothing is applied until you approve — your name
-   goes into the record.
+   projected schedule. At spec and design sign-off the agent offers an
+   adversarial review — a different model (or you) tries to break the
+   document before anything builds on it, with an optional
+   security-focused pass. Nothing is applied until you approve — your
+   name goes into the record.
 
 3. **Let it run.** Say: *"Run the scope."*
    The controller loop dispatches a worker per task (test-first, in an
@@ -139,7 +142,10 @@ agent session in the target repository, and drive it with prose:
    full verification, and a handoff PR from the epic branch into your
    target branch. **The final merge is yours** — `wddctl` has no code path
    to perform it, and the scope only reaches `delivered` once Git proves
-   you did.
+   you did. Afterwards the agent offers a retrospective — distilling what
+   the epic taught (root causes, quirks, decisions) into
+   `shared-context/knowledge/`, where every future epic reads it — and
+   archives the epic as a self-contained unit.
 
 "Where are we?" works at any point — the agent reads the state and reports
 the phase, active tasks, and blockers. For the full day-to-day narrative,
