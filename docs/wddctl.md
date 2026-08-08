@@ -24,6 +24,7 @@ call `wddctl` to record the outcome.
   [`render`](#render), [`start`](#start), [`submit`](#submit),
   [`review record`](#review-record), [`review run`](#review-run),
   [`review collect`](#review-collect), [`verify record`](#verify-record),
+  [`verify record --run`](#verify-record---run),
   [`verify collect`](#verify-collect), [`freshness check`](#freshness-check),
   [`freshness record`](#freshness-record), [`refresh`](#refresh),
   [`merge`](#merge), [`rebind`](#rebind), [`dispatch`](#dispatch),
@@ -37,8 +38,9 @@ call `wddctl` to record the outcome.
 - [Runners](#runners) — registering and dispatching an external agent CLI
 - [Gates (what `next` emits per task)](#gates-what-next-emits-per-task)
 - [The finalize phase](#the-finalize-phase) — `finalize review`/`verify`
-  record, `finalize handoff`, `finalize delivered`, the finalize ladder,
-  full transcripts
+  record, [`finalize verify record --run`](#finalize-verify-record---run),
+  `finalize handoff`, `finalize delivered`, the finalize ladder, full
+  transcripts
 - [Guarantees](#guarantees)
 
 ## Invocation
@@ -1831,6 +1833,131 @@ wddctl verify record --task TASK-001-token-types \
 when there's no meaningful automated check, rather than skipping
 verification silently.
 
+### `verify record --run`
+
+Machine-executed verification (spec Sec2): instead of trusting an agent's
+`--status`/`--command` report, `wddctl` itself runs the effective
+`verification.commands` in the task's own worktree, observes what actually
+happened, and records that. `--run` and `--status`/`--command` are mutually
+exclusive — passing both refuses before touching the repo or the store:
+
+```sh
+$ wddctl verify record --task TASK-001-greeting --run --status passed --repo .
+wddctl: verify record --run cannot be combined with --status or --command: --run supplies the observed status and command evidence itself
+```
+
+Real, unedited output from a scratch repository on this branch —
+`verification.commands` set to `["python3 src/app.py"]`, task
+`in_progress` with a clean worktree at the recorded `headSha`:
+
+```sh
+$ wddctl verify record --task TASK-001-greeting --run --repo .
+{
+  "duplicate": false,
+  "revision": 11,
+  "status": "merge_ready"
+}
+```
+
+The recorded evidence (`state.json`'s
+`tasks.TASK-001-greeting.verification`):
+
+```json
+{
+  "baseSha": "24b7f10e929e204032922828746df4fdca05615f",
+  "headSha": "a455673e0cfc9b388d695b515816deb2d10f247d",
+  "command": null,
+  "status": "passed",
+  "execution": "wddctl",
+  "results": [
+    {
+      "command": "python3 src/app.py",
+      "status": "passed",
+      "exitCode": 0,
+      "durationMs": 28,
+      "outputSha256": "49c98f64c9f4853122afc11ae00d4f709b10b3b5d011bf372985c128dae3ef15",
+      "tail": "hello from the greeting task\n"
+    }
+  ],
+  "logSha256": "386b1b414c64b92604d1f0ce7e991e95957b4fb89045bb0852b0f60356e281cf",
+  "telemetry": {"durationMs": 45},
+  "configSha256": "sha256:87e83824db5ecb384c007889512cee3189de083c6294346ae0912680052f09e4"
+}
+```
+
+`command` is always `null` on a `--run` record — the evidence lives in
+`results`, one entry per configured command, never a single string.
+`execution: "wddctl"` marks the record as machine-observed; a plain
+`verify record --status` record carries no `execution` field at all and
+reads back as `"reported"` — see [`docs/artifact-schema.md`](artifact-schema.md)
+for the full field reference, both shapes' JSON, and the verify-log
+layout.
+
+Refuses, before running anything, on: a task not `in_progress`, a missing
+or unparseable `headSha`, a dirty worktree, a worktree `HEAD` that has
+moved past the recorded `headSha`, or an empty effective command list —
+"nothing observed is not a pass" applies to the preflight too, not just
+execution.
+
+**A failing command** stops the sequence at the first non-pass; every
+later command is recorded `skipped` with no other fields — nothing about a
+command that never ran is knowable. Real output, same scratch repo,
+`verification.commands` set to `["python3 src/app.py", "python3 -c
+\"import sys; sys.exit(1)\"", "echo never runs"]`:
+
+```sh
+$ wddctl verify record --task TASK-002-break-it --run --repo .
+{
+  "duplicate": false,
+  "revision": 18,
+  "status": "in_progress"
+}
+```
+
+(`status` stays `in_progress`, not `merge_ready` — a failed run never
+advances the gate.) The recorded `results`:
+
+```json
+[
+  {"command": "python3 src/app.py", "status": "passed", "exitCode": 0, "durationMs": 28, "outputSha256": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03", "tail": "hello\n"},
+  {"command": "python3 -c \"import sys; sys.exit(1)\"", "status": "failed", "exitCode": 1, "durationMs": 53, "outputSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "tail": ""},
+  {"command": "echo never runs", "status": "skipped"}
+]
+```
+
+**A timeout** kills the whole process group (SIGTERM, a 5-second grace,
+then SIGKILL) and records `timedOut: true` with `exitCode: null` — the
+same "no fabricated exit code" idiom `runner.py`'s own dispatch timeout
+uses. Real output, `verification.timeoutSeconds` set to `1`,
+`verification.commands` set to `["sleep 20 && echo should-not-print"]`:
+
+```sh
+$ wddctl verify record --task TASK-003-slow-it --run --repo .
+{
+  "duplicate": false,
+  "revision": 25,
+  "status": "in_progress"
+}
+```
+
+```json
+[
+  {
+    "command": "sleep 20 && echo should-not-print",
+    "status": "failed",
+    "exitCode": null,
+    "timedOut": true,
+    "durationMs": 1002,
+    "outputSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tail": ""
+  }
+]
+```
+
+The command never got far enough to print anything before the group was
+killed, so `tail` and the captured output are both empty — this is a real
+command killed mid-run, not a synthetic entry.
+
 ### `verify collect`
 
 Read one externally produced verification result file — the `verify`
@@ -2823,6 +2950,73 @@ is per task. Every read site (`finalize status`, the handoff summary)
 normalizes both shapes to the same `[{command, status}, ...]` view via
 `verification_commands()`, so a legacy record reads as the one-entry list
 it always was.
+
+### `finalize verify record --run`
+
+The scope-level counterpart of `verify record --run` (spec AC-6): `wddctl`
+checks out the resolved epic head into its own dedicated integration
+worktree — never the operator's own `--repo` checkout, mirroring
+`merge.py`'s `_integration_dir` precedent, always by SHA and detached —
+and executes the required, ordered command list itself: every entry of
+the ratified global `verification.commands` then the scope's
+`intake.design.deliverableCommand`. Legal only for v5 non-legacy scopes,
+refused outright on a legacy one:
+
+```sh
+$ wddctl finalize verify record --run --repo .
+wddctl: finalize verify record --run is not available for a legacy scope: legacy scopes keep the reported-only single-command contract (wddctl finalize verify record --status ... --command ...)
+```
+
+`--run` is mutually exclusive with both `--results` and the legacy
+`--status`/`--command` pair — refused before anything executes:
+
+```sh
+$ wddctl finalize verify record --run --results '[]' --repo .
+wddctl: finalize verify record --run cannot be combined with --results: --run supplies the observed results itself
+```
+
+Real, unedited output — continuing the scratch repo above, after
+`TASK-001-greeting`/`TASK-002-break-it`/`TASK-003-slow-it` all merged and
+`finalize review record` passed, `verification.commands` reset to
+`["python3 src/app.py"]`:
+
+```sh
+$ wddctl finalize verify record --run --repo .
+{
+  "duplicate": false,
+  "headSha": "fce44a7f78f5bef890ca445ed8d79a90ab4594e2",
+  "revision": 41,
+  "status": "passed"
+}
+```
+
+`state.json`'s `finalize.verification`:
+
+```json
+{
+  "headSha": "fce44a7f78f5bef890ca445ed8d79a90ab4594e2",
+  "status": "passed",
+  "execution": "wddctl",
+  "results": [
+    {"command": "python3 src/app.py", "status": "passed", "exitCode": 0, "durationMs": 26, "outputSha256": "49c98f64c9f4853122afc11ae00d4f709b10b3b5d011bf372985c128dae3ef15", "tail": "hello from the greeting task\n"},
+    {"command": "python3 src/app.py", "status": "passed", "exitCode": 0, "durationMs": 21, "outputSha256": "49c98f64c9f4853122afc11ae00d4f709b10b3b5d011bf372985c128dae3ef15", "tail": "hello from the greeting task\n"}
+  ],
+  "logSha256": "9cc6f2d1a1f32a58ede0a82458b235187efb9eb4b25a191e61eb10fdad57eac1",
+  "telemetry": {"durationMs": 57},
+  "at": "2026-08-08T12:16:41Z",
+  "configSha256": "sha256:b928a0001b37855325659a7c4a5a010342e07f7cc1a1bbf35d9c98cef9cb7887"
+}
+```
+
+Two identical entries here because this demo scope's deliverable command
+happens to be the same string as its one verification command — `--run`
+still executes and records both, in order, exactly as a hand-built
+`--results` array would have to name both. The failed and timed-out entry
+shapes, `logSha256`, and the log file layout are identical to `verify
+record --run`'s above; see [`docs/artifact-schema.md`](artifact-schema.md)
+for the shared reference. The integration worktree is removed
+unconditionally after the run, success or failure, so nothing accumulates
+under `.worktrees/` across repeated finalize attempts.
 
 ### `finalize handoff`
 
