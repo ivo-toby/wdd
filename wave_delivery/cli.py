@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import (
+    _hydrate_optional_sections,
     check_ratifiable,
     config_path,
     derive_effective,
@@ -2070,7 +2071,14 @@ def main(argv: list[str] | None = None) -> int:
                     return 0
             config = load_config(wdd_dir)
             if args.config_command == "get":
-                _print_json(get_value(config, args.path))
+                # Resolve through the same hydrated view load_layers'
+                # `effective` uses (fix-round P2): a legacy config.json
+                # predating an optional key (verification.timeoutSeconds,
+                # runners, worktrees) has no in-tool path to read it via a
+                # raw get_value walk otherwise -- 'unknown path' every time,
+                # with nothing to backfill it. Pure read: this never writes,
+                # so the file and governance fingerprint stay untouched.
+                _print_json(get_value(_hydrate_optional_sections(config), args.path))
                 return 0
             if args.config_command == "show":
                 _print_json(config)
@@ -2080,7 +2088,11 @@ def main(argv: list[str] | None = None) -> int:
                     value = json.loads(args.value)
                 except json.JSONDecodeError:
                     value = args.value
-                updated = set_value(config, args.path, value)
+                # Same hydration as `get` above, so a missing optional key
+                # can be created rather than refused by name -- an explicit
+                # `set` IS supposed to move the governance fingerprint
+                # (that's governance working), unlike a mere `get`.
+                updated = set_value(_hydrate_optional_sections(config), args.path, value)
                 save_config(wdd_dir, updated)
                 _print_json(
                     {

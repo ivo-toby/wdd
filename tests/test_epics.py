@@ -39,6 +39,7 @@ from wave_delivery.config import (
     save_config,
     save_overlay,
     set_overlay_value,
+    validate_config,
     validate_overlay,
 )
 from wave_delivery.doctor import inspect_capabilities
@@ -62,13 +63,22 @@ from wave_delivery.migration import (
     read_source,
 )
 from wave_delivery.paths import resolve_artifact
+from wave_delivery.review import (
+    REVIEW_RESULT_KIND,
+    VERIFICATION_RESULT_KIND,
+    normalize_review_results,
+    normalize_verification_result,
+)
 from wave_delivery.schema import (
     SCHEMA_VERSION,
     TASK_STATUSES,
     new_setup_state,
     new_state,
+    normalize_execution,
     task_state,
+    validate_execution_value,
     validate_state,
+    validate_telemetry,
 )
 from wave_delivery.setup import create_epic, epic_orphans, setup_next_actions
 from wave_delivery.store import StateStore
@@ -380,6 +390,7 @@ class OverlayAllowlistTest(unittest.TestCase):
             "models.review": "gpt-review",
             "verification.commands": ["pytest -q"],
             "verification.unavailableJustification": None,
+            "verification.timeoutSeconds": 300,
             "merge.surface": "local",
             "riskRules": [{"pattern": "src/**", "risk": "high"}],
             "review.policy": "always",
@@ -658,9 +669,124 @@ class ProjectionPartitioningTest(unittest.TestCase):
             changed = {purpose for purpose in purposes if before[purpose] != after[purpose]}
             self.assertEqual(changed, {"taskVerification", "finalVerification"})
 
+    def test_timeout_seconds_edit_changes_exactly_the_two_verification_projections(
+        self,
+    ) -> None:
+        """T2 brief's independent oracle (spec AC-8): flip
+        `verification.timeoutSeconds` and assert exactly `taskVerification`
+        and `finalVerification` move, naming all five projections
+        explicitly -- the expected set comes from the spec, not from
+        reading `project()`'s implementation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            layers = load_layers(wdd, "my-epic")
+            purposes = ("plan", "taskReview", "finalReview", "taskVerification", "finalVerification")
+            before = {
+                purpose: effective_config_digest(project(layers["effective"], purpose))
+                for purpose in purposes
+            }
+            derived = derive_effective(layers, {"verification": {"timeoutSeconds": 120}})
+            after = {
+                purpose: effective_config_digest(project(derived["effective"], purpose))
+                for purpose in purposes
+            }
+            changed = {purpose for purpose in purposes if before[purpose] != after[purpose]}
+            self.assertEqual(changed, {"taskVerification", "finalVerification"})
+
     def test_unknown_purpose_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
             project(default_config(), "codeReview")
+
+
+class VerificationTimeoutSecondsConfigTest(unittest.TestCase):
+    """`verification.timeoutSeconds`: validated integer 1..86400, default
+    600 (T2 brief deliverable; spec AC-5)."""
+
+    def test_default_config_has_default_timeout(self) -> None:
+        self.assertEqual(default_config()["verification"]["timeoutSeconds"], 600)
+
+    def test_minimum_boundary_is_accepted(self) -> None:
+        config = default_config()
+        config["verification"]["timeoutSeconds"] = 1
+        validate_config(config)  # must not raise
+
+    def test_maximum_boundary_is_accepted(self) -> None:
+        config = default_config()
+        config["verification"]["timeoutSeconds"] = 86400
+        validate_config(config)  # must not raise
+
+    def test_zero_is_refused_by_name(self) -> None:
+        config = default_config()
+        config["verification"]["timeoutSeconds"] = 0
+        with self.assertRaises(ValidationError) as ctx:
+            validate_config(config)
+        self.assertIn("verification.timeoutSeconds", str(ctx.exception))
+
+    def test_above_maximum_is_refused_by_name(self) -> None:
+        config = default_config()
+        config["verification"]["timeoutSeconds"] = 86401
+        with self.assertRaises(ValidationError) as ctx:
+            validate_config(config)
+        self.assertIn("verification.timeoutSeconds", str(ctx.exception))
+
+    def test_non_integer_is_refused_by_name(self) -> None:
+        config = default_config()
+        config["verification"]["timeoutSeconds"] = 600.5
+        with self.assertRaises(ValidationError) as ctx:
+            validate_config(config)
+        self.assertIn("verification.timeoutSeconds", str(ctx.exception))
+
+    def test_bool_is_refused(self) -> None:
+        config = default_config()
+        config["verification"]["timeoutSeconds"] = True
+        with self.assertRaises(ValidationError):
+            validate_config(config)
+
+    def test_missing_key_validates(self) -> None:
+        # Fix-round: a real pre-existing config.json predating this key
+        # (empirically found against this repo's own live config) must not
+        # be bricked -- absence is backward-compat tolerated, only a
+        # present-but-invalid value is refused.
+        config = default_config()
+        del config["verification"]["timeoutSeconds"]
+        validate_config(config)  # must not raise
+
+    def test_missing_key_resolves_to_default_via_load(self) -> None:
+        config = default_config()
+        del config["verification"]["timeoutSeconds"]
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp, config)
+            layers = load_layers(wdd, None)
+            self.assertNotIn("timeoutSeconds", layers["global"]["verification"])
+            value, source = resolve_config_source(layers, "verification.timeoutSeconds")
+            self.assertEqual(value, 600)
+            self.assertEqual(source, "default")
+
+    def test_missing_key_digest_matches_explicit_default_digest(self) -> None:
+        # Digest stability: a config that omits the key and one that spells
+        # out the identical default (600) explicitly must hydrate to the
+        # exact same effective view, so their digests match byte-for-byte.
+        missing = default_config()
+        del missing["verification"]["timeoutSeconds"]
+        explicit = default_config()
+        explicit["verification"]["timeoutSeconds"] = 600
+        with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+            wdd_a = _wdd_with_config(tmp_a, missing)
+            wdd_b = _wdd_with_config(tmp_b, explicit)
+            digest_missing = effective_config_digest(load_layers(wdd_a, None)["effective"])
+            digest_explicit = effective_config_digest(load_layers(wdd_b, None)["effective"])
+            self.assertEqual(digest_missing, digest_explicit)
+
+    def test_overlay_leaf_is_reflected_in_effective(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp)
+            save_overlay(wdd, "my-epic", {"verification": {"timeoutSeconds": 120}})
+            layers = load_layers(wdd, "my-epic")
+            self.assertEqual(layers["effective"]["verification"]["timeoutSeconds"], 120)
+
+    def test_overlay_out_of_range_is_refused(self) -> None:
+        with self.assertRaises(ValidationError):
+            validate_overlay({"verification": {"timeoutSeconds": 0}})
 
 
 class ConfigEpicCliTest(unittest.TestCase):
@@ -810,6 +936,7 @@ class ResolveConfigSourceTest(unittest.TestCase):
                 "models.specReview",
                 "verification.commands",
                 "verification.unavailableJustification",
+                "verification.timeoutSeconds",
                 "merge.surface",
                 "riskRules",
                 "review.policy",
@@ -866,6 +993,112 @@ class LegacyConfigDefaultHydrationTest(unittest.TestCase):
             first = effective_config_digest(layers["effective"])
             second = effective_config_digest(layers["effective"])
             self.assertEqual(first, second)
+
+
+class LegacyConfigPlainCliGetSetTest(unittest.TestCase):
+    """Fix-round P2: plain (non-`--epic`) `config get`/`set` had the same
+    unhydrated-optional-section problem `LegacyConfigDefaultHydrationTest`
+    covers for `--epic` -- `get_value`/`set_value` walk the RAW config, so
+    a config.json predating `verification.timeoutSeconds` (tolerated absent
+    by `validate_config`, same as `runners`/`worktrees`) had no in-tool path
+    to read or write that knob globally: `unknown path` every time. Fixed by
+    routing the plain CLI get/set path through the same
+    `_hydrate_optional_sections` `load_layers`'s `effective` already uses --
+    one shared mechanism for every optional key, not a timeoutSeconds
+    special case. `get` must stay a pure read (no file write, no fingerprint
+    change); `set` is an explicit write and IS supposed to move the
+    fingerprint (governance working as intended)."""
+
+    def _run(self, tmp: str, *argv: str) -> tuple[int, str]:
+        state = str(Path(tmp) / ".wdd" / "state.json")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = main(["--state", state, *argv])
+        return code, stdout.getvalue()
+
+    def _legacy_wdd(self, tmp: str) -> Path:
+        config = default_config()
+        del config["verification"]["timeoutSeconds"]
+        return _wdd_with_config(tmp, config)
+
+    def test_get_on_legacy_config_resolves_default_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._legacy_wdd(tmp)
+            code, out = self._run(tmp, "config", "get", "verification.timeoutSeconds")
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out), 600)
+
+    def test_get_matches_load_layers_default_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = self._legacy_wdd(tmp)
+            layers = load_layers(wdd, None)
+            value, source = resolve_config_source(layers, "verification.timeoutSeconds")
+            self.assertEqual(source, "default")
+            code, out = self._run(tmp, "config", "get", "verification.timeoutSeconds")
+            self.assertEqual(json.loads(out), value)
+
+    def test_get_leaves_the_saved_file_byte_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = self._legacy_wdd(tmp)
+            before = (wdd / "config.json").read_bytes()
+            code, _out = self._run(tmp, "config", "get", "verification.timeoutSeconds")
+            self.assertEqual(code, 0)
+            self.assertEqual((wdd / "config.json").read_bytes(), before)
+
+    def test_get_does_not_change_governance_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = self._legacy_wdd(tmp)
+            (wdd / "constitution.md").write_text("# Constitution\n\nBe good.\n", encoding="utf-8")
+            before = governance_fingerprint(wdd)
+            code, _out = self._run(tmp, "config", "get", "verification.timeoutSeconds")
+            self.assertEqual(code, 0)
+            self.assertEqual(governance_fingerprint(wdd), before)
+
+    def test_set_on_legacy_config_creates_the_key_and_validates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = self._legacy_wdd(tmp)
+            code, out = self._run(tmp, "config", "set", "verification.timeoutSeconds", "120")
+            self.assertEqual(code, 0)
+            payload = json.loads(out)
+            self.assertEqual(payload["value"], 120)
+            saved = load_config(wdd)
+            self.assertEqual(saved["verification"]["timeoutSeconds"], 120)
+
+    def test_set_out_of_range_on_legacy_config_is_still_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._legacy_wdd(tmp)
+            stderr = io.StringIO()
+            state = str(Path(tmp) / ".wdd" / "state.json")
+            with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                code = main(
+                    ["--state", state, "config", "set", "verification.timeoutSeconds", "0"]
+                )
+            self.assertNotEqual(code, 0)
+
+    def test_set_changes_governance_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = self._legacy_wdd(tmp)
+            (wdd / "constitution.md").write_text("# Constitution\n\nBe good.\n", encoding="utf-8")
+            before = governance_fingerprint(wdd)
+            code, _out = self._run(tmp, "config", "set", "verification.timeoutSeconds", "120")
+            self.assertEqual(code, 0)
+            self.assertNotEqual(governance_fingerprint(wdd), before)
+
+    def test_set_on_legacy_config_also_backfills_other_optional_sections(self) -> None:
+        # The shared mechanism hydrates ALL optional sections at once, not
+        # just the one targeted by this set -- an explicit write is the
+        # correct moment for a legacy config.json to gain the concrete
+        # defaults it was silently missing.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = default_config()
+            del config["verification"]["timeoutSeconds"]
+            del config["runners"]
+            wdd = _wdd_with_config(tmp, config)
+            code, _out = self._run(tmp, "config", "set", "merge.surface", '"local"')
+            self.assertEqual(code, 0)
+            saved = load_config(wdd)
+            self.assertEqual(saved["verification"]["timeoutSeconds"], 600)
+            self.assertEqual(saved["runners"], {})
 
 
 class SetOverlayValueSubLeafSeedingTest(unittest.TestCase):
@@ -1228,6 +1461,531 @@ class SchemaV6ReviewEvidenceExtrasTest(unittest.TestCase):
         state["tasks"] = {"T1": task}
         with self.assertRaises(ValidationError):
             validate_state(state)
+
+    def _task_with_verification(self, verification: dict | None) -> dict:
+        task = task_state("T1")
+        task["verification"] = verification
+        state = new_state("SCOPE-x")
+        state["tasks"] = {"T1": task}
+        return state
+
+    # --- T2: execution provenance (spec AC-7) ------------------------------
+
+    def test_verification_without_execution_is_still_valid(self) -> None:
+        validate_state(self._task_with_verification({"baseSha": "a", "headSha": "b", "status": "passed"}))
+
+    def test_verification_with_execution_wddctl_is_accepted(self) -> None:
+        validate_state(
+            self._task_with_verification(
+                {"baseSha": "a", "headSha": "b", "status": "passed", "execution": "wddctl"}
+            )
+        )
+
+    def test_verification_with_execution_reported_is_accepted(self) -> None:
+        validate_state(
+            self._task_with_verification(
+                {"baseSha": "a", "headSha": "b", "status": "passed", "execution": "reported"}
+            )
+        )
+
+    def test_verification_with_invalid_execution_is_rejected_by_name(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(
+                self._task_with_verification(
+                    {"baseSha": "a", "headSha": "b", "status": "passed", "execution": "agent"}
+                )
+            )
+        self.assertIn("execution", str(ctx.exception))
+
+    def test_final_verification_with_execution_wddctl_is_accepted(self) -> None:
+        state = new_state("SCOPE-x")
+        state["finalize"] = {"verification": {"headSha": "a", "status": "passed", "execution": "wddctl"}}
+        validate_state(state)
+
+    def test_final_verification_with_invalid_execution_is_rejected_by_name(self) -> None:
+        state = new_state("SCOPE-x")
+        state["finalize"] = {"verification": {"headSha": "a", "status": "passed", "execution": "agent"}}
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(state)
+        self.assertIn("execution", str(ctx.exception))
+
+    # --- T2: logSha256 (spec AC-9) ------------------------------------------
+
+    def test_verification_with_log_sha256_is_accepted(self) -> None:
+        validate_state(
+            self._task_with_verification(
+                {"baseSha": "a", "headSha": "b", "status": "passed", "logSha256": "sha256:" + "a" * 64}
+            )
+        )
+
+    def test_verification_with_empty_log_sha256_is_rejected_by_name(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(
+                self._task_with_verification(
+                    {"baseSha": "a", "headSha": "b", "status": "passed", "logSha256": ""}
+                )
+            )
+        self.assertIn("logSha256", str(ctx.exception))
+
+    # --- T2: telemetry (spec AC-10) ------------------------------------------
+
+    def test_verification_with_valid_telemetry_is_accepted(self) -> None:
+        telemetry = {"model": "gpt-5", "durationMs": 120, "tokens": 40}
+        validate_state(
+            self._task_with_verification(
+                {"baseSha": "a", "headSha": "b", "status": "passed", "telemetry": telemetry}
+            )
+        )
+
+    def test_verification_with_partial_telemetry_is_accepted(self) -> None:
+        # spec: "all fields optional" -- a bare {} or any subset is legal.
+        validate_state(
+            self._task_with_verification(
+                {"baseSha": "a", "headSha": "b", "status": "passed", "telemetry": {"model": "gpt-5"}}
+            )
+        )
+
+    def test_verification_with_negative_telemetry_duration_is_rejected_by_name(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(
+                self._task_with_verification(
+                    {
+                        "baseSha": "a", "headSha": "b", "status": "passed",
+                        "telemetry": {"durationMs": -1},
+                    }
+                )
+            )
+        self.assertIn("telemetry.durationMs", str(ctx.exception))
+
+    def test_verification_with_negative_telemetry_tokens_is_rejected_by_name(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(
+                self._task_with_verification(
+                    {
+                        "baseSha": "a", "headSha": "b", "status": "passed",
+                        "telemetry": {"tokens": -1},
+                    }
+                )
+            )
+        self.assertIn("telemetry.tokens", str(ctx.exception))
+
+    def test_verification_with_non_string_telemetry_model_is_rejected_by_name(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(
+                self._task_with_verification(
+                    {
+                        "baseSha": "a", "headSha": "b", "status": "passed",
+                        "telemetry": {"model": 5},
+                    }
+                )
+            )
+        self.assertIn("telemetry.model", str(ctx.exception))
+
+    def test_verification_with_unknown_telemetry_key_is_rejected_by_name(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(
+                self._task_with_verification(
+                    {
+                        "baseSha": "a", "headSha": "b", "status": "passed",
+                        "telemetry": {"cost": 1},
+                    }
+                )
+            )
+        self.assertIn("telemetry", str(ctx.exception))
+        self.assertIn("cost", str(ctx.exception))
+
+    def test_review_with_valid_telemetry_is_accepted(self) -> None:
+        review = {
+            "baseSha": "a", "headSha": "b", "findings": [], "reviewer": "x",
+            "telemetry": {"model": "gpt-5", "durationMs": 30, "tokens": 10},
+        }
+        validate_state(self._task_with_review(review))
+
+    def test_review_with_malformed_telemetry_is_rejected_by_name(self) -> None:
+        review = {
+            "baseSha": "a", "headSha": "b", "findings": [], "reviewer": "x",
+            "telemetry": {"tokens": -1},
+        }
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(self._task_with_review(review))
+        self.assertIn("telemetry.tokens", str(ctx.exception))
+
+    def test_final_review_with_valid_telemetry_is_accepted(self) -> None:
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "review": {
+                "headSha": "a", "outcome": "passed", "findings": [], "reviewer": "x", "at": "t",
+                "telemetry": {"model": "gpt-5", "durationMs": 30, "tokens": 10},
+            }
+        }
+        validate_state(state)
+
+    # --- T2: per-command result entry shapes (spec AC-1/AC-4/AC-5) ---------
+
+    def test_verification_results_executed_entry_is_accepted(self) -> None:
+        entry = {
+            "command": "pytest -q", "status": "passed", "exitCode": 0,
+            "durationMs": 500, "outputSha256": "sha256:" + "a" * 64, "tail": "ok\n",
+        }
+        validate_state(
+            self._task_with_verification(
+                {"baseSha": "a", "headSha": "b", "status": "passed", "results": [entry]}
+            )
+        )
+
+    def test_verification_results_skipped_entry_is_accepted(self) -> None:
+        entry = {"command": "pytest -q", "status": "skipped"}
+        validate_state(
+            self._task_with_verification(
+                {"baseSha": "a", "headSha": "b", "status": "failed", "results": [entry]}
+            )
+        )
+
+    def test_verification_results_skipped_entry_with_fabricated_field_is_rejected_by_name(
+        self,
+    ) -> None:
+        # AC-4: skipped entries carry "no fabricated fields" -- an exitCode
+        # on a command that never ran is exactly that.
+        entry = {"command": "pytest -q", "status": "skipped", "exitCode": 0}
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(
+                self._task_with_verification(
+                    {"baseSha": "a", "headSha": "b", "status": "failed", "results": [entry]}
+                )
+            )
+        self.assertIn("exitCode", str(ctx.exception))
+
+    def test_verification_results_timed_out_entry_is_accepted(self) -> None:
+        entry = {
+            "command": "sleep 999", "status": "failed", "exitCode": None, "timedOut": True,
+            "durationMs": 600000, "outputSha256": "sha256:" + "b" * 64, "tail": "",
+        }
+        validate_state(
+            self._task_with_verification(
+                {"baseSha": "a", "headSha": "b", "status": "failed", "results": [entry]}
+            )
+        )
+
+    def test_verification_results_timed_out_entry_requires_null_exit_code_by_name(self) -> None:
+        entry = {
+            "command": "sleep 999", "status": "failed", "exitCode": 1, "timedOut": True,
+            "durationMs": 600000, "outputSha256": "sha256:" + "b" * 64, "tail": "",
+        }
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(
+                self._task_with_verification(
+                    {"baseSha": "a", "headSha": "b", "status": "failed", "results": [entry]}
+                )
+            )
+        self.assertIn("exitCode", str(ctx.exception))
+
+    def test_verification_results_timed_out_entry_requires_failed_status_by_name(self) -> None:
+        entry = {
+            "command": "sleep 999", "status": "passed", "exitCode": None, "timedOut": True,
+            "durationMs": 600000, "outputSha256": "sha256:" + "b" * 64, "tail": "",
+        }
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(
+                self._task_with_verification(
+                    {"baseSha": "a", "headSha": "b", "status": "failed", "results": [entry]}
+                )
+            )
+        self.assertIn("status", str(ctx.exception))
+
+    def test_verification_results_truncated_entry_is_accepted(self) -> None:
+        # AC-9: the 64MB per-command capture cap marker (T1's verify_run.py).
+        entry = {
+            "command": "pytest -q", "status": "passed", "exitCode": 0,
+            "durationMs": 500, "outputSha256": "sha256:" + "a" * 64, "tail": "ok\n",
+            "truncated": True,
+        }
+        validate_state(
+            self._task_with_verification(
+                {"baseSha": "a", "headSha": "b", "status": "passed", "results": [entry]}
+            )
+        )
+
+    def test_verification_results_truncated_non_literal_true_is_rejected_by_name(self) -> None:
+        # Mirrors `timedOut`'s "no fabricated fields" doctrine: a non-bool
+        # (or any value other than literal true) is refused by name.
+        entry = {
+            "command": "pytest -q", "status": "passed", "exitCode": 0,
+            "durationMs": 500, "outputSha256": "sha256:" + "a" * 64, "tail": "ok\n",
+            "truncated": "yes",
+        }
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(
+                self._task_with_verification(
+                    {"baseSha": "a", "headSha": "b", "status": "passed", "results": [entry]}
+                )
+            )
+        self.assertIn("truncated", str(ctx.exception))
+
+    def test_verification_results_executed_entry_missing_required_key_is_rejected_by_name(
+        self,
+    ) -> None:
+        entry = {"command": "pytest -q", "status": "passed", "exitCode": 0}
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(
+                self._task_with_verification(
+                    {"baseSha": "a", "headSha": "b", "status": "passed", "results": [entry]}
+                )
+            )
+        self.assertIn("durationMs", str(ctx.exception))
+
+    def test_verification_results_entry_with_unknown_key_is_rejected_by_name(self) -> None:
+        entry = {
+            "command": "pytest -q", "status": "passed", "exitCode": 0,
+            "durationMs": 1, "outputSha256": "sha256:" + "a" * 64, "tail": "",
+            "bogus": True,
+        }
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(
+                self._task_with_verification(
+                    {"baseSha": "a", "headSha": "b", "status": "passed", "results": [entry]}
+                )
+            )
+        self.assertIn("bogus", str(ctx.exception))
+
+    def test_verification_results_must_be_a_non_empty_list(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(
+                self._task_with_verification(
+                    {"baseSha": "a", "headSha": "b", "status": "passed", "results": []}
+                )
+            )
+        self.assertIn("results", str(ctx.exception))
+
+    def test_final_verification_results_shape_is_checked_by_the_same_validator(self) -> None:
+        # Final-level verification records go through the same shared
+        # per-command entry validator as task-level ones (config-schema
+        # brief: "ONE shared" doctrine extends to this shape too).
+        state = new_state("SCOPE-x")
+        state["finalize"] = {
+            "verification": {
+                "headSha": "a", "status": "passed",
+                "results": [{"command": "pytest -q", "status": "skipped", "exitCode": 0}],
+            }
+        }
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(state)
+        self.assertIn("exitCode", str(ctx.exception))
+
+
+class ExecutionReadNormalizerTest(unittest.TestCase):
+    """The one shared read-time normalizer for `execution` (spec AC-7):
+    absent -> 'reported'; render/status must never observe null. Not a
+    write-time default -- pre-existing records stay absent on disk (no
+    migration), only reads compute the fallback."""
+
+    def test_absent_execution_normalizes_to_reported(self) -> None:
+        self.assertEqual(normalize_execution(None), "reported")
+
+    def test_present_wddctl_execution_passes_through(self) -> None:
+        self.assertEqual(normalize_execution("wddctl"), "wddctl")
+
+    def test_present_reported_execution_passes_through(self) -> None:
+        self.assertEqual(normalize_execution("reported"), "reported")
+
+    def test_validate_execution_value_accepts_both_values(self) -> None:
+        validate_execution_value("wddctl", "x.execution")
+        validate_execution_value("reported", "x.execution")
+
+    def test_validate_execution_value_rejects_unknown_value_by_name(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            validate_execution_value("agent", "task.verification.execution")
+        self.assertIn("task.verification.execution", str(ctx.exception))
+
+
+class ResultNormalizerExecutionTelemetryTest(unittest.TestCase):
+    """`normalize_review_results`/`normalize_verification_result` (T2
+    brief scope, contract-inventory "Result normalizers"): preserve
+    `execution` (verification only, per spec: "on all verification
+    records"), pass through validated `telemetry` (either record kind),
+    reject malformed shapes by name."""
+
+    def _write_json(self, tmp: str, name: str, payload: dict) -> Path:
+        path = Path(tmp) / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_normalize_verification_result_preserves_reported_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_json(
+                tmp, "v.json",
+                {
+                    "schemaVersion": 1, "kind": VERIFICATION_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "status": "passed", "command": "pytest -q",
+                    "execution": "reported",
+                },
+            )
+            result = normalize_verification_result(path, task_id="T1")
+            self.assertEqual(result["execution"], "reported")
+
+    def test_normalize_verification_result_rejects_self_declared_wddctl_execution(
+        self,
+    ) -> None:
+        # Fix-round: a `--results` file is agent/reviewer-authored; only
+        # wddctl's own internal machine-run capture may claim
+        # execution="wddctl". A result file self-declaring it is fabricated
+        # machine provenance and must be refused, not trusted through.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_json(
+                tmp, "v.json",
+                {
+                    "schemaVersion": 1, "kind": VERIFICATION_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "status": "passed", "command": "pytest -q",
+                    "execution": "wddctl",
+                },
+            )
+            with self.assertRaises(ValidationError) as ctx:
+                normalize_verification_result(path, task_id="T1")
+            self.assertIn("execution", str(ctx.exception))
+            self.assertIn("wddctl", str(ctx.exception))
+
+    def test_normalize_verification_result_without_execution_key_omits_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_json(
+                tmp, "v.json",
+                {
+                    "schemaVersion": 1, "kind": VERIFICATION_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "status": "passed", "command": "pytest -q",
+                },
+            )
+            result = normalize_verification_result(path, task_id="T1")
+            self.assertNotIn("execution", result)
+
+    def test_normalize_verification_result_rejects_invalid_execution_by_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_json(
+                tmp, "v.json",
+                {
+                    "schemaVersion": 1, "kind": VERIFICATION_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "status": "passed", "command": "pytest -q",
+                    "execution": "agent",
+                },
+            )
+            with self.assertRaises(ValidationError) as ctx:
+                normalize_verification_result(path, task_id="T1")
+            self.assertIn("execution", str(ctx.exception))
+
+    def test_normalize_verification_result_passes_through_telemetry(self) -> None:
+        telemetry = {"model": "gpt-5", "durationMs": 120, "tokens": 40}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_json(
+                tmp, "v.json",
+                {
+                    "schemaVersion": 1, "kind": VERIFICATION_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "status": "passed", "command": "pytest -q",
+                    "telemetry": telemetry,
+                },
+            )
+            result = normalize_verification_result(path, task_id="T1")
+            self.assertEqual(result["telemetry"], telemetry)
+
+    def test_normalize_verification_result_rejects_malformed_telemetry_by_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_json(
+                tmp, "v.json",
+                {
+                    "schemaVersion": 1, "kind": VERIFICATION_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "status": "passed", "command": "pytest -q",
+                    "telemetry": {"tokens": -1},
+                },
+            )
+            with self.assertRaises(ValidationError) as ctx:
+                normalize_verification_result(path, task_id="T1")
+            self.assertIn("telemetry.tokens", str(ctx.exception))
+
+    def test_normalize_review_results_passes_through_telemetry(self) -> None:
+        telemetry = {"model": "gpt-review", "durationMs": 30, "tokens": 5}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_json(
+                tmp, "r.json",
+                {
+                    "schemaVersion": 1, "kind": REVIEW_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "reviewer": "x", "findings": [],
+                    "telemetry": telemetry,
+                },
+            )
+            result = normalize_review_results([path], task_id="T1")
+            self.assertEqual(result["telemetry"], telemetry)
+
+    def test_normalize_review_results_without_telemetry_omits_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_json(
+                tmp, "r.json",
+                {
+                    "schemaVersion": 1, "kind": REVIEW_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "reviewer": "x", "findings": [],
+                },
+            )
+            result = normalize_review_results([path], task_id="T1")
+            self.assertNotIn("telemetry", result)
+
+    def test_normalize_review_results_rejects_malformed_telemetry_by_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_json(
+                tmp, "r.json",
+                {
+                    "schemaVersion": 1, "kind": REVIEW_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "reviewer": "x", "findings": [],
+                    "telemetry": {"model": 5},
+                },
+            )
+            with self.assertRaises(ValidationError) as ctx:
+                normalize_review_results([path], task_id="T1")
+            self.assertIn("telemetry.model", str(ctx.exception))
+
+    def test_normalize_review_results_drops_telemetry_on_disagreement(self) -> None:
+        # Fix-round: telemetry is observability-only and must never be
+        # gate-blocking (spec "Telemetry (optional, additive)"). Merged
+        # reviewer files that disagree drop telemetry from the merged
+        # record entirely -- the record itself (findings, reviewers) is
+        # still accepted.
+        with tempfile.TemporaryDirectory() as tmp:
+            path_a = self._write_json(
+                tmp, "a.json",
+                {
+                    "schemaVersion": 1, "kind": REVIEW_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "reviewer": "x", "findings": [],
+                    "telemetry": {"model": "gpt-5"},
+                },
+            )
+            path_b = self._write_json(
+                tmp, "b.json",
+                {
+                    "schemaVersion": 1, "kind": REVIEW_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "reviewer": "y", "findings": [],
+                    "telemetry": {"model": "gpt-4"},
+                },
+            )
+            result = normalize_review_results([path_a, path_b], task_id="T1")
+            self.assertNotIn("telemetry", result)
+            self.assertEqual(result["reviewer"], "x, y")
+
+    def test_normalize_review_results_keeps_telemetry_from_single_source(self) -> None:
+        # When only one of several files supplies telemetry at all (the
+        # others simply omit the key, not disagree), it is not a conflict
+        # and must be kept.
+        with tempfile.TemporaryDirectory() as tmp:
+            path_a = self._write_json(
+                tmp, "a.json",
+                {
+                    "schemaVersion": 1, "kind": REVIEW_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "reviewer": "x", "findings": [],
+                    "telemetry": {"model": "gpt-5"},
+                },
+            )
+            path_b = self._write_json(
+                tmp, "b.json",
+                {
+                    "schemaVersion": 1, "kind": REVIEW_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "reviewer": "y", "findings": [],
+                },
+            )
+            result = normalize_review_results([path_a, path_b], task_id="T1")
+            self.assertEqual(result["telemetry"], {"model": "gpt-5"})
 
 
 # --- v5 -> v6 migration (spec Sec4) ----------------------------------------

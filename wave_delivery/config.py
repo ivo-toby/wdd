@@ -32,7 +32,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "basePattern": "wdd/{scope-slug}",
         "taskPattern": "task/{task-id}",
     },
-    "verification": {"commands": [], "unavailableJustification": None},
+    "verification": {"commands": [], "unavailableJustification": None, "timeoutSeconds": 600},
     "review": {"policy": "risk_based", "blockingSeverities": ["P1", "P2"]},
     "merge": {"surface": "pr", "mode": "controller", "reconcileEveryNMerges": 3},
     "concurrency": {"maxConcurrent": 3},
@@ -116,6 +116,21 @@ def validate_config(config: dict[str, Any]) -> None:
     justification = verification.get("unavailableJustification")
     _require(justification is None or (isinstance(justification, str) and justification),
              "verification.unavailableJustification must be null or a non-empty string")
+    # Per-command timeout for `--run` (spec Sec1, machine-verification epic).
+    # Absent is tolerated like `runners`/`worktrees` above -- a real
+    # pre-existing config.json written before this key existed has no
+    # legitimate way to supply it, and refusing it outright would brick
+    # every one of them with no in-tool remedy (fix-round: bug found against
+    # this repo's own live config). A PRESENT value is still held strictly:
+    # only an absent key falls back to the DEFAULT_CONFIG value (600) for
+    # this check; `_hydrate_optional_sections` is what actually writes 600
+    # into `effective` so downstream readers never see the key missing.
+    timeout_seconds = verification.get("timeoutSeconds", DEFAULT_CONFIG["verification"]["timeoutSeconds"])
+    _require(
+        isinstance(timeout_seconds, int) and not isinstance(timeout_seconds, bool)
+        and 1 <= timeout_seconds <= 86400,
+        "verification.timeoutSeconds must be an integer between 1 and 86400",
+    )
 
     review = config.get("review")
     _require(isinstance(review, dict), "review must be an object")
@@ -393,6 +408,7 @@ OVERLAY_ALLOWED_LEAVES: tuple[str, ...] = (
     "models.specReview",
     "verification.commands",
     "verification.unavailableJustification",
+    "verification.timeoutSeconds",
     "merge.surface",
     "riskRules",
     "review.policy",
@@ -511,12 +527,32 @@ def _hydrate_optional_sections(config: dict[str, Any]) -> dict[str, Any]:
     of this function -- hydrating it too would make `resolve_config_source`
     find these keys in `global` and report source='global' instead of the
     correct 'default'.
+
+    Also hydrates `verification.timeoutSeconds` when the key itself is
+    missing, one leaf deep inside the otherwise-required `verification`
+    object rather than a whole top-level section: `validate_config` accepts
+    its absence for the identical backward-compat reason `runners`/
+    `worktrees` are accepted absent, and `effective` needs the same
+    concrete default (600) here for the same reason (fix-round: a real
+    pre-existing config.json lacking this key must still resolve, not
+    crash). A present-but-invalid value is never touched here --
+    `validate_config` still refuses it by name.
+
+    Also called directly (not via `_effective_view`/`load_layers`) by
+    cli.py's plain, non-`--epic` `config get`/`set` handlers (fix-round P2):
+    those walk `get_value`/`set_value` over a config with no overlay
+    concept at all, so they had the identical unhydrated-optional-key
+    'unknown path' failure on a legacy config.json -- one shared mechanism
+    for every optional key rather than a per-key special case.
     """
     hydrated = deepcopy(config)
     defaults = DEFAULT_CONFIG
     for section in _OPTIONAL_GLOBAL_SECTIONS:
         if section not in hydrated:
             hydrated[section] = deepcopy(defaults[section])
+    verification = hydrated.get("verification")
+    if isinstance(verification, dict) and "timeoutSeconds" not in verification:
+        verification["timeoutSeconds"] = defaults["verification"]["timeoutSeconds"]
     return hydrated
 
 
