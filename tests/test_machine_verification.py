@@ -126,6 +126,29 @@ class ExecuteTimeoutShapeTests(unittest.TestCase):
             self.assertEqual(results[1], {"command": "echo never", "status": "skipped"})
 
 
+def _process_is_dead(pid: int) -> bool:
+    """True once `pid` is gone or lingering only as an unreaped zombie.
+
+    A killed grandchild is reparented away from our process (its parent,
+    `sh`, died with it), so nothing in this test tree ever calls `wait()`
+    on it -- some ancestor (PID 1, or a subreaper) reaps it on its own
+    schedule. Until then the PID stays in the process table as a zombie,
+    so a plain `os.kill(pid, 0)` still succeeds even though the process
+    has already stopped running. Checking `/proc/<pid>/status` for zombie
+    state (Linux-only, matches this sandbox) tests the actual claim --
+    "the child no longer runs" -- without depending on reap timing that
+    verify_run does not own.
+    """
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("State:"):
+                    return "zombie" in line.lower()
+        return False
+    except FileNotFoundError:
+        return True
+
+
 class ExecuteChildSurvivorTests(unittest.TestCase):
     def test_backgrounded_grandchild_is_killed_with_the_group(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -139,8 +162,13 @@ class ExecuteChildSurvivorTests(unittest.TestCase):
             # the group was killed rather than waited out.
             self.assertLess(elapsed, 10)
             child_pid = int(pidfile.read_text(encoding="utf-8").strip())
-            with self.assertRaises(ProcessLookupError):
-                os.kill(child_pid, 0)
+            deadline = time.monotonic() + 2.0
+            while not _process_is_dead(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(
+                _process_is_dead(child_pid),
+                f"child pid {child_pid} is still running after group kill",
+            )
 
 
 class ExecuteTruncationTests(unittest.TestCase):
