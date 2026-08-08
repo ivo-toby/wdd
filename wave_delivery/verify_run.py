@@ -198,11 +198,21 @@ def _run_one(
         # Mirrors runner.py:590's precedent for the same failure mode: a
         # Popen construction failure (missing cwd, fork/exec resource
         # exhaustion) is execution evidence to record, not an exception to
-        # let escape this module's observed-evidence contract.
+        # let escape this module's observed-evidence contract. The process
+        # never started, so there is no real exit code -- but T2's
+        # `_validate_result_entry` (wave_delivery/schema.py, spec
+        # AC-1/AC-9) requires the full executed-failure shape whenever
+        # `timedOut` isn't true (`exitCode: null` is reserved for the
+        # timeout shape only). 127 (the shell "command not found"
+        # convention) is used here as an explicitly synthetic marker for
+        # "never executed", not an observed value; durationMs and
+        # outputSha256 (of the empty, never-started capture) ARE observed.
         return {
             "command": command,
             "status": "failed",
-            "exitCode": None,
+            "exitCode": 127,
+            "durationMs": int((time.monotonic() - started) * 1000),
+            "outputSha256": hashlib.sha256(b"").hexdigest(),
             "tail": f"verify_run: could not exec command: {error}",
         }
     stdout = process.stdout
@@ -231,6 +241,7 @@ def _run_one(
         log_hasher.update(chunk)
 
     timed_out = False
+    exit_code: int | None = None
     try:
         # EOF on this fd -- not "the direct child exited" -- is the only
         # signal that every holder of the write end is gone. A backgrounded
@@ -256,23 +267,59 @@ def _run_one(
                 break
             consume(chunk)
 
+        if not timed_out:
+            # EOF on the pipe proves every write-end holder is gone, but
+            # NOT that the direct child has exited or been reaped -- e.g.
+            # `exec 1>/dev/null 2>/dev/null; sleep 15` closes the pipe
+            # almost instantly while `sh` (now running `sleep 15` in the
+            # same process image) keeps running well past the deadline. An
+            # unbounded `process.wait()` here used to block for the rest
+            # of that command's runtime and record "passed" once it
+            # finally exited, silently ignoring the timeout. Bounding this
+            # wait by the remaining deadline and falling into the same
+            # timeout+group-kill path on expiry closes that gap.
+            remaining = deadline - time.monotonic()
+            try:
+                exit_code = process.wait(timeout=max(remaining, 0))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+
         if timed_out:
-            _kill_process_group(process)
-            exit_code: int | None = None
-            # The group kill above blocks (with a SIGTERM grace period and a
-            # SIGKILL escalation) until every process in the group --
-            # including a backgrounded grandchild the exited/killed `sh`
-            # never waited on -- is dead, so every holder of the write end
-            # of this pipe is gone by the time it returns. A blocking drain
-            # here is therefore bounded: it can only pick up bytes already
-            # sitting in the kernel pipe buffer before read() hits EOF.
+            exit_code = None
+            # `_kill_process_group` used to decide whether to escalate to
+            # SIGKILL by calling `process.wait()` on the DIRECT child
+            # only. When `sh` has already exited (a backgrounded
+            # grandchild, `sh` itself exits) that wait() returns instantly
+            # and looked like "the group is handled", even though a
+            # SIGTERM-immune grandchild (`trap '' TERM`) was still holding
+            # this pipe open -- so the SIGKILL escalation was skipped
+            # entirely and a later blocking read hung for as long as the
+            # grandchild lived. The group is now killed with the SIGKILL
+            # escalation unconditional on elapsed grace time, never on the
+            # direct child's wait() outcome.
+            _kill_process_group(process, stdout, consume)
+            # A final bounded drain as a safety net: SIGKILL isn't
+            # interceptable, so every pipe holder should already be gone
+            # by the time `_kill_process_group` returns, but this still
+            # gets its own hard deadline (rather than a blocking read())
+            # so a pathological case -- an fd surviving outside the killed
+            # group -- can't hang the drain forever. On expiry the fd is
+            # simply closed (in the `finally` below) and whatever was
+            # captured up to that point is what gets recorded.
+            drain_deadline = time.monotonic() + _KILL_GRACE_SECONDS
             while True:
+                remaining = drain_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                ready, _, _ = select.select(
+                    [stdout], [], [], min(remaining, _POLL_INTERVAL_SECONDS)
+                )
+                if not ready:
+                    continue
                 chunk = os.read(stdout.fileno(), _READ_CHUNK_SIZE)
                 if not chunk:
                     break
                 consume(chunk)
-        else:
-            exit_code = process.wait()
     finally:
         stdout.close()
 
@@ -295,27 +342,61 @@ def _run_one(
 
 
 def _kill_process_group(
-    process: "subprocess.Popen[bytes]", *, grace_seconds: float = _KILL_GRACE_SECONDS
+    process: "subprocess.Popen[bytes]",
+    stdout: Any,
+    consume: Any,
+    *,
+    grace_seconds: float = _KILL_GRACE_SECONDS,
 ) -> None:
-    """SIGTERM the command's process group, give it `grace_seconds` to exit,
-    then SIGKILL the group (spec Sec2). `start_new_session=True` at spawn
-    makes the process its own session/group leader, so its pgid equals its
-    pid -- no `os.getpgid` race against the process having already exited.
+    """SIGTERM the command's process group, then escalate to SIGKILL once
+    `grace_seconds` has elapsed -- regardless of whether the DIRECT child
+    (`process`) has already exited (spec Sec2 / AC-5: "SIGTERM, 5-second
+    grace, SIGKILL"). `process.wait()` only proves `sh` itself is gone; a
+    backgrounded grandchild that inherited the pgid (and the write end of
+    `stdout`) can outlive `sh`'s own exit and even ignore SIGTERM outright
+    (`trap '' TERM`), so treating the direct child's exit as "the group is
+    handled" -- as this used to, by returning right after a successful
+    `process.wait(timeout=grace_seconds)` on the direct child alone --
+    skips the SIGKILL escalation while a SIGTERM-immune grandchild is
+    still holding the pipe open, and a caller blocking on that pipe next
+    hangs for as long as the grandchild lives.
+
+    While waiting out the grace window this also drains `stdout` (via
+    `consume`) so bytes written before the kill lands aren't lost; EOF on
+    the pipe (every write-end holder gone) ends the wait early, but
+    `grace_seconds` elapsing with no EOF always falls through to SIGKILL
+    regardless -- the grace window is a courtesy to a cooperating process,
+    not a promise this function returns before it elapses.
+    `start_new_session=True` at spawn makes the process its own
+    session/group leader, so its pgid equals its pid -- no `os.getpgid`
+    race against the process having already exited.
     """
     pgid = process.pid
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=grace_seconds)
-        return
-    except subprocess.TimeoutExpired:
         pass
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    else:
+        grace_deadline = time.monotonic() + grace_seconds
+        while True:
+            remaining = grace_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select(
+                [stdout], [], [], min(remaining, _POLL_INTERVAL_SECONDS)
+            )
+            if not ready:
+                continue
+            chunk = os.read(stdout.fileno(), _READ_CHUNK_SIZE)
+            if not chunk:
+                break  # EOF -- every holder of the write end is gone
+            consume(chunk)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    # Reap the direct child so it doesn't linger as this process's zombie;
+    # SIGKILL is not interceptable, so this should return almost at once.
     try:
         process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:

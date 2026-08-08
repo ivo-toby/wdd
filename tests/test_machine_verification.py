@@ -235,6 +235,81 @@ class ExecuteNaturalExitPipeHolderTests(unittest.TestCase):
                 )
 
 
+@unittest.skipUnless(
+    sys.platform.startswith("linux"),
+    "child-survivor oracle reads /proc/<pid>/status, which is Linux-only",
+)
+class ExecuteSigtermImmuneGrandchildTests(unittest.TestCase):
+    def test_deadline_enforced_past_a_sigterm_ignoring_grandchild(self) -> None:
+        """Regression test for the review finding: `_kill_process_group`
+        used to decide whether to escalate to SIGKILL by calling
+        `process.wait()` on the DIRECT child only. When that direct child
+        (the outer `sh`) has already exited -- as here, where it
+        backgrounds the grandchild and exits immediately -- that wait()
+        returned instantly and looked like "handled", so the SIGKILL
+        escalation never ran. A grandchild that ignores SIGTERM (`trap ''
+        TERM`) then held the pipe open forever, and the post-timeout
+        drain blocked for as long as it lived (its full 30s sleep here).
+        The fix always escalates to SIGKILL once the grace window elapses,
+        regardless of the direct child's own exit status.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child.pid"
+            log_path = Path(tmp) / "verify.log"
+            command = (
+                f"sh -c 'trap \"\" TERM; echo $$ > {pidfile}; sleep 30' & exit 0"
+            )
+            started = time.monotonic()
+            result = execute([command], cwd=tmp, timeout_seconds=1, log_path=log_path)
+            elapsed = time.monotonic() - started
+            # Pre-fix this hung for the full 30s. Post-fix it's bounded by
+            # the 1s command timeout plus the spec-mandated 5s SIGTERM
+            # grace (AC-5, .wdd/epics/machine-verification/spec.md:37)
+            # before the SIGKILL escalation fires -- ~6s expected. 8s
+            # leaves comfortable scheduling margin while still failing
+            # loudly on any regression back toward the 30s hang.
+            self.assertLess(elapsed, 8)
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "failed")
+            self.assertTrue(entry.get("timedOut"))
+            child_pid = int(pidfile.read_text(encoding="utf-8").strip())
+            deadline = time.monotonic() + 2.0
+            while not _process_is_dead(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(
+                _process_is_dead(child_pid),
+                f"SIGTERM-ignoring grandchild pid {child_pid} is still "
+                "running after the deadline-triggered group kill",
+            )
+
+
+class ExecutePostEofWaitTimeoutTests(unittest.TestCase):
+    def test_deadline_enforced_when_pipe_closes_but_process_keeps_running(self) -> None:
+        """Regression test for the review finding: once the read loop saw
+        EOF (every write-end holder of the pipe gone), the old code called
+        `process.wait()` with no timeout at all -- fine for the common
+        case where the process that closed the pipe has also exited, but
+        wrong when a process closes its own stdout/stderr via `exec` and
+        then keeps running: `exec 1>/dev/null 2>/dev/null; sleep 15`
+        returns EOF on the pipe almost instantly while `sh` (now running
+        `sleep 15` in the same process image) keeps running for the full
+        15s. The old unbounded `wait()` blocked for all 15s and recorded
+        "passed". The fix bounds that wait by the remaining deadline and
+        falls into the timeout+group-kill path on expiry.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "verify.log"
+            command = "exec 1>/dev/null 2>/dev/null; sleep 15"
+            started = time.monotonic()
+            result = execute([command], cwd=tmp, timeout_seconds=1, log_path=log_path)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 5)
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "failed")
+            self.assertIsNone(entry["exitCode"])
+            self.assertTrue(entry.get("timedOut"))
+
+
 class ExecuteTailBoundTests(unittest.TestCase):
     def test_tail_bounded_to_last_4096_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -259,7 +334,7 @@ class ExecuteTailBoundTests(unittest.TestCase):
 
 
 class ExecutePopenFailureTests(unittest.TestCase):
-    def test_popen_oserror_recorded_as_failed_entry(self) -> None:
+    def test_popen_oserror_recorded_as_schema_valid_failed_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing_cwd = Path(tmp) / "does-not-exist"
             log_path = Path(tmp) / "verify.log"
@@ -267,16 +342,66 @@ class ExecutePopenFailureTests(unittest.TestCase):
                 ["echo hi"], cwd=missing_cwd, timeout_seconds=5, log_path=log_path
             )
             entry = result["results"][0]
+            # Full executed-failure shape (T2's `_validate_result_entry`,
+            # wave_delivery/schema.py, spec AC-1/AC-9): a Popen OSError
+            # never produces a real exit code (the process never
+            # started), but the executed-entry contract requires an int
+            # `exitCode` whenever `timedOut` is not true -- `exitCode:
+            # null` is reserved for the timeout shape only. 127 is the
+            # shell "command not found" convention, used here as an
+            # explicitly synthetic marker for "never executed", not an
+            # observed value.
             self.assertEqual(
-                entry,
-                {
-                    "command": "echo hi",
-                    "status": "failed",
-                    "exitCode": None,
-                    "tail": entry["tail"],
-                },
+                set(entry.keys()),
+                {"command", "status", "exitCode", "durationMs", "outputSha256", "tail"},
             )
+            self.assertEqual(entry["command"], "echo hi")
+            self.assertEqual(entry["status"], "failed")
+            self.assertEqual(entry["exitCode"], 127)
+            self.assertIsInstance(entry["durationMs"], int)
+            self.assertGreaterEqual(entry["durationMs"], 0)
+            self.assertEqual(entry["outputSha256"], hashlib.sha256(b"").hexdigest())
             self.assertIn("does-not-exist", entry["tail"])
+            # "No fabricated fields" doctrine: timedOut/truncated are
+            # optional and must be absent when they don't apply.
+            self.assertNotIn("timedOut", entry)
+            self.assertNotIn("truncated", entry)
+
+    def test_popen_oserror_shape_pins_t2_validator_contract_fields(self) -> None:
+        """Cross-check against T2's `_validate_result_entry` contract
+        (wave_delivery/schema.py, spec AC-1/AC-9). T2's schema changes
+        live on another task's branch (T2-config-schema) and are not
+        importable from this worktree, so this pins the exact rules that
+        validator enforces for a non-skipped, non-timedOut entry rather
+        than importing it directly:
+          - required keys: command, status, exitCode, durationMs,
+            outputSha256, tail (`_EXECUTED_ENTRY_REQUIRED_KEYS`)
+          - status must be "passed" or "failed" (never bare "skipped"
+            fields mixed in)
+          - exitCode must be a real int (not None, not bool) whenever
+            timedOut is not true (`_validate_result_entry`)
+          - durationMs must be a non-negative int
+          - outputSha256 and tail must be strings
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_cwd = Path(tmp) / "does-not-exist"
+            log_path = Path(tmp) / "verify.log"
+            result = execute(
+                ["echo hi"], cwd=missing_cwd, timeout_seconds=5, log_path=log_path
+            )
+            entry = result["results"][0]
+            required = {
+                "command", "status", "exitCode", "durationMs", "outputSha256", "tail",
+            }
+            self.assertEqual(set(entry) - {"timedOut", "truncated"}, required)
+            self.assertIn(entry["status"], {"passed", "failed"})
+            self.assertIsInstance(entry["exitCode"], int)
+            self.assertNotIsInstance(entry["exitCode"], bool)
+            self.assertIsInstance(entry["durationMs"], int)
+            self.assertNotIsInstance(entry["durationMs"], bool)
+            self.assertGreaterEqual(entry["durationMs"], 0)
+            self.assertIsInstance(entry["outputSha256"], str)
+            self.assertIsInstance(entry["tail"], str)
 
 
 class ExecuteLogFilePermissionTests(unittest.TestCase):
