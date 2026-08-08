@@ -388,6 +388,17 @@ def transition(
         # above -- engine never reads config itself.
         if "configSha256" in data:
             task["verification"]["configSha256"] = data["configSha256"]
+        # Machine-verification epic (task T3): `execution`/`telemetry`/
+        # `logSha256`/`results` are the `--run` path's own evidence fields
+        # (review.record_verification_run), passed through unvalidated here
+        # exactly like `configSha256` above -- schema.py's
+        # `_validate_verification_evidence_extras` is what actually shape-
+        # checks them (on the data dict callers already validated before
+        # reaching this transition). Absent for the pre-existing agent-
+        # reported `--status` path, which sets none of these keys.
+        for key in ("execution", "telemetry", "logSha256", "results"):
+            if key in data:
+                task["verification"][key] = data[key]
         if result == "passed" and task_gate(state, task) == "ready_to_merge":
             task["status"] = "merge_ready"
     elif event_type == "task.head_updated":

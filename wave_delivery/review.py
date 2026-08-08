@@ -259,6 +259,63 @@ def record_verification(
     )
 
 
+def record_verification_run(
+    store: StateStore,
+    *,
+    task_id: str,
+    run_result: dict[str, Any],
+    duration_ms: int,
+    repo: Path | str | None = None,
+    layers: dict[str, Any] | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """The `--run`-fed counterpart of `record_verification` (machine-verification
+    epic, task T3): `run_result` is `verify_run.execute`'s own return shape
+    (`{"results": [...], "logSha256": ...}`), never re-derived here. Overall
+    `status` is "passed" only when every result entry passed -- AC-4's
+    stop-on-first-failure sequence guarantees at most one non-skipped
+    failure, so any "failed" entry makes the whole record "failed"; there is
+    no "unavailable" outcome for an observed run (a command either ran and
+    told us something, or wasn't reached).
+
+    `execution: "wddctl"` is written here, unconditionally, and ONLY here --
+    this is the sole code path that ever produces that literal (spec
+    "Provenance on the evidence"; `normalize_verification_result` refuses it
+    from a `--results` file by design, which this function does not touch).
+    `command` is left `None`: a `--run` record's evidence lives in
+    `results`, not a single command string, matching the per-command shape
+    `verify_run.execute` returns rather than forcing it back into the
+    legacy single-command field. `telemetry.durationMs` is auto-filled from
+    the caller's own wall-clock measurement of the whole `execute()` call
+    (spec: "runner dispatch auto-fills what it knows"; observability-only,
+    per AC-10 never read by any gate).
+    """
+    results = run_result["results"]
+    overall_status = "failed" if any(entry["status"] == "failed" for entry in results) else "passed"
+    state = store.read()
+    base_sha, head_sha = evidence_shas(state, task_id, repo=repo)
+    data: dict[str, Any] = {
+        "baseSha": base_sha,
+        "headSha": head_sha,
+        "status": overall_status,
+        "command": None,
+        "results": results,
+        "logSha256": run_result["logSha256"],
+        "execution": "wddctl",
+        "telemetry": {"durationMs": duration_ms},
+    }
+    data.update(_verification_evidence_binding(layers))
+    return apply_event(
+        store,
+        event_type="verification.recorded",
+        task_id=task_id,
+        data=data,
+        idempotency_key=idempotency_key,
+        expected_revision=expected_revision,
+    )
+
+
 def normalize_review_results(paths: list[Path | str], *, task_id: str) -> dict[str, Any]:
     """Merge one or more external reviewer result files into a single record.
 
