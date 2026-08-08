@@ -8,7 +8,11 @@ single admission-snapshot read, dirty/absent-worktree and empty-command
 refusals, the `--run` vs `--status`/`--command` post-parse conflict, the
 recorded evidence shape (execution/telemetry/logSha256/results), AC-10's
 gate-inertness, and a digest-stability pin left by the merged-foundations
-review.
+review. Also covers `wddctl finalize verify record --run` (task
+T4-final-verify, spec AC-6): the scope-level counterpart -- the resolved
+epic head checked out in a dedicated integration worktree (never the
+operator's own checkout), global-then-deliverable command ordering, the
+`--results` conflict, and the legacy-scope refusal.
 
 Local helpers only (no cross-file imports between test modules, per the
 phase-6a/6b test conventions -- see tests/test_execution_surfaces.py).
@@ -43,6 +47,8 @@ from wave_delivery.config import (
 )
 from wave_delivery.engine import task_gate
 from wave_delivery.errors import ValidationError
+from wave_delivery.git import integration_worktree_path
+from wave_delivery.schema import derived_phase
 from wave_delivery.store import StateStore
 from wave_delivery.verify_run import execute, reserve_numbered_path
 
@@ -1208,6 +1214,440 @@ class ConfigDigestBackfillStabilityTests(unittest.TestCase):
 
             after = effective_config_digest(load_layers(wdd, None)["effective"])
             self.assertEqual(before, after)
+
+
+# ---------------------------------------------------------------------------
+# T4-final-verify: `wddctl finalize verify record --run`. A v5 (non-legacy)
+# scope needs the full intake ladder walked before `plan apply` is legal, so
+# these helpers duplicate test_intake.py's `_ratified_repo`/`_walk_intake`/
+# `_apply_ladder_and_plan`/`_run_to_finalize` idiom rather than importing it
+# (module convention above: no cross-file imports between test modules).
+# ---------------------------------------------------------------------------
+
+
+def _ratified_v5_repo(tmp: str, *, commands: list[str] | None = None) -> tuple[Path, str]:
+    """A fresh ratified repo with no `intake.legacy` marker and no scope yet
+    -- the v5 ladder's starting point. `commands`, when given, overrides the
+    default single-command `verification.commands` list -- the failed/
+    skipped overall-status fixture (P2) needs more than one global command
+    so a first-command failure has something to skip ahead of the
+    deliverable command."""
+    root = _git_repo(tmp)
+    wdd = root / ".wdd"
+    state = str(wdd / "state.json")
+    assert _cli(state, "init", "--repo", str(root))[0] == 0
+    assert _cli(state, "config", "set", "merge.surface", "local")[0] == 0
+    assert (
+        _cli(
+            state, "config", "set", "models",
+            '{"planning": null, "implementation": {"default": null, "highRisk": null}, '
+            '"review": null}',
+        )[0]
+        == 0
+    )
+    assert _cli(
+        state, "config", "set", "verification.commands", json.dumps(commands or ["true"])
+    )[0] == 0
+    assert _cli(state, "constitution", "ratify", "--by", "t")[0] == 0
+    return root, state
+
+
+def _finalize_spec_text() -> str:
+    return (
+        "# Spec\n\n"
+        "## Goal\n\nShip it.\n\n"
+        "## In scope\n\n- x\n\n"
+        "## Out of scope\n\n- y\n\n"
+        "## Acceptance criteria\n\n- [ ] AC-1: the thing works\n"
+    )
+
+
+def _finalize_design_text() -> str:
+    return (
+        "# Design\n\n"
+        "## Components\n\n- core\n\n"
+        "## Interfaces\n\n- core: consumes nothing, produces lib\n\n"
+        "## Integration surfaces\n\n- `src/core.py` — owned by: core task\n\n"
+        "## Epic deliverable\n\nThe lib imports.\n"
+    )
+
+
+def _walk_v5_intake(
+    state: str, wdd: Path, approver: str = "t", *, deliverable_command: str = "true",
+    slug: str = "demo",
+) -> None:
+    """Canonical ladder walk: epic new -> configure -> spec -> research
+    skip -> design (mirrors test_intake.py's `_walk_intake`)."""
+    assert _cli(state, "epic", "new", "--slug", slug)[0] == 0
+    assert _cli(state, "intake", "configure", "--use-defaults", "--by", approver)[0] == 0
+    epic_dir = wdd / "epics" / slug
+    (epic_dir / "spec.md").write_text(_finalize_spec_text(), encoding="utf-8")
+    assert _cli(state, "intake", "spec", "--approved-by", approver)[0] == 0
+    assert _cli(
+        state, "intake", "research", "--skip", "--by", approver,
+        "--reason", "no external contracts",
+    )[0] == 0
+    (epic_dir / "design.md").write_text(_finalize_design_text(), encoding="utf-8")
+    assert _cli(
+        state, "intake", "design", "--approved-by", approver,
+        "--deliverable-command", deliverable_command,
+    )[0] == 0
+
+
+def _run_to_finalize_v5(
+    tmp: str,
+    *,
+    deliverable_command: str = "true",
+    slug: str = "demo",
+    commands: list[str] | None = None,
+) -> tuple[Path, str]:
+    """Drive a non-legacy (v5), composite-approved scope through one local
+    task to the finalize phase -- the fixture `finalize verify record --run`
+    needs, since it requires a real deliverable command and refuses on
+    legacy scopes (mirrors test_intake.py's `_run_to_finalize`). `commands`
+    forwards to `_ratified_v5_repo` to override the default single-command
+    global `verification.commands` list."""
+    root, state = _ratified_v5_repo(tmp, commands=commands)
+    wdd = root / ".wdd"
+    _walk_v5_intake(state, wdd, deliverable_command=deliverable_command, slug=slug)
+    epic_dir = wdd / "epics" / slug
+    (epic_dir / "tasks").mkdir(exist_ok=True)
+    (epic_dir / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+    plan_path = root / "plan.json"
+    plan_path.write_text(
+        json.dumps(_plan({"id": f"SCOPE-{slug}", "reviewPolicy": "always"})),
+        encoding="utf-8",
+    )
+    code, out = _cli(
+        state, "plan", "apply", "--plan", str(plan_path), "--repo", str(root),
+        "--approved-by", "t",
+    )
+    assert code == 0, out
+    _start_commit_submit(state, root)
+    assert _cli(
+        state, "review", "record", "--task", "T1", "--reviewer", "t", "--findings", "[]"
+    )[0] == 0
+    assert _cli(state, "verify", "record", "--task", "T1", "--status", "passed")[0] == 0
+    assert _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0] == 0
+    assert _cli(state, "merge", "--task", "T1", "--repo", str(root))[0] == 0
+
+    scope_state = StateStore(Path(state)).read()
+    assert derived_phase(scope_state) == "finalize", scope_state
+    return root, state
+
+
+def _run_to_finalize_legacy_scope(tmp: str) -> tuple[Path, str]:
+    """Drive a legacy (`intake.legacy`) scope through one local task to the
+    finalize phase -- `--run`'s legacy-refusal fixture."""
+    root, state = _bootstrap_scope(
+        tmp, commands=["true"], scope_overrides={"reviewPolicy": "always"}
+    )
+    _start_commit_submit(state, root)
+    assert _cli(
+        state, "review", "record", "--task", "T1", "--reviewer", "t", "--findings", "[]"
+    )[0] == 0
+    assert _cli(state, "verify", "record", "--task", "T1", "--status", "passed")[0] == 0
+    assert _cli(state, "freshness", "record", "--task", "T1", "--repo", str(root))[0] == 0
+    assert _cli(state, "merge", "--task", "T1", "--repo", str(root))[0] == 0
+
+    scope_state = StateStore(Path(state)).read()
+    assert derived_phase(scope_state) == "finalize", scope_state
+    return root, state
+
+
+class FinalVerificationRunResultsConflictTest(unittest.TestCase):
+    """AC-6: `--run` refuses when combined with `--results`, naming the
+    conflict, before the CLI ever touches the store -- no bootstrapped
+    scope is needed here (mirrors VerifyRunFlagConflictTests above)."""
+
+    def test_run_with_results_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "state.json")
+            code, _out, err = _cli_full(
+                state, "finalize", "verify", "record", "--run",
+                "--results", '[{"command": "true", "status": "passed"}]',
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("--run", err)
+            self.assertIn("--results", err)
+
+
+class FinalVerificationRunLegacyRefusalTest(unittest.TestCase):
+    """AC-6: `--run` refuses on a legacy scope, naming the reported-only
+    single-command contract it must use instead -- checked before any Git
+    worktree is touched or any command executes."""
+
+    def test_legacy_scope_refuses_run_naming_the_legacy_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize_legacy_scope(tmp)
+            code, _out, err = _cli_full(
+                state, "finalize", "verify", "record", "--run", "--repo", str(root)
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("legacy scope", err)
+            self.assertIn("--status", err)
+            self.assertIn("--command", err)
+            self.assertIsNone(
+                (StateStore(Path(state)).read().get("finalize") or {}).get("verification")
+            )
+            # No command execution happened: refusal fires before
+            # `verify_run.execute` is ever reached (a legacy scope's
+            # `merge` step already leaves an integration worktree behind
+            # from the ordinary merge -- its mere existence proves
+            # nothing here, but no --run log does).
+            dispatch_dir = root / ".wdd" / "dispatch"
+            self.assertFalse(list(dispatch_dir.glob("verify-final-*.log")))
+
+
+class FinalVerificationRunHappyPathTest(unittest.TestCase):
+    """AC-6/AC-7/AC-9: a successful `--run` executes the ordered required
+    commands (global verification.commands then the deliverable command)
+    and records `execution: "wddctl"`, `logSha256`, and per-command
+    observed evidence."""
+
+    def test_run_executes_and_records_observed_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize_v5(tmp, deliverable_command="true")
+            assert _cli(
+                state, "finalize", "review", "record", "--reviewer", "t",
+                "--findings", "[]", "--repo", str(root),
+            )[0] == 0
+            code, out = _cli(state, "finalize", "verify", "record", "--run", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            verification = StateStore(Path(state)).read()["finalize"]["verification"]
+            self.assertEqual(verification["status"], "passed")
+            self.assertEqual(verification["execution"], "wddctl")
+            self.assertIsInstance(verification["logSha256"], str)
+            results = verification["results"]
+            self.assertEqual([entry["command"] for entry in results], ["true", "true"])
+            for entry in results:
+                self.assertEqual(entry["status"], "passed")
+                self.assertIsInstance(entry["outputSha256"], str)
+
+
+class FinalVerificationRunOrderedResultsTest(unittest.TestCase):
+    """DoD: ordered results match global+deliverable order -- distinct
+    commands make reordering observable."""
+
+    def test_results_are_ordered_global_then_deliverable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize_v5(tmp, deliverable_command="echo deliverable")
+            assert _cli(
+                state, "finalize", "review", "record", "--reviewer", "t",
+                "--findings", "[]", "--repo", str(root),
+            )[0] == 0
+            code, out = _cli(state, "finalize", "verify", "record", "--run", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            results = StateStore(Path(state)).read()["finalize"]["verification"]["results"]
+            self.assertEqual([entry["command"] for entry in results], ["true", "echo deliverable"])
+
+
+class FinalVerificationRunIntegrationWorktreeOracleTest(unittest.TestCase):
+    """Spec AC-6 / reconciliation addendum 3: `--run` executes in a
+    dedicated integration worktree checked out at the resolved epic head,
+    never the operator's own checkout. Independent oracle (per the brief):
+    a deliverable command that records its own `pwd` must observe the
+    integration worktree's path, never the operator checkout's.
+
+    Records to an ABSOLUTE path outside the integration worktree (a sibling
+    tmp dir), not a marker file inside the worktree's own cwd: the P1 fix
+    (`_remove_finalize_integration_worktree`) tears that worktree down as
+    soon as `--run` completes, so a marker left inside it would no longer be
+    observable by the time this test asserts -- proving that removal is
+    exactly the point, not a test bug."""
+
+    def test_deliverable_command_runs_in_integration_worktree_not_operator_checkout(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker_dir = Path(tmp) / "marker"
+            marker_dir.mkdir()
+            cwd_marker = marker_dir / "cwd.txt"
+            root, state = _run_to_finalize_v5(
+                tmp, deliverable_command=f"pwd > {cwd_marker}"
+            )
+            assert _cli(
+                state, "finalize", "review", "record", "--reviewer", "t",
+                "--findings", "[]", "--repo", str(root),
+            )[0] == 0
+            code, out = _cli(state, "finalize", "verify", "record", "--run", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            scope_state = StateStore(Path(state)).read()
+            scope_id = scope_state["scope"]["id"]
+            base_ref = scope_state["scope"]["baseRef"]
+            integration_dir = integration_worktree_path(root, scope_id)
+
+            recorded_cwd = cwd_marker.read_text(encoding="utf-8").strip()
+            self.assertEqual(recorded_cwd, str(integration_dir))
+            self.assertNotEqual(recorded_cwd, str(root))
+
+            # P1: the integration worktree used above must not survive --run.
+            self.assertFalse(integration_dir.exists())
+
+            epic_head = _git(root, "rev-parse", base_ref)
+            self.assertEqual(
+                scope_state["finalize"]["verification"]["headSha"], epic_head
+            )
+
+
+class FinalVerificationRunIdempotencyKeyReplayTest(unittest.TestCase):
+    """Reconciliation addendum 2: an already-applied `--idempotency-key`
+    must be inert BEFORE execution -- a replayed `finalize verify record
+    --run` must return the duplicate without a second log or a second
+    integration-worktree checkout ever happening (mirrors
+    VerifyRunIdempotencyKeyReplayTests at scope granularity)."""
+
+    def test_replayed_idempotency_key_does_not_re_execute(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize_v5(tmp)
+            assert _cli(
+                state, "finalize", "review", "record", "--reviewer", "t",
+                "--findings", "[]", "--repo", str(root),
+            )[0] == 0
+            dispatch_dir = root / ".wdd" / "dispatch"
+
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--run", "--repo", str(root),
+                "--idempotency-key", "finalize-verify-once",
+            )
+            self.assertEqual(code, 0, out)
+            self.assertFalse(json.loads(out)["duplicate"])
+            self.assertEqual(len(list(dispatch_dir.glob("verify-final-*.log"))), 1)
+
+            code, out = _cli(
+                state, "finalize", "verify", "record", "--run", "--repo", str(root),
+                "--idempotency-key", "finalize-verify-once",
+            )
+            self.assertEqual(code, 0, out)
+            self.assertTrue(json.loads(out)["duplicate"])
+            self.assertEqual(len(list(dispatch_dir.glob("verify-final-*.log"))), 1)
+
+
+class FinalVerificationRunSingleLoadLayersCallTest(unittest.TestCase):
+    """Pin: `finalize verify record --run` resolves its required command
+    list from the admission snapshot the chokepoint already read
+    (`_governed_config`), never a second `load_layers` call of its own
+    (mirrors VerifyRunSingleLoadLayersCallTests at scope granularity)."""
+
+    def test_run_calls_load_layers_exactly_once_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize_v5(tmp)
+            assert _cli(
+                state, "finalize", "review", "record", "--reviewer", "t",
+                "--findings", "[]", "--repo", str(root),
+            )[0] == 0
+            calls: list[int] = []
+            real_load_layers = cli_module.load_layers
+
+            def counting(*args: Any, **kwargs: Any) -> Any:
+                calls.append(1)
+                return real_load_layers(*args, **kwargs)
+
+            with unittest.mock.patch.object(cli_module, "load_layers", side_effect=counting):
+                code, out = _cli(state, "finalize", "verify", "record", "--run", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertEqual(len(calls), 1)
+
+
+class FinalVerificationRunCleansUpIntegrationWorktreeTest(unittest.TestCase):
+    """P1 (reviewer-reproduced finding): `--run`'s detached integration
+    worktree must not survive the invocation. Left in place at
+    `integration_worktree_path`, it collides with `merge.py`'s own
+    `_integration_dir`/`ensure_worktree` call at that SAME path --
+    `ensure_worktree` reuses an existing worktree only on an exact branch
+    match and raises for the detached one `--run` left behind (sees
+    `branch: None`), wedging `assign_final_fixes` -> merge whenever the
+    operator is not already on `baseRef` (the fixture's own operator
+    checkout stays on `main`, never `baseRef` -- exactly that common case)."""
+
+    def test_run_removes_its_integration_worktree_on_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize_v5(tmp)
+            assert _cli(
+                state, "finalize", "review", "record", "--reviewer", "t",
+                "--findings", "[]", "--repo", str(root),
+            )[0] == 0
+            code, out = _cli(state, "finalize", "verify", "record", "--run", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            scope_state = StateStore(Path(state)).read()
+            scope_id = scope_state["scope"]["id"]
+            base_ref = scope_state["scope"]["baseRef"]
+            integration_dir = integration_worktree_path(root, scope_id)
+
+            self.assertFalse(integration_dir.exists())
+            self.assertNotIn(str(integration_dir), _git(root, "worktree", "list"))
+
+            # Prove the fix, not just the absence: merge.py's own
+            # ensure_worktree-based path must now succeed at the same path
+            # a leftover detached worktree used to wedge.
+            from wave_delivery.merge import _integration_dir as merge_integration_dir
+
+            merge_dir = merge_integration_dir(root, scope_state, base_ref)
+            self.assertEqual(merge_dir, integration_dir)
+            self.assertEqual(_git(merge_dir, "rev-parse", "--abbrev-ref", "HEAD"), base_ref)
+
+    def test_run_removes_its_integration_worktree_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize_v5(tmp)
+            assert _cli(
+                state, "finalize", "review", "record", "--reviewer", "t",
+                "--findings", "[]", "--repo", str(root),
+            )[0] == 0
+            current_revision = StateStore(Path(state)).read()["revision"]
+
+            # Commands execute (the worktree gets used) but recording the
+            # evidence then raises RevisionConflict -- exercising the
+            # failure path of the try/finally, not just the happy path.
+            code, _out, err = _cli_full(
+                state, "finalize", "verify", "record", "--run", "--repo", str(root),
+                "--expected-revision", str(current_revision + 1),
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("expected revision", err)
+
+            scope_state = StateStore(Path(state)).read()
+            integration_dir = integration_worktree_path(root, scope_state["scope"]["id"])
+            self.assertFalse(integration_dir.exists())
+            self.assertNotIn(str(integration_dir), _git(root, "worktree", "list"))
+
+
+class FinalVerificationRunFailedOverallStatusGatesHandoffTest(unittest.TestCase):
+    """P2: the failed/skipped `overall_status` path of
+    `record_final_verification_run` is gate-consumed
+    (`_require_current_finalize_evidence`) but was untested end-to-end.
+    When the FIRST global command fails, the executor stops the sequence
+    (T1's contract): every remaining command, including the scope's own
+    deliverable command, records `skipped`. Recorded evidence's overall
+    `status` must be `failed`, and `finalize handoff` must refuse on it."""
+
+    def test_run_records_failed_status_and_handoff_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _run_to_finalize_v5(
+                tmp, commands=["false", "true"], deliverable_command="true",
+            )
+            assert _cli(
+                state, "finalize", "review", "record", "--reviewer", "t",
+                "--findings", "[]", "--repo", str(root),
+            )[0] == 0
+
+            code, out = _cli(state, "finalize", "verify", "record", "--run", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+
+            verification = StateStore(Path(state)).read()["finalize"]["verification"]
+            self.assertEqual(verification["status"], "failed")
+            results = verification["results"]
+            self.assertEqual(
+                [entry["command"] for entry in results], ["false", "true", "true"]
+            )
+            self.assertEqual(
+                [entry["status"] for entry in results], ["failed", "skipped", "skipped"]
+            )
+
+            code, _out, err = _cli_full(state, "finalize", "handoff", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("passed final verification", err)
 
 
 if __name__ == "__main__":

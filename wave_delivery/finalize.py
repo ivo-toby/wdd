@@ -36,7 +36,14 @@ from typing import Any
 from .config import config_path, effective_config_digest, load_config, merge_settings, project
 from .engine import apply_mutation, event_id, utc_now
 from .errors import IllegalTransition, RevisionConflict, ValidationError
-from .git import is_ancestor, require_repository, resolve_ref, run_git
+from .git import (
+    integration_worktree_path,
+    is_ancestor,
+    require_repository,
+    resolve_ref,
+    run_git,
+    worktree_at,
+)
 from .github import create_pr, push_branch
 from .merge import _fetched_base_refs
 from .review import validate_findings
@@ -399,6 +406,24 @@ def verification_commands(verification: dict[str, Any] | None) -> list[dict[str,
         return []
     if "commands" in verification:
         return list(verification["commands"])
+    if "results" in verification:
+        # `--run`-fed evidence (`record_final_verification_run`): the rich
+        # per-command executor shape, keyed `results` -- deliberately NOT
+        # `commands`, since that key's validator (schema.py
+        # `_validate_finalize_verification`) predates `--run` and only
+        # accepts the reported two-key `{command, status}` entries (its
+        # status vocabulary excludes "skipped", which AC-4 requires here
+        # too); `results` reuses the already-`--run`-shaped validation
+        # `_validate_verification_evidence_extras` gives task-level
+        # evidence, task T3's own field name for the identical shape.
+        # Normalized to the same two-key view this read site already
+        # presents for the other shapes -- the executor-only fields
+        # (exitCode/durationMs/outputSha256/tail) have no place in a
+        # cosmetic command listing.
+        return [
+            {"command": entry.get("command"), "status": entry.get("status")}
+            for entry in verification["results"]
+        ]
     command = verification.get("command")
     if command is None:
         return []
@@ -522,6 +547,144 @@ def record_final_verification(
                 "at": utc_now(),
                 **binding,
             }
+        return updated
+
+    return apply_mutation(
+        store,
+        event_type="final.verification_recorded",
+        task_id=None,
+        data={},
+        idempotency_key=idempotency_key,
+        expected_revision=expected_revision,
+        mutator=mutator,
+    )
+
+
+def _finalize_integration_worktree(repo: Path, state: dict[str, Any], epic_head_sha: str) -> Path:
+    """Where `finalize verify record --run` executes (spec AC-6): a
+    dedicated integration worktree, DETACHED at the resolved epic head SHA
+    -- never `repo` itself (the operator's own checkout), and never
+    attached to `base_ref` by branch name the way `merge.py`'s
+    `_integration_dir` reuses the operator checkout when it is already on
+    that branch (exactly the checkout this must avoid: the operator's
+    checkout commonly IS on the epic branch during finalize, and Git
+    refuses to check the same branch out twice). Checking out the resolved
+    SHA detached sidesteps that one-checkout-per-branch rule entirely --
+    the same commit can be checked out on `base_ref` in the operator's
+    checkout and, detached, in this worktree at the same time.
+
+    Idempotent by force-recreation rather than reuse-and-verify: an
+    existing worktree at this path is removed and rebuilt fresh on every
+    call, so a prior `--run`'s untracked marker/output files never linger
+    into the next one, and the post-checkout `resolve_ref` assertion below
+    (reconciliation addendum 3) always confirms a checkout this function
+    just performed, not a stale one from a previous invocation.
+    """
+    path = integration_worktree_path(repo, state["scope"]["id"])
+    if worktree_at(repo, path) is not None:
+        run_git(repo, "worktree", "remove", "--force", str(path))
+    elif path.exists():
+        raise ValidationError(
+            f"integration worktree path exists but is not managed by Git: {path}"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    run_git(repo, "worktree", "add", "--detach", str(path), epic_head_sha)
+    actual = resolve_ref(path, "HEAD")
+    if actual != epic_head_sha:
+        raise IllegalTransition(
+            f"integration worktree {path} is checked out at {actual}, not the "
+            f"resolved epic head {epic_head_sha}"
+        )
+    return path
+
+
+def _remove_finalize_integration_worktree(repo: Path, path: Path) -> None:
+    """Tear down the detached worktree `_finalize_integration_worktree`
+    creates, once a `--run` invocation is done with it -- success or
+    failure (cli.py's `_run_final_verification` wraps create/execute/record
+    in a try/finally that calls this unconditionally).
+
+    Left in place, that detached worktree squats on
+    `integration_worktree_path`, the exact path `merge.py`'s own
+    `_integration_dir` uses for its `ensure_worktree` call. `ensure_worktree`
+    only ever reuses an existing worktree on an exact branch match; a
+    detached HEAD reports `branch: None`, so it raises instead of
+    reconciling -- wedging `assign_final_fixes` -> merge shut the moment the
+    operator's own checkout isn't already on `baseRef` (the common case).
+    Removing the worktree here, unconditionally after `--run`, frees that
+    path for merge's own worktree management the next time it is needed.
+
+    `git worktree remove --force` then `prune`, mirroring `leases.py`'s
+    release-side remove+prune pattern; `--force` because a `--run` failure
+    path may not have left the worktree clean, and this is a disposable
+    integration checkout, never something to preserve. A no-op when nothing
+    was ever created (e.g. `_finalize_integration_worktree` itself raised
+    before `worktree add` ran).
+    """
+    if worktree_at(repo, path) is not None:
+        run_git(repo, "worktree", "remove", "--force", str(path))
+    run_git(repo, "worktree", "prune")
+
+
+def record_final_verification_run(
+    store: StateStore,
+    *,
+    run_result: dict[str, Any],
+    duration_ms: int,
+    repo: Path | str,
+    layers: dict[str, Any] | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """The `--run`-fed counterpart of `record_final_verification` (spec
+    AC-6), mirroring `review.record_verification_run`'s task-level pattern
+    at scope granularity: `run_result` is `verify_run.execute`'s own return
+    shape (`{"results": [...], "logSha256": ...}`), recorded verbatim (as
+    `results`, not `commands` -- see `verification_commands`'s docstring
+    note for why) since `cli.py`'s `_run_final_verification` is the sole
+    caller and already built the exact required, ordered command list
+    (global `verification.commands` then the deliverable command) before
+    executing it; there is nothing left to re-validate here.
+
+    `execution: "wddctl"` is written here, unconditionally, and ONLY here
+    -- the sole code path that ever produces that literal on a final
+    verification record. Legal only for non-legacy (v5) scopes; the legacy
+    refusal is repeated here even though `_run_final_verification` already
+    refuses it before ever executing a command, same defense-in-depth
+    reasoning as the finalize-phase/not-delivered checks below (both
+    checked before AND inside the locked mutator).
+    """
+    state = store.read()
+    if _is_legacy_intake(state):
+        raise ValidationError(
+            "finalize verify record --run is not available for a legacy scope: legacy "
+            "scopes keep the reported-only single-command contract (wddctl finalize "
+            "verify record --status ... --command ...)"
+        )
+    repo_path = require_repository(repo)
+    _require_finalize_phase(state)
+    _require_not_delivered(state, what="verify")
+
+    results = run_result["results"]
+    overall_status = "failed" if any(entry["status"] == "failed" for entry in results) else "passed"
+
+    def mutator(state: dict[str, Any]) -> dict[str, Any]:
+        _require_finalize_phase(state)
+        _require_not_delivered(state, what="verify")
+        base_sha = resolve_ref(repo_path, _base_ref(state))
+        updated = copied_state(state)
+        updated.setdefault("finalize", {})
+        binding = _final_verification_evidence_binding(layers, state)
+        updated["finalize"]["verification"] = {
+            "headSha": base_sha,
+            "results": results,
+            "status": overall_status,
+            "logSha256": run_result["logSha256"],
+            "execution": "wddctl",
+            "telemetry": {"durationMs": duration_ms},
+            "at": utc_now(),
+            **binding,
+        }
         return updated
 
     return apply_mutation(

@@ -51,6 +51,7 @@ from .engine import (
     ACTIVE_STATUSES,
     admission_schedule,
     apply_event,
+    apply_mutation,
     bounded_next_actions,
     human_reference,
     render_to_path,
@@ -59,6 +60,13 @@ from .engine import (
 from .errors import IllegalTransition, ValidationError, WaveDeliveryError
 from .schema import derived_phase, intake_complete
 from .finalize import (
+    _base_ref as _finalize_base_ref,
+    _finalize_integration_worktree,
+    _is_legacy_intake,
+    _remove_finalize_integration_worktree,
+    _require_finalize_phase,
+    _require_not_delivered,
+    _required_verification_commands,
     archive_scope,
     finalize_next_actions,
     finalize_status,
@@ -66,6 +74,7 @@ from .finalize import (
     record_delivered,
     record_final_review,
     record_final_verification,
+    record_final_verification_run,
 )
 from .freshness import check_freshness, record_freshness
 from .git import require_repository, resolve_ref, run_git, worktree_for
@@ -453,6 +462,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="v5 non-legacy scopes only: JSON array '[{\"command\":..., \"status\":...}, ...]' "
         "naming, in order, every entry of the ratified global verification.commands then the "
         "scope's deliverable command",
+    )
+    finalize_verify_record.add_argument(
+        "--run",
+        action="store_true",
+        help="execute the ratified global verification commands then the scope's "
+        "deliverable command, in order, in an integration worktree at the resolved "
+        "epic head, and record what wddctl observed; mutually exclusive with "
+        "--results and unavailable on legacy scopes",
     )
     finalize_verify_record.add_argument("--repo", type=Path, default=Path("."))
     _add_concurrency_flags(finalize_verify_record)
@@ -960,6 +977,97 @@ def _run_task_verification(
         layers=admission_layers,
         **_concurrency(args),
     )
+
+
+def _run_final_verification(
+    store: StateStore, *, args: argparse.Namespace, admission_layers: dict[str, Any] | None
+) -> tuple[dict[str, Any], bool]:
+    """`wddctl finalize verify record --run` (spec AC-6): the scope-level
+    counterpart of `_run_task_verification`, same preflight-before-
+    execution discipline -- every refusal below (idempotency-key replay
+    first, then legacy scope, then finalize phase/not-delivered, then an
+    empty required command list) happens before `verify_run.execute` is
+    ever called, so no command runs on refusal. The required, ordered
+    command list (ratified global `verification.commands` then the
+    scope's deliverable command) is executed in a dedicated integration
+    worktree checked out at the resolved epic head -- never this
+    invocation's own `--repo` checkout (`finalize._finalize_integration_
+    worktree`, mirroring `merge.py`'s `_integration_dir` precedent but
+    always by SHA, detached, never by reusing the operator's checkout).
+    """
+    repo_path = require_repository(args.repo)
+    state = store.read()
+
+    # Mirrors `_run_task_verification`'s identical early return: an
+    # already-applied idempotency key must be inert before any other
+    # precondition, execution included. `apply_mutation`'s own dedupe
+    # (inside `record_final_verification_run`'s eventual call) checks the
+    # key ahead of every mutator-embedded validation too, but only once
+    # the mutator would otherwise run AFTER a command has already
+    # executed -- this preflight read skips execution entirely on replay.
+    idempotency_key = getattr(args, "idempotency_key", None)
+    if idempotency_key and idempotency_key in state.get("appliedIdempotencyKeys", []):
+        return apply_mutation(
+            store,
+            event_type="final.verification_recorded",
+            task_id=None,
+            data={},
+            idempotency_key=idempotency_key,
+            expected_revision=getattr(args, "expected_revision", None),
+            mutator=lambda current: current,
+        )
+
+    if _is_legacy_intake(state):
+        raise ValidationError(
+            "finalize verify record --run is not available for a legacy scope: legacy "
+            "scopes keep the reported-only single-command contract (wddctl finalize "
+            "verify record --status ... --command ...)"
+        )
+    _require_finalize_phase(state)
+    _require_not_delivered(state, what="verify")
+
+    wdd_dir = store.path.parent
+    config = _governed_config(admission_layers)
+    if config is None:
+        raise ValidationError(
+            "finalize verify record --run requires a ratified config.json (the global "
+            "verification commands and verification.timeoutSeconds are resolved from it)"
+        )
+    commands = _required_verification_commands(state, wdd_dir, config)
+    if not commands:
+        raise ValidationError(
+            "finalize verify record --run requires a non-empty required command list "
+            "(the ratified global verification.commands plus the scope's deliverable "
+            "command): nothing observed is not a pass"
+        )
+    timeout_seconds = config["verification"]["timeoutSeconds"]
+
+    epic_head_sha = resolve_ref(repo_path, _finalize_base_ref(state))
+    worktree_path = _finalize_integration_worktree(repo_path, state, epic_head_sha)
+    try:
+        dispatch_dir = wdd_dir / "dispatch"
+        log_path = reserve_numbered_path(dispatch_dir, "verify-final-", ".log")
+        started = time.monotonic()
+        run_result = verify_run_execute(
+            commands, cwd=worktree_path, timeout_seconds=timeout_seconds, log_path=log_path
+        )
+        duration_ms = int((time.monotonic() - started) * 1000)
+        return record_final_verification_run(
+            store,
+            run_result=run_result,
+            duration_ms=duration_ms,
+            repo=args.repo,
+            layers=admission_layers,
+            **_concurrency(args),
+        )
+    finally:
+        # Unconditional, success or failure: a detached worktree left behind
+        # at `integration_worktree_path` squats on the exact path merge.py's
+        # own `_integration_dir`/`ensure_worktree` uses, and `ensure_worktree`
+        # cannot reconcile a detached HEAD (`branch: None`) against the
+        # branch name it expects -- see `_remove_finalize_integration_
+        # worktree`'s docstring for the wedge this closes.
+        _remove_finalize_integration_worktree(repo_path, worktree_path)
 
 
 def _overlaid_plan(
@@ -1750,16 +1858,37 @@ def main(argv: list[str] | None = None) -> int:
             and args.finalize_command == "verify"
             and args.finalize_verify_command == "record"
         ):
-            state, duplicate = record_final_verification(
-                store,
-                status=args.status,
-                command=args.finalize_verify_command_text,
-                justification=args.justification,
-                results=args.results,
-                repo=args.repo,
-                layers=admission_layers,
-                **_concurrency(args),
-            )
+            if args.run:
+                # Post-parse conflict check (spec AC-6), same discipline as
+                # `verify record --run`'s --status/--command check above:
+                # checked before anything else in this branch touches the
+                # repo or the store, so a bad combination never gets far
+                # enough to execute a command.
+                if args.results is not None:
+                    raise ValidationError(
+                        "finalize verify record --run cannot be combined with "
+                        "--results: --run supplies the observed results itself"
+                    )
+                if args.status is not None or args.finalize_verify_command_text is not None:
+                    raise ValidationError(
+                        "finalize verify record --run cannot be combined with "
+                        "--status or --command: --run supplies the observed "
+                        "results itself"
+                    )
+                state, duplicate = _run_final_verification(
+                    store, args=args, admission_layers=admission_layers
+                )
+            else:
+                state, duplicate = record_final_verification(
+                    store,
+                    status=args.status,
+                    command=args.finalize_verify_command_text,
+                    justification=args.justification,
+                    results=args.results,
+                    repo=args.repo,
+                    layers=admission_layers,
+                    **_concurrency(args),
+                )
             verification = (state.get("finalize") or {}).get("verification") or {}
             _print_json(
                 {
