@@ -17,6 +17,7 @@ import time
 import unittest
 import unittest.mock
 from pathlib import Path
+from typing import Any
 
 from wave_delivery.errors import ValidationError
 from wave_delivery.verify_run import execute, reserve_numbered_path
@@ -280,6 +281,92 @@ class ExecuteSigtermImmuneGrandchildTests(unittest.TestCase):
                 _process_is_dead(child_pid),
                 f"SIGTERM-ignoring grandchild pid {child_pid} is still "
                 "running after the deadline-triggered group kill",
+            )
+
+
+@unittest.skipUnless(
+    sys.platform.startswith("linux"),
+    "child-survivor oracle reads /proc/<pid>/status, which is Linux-only",
+)
+class ExecuteKillDrainLogWriteFailureTests(unittest.TestCase):
+    def test_log_write_oserror_during_kill_drain_still_kills_group_and_records_failure(
+        self,
+    ) -> None:
+        """Regression test for the review finding: `_kill_process_group`'s
+        grace-window drain calls `consume`, which writes each drained
+        chunk straight to the shared log file with no try/finally around
+        the SIGKILL escalation below it. An OSError there (ENOSPC/EIO)
+        used to propagate straight out of `_kill_process_group`, skipping
+        `killpg(pgid, SIGKILL)` entirely and leaking the process group.
+        The fix wraps the drain in try/finally so SIGKILL always fires
+        before the error is re-raised, and `_run_one` converts that
+        re-raised error into a recorded failed entry (mirroring the
+        Popen-OSError precedent) instead of letting it crash `execute()`
+        mid-run.
+
+        The command traps SIGTERM to emit output (`caught`) and exit
+        cleanly, without ever backgrounding a grandchild -- so the only
+        process in the group is the direct child itself, and that output
+        is what reaches `consume` inside `_kill_process_group`'s grace
+        window (the command produces nothing before the timeout, so the
+        first and only chunk write happens there, not in the main read
+        loop or the caller's post-kill safety drain).
+        """
+        real_fdopen = os.fdopen
+
+        class _FailAfterNWrites:
+            def __init__(self, real_file: Any, allowed: int) -> None:
+                self._real = real_file
+                self._allowed = allowed
+                self._calls = 0
+
+            def write(self, data: bytes) -> int:
+                self._calls += 1
+                if self._calls > self._allowed:
+                    raise OSError(28, "No space left on device")
+                return self._real.write(data)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real, name)
+
+            def __enter__(self) -> "_FailAfterNWrites":
+                return self
+
+            def __exit__(self, *exc_info: Any) -> None:
+                self._real.__exit__(*exc_info)
+
+        def fake_fdopen(fd: int, mode: str) -> Any:
+            # allowed=1 lets the per-command "$ <command>\n" framing
+            # write through untouched; the next write -- the "caught\n"
+            # chunk drained inside `_kill_process_group` -- is the one
+            # that must fail.
+            return _FailAfterNWrites(real_fdopen(fd, mode), allowed=1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child.pid"
+            log_path = Path(tmp) / "verify.log"
+            command = f"trap 'echo caught; exit 0' TERM; echo $$ > {pidfile}; sleep 5"
+            with unittest.mock.patch(
+                "wave_delivery.verify_run.os.fdopen", side_effect=fake_fdopen
+            ):
+                result = execute(
+                    [command], cwd=tmp, timeout_seconds=1, log_path=log_path
+                )
+
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "failed")
+            self.assertIsNone(entry["exitCode"])
+            self.assertTrue(entry.get("timedOut"))
+            self.assertIn("error draining output during kill", entry["tail"])
+
+            child_pid = int(pidfile.read_text(encoding="utf-8").strip())
+            deadline = time.monotonic() + 2.0
+            while not _process_is_dead(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(
+                _process_is_dead(child_pid),
+                f"pid {child_pid} is still running after a log-write OSError "
+                "during the kill drain -- SIGKILL escalation was skipped",
             )
 
 

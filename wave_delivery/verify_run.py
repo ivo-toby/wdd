@@ -250,7 +250,7 @@ def _run_one(
         # `process.poll()` already shows the child dead; breaking out early
         # on that poll (as this loop used to) means the deadline is never
         # consulted again and a later blocking read can hang for as long as
-        # the grandchild lives. So this loop only ever stops on a real EOF
+        # the grandchild lived. So this loop only ever stops on a real EOF
         # or on deadline expiry -- never on the direct child's exit alone.
         while True:
             remaining = deadline - time.monotonic()
@@ -297,7 +297,33 @@ def _run_one(
             # grandchild lived. The group is now killed with the SIGKILL
             # escalation unconditional on elapsed grace time, never on the
             # direct child's wait() outcome.
-            _kill_process_group(process, stdout, consume)
+            try:
+                _kill_process_group(process, stdout, consume)
+            except OSError as error:
+                # `_kill_process_group`'s grace-window drain writes into
+                # `consume`, which can hit ENOSPC/EIO on the shared log
+                # file; that function guarantees the group is SIGKILLed
+                # and reaped before this propagates (see its docstring).
+                # Mirroring the Popen-OSError precedent above, this is
+                # recorded as failed evidence rather than left to crash
+                # `execute()` mid-run with the group already handled.
+                duration_ms = int((time.monotonic() - started) * 1000)
+                tail_text = bytes(tail_buffer).decode("utf-8", errors="replace")
+                entry: dict[str, Any] = {
+                    "command": command,
+                    "status": "failed",
+                    "exitCode": None,
+                    "durationMs": duration_ms,
+                    "outputSha256": output_hasher.hexdigest(),
+                    "tail": (
+                        f"{tail_text}\nverify_run: error draining output "
+                        f"during kill: {error}"
+                    ),
+                    "timedOut": True,
+                }
+                if state["truncated"]:
+                    entry["truncated"] = True
+                return entry
             # A final bounded drain as a safety net: SIGKILL isn't
             # interceptable, so every pipe holder should already be gone
             # by the time `_kill_process_group` returns, but this still
@@ -370,27 +396,48 @@ def _kill_process_group(
     `start_new_session=True` at spawn makes the process its own
     session/group leader, so its pgid equals its pid -- no `os.getpgid`
     race against the process having already exited.
+
+    Real worst-case bound past `timeout_seconds`, contrary to what the
+    spec prose above ("SIGTERM, 5-second grace, SIGKILL") reads as a
+    single grace window: this function alone can take up to
+    `2 * grace_seconds` (the drain above, then the post-SIGKILL reap
+    below), and `_run_one` layers its own bounded safety drain of a
+    further `_KILL_GRACE_SECONDS` on top once this returns -- so
+    `execute()`'s measured worst case is `timeout_seconds + 3 *
+    grace_seconds`, not `timeout_seconds + grace_seconds`.
     """
     pgid = process.pid
+    drain_error: OSError | None = None
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         pass
     else:
         grace_deadline = time.monotonic() + grace_seconds
-        while True:
-            remaining = grace_deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            ready, _, _ = select.select(
-                [stdout], [], [], min(remaining, _POLL_INTERVAL_SECONDS)
-            )
-            if not ready:
-                continue
-            chunk = os.read(stdout.fileno(), _READ_CHUNK_SIZE)
-            if not chunk:
-                break  # EOF -- every holder of the write end is gone
-            consume(chunk)
+        try:
+            while True:
+                remaining = grace_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                ready, _, _ = select.select(
+                    [stdout], [], [], min(remaining, _POLL_INTERVAL_SECONDS)
+                )
+                if not ready:
+                    continue
+                chunk = os.read(stdout.fileno(), _READ_CHUNK_SIZE)
+                if not chunk:
+                    break  # EOF -- every holder of the write end is gone
+                consume(chunk)
+        except OSError as error:
+            # `consume` writes each drained chunk to the shared log file;
+            # ENOSPC/EIO there must not skip the SIGKILL escalation below
+            # -- doing so would leave the process group alive with
+            # nothing left to ever kill it. Stash the error and re-raise
+            # once the group is confirmed dead and reaped (below), so the
+            # caller (`_run_one`) can turn it into recorded evidence --
+            # mirroring the Popen-OSError precedent there -- instead of
+            # it vanishing along with a live process group.
+            drain_error = error
         try:
             os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:
@@ -401,3 +448,5 @@ def _kill_process_group(
         process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
         pass
+    if drain_error is not None:
+        raise drain_error
