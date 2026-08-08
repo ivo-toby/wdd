@@ -81,6 +81,17 @@ result JSON for you to record with `wddctl review collect`. Registering and
 probing a runner is `wdd-runners`' job, not this skill's — by the time a
 task's model names one, it's already registered and probed.
 
+**Packet capture.** For harness-native dispatch, once you've assembled the
+worker's or reviewer's packet, write it to the task's attempt dir (the
+`dispatch/TASK-001-1`-style directory `start`'s output named) as
+`packet-<role>-<n>.md` (`worker` or `reviewer`) before dispatching — the
+exact bytes handed to the subagent, on disk for later review. Reserve the
+path with the same O_EXCL numbering the verify-run log uses:
+`verify_run.reserve_numbered_path` (numbering is per-prefix, so
+`packet-worker-` and `packet-reviewer-` count independently). Runner-routed
+dispatch doesn't need this — `wddctl dispatch` already assembles and,
+per its own contract, captures the packet it execs.
+
 ## The judgment, action by action
 
 - **`start_task`** → run `command`. Its output now carries the task's
@@ -106,8 +117,14 @@ task's model names one, it's already registered and probed.
   target in the packet — a wrong decision reviewed early is a P2; the same
   decision discovered at final review is a rewrite. Their findings go into
   `recordWith` in place of `'[]'`.
-- **`run_verification`** → run the constitution's verification command, then
-  record the real result. Never record `passed` you didn't observe.
+- **`run_verification`** → `wddctl verify record --task ID --run` is the
+  default obligation: it resolves the task's effective verification
+  commands itself, executes them in the task's worktree, and records what
+  it observed — no agent-reported status involved. Run it as-is unless the
+  command cannot run on this machine, and say why in the conversation when
+  it can't; only then fall back to running the constitution's verification
+  command yourself and recording `--status`/`--command`. Never record
+  `passed` you didn't observe.
 - **`assign_fix_writer`** → unresolved P1/P2. Dispatch a fix worker with the
   task, the findings, and instructions not to broaden scope.
 - **`check_branch_freshness`** → run `command`. If it comes back
@@ -159,16 +176,21 @@ actions and starts driving the finalize ladder instead — same one-action,
   There is no `command` — the fix is new commits on the base branch, which
   re-stales the final review and routes the scope back to `final_review`
   on its own.
-- **`final_verification`** → for a v5 (non-legacy) scope, evidence is
-  `--results`: one ordered JSON array covering exactly the ratified global
-  `verification.commands` then the scope's deliverable command (recorded
-  at design approval), each entry `{"command": ..., "status": ...}` in that
-  order. Overall passes only when every entry's status is `passed`. Run
-  EVERY listed command yourself, against the current epic branch head, and
-  record only the statuses you actually observed — the pre-filled array in
-  `recordWith` is a template of what must be run, not a license to stamp
-  `passed` on commands you didn't execute. Legacy scopes keep the old
-  single-command `--status`/`--command` shape — same discipline as
+- **`final_verification`** → for a v5 (non-legacy) scope, `wddctl finalize
+  verify record --run` is the default obligation: it executes the ratified
+  global `verification.commands` then the scope's deliverable command, in
+  that order, in an integration worktree at the resolved epic head, and
+  records what it observed. Run it as-is unless the command cannot run on
+  this machine, and say why in the conversation when it can't; only then
+  fall back to `--results` — one ordered JSON array covering exactly the
+  same commands in the same order, each entry `{"command": ...,
+  "status": ...}`, overall passing only when every entry's status is
+  `passed`. If you do fall back, run EVERY listed command yourself, against
+  the current epic branch head, and record only the statuses you actually
+  observed — the pre-filled array in `recordWith` is a template of what
+  must be run, not a license to stamp `passed` on commands you didn't
+  execute. Legacy scopes keep the old single-command `--status`/`--command`
+  shape and refuse `--run` outright — same discipline as
   `run_verification`.
 - **`prepare_handoff`** → run `command`. On the `pr` surface this pushes
   the epic branch and opens the epic→target PR; on `local` it records

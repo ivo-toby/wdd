@@ -126,6 +126,12 @@ above.
   tasks, and orphaned partial work (a criterion two tasks were each
   supposed to half-satisfy, where neither diff alone would have looked
   incomplete).
+- **Verification provenance.** Any verification evidence carrying
+  `execution: "reported"` — agent-reported rather than executed by
+  `wddctl --run` — is itself a review target, not evidence to take on
+  trust: check what it claims against the diff as carefully as any other
+  claim in this review, since nothing in the record proves the command
+  ran the way it says.
 - **Classification.** Same P1/P2/P3 semantics as task-level review above —
   P1 and P2 block, P3 doesn't inflate or downgrade to force or avoid a
   block.
