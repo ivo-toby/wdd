@@ -1,7 +1,14 @@
 """Tests for `wave_delivery.verify_run` — the machine-verification executor
 (epic: machine-executed verification and dispatch observability, task
-T1-executor). Covers `execute()`'s observed-evidence contract (spec AC-1,
-AC-4, AC-5, AC-9) and `reserve_numbered_path()`'s O_EXCL reservation.
+T1-executor) — and for `wddctl verify record --task T --run`, the CLI/review
+wiring on top of it (task T3-task-verify). Covers `execute()`'s
+observed-evidence contract (spec AC-1, AC-4, AC-5, AC-9) and
+`reserve_numbered_path()`'s O_EXCL reservation, then the T3 surface: the
+single admission-snapshot read, dirty/absent-worktree and empty-command
+refusals, the `--run` vs `--status`/`--command` post-parse conflict, the
+recorded evidence shape (execution/telemetry/logSha256/results), AC-10's
+gate-inertness, and a digest-stability pin left by the merged-foundations
+review.
 
 Local helpers only (no cross-file imports between test modules, per the
 phase-6a/6b test conventions -- see tests/test_execution_surfaces.py).
@@ -9,8 +16,14 @@ phase-6a/6b test conventions -- see tests/test_execution_surfaces.py).
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import hashlib
+import io
+import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -19,7 +32,18 @@ import unittest.mock
 from pathlib import Path
 from typing import Any
 
+import wave_delivery.cli as cli_module
+from wave_delivery.cli import main
+from wave_delivery.config import (
+    default_config,
+    effective_config_digest,
+    load_config,
+    load_layers,
+    save_config,
+)
+from wave_delivery.engine import task_gate
 from wave_delivery.errors import ValidationError
+from wave_delivery.store import StateStore
 from wave_delivery.verify_run import execute, reserve_numbered_path
 
 
@@ -554,6 +578,636 @@ class ReserveNumberedPathTests(unittest.TestCase):
             b = reserve_numbered_path(directory, "verify-b-", ".log")
             self.assertEqual(a.name, "verify-a-1.log")
             self.assertEqual(b.name, "verify-b-1.log")
+
+
+# ---------------------------------------------------------------------------
+# `wddctl verify record --task T --run` (task T3-task-verify).
+#
+# Local CLI/git test helpers, deliberately duplicated rather than imported
+# from tests/test_wave_delivery.py or tests/test_execution_surfaces.py (see
+# module docstring: no cross-file imports between test modules). Mirrors
+# test_execution_surfaces.py's `_bootstrap_ready_scope`/`_mark_legacy`
+# idiom: a real `wddctl init`-produced config.json (so `--run` has a real
+# admission snapshot to resolve commands and timeoutSeconds from) with the
+# intake ladder short-circuited via `intake.legacy` -- these tests exercise
+# --run's cli.py/review.py wiring, not the intake ladder.
+# ---------------------------------------------------------------------------
+
+
+def _git(repo: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *arguments],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).stdout.strip()
+
+
+def _git_repo(tmp: str) -> Path:
+    root = Path(tmp) / "repo"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    (root / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(
+        root, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+        "commit", "-qm", "seed",
+    )
+    return root
+
+
+def _cli(state: str, *argv: str) -> tuple[int, str]:
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        code = main(["--state", state, *argv])
+    return code, stdout.getvalue()
+
+
+def _cli_full(state: str, *argv: str) -> tuple[int, str, str]:
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        code = main(["--state", state, *argv])
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+def _plan(scope_overrides: dict | None = None) -> dict:
+    plan = {
+        "schemaVersion": 1,
+        "kind": "wdd_plan",
+        "scope": {
+            "id": "SCOPE-x",
+            "baseRef": "wdd/scope-x",
+            "maxConcurrent": 3,
+            "reviewPolicy": "risk_based",
+            "reconcileEveryNMerges": 3,
+        },
+        "tasks": [
+            {
+                "id": "T1",
+                "title": "T1",
+                "specPath": "tasks/T1.md",
+                "risk": "normal",
+                "dependsOn": [],
+                "conflictDomains": ["src/t1/**"],
+            }
+        ],
+    }
+    if scope_overrides:
+        plan["scope"].update(scope_overrides)
+    return plan
+
+
+def _mark_legacy(state: str) -> None:
+    store = StateStore(Path(state))
+    current = store.read()
+    current["intake"] = {"legacy": True}
+    store.write(current)
+
+
+def _bootstrap_scope(
+    tmp: str,
+    *,
+    commands: list[str] | None = None,
+    timeout_seconds: int | None = None,
+    scope_overrides: dict | None = None,
+) -> tuple[Path, str]:
+    """A real config.json (so `--run` resolves commands/timeoutSeconds from
+    a genuine admission snapshot) with the intake ladder short-circuited,
+    scope `SCOPE-x` applied with one admissible task `T1`. `scope_overrides`
+    (e.g. `{"reviewPolicy": "always"}`) passes straight through to `_plan`,
+    for tests that need `submit` to land T1 somewhere other than the
+    default risk_based/normal-risk `in_progress`."""
+    root = _git_repo(tmp)
+    wdd = root / ".wdd"
+    state = str(wdd / "state.json")
+    assert _cli(state, "init", "--repo", str(root))[0] == 0
+    assert _cli(state, "config", "set", "merge.surface", "local")[0] == 0
+    assert (
+        _cli(
+            state, "config", "set", "models",
+            '{"planning": null, "implementation": {"default": null, "highRisk": null}, '
+            '"review": null}',
+        )[0]
+        == 0
+    )
+    if commands is not None:
+        assert _cli(state, "config", "set", "verification.commands", json.dumps(commands))[0] == 0
+    if timeout_seconds is not None:
+        assert (
+            _cli(state, "config", "set", "verification.timeoutSeconds", str(timeout_seconds))[0]
+            == 0
+        )
+    assert _cli(state, "constitution", "ratify", "--by", "tester")[0] == 0
+    _mark_legacy(state)
+    (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
+    plan_path = root / "plan.json"
+    plan_path.write_text(json.dumps(_plan(scope_overrides)), encoding="utf-8")
+    code, out = _cli(state, "plan", "apply", "--plan", str(plan_path), "--repo", str(root))
+    assert code == 0, out
+    return root, state
+
+
+def _start_commit_submit(state: str, root: Path, task_id: str = "T1") -> Path:
+    code, out = _cli(state, "start", "--task", task_id, "--repo", str(root))
+    assert code == 0, out
+    worktree = Path(json.loads(out)["worktree"])
+    (worktree / "change.txt").write_text("work\n", encoding="utf-8")
+    _git(worktree, "add", "-A")
+    _git(
+        worktree, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+        "commit", "-qm", "do work",
+    )
+    code, out = _cli(state, "submit", "--task", task_id, "--repo", str(root))
+    assert code == 0, out
+    return worktree
+
+
+class VerifyRunFlagConflictTests(unittest.TestCase):
+    """AC-3: `--run` refuses post-parse alongside `--status`/`--command`,
+    with a message naming the conflict -- checked before the CLI ever
+    touches the store, so no bootstrapped scope is needed here."""
+
+    def test_run_with_status_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "state.json")
+            code, _out, err = _cli_full(
+                state, "verify", "record", "--task", "T1", "--run", "--status", "passed"
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("--run", err)
+            self.assertIn("--status", err)
+
+    def test_run_with_command_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "state.json")
+            code, _out, err = _cli_full(
+                state, "verify", "record", "--task", "T1", "--run", "--command", "pytest"
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("--run", err)
+            self.assertIn("--command", err)
+
+    def test_neither_status_nor_run_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "state.json")
+            code, _out, err = _cli_full(state, "verify", "record", "--task", "T1")
+            self.assertNotEqual(code, 0)
+            self.assertIn("--status", err)
+            self.assertIn("--run", err)
+
+
+class VerifyRunEmptyCommandListTests(unittest.TestCase):
+    """AC-4: an empty effective command list refuses `--run` outright, with
+    no command ever executed and no dispatch log left behind."""
+
+    def test_empty_verification_commands_refuses_before_executing_anything(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(tmp, commands=[])
+            _start_commit_submit(state, root)
+            code, _out, err = _cli_full(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("verification.commands is empty", err)
+            dispatch_dir = root / ".wdd" / "dispatch"
+            self.assertFalse(list(dispatch_dir.glob("verify-*.log")))
+            self.assertIsNone(StateStore(Path(state)).read()["tasks"]["T1"].get("verification"))
+
+
+class VerifyRunAbsentWorktreeTests(unittest.TestCase):
+    """AC-2: `--run` refuses when the task's worktree is absent, naming
+    start's reattach remedy -- checked before any dirtiness check or
+    execution. A never-started (`todo`) task no longer reaches this check
+    (the P1-2 fix round hoisted status legality and the recorded-headSha
+    check ahead of the worktree-exists check, and `todo` is illegal for
+    `--run`, with no headSha yet, on its own), so this test now takes the
+    task through `start`/commit/`submit` -- landing it in the legal
+    `in_progress` status with a recorded headSha -- then deletes the
+    worktree `start` created, to isolate this refusal from those two."""
+
+    def test_absent_worktree_refuses_naming_the_reattach_remedy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(tmp, commands=["true"])
+            worktree = _start_commit_submit(state, root)
+            shutil.rmtree(worktree)
+            code, _out, err = _cli_full(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("worktree is missing", err)
+            self.assertIn("wddctl start --task T1 --repo .", err)
+            self.assertEqual(StateStore(Path(state)).read()["tasks"]["T1"]["status"], "in_progress")
+
+
+class VerifyRunDirtyWorktreeTests(unittest.TestCase):
+    """AC-2: `--run` refuses on an uncommitted worktree, naming the files --
+    evidence binds committed bytes only."""
+
+    def test_dirty_worktree_refuses_naming_the_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(tmp, commands=["true"])
+            worktree = _start_commit_submit(state, root)
+            (worktree / "uncommitted.txt").write_text("dirty\n", encoding="utf-8")
+            code, _out, err = _cli_full(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("uncommitted changes", err)
+            self.assertIn("uncommitted.txt", err)
+            dispatch_dir = root / ".wdd" / "dispatch"
+            self.assertFalse(list(dispatch_dir.glob("verify-*.log")))
+            self.assertIsNone(StateStore(Path(state)).read()["tasks"]["T1"].get("verification"))
+
+
+class VerifyRunStaleWorktreeHeadTests(unittest.TestCase):
+    """P1-1 (opus review): `--run` bound evidence to state's recorded
+    task["headSha"] without ever checking the worktree's ACTUAL HEAD. A
+    commit landed in the worktree after 'submit' last pinned that headSha
+    (or any other way HEAD moved without going through 'submit'/'refresh')
+    must refuse by name -- naming 'submit' to re-pin the new head, or
+    'refresh' if the base moved -- before anything executes."""
+
+    def test_commit_after_recorded_head_refuses_by_name_with_no_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(tmp, commands=["true"])
+            worktree = _start_commit_submit(state, root)
+            recorded_head = StateStore(Path(state)).read()["tasks"]["T1"]["headSha"]
+
+            (worktree / "extra.txt").write_text("more\n", encoding="utf-8")
+            _git(worktree, "add", "-A")
+            _git(
+                worktree, "-c", "user.email=t@t", "-c", "user.name=t",
+                "-c", "commit.gpgsign=false", "commit", "-qm", "extra work",
+            )
+            actual_head = _git(worktree, "rev-parse", "HEAD")
+            self.assertNotEqual(actual_head, recorded_head)
+
+            code, _out, err = _cli_full(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("does not match its recorded headSha", err)
+            self.assertIn("submit", err)
+            self.assertIn("refresh", err)
+            dispatch_dir = root / ".wdd" / "dispatch"
+            self.assertFalse(list(dispatch_dir.glob("verify-*.log")))
+            self.assertIsNone(StateStore(Path(state)).read()["tasks"]["T1"].get("verification"))
+
+
+class VerifyRunIllegalStatusTests(unittest.TestCase):
+    """P1-2 (opus review): status legality for `verification.recorded`
+    (engine.transition's `_require_status(task, {"in_progress"}, ...)`)
+    previously only fired from inside `apply_event`, AFTER
+    `verify_run.execute` had already run every configured command and
+    written a log -- a refusal that only exists post-execution does not
+    satisfy AC-2. A task sitting in `review` (the smallest status this
+    module's fixtures can reach via a `reviewPolicy: always` scope) must
+    now refuse `--run` before touching the worktree at all."""
+
+    def test_task_in_review_status_refuses_before_executing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(
+                tmp, commands=["true"], scope_overrides={"reviewPolicy": "always"}
+            )
+            _start_commit_submit(state, root)
+            self.assertEqual(StateStore(Path(state)).read()["tasks"]["T1"]["status"], "review")
+
+            code, _out, err = _cli_full(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("not legal", err)
+            self.assertIn("review", err)
+            dispatch_dir = root / ".wdd" / "dispatch"
+            self.assertFalse(list(dispatch_dir.glob("verify-*.log")))
+            self.assertIsNone(StateStore(Path(state)).read()["tasks"]["T1"].get("verification"))
+
+
+class VerifyRunFailThenSkipEndToEndTests(unittest.TestCase):
+    """P2: a two-command `--run` where the first command fails and the
+    second is never reached (AC-4's stop-on-first-failure), exercised
+    through the real CLI record path end to end -- not `verify_run.execute`
+    directly (that shape is already pinned by ExecuteSkippedShapeTests)."""
+
+    def test_first_command_fails_second_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(tmp, commands=["false", "true"])
+            _start_commit_submit(state, root)
+            code, out = _cli(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            verification = StateStore(Path(state)).read()["tasks"]["T1"]["verification"]
+            self.assertEqual(verification["status"], "failed")
+            results = verification["results"]
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results[0]["command"], "false")
+            self.assertEqual(results[0]["status"], "failed")
+            self.assertEqual(results[1], {"command": "true", "status": "skipped"})
+            self.assertEqual(
+                StateStore(Path(state)).read()["tasks"]["T1"]["status"], "in_progress"
+            )
+
+
+class VerifyRunIdempotencyKeyReplayTests(unittest.TestCase):
+    """P3: an already-applied `--idempotency-key` must be inert BEFORE
+    execution. Previously the dedupe only lived inside `apply_mutation`,
+    reached AFTER `verify_run.execute` already ran every command and wrote
+    a fresh log -- a replay was cheap for the STATE but not for the
+    worktree. A second `--run` with the same key must return the duplicate
+    without a second log ever being created."""
+
+    def test_replayed_idempotency_key_does_not_re_execute(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(tmp, commands=["true"])
+            _start_commit_submit(state, root)
+            dispatch_dir = root / ".wdd" / "dispatch"
+
+            code, out = _cli(
+                state, "verify", "record", "--task", "T1", "--run", "--repo", str(root),
+                "--idempotency-key", "verify-once",
+            )
+            self.assertEqual(code, 0, out)
+            self.assertFalse(json.loads(out)["duplicate"])
+            self.assertEqual(len(list(dispatch_dir.glob("verify-*.log"))), 1)
+
+            code, out = _cli(
+                state, "verify", "record", "--task", "T1", "--run", "--repo", str(root),
+                "--idempotency-key", "verify-once",
+            )
+            self.assertEqual(code, 0, out)
+            self.assertTrue(json.loads(out)["duplicate"])
+            self.assertEqual(len(list(dispatch_dir.glob("verify-*.log"))), 1)
+
+
+class VerifyRunSingleLoadLayersCallTests(unittest.TestCase):
+    """Pin: `--run` resolves commands from the admission snapshot the
+    chokepoint already read (`_governed_config`), never a second
+    `load_layers` call of its own."""
+
+    def test_run_calls_load_layers_exactly_once_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(tmp, commands=["true"])
+            _start_commit_submit(state, root)
+            calls: list[int] = []
+            real_load_layers = cli_module.load_layers
+
+            def counting(*args: Any, **kwargs: Any) -> Any:
+                calls.append(1)
+                return real_load_layers(*args, **kwargs)
+
+            with unittest.mock.patch.object(cli_module, "load_layers", side_effect=counting):
+                code, out = _cli(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            self.assertEqual(len(calls), 1)
+
+
+class VerifyRunHappyPathTests(unittest.TestCase):
+    """AC-1/AC-7/AC-9: a successful `--run` records execution: "wddctl",
+    per-command results from `verify_run.execute`, `logSha256` over the
+    actual log bytes, and an auto-filled `telemetry.durationMs`."""
+
+    def test_single_passing_command_is_recorded_as_machine_observed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(tmp, commands=["true"])
+            _start_commit_submit(state, root)
+            code, out = _cli(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            verification = StateStore(Path(state)).read()["tasks"]["T1"]["verification"]
+            self.assertEqual(verification["status"], "passed")
+            self.assertEqual(verification["execution"], "wddctl")
+            self.assertIsNone(verification["command"])
+            self.assertEqual(len(verification["results"]), 1)
+            entry = verification["results"][0]
+            self.assertEqual(entry["command"], "true")
+            self.assertEqual(entry["status"], "passed")
+            self.assertEqual(entry["exitCode"], 0)
+            self.assertIsInstance(verification["telemetry"]["durationMs"], int)
+            self.assertGreaterEqual(verification["telemetry"]["durationMs"], 0)
+            dispatch_dir = root / ".wdd" / "dispatch"
+            logs = list(dispatch_dir.glob("verify-T1-*.log"))
+            self.assertEqual(len(logs), 1)
+            self.assertEqual(
+                verification["logSha256"], hashlib.sha256(logs[0].read_bytes()).hexdigest()
+            )
+            self.assertEqual(
+                StateStore(Path(state)).read()["tasks"]["T1"]["status"], "merge_ready"
+            )
+
+    def test_failing_command_is_recorded_failed_with_its_real_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(tmp, commands=["false"])
+            _start_commit_submit(state, root)
+            code, out = _cli(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            verification = StateStore(Path(state)).read()["tasks"]["T1"]["verification"]
+            self.assertEqual(verification["status"], "failed")
+            self.assertEqual(verification["execution"], "wddctl")
+            self.assertEqual(verification["results"][0]["exitCode"], 1)
+            self.assertEqual(
+                StateStore(Path(state)).read()["tasks"]["T1"]["status"], "in_progress"
+            )
+
+
+class VerifyRunEndToEndOracleTests(unittest.TestCase):
+    """Independent oracle (brief): drives a scratch repo through the real
+    epic/intake ladder (not the `intake.legacy` shortcut the other tests in
+    this section use) to `start` -> commit-in-worktree -> `verify record
+    --run`, first against a command that really fails (`false`) then, after
+    reconfiguring, one that really passes (`true`). The expected exitCodes
+    (1, then 0) come from what `sh` itself returns for those commands, not
+    from anything this test asserts about the implementation's internals.
+    """
+
+    def test_run_records_exit_codes_sh_actually_returned_across_a_config_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_repo(tmp)
+            wdd = root / ".wdd"
+            state = str(wdd / "state.json")
+            self.assertEqual(_cli(state, "init", "--repo", str(root))[0], 0)
+            self.assertEqual(_cli(state, "config", "set", "merge.surface", "local")[0], 0)
+            self.assertEqual(
+                _cli(
+                    state, "config", "set", "models",
+                    '{"planning": null, "implementation": {"default": null, "highRisk": null}, '
+                    '"review": null}',
+                )[0],
+                0,
+            )
+            self.assertEqual(
+                _cli(state, "config", "set", "verification.commands", '["false"]')[0], 0
+            )
+            self.assertEqual(_cli(state, "constitution", "ratify", "--by", "tester")[0], 0)
+
+            self.assertEqual(_cli(state, "epic", "new", "--slug", "demo")[0], 0)
+            epic_dir = wdd / "epics" / "demo"
+            self.assertEqual(
+                _cli(state, "intake", "configure", "--use-defaults", "--by", "tester")[0], 0
+            )
+            (epic_dir / "spec.md").write_text(
+                "# Spec\n\n## Goal\n\nShip it.\n\n## In scope\n\n- x\n\n"
+                "## Out of scope\n\n- y\n\n## Acceptance criteria\n\n- [ ] AC-1: it works\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_cli(state, "intake", "spec", "--approved-by", "tester")[0], 0)
+            self.assertEqual(
+                _cli(
+                    state, "intake", "research", "--skip", "--by", "tester",
+                    "--reason", "no external contracts",
+                )[0],
+                0,
+            )
+            (epic_dir / "design.md").write_text(
+                "# Design\n\n## Components\n\n- core\n\n## Interfaces\n\n"
+                "- core: consumes nothing, produces lib\n\n"
+                "## Integration surfaces\n\n- `src/core.py` — owned by: core task\n\n"
+                "## Epic deliverable\n\nThe lib imports.\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                _cli(
+                    state, "intake", "design", "--approved-by", "tester",
+                    "--deliverable-command", "true",
+                )[0],
+                0,
+            )
+
+            plan = _plan({"id": "SCOPE-demo", "baseRef": "wdd/demo"})
+            plan_path = root / "plan.json"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            (epic_dir / "tasks").mkdir(exist_ok=True)
+            for task in plan["tasks"]:
+                (epic_dir / task.get("specPath", f"tasks/{task['id']}.md")).write_text(
+                    f"# {task['id']}\n\nBrief.\n", encoding="utf-8"
+                )
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_path), "--repo", str(root),
+                "--approved-by", "tester",
+            )
+            self.assertEqual(code, 0, out)
+
+            code, out = _cli(state, "start", "--task", "T1", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            worktree = Path(json.loads(out)["worktree"])
+            (worktree / "change.txt").write_text("work\n", encoding="utf-8")
+            _git(worktree, "add", "-A")
+            _git(
+                worktree, "-c", "user.email=t@t", "-c", "user.name=t",
+                "-c", "commit.gpgsign=false", "commit", "-qm", "do work",
+            )
+            self.assertEqual(_cli(state, "submit", "--task", "T1", "--repo", str(root))[0], 0)
+
+            code, out = _cli(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            failed_verification = StateStore(Path(state)).read()["tasks"]["T1"]["verification"]
+            self.assertEqual(failed_verification["status"], "failed")
+            self.assertEqual(failed_verification["results"][0]["command"], "false")
+            self.assertEqual(failed_verification["results"][0]["exitCode"], 1)
+
+            self.assertEqual(
+                _cli(state, "config", "set", "verification.commands", '["true"]')[0], 0
+            )
+            self.assertEqual(_cli(state, "constitution", "amend", "--by", "tester")[0], 0)
+            self.assertEqual(
+                _cli(state, "intake", "configure", "--use-defaults", "--by", "tester")[0], 0
+            )
+            # Re-approving the configure rung cascades and clears the plan's
+            # own composite approval (spec: a rung re-approval clears every
+            # downstream rung) -- re-stamp it before any governed verb.
+            code, out = _cli(
+                state, "plan", "apply", "--plan", str(plan_path), "--repo", str(root),
+                "--approved-by", "tester",
+            )
+            self.assertEqual(code, 0, out)
+
+            code, out = _cli(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            passed_verification = StateStore(Path(state)).read()["tasks"]["T1"]["verification"]
+            self.assertEqual(passed_verification["status"], "passed")
+            self.assertEqual(passed_verification["results"][0]["command"], "true")
+            self.assertEqual(passed_verification["results"][0]["exitCode"], 0)
+
+
+class VerifyRunTelemetryGateInertnessTests(unittest.TestCase):
+    """AC-10: a `telemetry` object on a verification record is stored but
+    provably ignored by the merge gate -- flipping it leaves `task_gate`'s
+    outcome unchanged.
+
+    P3 (opus review): a test that only ever exercises the "nothing changed"
+    branch cannot distinguish "this field is inert" from "this test cannot
+    detect a change at all" -- so `test_...` first flips something task_gate
+    IS documented to key off (`verification["status"]`, engine.py's own
+    `task_gate` merge_ready branch: "Re-check evidence, not just freshness")
+    and asserts the gate DOES move, before repeating the same flip-and-check
+    shape on telemetry to show it does not. That positive control is what
+    makes the telemetry assertions below mean anything.
+
+    Extending this to the handoff gate: `finalize.py`'s `finalize_next_actions`
+    is the handoff-readiness equivalent of `task_gate`, but it is scope-level,
+    not task-level -- it reads `state["finalize"]` (a single scope-wide
+    review/verification/handoff record keyed to the scope's base branch
+    head), not any individual `task["verification"]`, and takes `state` plus
+    a live repo (it calls `resolve_ref`), not a `(state, task)` pair the way
+    `task_gate` does. There is no task-level handoff gate to extend this
+    positive-control-then-telemetry shape onto; `finalize.py` also has no
+    verification `--run`/telemetry surface of its own to flip in the first
+    place (`record_final_verification` takes only `--status`/`--command` or
+    `--results`, never `--run`). Nothing here is "reachable at task level"
+    to extend to.
+    """
+
+    def test_flipping_recorded_telemetry_does_not_change_the_merge_gate_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(tmp, commands=["true"])
+            _start_commit_submit(state, root)
+            code, out = _cli(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            recorded = StateStore(Path(state)).read()
+            gate_before = task_gate(recorded, recorded["tasks"]["T1"])
+            # No freshness has been recorded yet, so the gate isn't fully
+            # "merge_ready" -- it's still evidence-gated on verification's
+            # own status, which is exactly what the positive control below
+            # needs.
+            self.assertEqual(gate_before, "needs_freshness")
+
+            # Positive control: task_gate DOES move when the evidence it
+            # actually keys off changes -- proves the harness below can
+            # detect a real difference, so telemetry's non-difference means
+            # something.
+            status_flipped = copy.deepcopy(recorded)
+            status_flipped["tasks"]["T1"]["verification"]["status"] = "failed"
+            gate_on_status_flip = task_gate(status_flipped, status_flipped["tasks"]["T1"])
+            self.assertNotEqual(gate_before, gate_on_status_flip)
+            self.assertEqual(gate_on_status_flip, "needs_verification")
+
+            flipped = copy.deepcopy(recorded)
+            flipped["tasks"]["T1"]["verification"]["telemetry"] = {
+                "model": "a-completely-different-model",
+                "durationMs": 999999999,
+                "tokens": 123456,
+            }
+            gate_after = task_gate(flipped, flipped["tasks"]["T1"])
+            self.assertEqual(gate_before, gate_after)
+
+            stripped = copy.deepcopy(recorded)
+            del stripped["tasks"]["T1"]["verification"]["telemetry"]
+            gate_without = task_gate(stripped, stripped["tasks"]["T1"])
+            self.assertEqual(gate_before, gate_without)
+
+
+class ConfigDigestBackfillStabilityTests(unittest.TestCase):
+    """Reconciliation addendum: a backfill-only config write -- setting
+    `verification.timeoutSeconds` explicitly to the exact value hydration
+    already supplies for its absence -- must leave the effective config
+    digest unchanged. Exercises config.py's existing hydration (T2), not
+    anything this task implements; pinned here per the merged-foundations
+    review addenda."""
+
+    def test_backfilling_the_hydrated_default_leaves_the_effective_digest_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = Path(tmp) / ".wdd"
+            wdd.mkdir()
+            legacy_config = default_config()
+            del legacy_config["verification"]["timeoutSeconds"]
+            save_config(wdd, legacy_config)
+            before = effective_config_digest(load_layers(wdd, None)["effective"])
+
+            raw = load_config(wdd)
+            self.assertNotIn("timeoutSeconds", raw["verification"])
+            raw["verification"]["timeoutSeconds"] = default_config()["verification"]["timeoutSeconds"]
+            save_config(wdd, raw)
+
+            after = effective_config_digest(load_layers(wdd, None)["effective"])
+            self.assertEqual(before, after)
 
 
 if __name__ == "__main__":
