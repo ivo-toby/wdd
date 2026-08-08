@@ -17,6 +17,7 @@ from .config import effective_config_digest, project
 from .engine import apply_event
 from .errors import IllegalTransition, ValidationError
 from .git import is_ancestor, require_repository, resolve_ref, run_git
+from .schema import validate_execution_value, validate_telemetry
 from .store import StateStore, atomic_write_text
 
 
@@ -280,6 +281,8 @@ def normalize_review_results(paths: list[Path | str], *, task_id: str) -> dict[s
     head_sha: str | None = None
     reviewers: list[str] = []
     findings: list[dict[str, Any]] = []
+    telemetry: Any = None
+    telemetry_seen = False
     for result in results:
         if result.get("schemaVersion") != 1 or result.get("kind") != REVIEW_RESULT_KIND:
             raise ValidationError(
@@ -296,12 +299,22 @@ def normalize_review_results(paths: list[Path | str], *, task_id: str) -> dict[s
         base_sha, head_sha = result_base, result_head
         reviewers.append(_required_string(result.get("reviewer"), "review result reviewer"))
         findings.extend(validate_findings(result.get("findings", [])))
-    return {
+        if "telemetry" in result:
+            validate_telemetry(result.get("telemetry"), "review result telemetry")
+            if telemetry_seen and result["telemetry"] != telemetry:
+                raise ValidationError(
+                    "review results disagree on telemetry; merge only accepts one reviewer's"
+                )
+            telemetry, telemetry_seen = result["telemetry"], True
+    normalized = {
         "baseSha": base_sha,
         "headSha": head_sha,
         "reviewer": ", ".join(sorted(set(reviewers))),
         "findings": findings,
     }
+    if telemetry_seen:
+        normalized["telemetry"] = telemetry
+    return normalized
 
 
 def normalize_verification_result(path: Path | str, *, task_id: str) -> dict[str, Any]:
@@ -329,12 +342,22 @@ def normalize_verification_result(path: Path | str, *, task_id: str) -> dict[str
     status = result.get("status")
     if status not in {"passed", "failed", "unavailable"}:
         raise ValidationError("verification result status must be passed, failed, or unavailable")
-    return {
+    normalized = {
         "baseSha": _required_string(result.get("baseSha"), "verification result baseSha"),
         "headSha": _required_string(result.get("headSha"), "verification result headSha"),
         "status": status,
         "command": result.get("command"),
     }
+    # `execution` (spec "Provenance on the evidence"): preserved when the
+    # result file supplies it, never fabricated when absent -- absence is
+    # resolved to "reported" only at read time (schema.normalize_execution).
+    if "execution" in result:
+        validate_execution_value(result.get("execution"), "verification result execution")
+        normalized["execution"] = result["execution"]
+    if "telemetry" in result:
+        validate_telemetry(result.get("telemetry"), "verification result telemetry")
+        normalized["telemetry"] = result["telemetry"]
+    return normalized
 
 
 def run_review(

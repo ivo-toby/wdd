@@ -32,7 +32,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "basePattern": "wdd/{scope-slug}",
         "taskPattern": "task/{task-id}",
     },
-    "verification": {"commands": [], "unavailableJustification": None},
+    "verification": {"commands": [], "unavailableJustification": None, "timeoutSeconds": 600},
     "review": {"policy": "risk_based", "blockingSeverities": ["P1", "P2"]},
     "merge": {"surface": "pr", "mode": "controller", "reconcileEveryNMerges": 3},
     "concurrency": {"maxConcurrent": 3},
@@ -116,6 +116,16 @@ def validate_config(config: dict[str, Any]) -> None:
     justification = verification.get("unavailableJustification")
     _require(justification is None or (isinstance(justification, str) and justification),
              "verification.unavailableJustification must be null or a non-empty string")
+    # Per-command timeout for `--run` (spec Sec1, machine-verification epic):
+    # required (unlike runners/worktrees' backward-compat looseness -- this
+    # key has a DEFAULT_CONFIG value on every construction path in this
+    # codebase, so there is no legacy config that legitimately lacks it).
+    timeout_seconds = verification.get("timeoutSeconds")
+    _require(
+        isinstance(timeout_seconds, int) and not isinstance(timeout_seconds, bool)
+        and 1 <= timeout_seconds <= 86400,
+        "verification.timeoutSeconds must be an integer between 1 and 86400",
+    )
 
     review = config.get("review")
     _require(isinstance(review, dict), "review must be an object")
@@ -393,6 +403,7 @@ OVERLAY_ALLOWED_LEAVES: tuple[str, ...] = (
     "models.specReview",
     "verification.commands",
     "verification.unavailableJustification",
+    "verification.timeoutSeconds",
     "merge.surface",
     "riskRules",
     "review.policy",

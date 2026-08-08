@@ -228,6 +228,113 @@ def _validate_review_evidence_extras(
         _require_string(review.get("reviewModel"), f"{name}.reviewModel", nullable=True)
     if "configSha256" in review:
         _require_string(review.get("configSha256"), f"{name}.configSha256")
+    if "telemetry" in review:
+        validate_telemetry(review.get("telemetry"), f"{name}.telemetry")
+
+
+# Execution provenance (machine-verification epic, spec "Provenance on the
+# evidence"): every verification record gains `execution: "wddctl" |
+# "reported"`. Absent means `reported` -- but ONLY at read time, via
+# `normalize_execution` below, the ONE shared helper (T2 brief: "render/status
+# can never see null"). No migration back-fills the field onto existing
+# records; a present-but-invalid value is refused by name here.
+EXECUTION_VALUES = ("wddctl", "reported")
+
+
+def validate_execution_value(value: Any, name: str) -> None:
+    if value not in EXECUTION_VALUES:
+        raise ValidationError(f"{name} must be one of {sorted(EXECUTION_VALUES)}")
+
+
+def normalize_execution(value: Any) -> str:
+    """The one shared read-time normalizer for a verification record's
+    `execution` field (spec: absent -> 'reported'; render/status must never
+    observe null). `value` is the raw stored value -- `None` for every
+    record that predates this phase or was never touched by `--run` (no
+    migration writes it back). A present value is trusted as already
+    validated by `validate_state`/`validate_execution_value`, not
+    re-checked here."""
+    return value if value is not None else "reported"
+
+
+# Telemetry (machine-verification epic, spec "Telemetry (optional,
+# additive)"): `{model: str, durationMs: int>=0, tokens: int>=0}`, all
+# fields optional, on review AND verification records. Never read by any
+# gate -- observability only. Unknown keys are rejected: this is a fresh,
+# narrowly-specified shape landing whole in one task, not a
+# tolerate-legacy-drift case like `models.review`'s object form.
+_TELEMETRY_KEYS = {"model", "durationMs", "tokens"}
+
+
+def validate_telemetry(value: Any, name: str) -> None:
+    if value is None:
+        return
+    value = _require_mapping(value, name)
+    unknown = set(value) - _TELEMETRY_KEYS
+    if unknown:
+        raise ValidationError(f"{name} has unknown key(s): {sorted(unknown)}")
+    if "model" in value:
+        _require_string(value.get("model"), f"{name}.model")
+    for field in ("durationMs", "tokens"):
+        if field in value:
+            number = value[field]
+            if not isinstance(number, int) or isinstance(number, bool) or number < 0:
+                raise ValidationError(f"{name}.{field} must be a non-negative integer")
+
+
+# Per-command result entries (spec "Captured per command", AC-1/AC-4/AC-5):
+# three shapes, distinguished by `status`/`timedOut` --
+#   executed:  {command, status: passed|failed, exitCode: int, durationMs,
+#               outputSha256, tail}
+#   timedOut:  the executed shape plus `timedOut: true`, with `status`
+#              forced to "failed" and `exitCode` forced to null (the
+#              runner.py:604 precedent this mirrors)
+#   skipped:   {command, status: "skipped"} EXACTLY -- AC-4: "no fabricated
+#              fields" for a command that never ran.
+_EXECUTED_STATUSES = {"passed", "failed"}
+_SKIPPED_ENTRY_KEYS = {"command", "status"}
+_EXECUTED_ENTRY_REQUIRED_KEYS = {
+    "command", "status", "exitCode", "durationMs", "outputSha256", "tail",
+}
+_EXECUTED_ENTRY_OPTIONAL_KEYS = {"timedOut"}
+
+
+def _validate_result_entry(entry: Any, name: str) -> None:
+    entry = _require_mapping(entry, name)
+    if entry.get("status") == "skipped":
+        extra = set(entry) - _SKIPPED_ENTRY_KEYS
+        if extra:
+            raise ValidationError(f"{name} (skipped) has unexpected key(s): {sorted(extra)}")
+        _require_string(entry.get("command"), f"{name}.command")
+        return
+    unknown = set(entry) - _EXECUTED_ENTRY_REQUIRED_KEYS - _EXECUTED_ENTRY_OPTIONAL_KEYS
+    if unknown:
+        raise ValidationError(f"{name} has unknown key(s): {sorted(unknown)}")
+    missing = _EXECUTED_ENTRY_REQUIRED_KEYS - set(entry)
+    if missing:
+        raise ValidationError(f"{name} is missing required key(s): {sorted(missing)}")
+    _require_string(entry.get("command"), f"{name}.command")
+    if entry.get("status") not in _EXECUTED_STATUSES:
+        raise ValidationError(
+            f"{name}.status must be one of {sorted(_EXECUTED_STATUSES | {'skipped'})}"
+        )
+    timed_out = entry.get("timedOut", False)
+    if not isinstance(timed_out, bool):
+        raise ValidationError(f"{name}.timedOut must be a boolean")
+    exit_code = entry.get("exitCode")
+    if timed_out:
+        if entry["status"] != "failed":
+            raise ValidationError(f"{name}.status must be 'failed' when timedOut is true")
+        if exit_code is not None:
+            raise ValidationError(f"{name}.exitCode must be null when timedOut is true")
+    elif not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        raise ValidationError(f"{name}.exitCode must be an integer when timedOut is not true")
+    duration = entry.get("durationMs")
+    if not isinstance(duration, int) or isinstance(duration, bool) or duration < 0:
+        raise ValidationError(f"{name}.durationMs must be a non-negative integer")
+    _require_string(entry.get("outputSha256"), f"{name}.outputSha256")
+    if not isinstance(entry.get("tail"), str):
+        raise ValidationError(f"{name}.tail must be a string")
 
 
 def _validate_verification_evidence_extras(verification: Any, name: str) -> None:
@@ -235,6 +342,18 @@ def _validate_verification_evidence_extras(verification: Any, name: str) -> None
         return
     if "configSha256" in verification:
         _require_string(verification.get("configSha256"), f"{name}.configSha256")
+    if "execution" in verification:
+        validate_execution_value(verification.get("execution"), f"{name}.execution")
+    if "telemetry" in verification:
+        validate_telemetry(verification.get("telemetry"), f"{name}.telemetry")
+    if "logSha256" in verification:
+        _require_string(verification.get("logSha256"), f"{name}.logSha256")
+    if "results" in verification:
+        results = verification["results"]
+        if not isinstance(results, list) or not results:
+            raise ValidationError(f"{name}.results must be a non-empty list")
+        for index, entry in enumerate(results):
+            _validate_result_entry(entry, f"{name}.results[{index}]")
 
 
 def _validate_scope(scope: Any, *, tasks_present: bool, label: str = "scope") -> None:
