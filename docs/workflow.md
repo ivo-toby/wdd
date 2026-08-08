@@ -21,6 +21,8 @@ output.
 - [What is enforced vs. what is convention](#what-is-enforced-vs-what-is-convention)
   — the line between what the state machine guarantees and what still
   depends on the agent reading the skill.
+- [Upgrading](#upgrading) — why upgrading stales existing verification
+  evidence, and why that's fail-closed on purpose.
 - [Finishing a scope](#finishing-a-scope) — the finalize ladder: review,
   verification, handoff, the observed human merge, archive.
 - [Appendix: a local runner, worked](#appendix-a-local-runner-worked) —
@@ -371,6 +373,24 @@ $ wddctl verify record --task TASK-003-client-retry --status passed --command "p
 {"duplicate": false, "status": "merge_ready", "revision": 13}
 $ wddctl freshness record --task TASK-003-client-retry --repo .
 {"classification": "current", "duplicate": false, "revision": 14}
+```
+
+`--status passed --command "..."` above is an agent's *report*: `wddctl`
+takes the word for it, the same way it takes a reviewer's `--findings` on
+trust. Passing `--run` instead of `--status`/`--command` is the moment
+verification stops being reported and starts being observed: `wddctl
+verify record --task TASK-003-client-retry --run` would have run
+`python3 -m unittest discover -s tests` itself, in that task's own
+worktree, under a process-group timeout, and recorded exactly what
+happened — exit code, captured output, a SHA-256 of the log — rather than
+trusting that the agent ran it, ran the right command, or read the result
+correctly. Same gate, same `merge_ready` transition on success; the
+difference is entirely in what the evidence is now allowed to claim. See
+"`verify record --run`" and "`finalize verify record --run`" in
+[`docs/wddctl.md`](wddctl.md) for real transcripts, including a failing
+command and a timeout.
+
+```
 $ wddctl merge --task TASK-003-client-retry --repo .
 {"action": "merged", "baseRef": "wdd/auth-refresh", "headSha": "16f9790...", "revision": 15}
 $ wddctl release --task TASK-003-client-retry --repo .
@@ -635,6 +655,13 @@ trust the agent doing the work.
   brief or `context` files on disk; the remedy is `rebind` (accept the
   existing work as still valid) or a fresh re-dispatch, never a silent
   pass-through.
+- **Machine-observed verification.** `verify record --task T --run` and
+  `finalize verify record --run` (see above) don't take anyone's word for
+  the outcome — `wddctl` itself runs the effective commands, under a
+  process-group timeout, and records the exit code, output hash, and log
+  it actually observed. This is the one case where "verification honesty"
+  (below) stops being convention: with `--run`, there is no report to lie
+  about.
 
 **Convention — depends on the agent reading and following the skill:**
 
@@ -644,11 +671,12 @@ trust the agent doing the work.
   check.
 - **Review and verification honesty.** `review record` and
   `verify record --status passed` take your word for it; the schema
-  validates shape, not substance. The same is true of `--approved-by NAME`
-  itself: the state machine now refuses a changed plan without it, but
-  nothing checks that `NAME` actually read the diff before typing it —
-  that discipline is `wdd-plan`'s and `wdd-intake`'s instruction, not a
-  gate.
+  validates shape, not substance — this is exactly the gap `verify record
+  --run` closes for verification (not for review; there is no `--run` for
+  reviews). The same is true of `--approved-by NAME` itself: the state
+  machine now refuses a changed plan without it, but nothing checks that
+  `NAME` actually read the diff before typing it — that discipline is
+  `wdd-plan`'s and `wdd-intake`'s instruction, not a gate.
 - **Task decomposition and sizing.** Nothing stops a `plan.json` with one
   task that touches the entire repository.
 - **`.wdd/shared-context/`.** A plain folder `wddctl` never writes to; a
@@ -661,6 +689,24 @@ this fingerprint match. Everything on the convention list requires
 understanding what the code actually does — exactly the half of the job
 WDD leaves to agents and skills rather than encoding into a transition
 function.
+
+## Upgrading
+
+Upgrading a repository onto the version that introduced `--run` stales
+every verification record that already exists, on purpose, and fails
+closed rather than silently trusting old evidence. `verification.timeoutSeconds`
+joined the `taskVerification`/`finalVerification` projections the moment
+it existed (see "Purpose-projected digests on evidence" in
+[`docs/wddctl.md`](wddctl.md)) — a config that had no opinion on it now
+resolves to the default (`600`), which changes the projected digest a
+previously recorded `configSha256` was pinned to, exactly as if
+`verification.commands` itself had been edited. The consuming gate treats
+that mismatch the same as any other stale evidence: it refuses to trust
+the old record and asks for a fresh `verify record` (`--status` or
+`--run`) rather than quietly grandfathering it in. There is no separate
+migration step for this — it falls directly out of the projection
+including `verification.*` wholesale, and it is the intended failure
+mode, not a bug to route around.
 
 ## Finishing a scope
 

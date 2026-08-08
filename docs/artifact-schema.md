@@ -474,6 +474,147 @@ finds, computed from the then-effective config, and from that point every
 later config change is checked against them through the ordinary gate
 comparison.
 
+### Verification evidence: `results`, `logSha256`, `execution`, `telemetry`
+
+A `--run`-fed record (`wddctl verify record --task T --run` or `wddctl
+finalize verify record --run`; see [`docs/wddctl.md`](wddctl.md) for real
+transcripts) replaces the single `command` string with per-command
+`results`, plus `logSha256` and `execution`. An agent-reported record
+(`--status`/`--command`, or `--results`) never carries `results`,
+`logSha256`, or `execution: "wddctl"` — the two contracts are visibly
+different shapes on the same `verification`/`finalize.verification`
+object, not a flag on one shape.
+
+**`execution`** — `"wddctl"` or `"reported"`. Written only by the `--run`
+path; a record that predates this field, or was never touched by `--run`,
+carries no key at all. `normalize_execution()` is the one read-time
+helper that turns that absence into `"reported"` — render/status code
+never observes `null` — but nothing migrates old records to carry the
+field explicitly, so its physical absence on disk always means
+"reported", forever.
+
+**`results`** — a non-empty list of per-command entries, in the order the
+commands were given. Three shapes, distinguished by `status`/`timedOut`,
+matching exactly what `verify_run.execute()` (`wave_delivery/verify_run.py`)
+observed and `_validate_result_entry` (`wave_delivery/schema.py`)
+enforces — no field is ever fabricated for a command that didn't finish
+running:
+
+- **executed** — `{command, status: "passed"|"failed", exitCode: int,
+  durationMs: int, outputSha256: <hex>, tail: string}`. `tail` is the last
+  4KB of that command's own captured output (stdout+stderr merged),
+  lossy-decoded for display; the hash and the log file on disk carry the
+  raw bytes.
+- **timedOut** — the executed shape plus `timedOut: true`, with `status`
+  forced to `"failed"` and `exitCode` forced to `null` — the same
+  "no exit code, because there wasn't one" idiom `runner.py:604`'s own
+  dispatch-timeout entry already used. `_validate_result_entry` refuses
+  `timedOut: true` paired with any `status` other than `"failed"`, or with
+  a non-null `exitCode`.
+- **skipped** — `{command, status: "skipped"}` **exactly**, no other keys.
+  Every command after the first non-pass is skipped; nothing about a
+  command that never ran is knowable, so nothing else is claimed.
+
+`truncated: true` is independently combinable onto the executed/timedOut
+shapes when a single command's captured output hit the 64MB per-command
+cap — literal `true` only, mirroring `timedOut`'s doctrine: a command
+whose output fit never carries `truncated: false`, it simply omits the
+key.
+
+Real shapes, captured by running `wddctl verify record --task T --run`
+for real (see [`docs/wddctl.md`](wddctl.md)):
+
+```json
+[
+  {"command": "python3 src/app.py", "status": "passed", "exitCode": 0,
+   "durationMs": 28, "outputSha256": "5891b5b5...", "tail": "hello\n"},
+  {"command": "python3 -c \"import sys; sys.exit(1)\"", "status": "failed",
+   "exitCode": 1, "durationMs": 53, "outputSha256": "e3b0c442...", "tail": ""},
+  {"command": "echo never runs", "status": "skipped"}
+]
+```
+
+```json
+[
+  {"command": "sleep 20 && echo should-not-print", "status": "failed",
+   "exitCode": null, "timedOut": true, "durationMs": 1002,
+   "outputSha256": "e3b0c442...", "tail": ""}
+]
+```
+
+The overall record's `status` is `"passed"` only when every entry passed;
+any `"failed"` entry (executed or timed out) makes the whole record
+`"failed"` — there is no `"unavailable"` outcome for an observed run, only
+for a `--status unavailable` agent report.
+
+**`logSha256`** — a SHA-256 over the exact bytes of the shared verify-run
+log file on disk (below), computed over the same stream `execute()`
+writes: a `$ <command>\n` framing line ahead of each command's own
+captured output, in command order. It is a record-level field, not
+per-command — `results[].outputSha256` is the narrower per-command hash
+of that command's raw captured bytes alone, excluding the framing line.
+
+**`telemetry`** — `{model?: string, durationMs?: int, tokens?: int}`, all
+keys optional, unknown keys rejected. On a `--run` record, `durationMs` is
+auto-filled from `wddctl`'s own wall-clock measurement of the whole
+`verify_run.execute()` call — the same field an agent-reported record can
+also set by hand. Observability only: no gate anywhere reads `telemetry`.
+
+### `verification.timeoutSeconds`
+
+A `config.json` leaf (`verification.timeoutSeconds`, default `600`,
+validated as an integer `1..86400`) that bounds every command a `--run`
+executes: `_run_one` (`wave_delivery/verify_run.py`) starts the deadline
+when the command starts, and on expiry kills the command's whole process
+group — `SIGTERM`, a 5-second grace, then `SIGKILL` — rather than the
+direct child alone, so a backgrounded grandchild cannot outlive the
+timeout and hold a caller's pipe open indefinitely. It is part of the
+`verification` object both `taskVerification` and `finalVerification`
+project wholesale (see "Purpose-projected digests on evidence" in
+[`docs/wddctl.md`](wddctl.md)), so it is bound into `configSha256` exactly
+like `verification.commands` is — a bare `config set
+verification.timeoutSeconds` is governance drift like any other
+`config.json` edit, and stales any recorded verification evidence exactly
+as an edited command list would (see "Upgrading" in
+[`docs/workflow.md`](workflow.md)). It also joins the epic overlay
+allowlist (`OVERLAY_ALLOWED_LEAVES`), so an epic can override it the same
+way it overrides `verification.commands`.
+
+**Backfill-on-write.** A `config.json` written before this key existed
+has no `verification.timeoutSeconds` entry at all — tolerated the same
+way a pre-existing `runners`/`worktrees` omission is, for the identical
+reason: refusing an old, otherwise-valid file outright would brick it with
+no in-tool remedy. `wddctl config get` reads through a hydrated view (the
+missing key resolves to `600` without writing anything back — a pure
+read never moves the governance fingerprint). `wddctl config set`
+(any path, not just `verification.timeoutSeconds` itself) hydrates the
+same way *and writes the hydrated file back* — one `set` on a legacy
+config therefore backfills every missing optional section
+(`verification.timeoutSeconds`, `runners`, `worktrees`) in the same
+write, and moves the governance fingerprint exactly once, the same as any
+other `set` — an explicit `set` is supposed to move it; that is
+governance working as intended, not a side effect to route around.
+
+### The verify-run log
+
+`--run` streams every command's merged stdout+stderr into one shared,
+per-invocation log file under `.wdd/dispatch/` (see below), reserved with
+`reserve_numbered_path()`'s `O_CREAT|O_EXCL` idiom so two concurrent
+`--run` invocations can never collide on the same path:
+
+```text
+.wdd/dispatch/
+  verify-<TASK-ID>-<n>.log   # wddctl verify record --task ID --run (TASK-ID sanitized)
+  verify-final-<n>.log       # wddctl finalize verify record --run
+```
+
+Mode `0600`, like every other reserved dispatch file. Content is `$
+<command>\n` followed by that command's raw captured bytes, repeated per
+command in order, truncated per command at the 64MB capture cap (`tail`
+above is only the last 4KB of it). `logSha256` on the recorded evidence is
+the hash of this exact file's bytes — a caller can `sha256sum` the log on
+disk and compare directly, with no reconstruction needed.
+
 Each entry under `tasks` carries: `id`, `title`, `specPath`, `status`
 (`todo` / `in_progress` / `review` / `merge_ready` / `done` / `blocked` /
 `cancelled`), `risk`, `dependsOn`, `conflictDomains`, `context`, `model`,
@@ -659,9 +800,9 @@ moment `dispatch/` is first created (idempotent, content-preserving: it
 only ever appends the one line, never touches anything else already in the
 file) -- covering an install that predates the scratch dir and never runs
 `init`/`migrate --governance` again. `wddctl` never reads this directory
-back into `state.json`; it exists purely as working storage for two related
-but distinct things, both keyed by sanitized task ID (`[A-Za-z0-9._-]`,
-anything else replaced with `_`):
+back into `state.json`; it exists purely as working storage for three
+related but distinct things, all keyed by sanitized task ID
+(`[A-Za-z0-9._-]`, anything else replaced with `_`):
 
 ```text
 .wdd/dispatch/
@@ -672,6 +813,8 @@ anything else replaced with `_`):
   <TASK-ID>-<role>-<attempt>.log           # wddctl's own captured stdout+stderr
   <TASK-ID>-<role>-<attempt>-runner.log    # the {logfile} placeholder target -- the runner's own transcript, if it writes one; a distinct path from the .log above so the two never collide
   <TASK-ID>-<role>-<attempt>-result.json   # reviewer only: the validated wddctl_review_result
+  verify-<TASK-ID>-<n>.log                 # wddctl verify record --task ID --run
+  verify-final-<n>.log                     # wddctl finalize verify record --run
 ```
 
 **Attempt snapshots** (`<TASK-ID>-<attempt>/`): `wddctl start` copies the
@@ -703,6 +846,13 @@ echoed back in `dispatch`'s own JSON result — the full output lives only in
 this file. A reviewer's successful, contract-valid run additionally writes
 a `-result.json` file beside the log, ready to hand directly to `wddctl
 review collect --result <path>`.
+
+**Verify-run logs** (`wddctl verify record --task ID --run` / `wddctl
+finalize verify record --run`): see "The verify-run log" above for the
+full reference — one reserved, `0600` log per invocation, numbered the
+same `O_EXCL`-reservation way dispatch prompts/logs are, holding every
+command's raw merged output framed by a `$ <command>` line, hashed
+record-level as `logSha256`.
 
 ## Task briefs (`.wdd/epics/<slug>/tasks/<TASK-ID>.md`)
 
