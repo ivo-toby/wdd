@@ -282,8 +282,12 @@ def validate_telemetry(value: Any, name: str) -> None:
                 raise ValidationError(f"{name}.{field} must be a non-negative integer")
 
 
-# Per-command result entries (spec "Captured per command", AC-1/AC-4/AC-5):
-# three shapes, distinguished by `status`/`timedOut` --
+# Per-command result entries (spec "Captured per command", AC-1/AC-4/AC-5).
+# Note: this is the record-level `verification.results[]` entry shape below
+# -- unrelated to the CLI's `finalize verify record --results` flag, which
+# takes the much simpler legacy `[{"command":..., "status":...}, ...]` array
+# (cli.py); the two share a name by coincidence, not a shape.
+# Three base shapes, distinguished by `status`/`timedOut` --
 #   executed:  {command, status: passed|failed, exitCode: int, durationMs,
 #               outputSha256, tail}
 #   timedOut:  the executed shape plus `timedOut: true`, with `status`
@@ -291,12 +295,17 @@ def validate_telemetry(value: Any, name: str) -> None:
 #              runner.py:604 precedent this mirrors)
 #   skipped:   {command, status: "skipped"} EXACTLY -- AC-4: "no fabricated
 #              fields" for a command that never ran.
+# `truncated: true` (AC-9) is independently combinable onto the executed/
+# timedOut shapes when the 64MB per-command capture cap was hit
+# (verify_run.py, task T1) -- literal `true` only, mirroring `timedOut`'s
+# own "no fabricated fields" doctrine: a command whose output fit never
+# carries `truncated: false`, it simply omits the key.
 _EXECUTED_STATUSES = {"passed", "failed"}
 _SKIPPED_ENTRY_KEYS = {"command", "status"}
 _EXECUTED_ENTRY_REQUIRED_KEYS = {
     "command", "status", "exitCode", "durationMs", "outputSha256", "tail",
 }
-_EXECUTED_ENTRY_OPTIONAL_KEYS = {"timedOut"}
+_EXECUTED_ENTRY_OPTIONAL_KEYS = {"timedOut", "truncated"}
 
 
 def _validate_result_entry(entry: Any, name: str) -> None:
@@ -335,6 +344,8 @@ def _validate_result_entry(entry: Any, name: str) -> None:
     _require_string(entry.get("outputSha256"), f"{name}.outputSha256")
     if not isinstance(entry.get("tail"), str):
         raise ValidationError(f"{name}.tail must be a string")
+    if "truncated" in entry and entry["truncated"] is not True:
+        raise ValidationError(f"{name}.truncated must be true when present")
 
 
 def _validate_verification_evidence_extras(verification: Any, name: str) -> None:

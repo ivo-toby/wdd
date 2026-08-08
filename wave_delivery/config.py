@@ -116,11 +116,16 @@ def validate_config(config: dict[str, Any]) -> None:
     justification = verification.get("unavailableJustification")
     _require(justification is None or (isinstance(justification, str) and justification),
              "verification.unavailableJustification must be null or a non-empty string")
-    # Per-command timeout for `--run` (spec Sec1, machine-verification epic):
-    # required (unlike runners/worktrees' backward-compat looseness -- this
-    # key has a DEFAULT_CONFIG value on every construction path in this
-    # codebase, so there is no legacy config that legitimately lacks it).
-    timeout_seconds = verification.get("timeoutSeconds")
+    # Per-command timeout for `--run` (spec Sec1, machine-verification epic).
+    # Absent is tolerated like `runners`/`worktrees` above -- a real
+    # pre-existing config.json written before this key existed has no
+    # legitimate way to supply it, and refusing it outright would brick
+    # every one of them with no in-tool remedy (fix-round: bug found against
+    # this repo's own live config). A PRESENT value is still held strictly:
+    # only an absent key falls back to the DEFAULT_CONFIG value (600) for
+    # this check; `_hydrate_optional_sections` is what actually writes 600
+    # into `effective` so downstream readers never see the key missing.
+    timeout_seconds = verification.get("timeoutSeconds", DEFAULT_CONFIG["verification"]["timeoutSeconds"])
     _require(
         isinstance(timeout_seconds, int) and not isinstance(timeout_seconds, bool)
         and 1 <= timeout_seconds <= 86400,
@@ -522,12 +527,25 @@ def _hydrate_optional_sections(config: dict[str, Any]) -> dict[str, Any]:
     of this function -- hydrating it too would make `resolve_config_source`
     find these keys in `global` and report source='global' instead of the
     correct 'default'.
+
+    Also hydrates `verification.timeoutSeconds` when the key itself is
+    missing, one leaf deep inside the otherwise-required `verification`
+    object rather than a whole top-level section: `validate_config` accepts
+    its absence for the identical backward-compat reason `runners`/
+    `worktrees` are accepted absent, and `effective` needs the same
+    concrete default (600) here for the same reason (fix-round: a real
+    pre-existing config.json lacking this key must still resolve, not
+    crash). A present-but-invalid value is never touched here --
+    `validate_config` still refuses it by name.
     """
     hydrated = deepcopy(config)
     defaults = DEFAULT_CONFIG
     for section in _OPTIONAL_GLOBAL_SECTIONS:
         if section not in hydrated:
             hydrated[section] = deepcopy(defaults[section])
+    verification = hydrated.get("verification")
+    if isinstance(verification, dict) and "timeoutSeconds" not in verification:
+        verification["timeoutSeconds"] = defaults["verification"]["timeoutSeconds"]
     return hydrated
 
 

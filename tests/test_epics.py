@@ -742,12 +742,40 @@ class VerificationTimeoutSecondsConfigTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate_config(config)
 
-    def test_missing_key_is_refused(self) -> None:
+    def test_missing_key_validates(self) -> None:
+        # Fix-round: a real pre-existing config.json predating this key
+        # (empirically found against this repo's own live config) must not
+        # be bricked -- absence is backward-compat tolerated, only a
+        # present-but-invalid value is refused.
         config = default_config()
         del config["verification"]["timeoutSeconds"]
-        with self.assertRaises(ValidationError) as ctx:
-            validate_config(config)
-        self.assertIn("verification.timeoutSeconds", str(ctx.exception))
+        validate_config(config)  # must not raise
+
+    def test_missing_key_resolves_to_default_via_load(self) -> None:
+        config = default_config()
+        del config["verification"]["timeoutSeconds"]
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = _wdd_with_config(tmp, config)
+            layers = load_layers(wdd, None)
+            self.assertNotIn("timeoutSeconds", layers["global"]["verification"])
+            value, source = resolve_config_source(layers, "verification.timeoutSeconds")
+            self.assertEqual(value, 600)
+            self.assertEqual(source, "default")
+
+    def test_missing_key_digest_matches_explicit_default_digest(self) -> None:
+        # Digest stability: a config that omits the key and one that spells
+        # out the identical default (600) explicitly must hydrate to the
+        # exact same effective view, so their digests match byte-for-byte.
+        missing = default_config()
+        del missing["verification"]["timeoutSeconds"]
+        explicit = default_config()
+        explicit["verification"]["timeoutSeconds"] = 600
+        with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+            wdd_a = _wdd_with_config(tmp_a, missing)
+            wdd_b = _wdd_with_config(tmp_b, explicit)
+            digest_missing = effective_config_digest(load_layers(wdd_a, None)["effective"])
+            digest_explicit = effective_config_digest(load_layers(wdd_b, None)["effective"])
+            self.assertEqual(digest_missing, digest_explicit)
 
     def test_overlay_leaf_is_reflected_in_effective(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1558,6 +1586,35 @@ class SchemaV6ReviewEvidenceExtrasTest(unittest.TestCase):
             )
         self.assertIn("status", str(ctx.exception))
 
+    def test_verification_results_truncated_entry_is_accepted(self) -> None:
+        # AC-9: the 64MB per-command capture cap marker (T1's verify_run.py).
+        entry = {
+            "command": "pytest -q", "status": "passed", "exitCode": 0,
+            "durationMs": 500, "outputSha256": "sha256:" + "a" * 64, "tail": "ok\n",
+            "truncated": True,
+        }
+        validate_state(
+            self._task_with_verification(
+                {"baseSha": "a", "headSha": "b", "status": "passed", "results": [entry]}
+            )
+        )
+
+    def test_verification_results_truncated_non_literal_true_is_rejected_by_name(self) -> None:
+        # Mirrors `timedOut`'s "no fabricated fields" doctrine: a non-bool
+        # (or any value other than literal true) is refused by name.
+        entry = {
+            "command": "pytest -q", "status": "passed", "exitCode": 0,
+            "durationMs": 500, "outputSha256": "sha256:" + "a" * 64, "tail": "ok\n",
+            "truncated": "yes",
+        }
+        with self.assertRaises(ValidationError) as ctx:
+            validate_state(
+                self._task_with_verification(
+                    {"baseSha": "a", "headSha": "b", "status": "passed", "results": [entry]}
+                )
+            )
+        self.assertIn("truncated", str(ctx.exception))
+
     def test_verification_results_executed_entry_missing_required_key_is_rejected_by_name(
         self,
     ) -> None:
@@ -1646,7 +1703,26 @@ class ResultNormalizerExecutionTelemetryTest(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
-    def test_normalize_verification_result_preserves_execution(self) -> None:
+    def test_normalize_verification_result_preserves_reported_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_json(
+                tmp, "v.json",
+                {
+                    "schemaVersion": 1, "kind": VERIFICATION_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "status": "passed", "command": "pytest -q",
+                    "execution": "reported",
+                },
+            )
+            result = normalize_verification_result(path, task_id="T1")
+            self.assertEqual(result["execution"], "reported")
+
+    def test_normalize_verification_result_rejects_self_declared_wddctl_execution(
+        self,
+    ) -> None:
+        # Fix-round: a `--results` file is agent/reviewer-authored; only
+        # wddctl's own internal machine-run capture may claim
+        # execution="wddctl". A result file self-declaring it is fabricated
+        # machine provenance and must be refused, not trusted through.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_json(
                 tmp, "v.json",
@@ -1656,8 +1732,10 @@ class ResultNormalizerExecutionTelemetryTest(unittest.TestCase):
                     "execution": "wddctl",
                 },
             )
-            result = normalize_verification_result(path, task_id="T1")
-            self.assertEqual(result["execution"], "wddctl")
+            with self.assertRaises(ValidationError) as ctx:
+                normalize_verification_result(path, task_id="T1")
+            self.assertIn("execution", str(ctx.exception))
+            self.assertIn("wddctl", str(ctx.exception))
 
     def test_normalize_verification_result_without_execution_key_omits_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1753,7 +1831,12 @@ class ResultNormalizerExecutionTelemetryTest(unittest.TestCase):
                 normalize_review_results([path], task_id="T1")
             self.assertIn("telemetry.model", str(ctx.exception))
 
-    def test_normalize_review_results_rejects_conflicting_telemetry_across_files(self) -> None:
+    def test_normalize_review_results_drops_telemetry_on_disagreement(self) -> None:
+        # Fix-round: telemetry is observability-only and must never be
+        # gate-blocking (spec "Telemetry (optional, additive)"). Merged
+        # reviewer files that disagree drop telemetry from the merged
+        # record entirely -- the record itself (findings, reviewers) is
+        # still accepted.
         with tempfile.TemporaryDirectory() as tmp:
             path_a = self._write_json(
                 tmp, "a.json",
@@ -1771,9 +1854,32 @@ class ResultNormalizerExecutionTelemetryTest(unittest.TestCase):
                     "telemetry": {"model": "gpt-4"},
                 },
             )
-            with self.assertRaises(ValidationError) as ctx:
-                normalize_review_results([path_a, path_b], task_id="T1")
-            self.assertIn("telemetry", str(ctx.exception))
+            result = normalize_review_results([path_a, path_b], task_id="T1")
+            self.assertNotIn("telemetry", result)
+            self.assertEqual(result["reviewer"], "x, y")
+
+    def test_normalize_review_results_keeps_telemetry_from_single_source(self) -> None:
+        # When only one of several files supplies telemetry at all (the
+        # others simply omit the key, not disagree), it is not a conflict
+        # and must be kept.
+        with tempfile.TemporaryDirectory() as tmp:
+            path_a = self._write_json(
+                tmp, "a.json",
+                {
+                    "schemaVersion": 1, "kind": REVIEW_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "reviewer": "x", "findings": [],
+                    "telemetry": {"model": "gpt-5"},
+                },
+            )
+            path_b = self._write_json(
+                tmp, "b.json",
+                {
+                    "schemaVersion": 1, "kind": REVIEW_RESULT_KIND, "task": "T1",
+                    "baseSha": "a", "headSha": "b", "reviewer": "y", "findings": [],
+                },
+            )
+            result = normalize_review_results([path_a, path_b], task_id="T1")
+            self.assertEqual(result["telemetry"], {"model": "gpt-5"})
 
 
 # --- v5 -> v6 migration (spec Sec4) ----------------------------------------
