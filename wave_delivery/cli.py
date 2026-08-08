@@ -63,6 +63,7 @@ from .finalize import (
     _base_ref as _finalize_base_ref,
     _finalize_integration_worktree,
     _is_legacy_intake,
+    _remove_finalize_integration_worktree,
     _require_finalize_phase,
     _require_not_delivered,
     _required_verification_commands,
@@ -1043,22 +1044,30 @@ def _run_final_verification(
 
     epic_head_sha = resolve_ref(repo_path, _finalize_base_ref(state))
     worktree_path = _finalize_integration_worktree(repo_path, state, epic_head_sha)
-
-    dispatch_dir = wdd_dir / "dispatch"
-    log_path = reserve_numbered_path(dispatch_dir, "verify-final-", ".log")
-    started = time.monotonic()
-    run_result = verify_run_execute(
-        commands, cwd=worktree_path, timeout_seconds=timeout_seconds, log_path=log_path
-    )
-    duration_ms = int((time.monotonic() - started) * 1000)
-    return record_final_verification_run(
-        store,
-        run_result=run_result,
-        duration_ms=duration_ms,
-        repo=args.repo,
-        layers=admission_layers,
-        **_concurrency(args),
-    )
+    try:
+        dispatch_dir = wdd_dir / "dispatch"
+        log_path = reserve_numbered_path(dispatch_dir, "verify-final-", ".log")
+        started = time.monotonic()
+        run_result = verify_run_execute(
+            commands, cwd=worktree_path, timeout_seconds=timeout_seconds, log_path=log_path
+        )
+        duration_ms = int((time.monotonic() - started) * 1000)
+        return record_final_verification_run(
+            store,
+            run_result=run_result,
+            duration_ms=duration_ms,
+            repo=args.repo,
+            layers=admission_layers,
+            **_concurrency(args),
+        )
+    finally:
+        # Unconditional, success or failure: a detached worktree left behind
+        # at `integration_worktree_path` squats on the exact path merge.py's
+        # own `_integration_dir`/`ensure_worktree` uses, and `ensure_worktree`
+        # cannot reconcile a detached HEAD (`branch: None`) against the
+        # branch name it expects -- see `_remove_finalize_integration_
+        # worktree`'s docstring for the wedge this closes.
+        _remove_finalize_integration_worktree(repo_path, worktree_path)
 
 
 def _overlaid_plan(

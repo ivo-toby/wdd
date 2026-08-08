@@ -598,6 +598,34 @@ def _finalize_integration_worktree(repo: Path, state: dict[str, Any], epic_head_
     return path
 
 
+def _remove_finalize_integration_worktree(repo: Path, path: Path) -> None:
+    """Tear down the detached worktree `_finalize_integration_worktree`
+    creates, once a `--run` invocation is done with it -- success or
+    failure (cli.py's `_run_final_verification` wraps create/execute/record
+    in a try/finally that calls this unconditionally).
+
+    Left in place, that detached worktree squats on
+    `integration_worktree_path`, the exact path `merge.py`'s own
+    `_integration_dir` uses for its `ensure_worktree` call. `ensure_worktree`
+    only ever reuses an existing worktree on an exact branch match; a
+    detached HEAD reports `branch: None`, so it raises instead of
+    reconciling -- wedging `assign_final_fixes` -> merge shut the moment the
+    operator's own checkout isn't already on `baseRef` (the common case).
+    Removing the worktree here, unconditionally after `--run`, frees that
+    path for merge's own worktree management the next time it is needed.
+
+    `git worktree remove --force` then `prune`, mirroring `leases.py`'s
+    release-side remove+prune pattern; `--force` because a `--run` failure
+    path may not have left the worktree clean, and this is a disposable
+    integration checkout, never something to preserve. A no-op when nothing
+    was ever created (e.g. `_finalize_integration_worktree` itself raised
+    before `worktree add` ran).
+    """
+    if worktree_at(repo, path) is not None:
+        run_git(repo, "worktree", "remove", "--force", str(path))
+    run_git(repo, "worktree", "prune")
+
+
 def record_final_verification_run(
     store: StateStore,
     *,
