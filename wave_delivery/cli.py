@@ -71,11 +71,11 @@ from .freshness import check_freshness, record_freshness
 from .git import require_repository, resolve_ref, run_git, worktree_for
 from .github import comment_pr, create_pr, push_branch
 from .handover import (
-    _sanitize_task_id_for_filename,
     inputs_status,
     materialize_attempt,
     record_attempt,
     rebind_attempt,
+    sanitize_task_id_for_filename,
 )
 from .intake import (
     intake_status,
@@ -829,21 +829,39 @@ def _governed_config(admission_layers: dict[str, Any] | None) -> dict[str, Any] 
     return admission_layers["effective"] if admission_layers is not None else None
 
 
+# The same legal-status set engine.transition's "verification.recorded"
+# branch enforces (`_require_status(task, {"in_progress"}, ...)`). Duplicated
+# here, deliberately, so `_run_task_verification` can refuse BEFORE
+# `verify_run.execute` ever runs a command (see its docstring) -- the
+# transition's own check stays in engine.py as defense in depth for state
+# that changes between this read and the locked write, not as the only
+# gate.
+_VERIFICATION_RUN_LEGAL_STATUSES = {"in_progress"}
+
+
 def _run_task_verification(
     store: StateStore, *, args: argparse.Namespace, admission_layers: dict[str, Any] | None
 ) -> tuple[dict[str, Any], bool]:
     """`wddctl verify record --task T --run` (spec AC-1/AC-2/AC-4/AC-9):
     resolve the effective verification commands from the SAME admission
     snapshot the chokepoint already read (`_governed_config`, never a second
-    `load_layers`), refuse before executing anything on a dirty or absent
-    worktree or an empty command list, then hand the commands to
+    `load_layers`), refuse before executing anything on an illegal task
+    status, an unparseable/missing headSha, a worktree HEAD that has moved
+    past the recorded headSha, a dirty or absent worktree, an empty command
+    list, or a replayed idempotency key, then hand the commands to
     `verify_run.execute` and record what it observed via
     `review.record_verification_run`.
 
-    Every refusal below (empty commands, absent worktree, dirty worktree)
-    happens before `verify_run.execute` is ever called, so AC-2's "no
-    command executes on refusal" holds by construction -- there is no
-    partially-executed state to unwind.
+    Every refusal below happens before `verify_run.execute` is ever called,
+    so AC-2's "no command executes on refusal" holds by construction --
+    there is no partially-executed state to unwind. This includes checks
+    (status legality, headSha) that `engine.transition` ALSO enforces: that
+    enforcement only fires from inside `apply_event`, which this function
+    calls AFTER execution, so relying on it alone would mean a bad status or
+    stale head gets discovered only after commands already ran and a log
+    was already written (review finding P1-2). Hoisting them here, ahead of
+    every side effect, is what actually satisfies AC-2 for those cases;
+    engine.transition's copy remains authoritative defense in depth.
     """
     repo_path = require_repository(args.repo)
     state = store.read()
@@ -851,6 +869,38 @@ def _run_task_verification(
         task = state["tasks"][args.task]
     except KeyError as error:
         raise ValidationError(f"unknown task: {args.task}") from error
+    # P3: an already-applied idempotency key must be inert BEFORE any other
+    # precondition, execution included. apply_mutation's own dedupe (inside
+    # record_verification_run's eventual apply_event call) checks the key
+    # ahead of every mutator-embedded validation too (a replay must not
+    # newly fail on e.g. a status the FIRST call already advanced past) --
+    # mirrored here so a replayed --run also skips execution and every
+    # other preflight check, not just the state write. appliedIdempotencyKeys
+    # only ever grows (apply_mutation appends, never removes), so this
+    # preflight read is exactly as reliable as the locked check apply_mutation
+    # performs afterwards; it just runs early enough to skip execution.
+    idempotency_key = getattr(args, "idempotency_key", None)
+    if idempotency_key and idempotency_key in state.get("appliedIdempotencyKeys", []):
+        return apply_event(
+            store,
+            event_type="verification.recorded",
+            task_id=args.task,
+            data={},
+            idempotency_key=idempotency_key,
+            expected_revision=getattr(args, "expected_revision", None),
+        )
+    if task["status"] not in _VERIFICATION_RUN_LEGAL_STATUSES:
+        allowed_text = ", ".join(sorted(_VERIFICATION_RUN_LEGAL_STATUSES))
+        raise IllegalTransition(
+            f"verify record --run is not legal for task {args.task} from status "
+            f"{task['status']!r}; expected one of {allowed_text}"
+        )
+    head_sha = task.get("headSha")
+    if not isinstance(head_sha, str) or not head_sha:
+        raise ValidationError(
+            f"verify record --run requires task {args.task} to have a recorded, "
+            "parseable headSha (none found); run 'wddctl submit' to pin one"
+        )
     config = _governed_config(admission_layers)
     commands = list(config["verification"]["commands"]) if config else []
     if not commands:
@@ -876,9 +926,25 @@ def _run_task_verification(
             f"verify record --run refuses: task {args.task}'s worktree {worktree_path} "
             f"has uncommitted changes (evidence binds committed bytes only): {porcelain}"
         )
+    # P1-1: a clean worktree can still sit on a DIFFERENT commit than the
+    # one state believes is current -- e.g. a commit landed in the worktree
+    # after 'submit' last pinned task["headSha"], or a rebase/reset moved
+    # HEAD without going through 'submit'/'refresh'. Evidence bound to
+    # task["headSha"] while the worktree's actual HEAD disagrees would
+    # silently verify the wrong bytes, so rev-parse the real HEAD and
+    # refuse on any mismatch rather than trusting the recorded value.
+    actual_head = run_git(worktree_path, "rev-parse", "HEAD").stdout.strip()
+    if actual_head != head_sha:
+        raise IllegalTransition(
+            f"verify record --run refuses: task {args.task}'s worktree HEAD "
+            f"({actual_head}) does not match its recorded headSha ({head_sha}); run "
+            f"'wddctl submit --task {args.task} --repo {args.repo}' to re-pin the new "
+            f"head, or 'wddctl refresh --task {args.task} --repo {args.repo}' if the "
+            "base moved"
+        )
     timeout_seconds = config["verification"]["timeoutSeconds"]
     dispatch_dir = store.path.parent / "dispatch"
-    sanitized = _sanitize_task_id_for_filename(args.task)
+    sanitized = sanitize_task_id_for_filename(args.task)
     log_path = reserve_numbered_path(dispatch_dir, f"verify-{sanitized}-", ".log")
     started = time.monotonic()
     run_result = verify_run_execute(

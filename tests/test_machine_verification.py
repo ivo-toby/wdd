@@ -22,6 +22,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -665,11 +666,18 @@ def _mark_legacy(state: str) -> None:
 
 
 def _bootstrap_scope(
-    tmp: str, *, commands: list[str] | None = None, timeout_seconds: int | None = None
+    tmp: str,
+    *,
+    commands: list[str] | None = None,
+    timeout_seconds: int | None = None,
+    scope_overrides: dict | None = None,
 ) -> tuple[Path, str]:
     """A real config.json (so `--run` resolves commands/timeoutSeconds from
     a genuine admission snapshot) with the intake ladder short-circuited,
-    scope `SCOPE-x` applied with one admissible task `T1`."""
+    scope `SCOPE-x` applied with one admissible task `T1`. `scope_overrides`
+    (e.g. `{"reviewPolicy": "always"}`) passes straight through to `_plan`,
+    for tests that need `submit` to land T1 somewhere other than the
+    default risk_based/normal-risk `in_progress`."""
     root = _git_repo(tmp)
     wdd = root / ".wdd"
     state = str(wdd / "state.json")
@@ -694,7 +702,7 @@ def _bootstrap_scope(
     _mark_legacy(state)
     (wdd / "tasks" / "T1.md").write_text("# T1\n\nBrief.\n", encoding="utf-8")
     plan_path = root / "plan.json"
-    plan_path.write_text(json.dumps(_plan()), encoding="utf-8")
+    plan_path.write_text(json.dumps(_plan(scope_overrides)), encoding="utf-8")
     code, out = _cli(state, "plan", "apply", "--plan", str(plan_path), "--repo", str(root))
     assert code == 0, out
     return root, state
@@ -768,16 +776,24 @@ class VerifyRunEmptyCommandListTests(unittest.TestCase):
 class VerifyRunAbsentWorktreeTests(unittest.TestCase):
     """AC-2: `--run` refuses when the task's worktree is absent, naming
     start's reattach remedy -- checked before any dirtiness check or
-    execution, so a never-started task (still `todo`) is enough."""
+    execution. A never-started (`todo`) task no longer reaches this check
+    (the P1-2 fix round hoisted status legality and the recorded-headSha
+    check ahead of the worktree-exists check, and `todo` is illegal for
+    `--run`, with no headSha yet, on its own), so this test now takes the
+    task through `start`/commit/`submit` -- landing it in the legal
+    `in_progress` status with a recorded headSha -- then deletes the
+    worktree `start` created, to isolate this refusal from those two."""
 
     def test_absent_worktree_refuses_naming_the_reattach_remedy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, state = _bootstrap_scope(tmp, commands=["true"])
+            worktree = _start_commit_submit(state, root)
+            shutil.rmtree(worktree)
             code, _out, err = _cli_full(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
             self.assertNotEqual(code, 0)
             self.assertIn("worktree is missing", err)
             self.assertIn("wddctl start --task T1 --repo .", err)
-            self.assertEqual(StateStore(Path(state)).read()["tasks"]["T1"]["status"], "todo")
+            self.assertEqual(StateStore(Path(state)).read()["tasks"]["T1"]["status"], "in_progress")
 
 
 class VerifyRunDirtyWorktreeTests(unittest.TestCase):
@@ -796,6 +812,121 @@ class VerifyRunDirtyWorktreeTests(unittest.TestCase):
             dispatch_dir = root / ".wdd" / "dispatch"
             self.assertFalse(list(dispatch_dir.glob("verify-*.log")))
             self.assertIsNone(StateStore(Path(state)).read()["tasks"]["T1"].get("verification"))
+
+
+class VerifyRunStaleWorktreeHeadTests(unittest.TestCase):
+    """P1-1 (opus review): `--run` bound evidence to state's recorded
+    task["headSha"] without ever checking the worktree's ACTUAL HEAD. A
+    commit landed in the worktree after 'submit' last pinned that headSha
+    (or any other way HEAD moved without going through 'submit'/'refresh')
+    must refuse by name -- naming 'submit' to re-pin the new head, or
+    'refresh' if the base moved -- before anything executes."""
+
+    def test_commit_after_recorded_head_refuses_by_name_with_no_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(tmp, commands=["true"])
+            worktree = _start_commit_submit(state, root)
+            recorded_head = StateStore(Path(state)).read()["tasks"]["T1"]["headSha"]
+
+            (worktree / "extra.txt").write_text("more\n", encoding="utf-8")
+            _git(worktree, "add", "-A")
+            _git(
+                worktree, "-c", "user.email=t@t", "-c", "user.name=t",
+                "-c", "commit.gpgsign=false", "commit", "-qm", "extra work",
+            )
+            actual_head = _git(worktree, "rev-parse", "HEAD")
+            self.assertNotEqual(actual_head, recorded_head)
+
+            code, _out, err = _cli_full(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("does not match its recorded headSha", err)
+            self.assertIn("submit", err)
+            self.assertIn("refresh", err)
+            dispatch_dir = root / ".wdd" / "dispatch"
+            self.assertFalse(list(dispatch_dir.glob("verify-*.log")))
+            self.assertIsNone(StateStore(Path(state)).read()["tasks"]["T1"].get("verification"))
+
+
+class VerifyRunIllegalStatusTests(unittest.TestCase):
+    """P1-2 (opus review): status legality for `verification.recorded`
+    (engine.transition's `_require_status(task, {"in_progress"}, ...)`)
+    previously only fired from inside `apply_event`, AFTER
+    `verify_run.execute` had already run every configured command and
+    written a log -- a refusal that only exists post-execution does not
+    satisfy AC-2. A task sitting in `review` (the smallest status this
+    module's fixtures can reach via a `reviewPolicy: always` scope) must
+    now refuse `--run` before touching the worktree at all."""
+
+    def test_task_in_review_status_refuses_before_executing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(
+                tmp, commands=["true"], scope_overrides={"reviewPolicy": "always"}
+            )
+            _start_commit_submit(state, root)
+            self.assertEqual(StateStore(Path(state)).read()["tasks"]["T1"]["status"], "review")
+
+            code, _out, err = _cli_full(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertNotEqual(code, 0)
+            self.assertIn("not legal", err)
+            self.assertIn("review", err)
+            dispatch_dir = root / ".wdd" / "dispatch"
+            self.assertFalse(list(dispatch_dir.glob("verify-*.log")))
+            self.assertIsNone(StateStore(Path(state)).read()["tasks"]["T1"].get("verification"))
+
+
+class VerifyRunFailThenSkipEndToEndTests(unittest.TestCase):
+    """P2: a two-command `--run` where the first command fails and the
+    second is never reached (AC-4's stop-on-first-failure), exercised
+    through the real CLI record path end to end -- not `verify_run.execute`
+    directly (that shape is already pinned by ExecuteSkippedShapeTests)."""
+
+    def test_first_command_fails_second_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(tmp, commands=["false", "true"])
+            _start_commit_submit(state, root)
+            code, out = _cli(state, "verify", "record", "--task", "T1", "--run", "--repo", str(root))
+            self.assertEqual(code, 0, out)
+            verification = StateStore(Path(state)).read()["tasks"]["T1"]["verification"]
+            self.assertEqual(verification["status"], "failed")
+            results = verification["results"]
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results[0]["command"], "false")
+            self.assertEqual(results[0]["status"], "failed")
+            self.assertEqual(results[1], {"command": "true", "status": "skipped"})
+            self.assertEqual(
+                StateStore(Path(state)).read()["tasks"]["T1"]["status"], "in_progress"
+            )
+
+
+class VerifyRunIdempotencyKeyReplayTests(unittest.TestCase):
+    """P3: an already-applied `--idempotency-key` must be inert BEFORE
+    execution. Previously the dedupe only lived inside `apply_mutation`,
+    reached AFTER `verify_run.execute` already ran every command and wrote
+    a fresh log -- a replay was cheap for the STATE but not for the
+    worktree. A second `--run` with the same key must return the duplicate
+    without a second log ever being created."""
+
+    def test_replayed_idempotency_key_does_not_re_execute(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = _bootstrap_scope(tmp, commands=["true"])
+            _start_commit_submit(state, root)
+            dispatch_dir = root / ".wdd" / "dispatch"
+
+            code, out = _cli(
+                state, "verify", "record", "--task", "T1", "--run", "--repo", str(root),
+                "--idempotency-key", "verify-once",
+            )
+            self.assertEqual(code, 0, out)
+            self.assertFalse(json.loads(out)["duplicate"])
+            self.assertEqual(len(list(dispatch_dir.glob("verify-*.log"))), 1)
+
+            code, out = _cli(
+                state, "verify", "record", "--task", "T1", "--run", "--repo", str(root),
+                "--idempotency-key", "verify-once",
+            )
+            self.assertEqual(code, 0, out)
+            self.assertTrue(json.loads(out)["duplicate"])
+            self.assertEqual(len(list(dispatch_dir.glob("verify-*.log"))), 1)
 
 
 class VerifyRunSingleLoadLayersCallTests(unittest.TestCase):
@@ -989,7 +1120,30 @@ class VerifyRunEndToEndOracleTests(unittest.TestCase):
 class VerifyRunTelemetryGateInertnessTests(unittest.TestCase):
     """AC-10: a `telemetry` object on a verification record is stored but
     provably ignored by the merge gate -- flipping it leaves `task_gate`'s
-    outcome unchanged."""
+    outcome unchanged.
+
+    P3 (opus review): a test that only ever exercises the "nothing changed"
+    branch cannot distinguish "this field is inert" from "this test cannot
+    detect a change at all" -- so `test_...` first flips something task_gate
+    IS documented to key off (`verification["status"]`, engine.py's own
+    `task_gate` merge_ready branch: "Re-check evidence, not just freshness")
+    and asserts the gate DOES move, before repeating the same flip-and-check
+    shape on telemetry to show it does not. That positive control is what
+    makes the telemetry assertions below mean anything.
+
+    Extending this to the handoff gate: `finalize.py`'s `finalize_next_actions`
+    is the handoff-readiness equivalent of `task_gate`, but it is scope-level,
+    not task-level -- it reads `state["finalize"]` (a single scope-wide
+    review/verification/handoff record keyed to the scope's base branch
+    head), not any individual `task["verification"]`, and takes `state` plus
+    a live repo (it calls `resolve_ref`), not a `(state, task)` pair the way
+    `task_gate` does. There is no task-level handoff gate to extend this
+    positive-control-then-telemetry shape onto; `finalize.py` also has no
+    verification `--run`/telemetry surface of its own to flip in the first
+    place (`record_final_verification` takes only `--status`/`--command` or
+    `--results`, never `--run`). Nothing here is "reachable at task level"
+    to extend to.
+    """
 
     def test_flipping_recorded_telemetry_does_not_change_the_merge_gate_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -999,6 +1153,21 @@ class VerifyRunTelemetryGateInertnessTests(unittest.TestCase):
             self.assertEqual(code, 0, out)
             recorded = StateStore(Path(state)).read()
             gate_before = task_gate(recorded, recorded["tasks"]["T1"])
+            # No freshness has been recorded yet, so the gate isn't fully
+            # "merge_ready" -- it's still evidence-gated on verification's
+            # own status, which is exactly what the positive control below
+            # needs.
+            self.assertEqual(gate_before, "needs_freshness")
+
+            # Positive control: task_gate DOES move when the evidence it
+            # actually keys off changes -- proves the harness below can
+            # detect a real difference, so telemetry's non-difference means
+            # something.
+            status_flipped = copy.deepcopy(recorded)
+            status_flipped["tasks"]["T1"]["verification"]["status"] = "failed"
+            gate_on_status_flip = task_gate(status_flipped, status_flipped["tasks"]["T1"])
+            self.assertNotEqual(gate_before, gate_on_status_flip)
+            self.assertEqual(gate_on_status_flip, "needs_verification")
 
             flipped = copy.deepcopy(recorded)
             flipped["tasks"]["T1"]["verification"]["telemetry"] = {

@@ -44,11 +44,19 @@ _ATTEMPT_FILE_MODE = 0o400
 _MAX_ATTEMPT_DIR_RETRIES = 100
 
 
-def _sanitize_task_id_for_filename(task_id: str) -> str:
+def sanitize_task_id_for_filename(task_id: str) -> str:
     sanitized = _UNSAFE_FILENAME_CHARS.sub("_", task_id)
     if not sanitized:
         raise ValidationError(f"task id sanitizes to an empty dispatch dirname: {task_id!r}")
     return sanitized
+
+
+# Back-compat alias (machine-verification epic, task T3 fix-round): this was
+# private (`_sanitize_task_id_for_filename`) before cli.py started importing
+# it directly rather than duplicating the sanitization inline. migration.py
+# still imports the old name -- kept working via this alias rather than
+# forcing an unrelated rename there too.
+_sanitize_task_id_for_filename = sanitize_task_id_for_filename
 
 
 def ensure_dispatch_gitignore(wdd_dir: Path | str) -> bool:
