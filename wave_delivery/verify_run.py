@@ -2,24 +2,25 @@
 machine-executed verification and dispatch observability, spec Sec2/Sec3,
 task T1-executor).
 
-Cross-reference (both ways -- see `runner.py`'s dispatch-timeout comment,
-which this module's own read/kill loop is the origin of the "should point
-back here" note, added when `runner.py` itself grows a matching timeout fix):
-`wave_delivery/runner.py:585-615`'s dispatch path shares the same shape --
-`subprocess` capture -> wall-clock duration -> a lossy-decoded tail -- but
-is NOT reused here. `runner.py` calls `subprocess.run(..., timeout=...)`,
-which on expiry kills only the direct child, not its process group; a
-dispatched runner command that backgrounds a grandchild (`cmd &`) survives
-a runner timeout today. This epic's contract (spec AC-5, the
-"child-survivor" test) requires that grandchild be dead too, which needs
-`start_new_session=True` plus an explicit `killpg` escalation that
-`subprocess.run`'s high-level timeout cannot express. A parallel
-implementation is intentional and constitution-sanctioned here because
-`runner.py` is dispatch-specific (its contract, one shot in/one shot out,
-is deliberately different); it is not something this task edits, since
-`wave_delivery/runner.py` is outside T1-executor's conflict domains
-(`wave_delivery/verify_run.py`, `tests/test_machine_verification.py`) --
-flagged in the task report rather than silently patched here.
+Cross-reference: `wave_delivery/runner.py:585-615`'s dispatch path shares
+the same shape -- `subprocess` capture -> wall-clock duration -> a
+lossy-decoded tail -- but is NOT reused here. `runner.py` calls
+`subprocess.run(..., timeout=...)`, which on expiry kills only the direct
+child, not its process group; a dispatched runner command that backgrounds
+a grandchild (`cmd &`) survives a runner timeout today. This epic's
+contract (spec AC-5, the "child-survivor" test) requires that grandchild
+be dead too, which needs `start_new_session=True` plus an explicit
+`killpg` escalation that `subprocess.run`'s high-level timeout cannot
+express. A parallel implementation is intentional and
+constitution-sanctioned here because `runner.py` is dispatch-specific (its
+contract, one shot in/one shot out, is deliberately different); it is not
+something this task edits, since `wave_delivery/runner.py` is outside
+T1-executor's conflict domains (`wave_delivery/verify_run.py`,
+`tests/test_machine_verification.py`). `runner.py` does not currently
+carry a reciprocal comment pointing back at this module's timeout fix --
+adding one is deferred to whoever next touches `runner.py`'s
+dispatch-timeout path, tracked via a controller note rather than done
+silently here.
 
 Pure of state writes: `execute()` returns the observed evidence structure;
 callers (`review.py`'s `record_verification`, `finalize.py`'s
@@ -134,7 +135,16 @@ def execute(
     results: list[dict[str, Any]] = []
     log_hasher = hashlib.sha256()
     stop = False
-    with open(log_path, "wb") as log_file:
+    # `open(log_path, "wb")` would create a fresh file at the umask-derived
+    # default mode (typically 0644) if `log_path` was not already created
+    # by `reserve_numbered_path` (which pre-creates it at 0600). Using
+    # `os.open` with an explicit mode is defensive for the non-reserved
+    # case; if the path already exists (the reserved case) the mode is
+    # ignored and the existing 0600 permissions are left untouched.
+    log_descriptor = os.open(
+        log_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, _RESERVED_FILE_MODE
+    )
+    with os.fdopen(log_descriptor, "wb") as log_file:
         for command in commands:
             if stop:
                 results.append({"command": command, "status": "skipped"})
@@ -175,14 +185,26 @@ def _run_one(
     started = time.monotonic()
     deadline = started + timeout_seconds
 
-    process = subprocess.Popen(
-        ["sh", "-c", command],
-        cwd=cwd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,  # own process group -- see module docstring / spec AC-5
-    )
+    try:
+        process = subprocess.Popen(
+            ["sh", "-c", command],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # own process group -- see module docstring / spec AC-5
+        )
+    except OSError as error:
+        # Mirrors runner.py:590's precedent for the same failure mode: a
+        # Popen construction failure (missing cwd, fork/exec resource
+        # exhaustion) is execution evidence to record, not an exception to
+        # let escape this module's observed-evidence contract.
+        return {
+            "command": command,
+            "status": "failed",
+            "exitCode": None,
+            "tail": f"verify_run: could not exec command: {error}",
+        }
     stdout = process.stdout
     assert stdout is not None
 
@@ -210,6 +232,15 @@ def _run_one(
 
     timed_out = False
     try:
+        # EOF on this fd -- not "the direct child exited" -- is the only
+        # signal that every holder of the write end is gone. A backgrounded
+        # grandchild (`cmd &`) that outlives its parent `sh` (which may exit
+        # on its own, e.g. `sleep 20 & exit 0`) keeps the pipe open after
+        # `process.poll()` already shows the child dead; breaking out early
+        # on that poll (as this loop used to) means the deadline is never
+        # consulted again and a later blocking read can hang for as long as
+        # the grandchild lives. So this loop only ever stops on a real EOF
+        # or on deadline expiry -- never on the direct child's exit alone.
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -219,8 +250,6 @@ def _run_one(
                 [stdout], [], [], min(remaining, _POLL_INTERVAL_SECONDS)
             )
             if not ready:
-                if process.poll() is not None:
-                    break
                 continue
             chunk = os.read(stdout.fileno(), _READ_CHUNK_SIZE)
             if not chunk:
@@ -230,20 +259,20 @@ def _run_one(
         if timed_out:
             _kill_process_group(process)
             exit_code: int | None = None
+            # The group kill above blocks (with a SIGTERM grace period and a
+            # SIGKILL escalation) until every process in the group --
+            # including a backgrounded grandchild the exited/killed `sh`
+            # never waited on -- is dead, so every holder of the write end
+            # of this pipe is gone by the time it returns. A blocking drain
+            # here is therefore bounded: it can only pick up bytes already
+            # sitting in the kernel pipe buffer before read() hits EOF.
+            while True:
+                chunk = os.read(stdout.fileno(), _READ_CHUNK_SIZE)
+                if not chunk:
+                    break
+                consume(chunk)
         else:
             exit_code = process.wait()
-
-        # By this point the process (and thus every writer of the pipe) has
-        # exited, either naturally or via the group kill above, so a
-        # blocking-mode drain cannot hang -- it only picks up whatever was
-        # still buffered in the kernel pipe when the read loop above last
-        # checked.
-        os.set_blocking(stdout.fileno(), True)
-        while True:
-            chunk = os.read(stdout.fileno(), _READ_CHUNK_SIZE)
-            if not chunk:
-                break
-            consume(chunk)
     finally:
         stdout.close()
 

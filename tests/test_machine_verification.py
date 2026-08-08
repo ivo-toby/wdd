@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -132,12 +133,26 @@ def _process_is_dead(pid: int) -> bool:
     A killed grandchild is reparented away from our process (its parent,
     `sh`, died with it), so nothing in this test tree ever calls `wait()`
     on it -- some ancestor (PID 1, or a subreaper) reaps it on its own
-    schedule. Until then the PID stays in the process table as a zombie,
-    so a plain `os.kill(pid, 0)` still succeeds even though the process
-    has already stopped running. Checking `/proc/<pid>/status` for zombie
-    state (Linux-only, matches this sandbox) tests the actual claim --
-    "the child no longer runs" -- without depending on reap timing that
-    verify_run does not own.
+    schedule, and that schedule is not something this test controls or
+    can assume is slow: on a system with a prompt subreaper (systemd,
+    tini, s6, and most container inits, including the one this sandbox
+    runs under -- empirically confirmed: `/proc/<pid>/status` is already
+    gone on the very first check after every observed group kill here,
+    never caught mid-zombie) the grandchild can be fully reaped before
+    this test ever gets a chance to look. `FileNotFoundError` -- the pid
+    absent from the process table entirely -- is therefore at least as
+    strong evidence of "no longer running" as an observed zombie line;
+    there is no code path by which a pid we captured as running moments
+    ago (via `$!`) reappears as a *different*, still-alive process inside
+    this single test's lifetime. So both branches -- zombie or vanished --
+    are treated as dead here.
+
+    This check is deliberately Linux-only (the caller below is gated with
+    `skipUnless`): on a platform without `/proc` at all, this would report
+    "dead" on the very first call regardless of whether the kill has had
+    any chance to take effect yet, which is a genuinely vacuous oracle --
+    a different failure mode than the reap-timing question above, and the
+    one the platform gate exists to rule out.
     """
     try:
         with open(f"/proc/{pid}/status", encoding="utf-8") as handle:
@@ -149,6 +164,10 @@ def _process_is_dead(pid: int) -> bool:
         return True
 
 
+@unittest.skipUnless(
+    sys.platform.startswith("linux"),
+    "child-survivor oracle reads /proc/<pid>/status, which is Linux-only",
+)
 class ExecuteChildSurvivorTests(unittest.TestCase):
     def test_backgrounded_grandchild_is_killed_with_the_group(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -169,6 +188,107 @@ class ExecuteChildSurvivorTests(unittest.TestCase):
                 _process_is_dead(child_pid),
                 f"child pid {child_pid} is still running after group kill",
             )
+
+
+class ExecuteNaturalExitPipeHolderTests(unittest.TestCase):
+    def test_deadline_enforced_when_child_exits_but_grandchild_holds_pipe(self) -> None:
+        """Regression test for the probe: `sleep 20 & exit 0` with a 1s
+        timeout used to return after the full 20s with status "passed".
+
+        Unlike `ExecuteChildSurvivorTests` (where `sh` blocks on `wait` and
+        so never exits on its own before the group kill), here `sh`
+        backgrounds the sleep and exits immediately -- `process.poll()` on
+        the direct child goes non-None almost at once, while the
+        grandchild still holds the write end of the stdout pipe open. The
+        old code treated the direct child's exit as proof the pipe was
+        fully drained and fell into an unbounded blocking read; the fix
+        keeps waiting on EOF-or-deadline and only trusts the pipe is done
+        once every holder -- including the grandchild -- is confirmed dead
+        via a group kill.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child.pid"
+            log_path = Path(tmp) / "verify.log"
+            command = f"sleep 20 & echo $! > {pidfile}; exit 0"
+            started = time.monotonic()
+            result = execute([command], cwd=tmp, timeout_seconds=1, log_path=log_path)
+            elapsed = time.monotonic() - started
+            self.assertLess(
+                elapsed,
+                3,
+                "execute() must enforce the deadline instead of waiting out "
+                "the backgrounded grandchild",
+            )
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "failed")
+            self.assertNotEqual(entry["status"], "passed")
+            self.assertTrue(entry.get("timedOut"))
+            if sys.platform.startswith("linux"):
+                child_pid = int(pidfile.read_text(encoding="utf-8").strip())
+                deadline = time.monotonic() + 2.0
+                while not _process_is_dead(child_pid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(
+                    _process_is_dead(child_pid),
+                    f"grandchild pid {child_pid} is still running after the "
+                    "deadline-triggered group kill",
+                )
+
+
+class ExecuteTailBoundTests(unittest.TestCase):
+    def test_tail_bounded_to_last_4096_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "verify.log"
+            result = execute(
+                ["printf '%0.sa' $(seq 1 10000)"],
+                cwd=tmp,
+                timeout_seconds=5,
+                log_path=log_path,
+            )
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "passed")
+            tail_bytes = entry["tail"].encode("utf-8")
+            self.assertEqual(len(tail_bytes), 4096)
+            self.assertEqual(tail_bytes, b"a" * 4096)
+            # The tail is bounded, but the hash (and capture) still cover
+            # all 10000 bytes -- truncation to 4096 is display-only.
+            self.assertEqual(
+                entry["outputSha256"], hashlib.sha256(b"a" * 10000).hexdigest()
+            )
+            self.assertNotIn("truncated", entry)
+
+
+class ExecutePopenFailureTests(unittest.TestCase):
+    def test_popen_oserror_recorded_as_failed_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_cwd = Path(tmp) / "does-not-exist"
+            log_path = Path(tmp) / "verify.log"
+            result = execute(
+                ["echo hi"], cwd=missing_cwd, timeout_seconds=5, log_path=log_path
+            )
+            entry = result["results"][0]
+            self.assertEqual(
+                entry,
+                {
+                    "command": "echo hi",
+                    "status": "failed",
+                    "exitCode": None,
+                    "tail": entry["tail"],
+                },
+            )
+            self.assertIn("does-not-exist", entry["tail"])
+
+
+class ExecuteLogFilePermissionTests(unittest.TestCase):
+    def test_log_file_created_at_0600_when_not_pre_reserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Deliberately not created via reserve_numbered_path, to cover
+            # the caller path that used to fall through to a plain
+            # open(..., "wb") at the umask-derived default mode.
+            log_path = Path(tmp) / "verify.log"
+            execute(["echo hi"], cwd=tmp, timeout_seconds=5, log_path=log_path)
+            mode = log_path.stat().st_mode & 0o777
+            self.assertEqual(mode, 0o600)
 
 
 class ExecuteTruncationTests(unittest.TestCase):
