@@ -995,6 +995,112 @@ class LegacyConfigDefaultHydrationTest(unittest.TestCase):
             self.assertEqual(first, second)
 
 
+class LegacyConfigPlainCliGetSetTest(unittest.TestCase):
+    """Fix-round P2: plain (non-`--epic`) `config get`/`set` had the same
+    unhydrated-optional-section problem `LegacyConfigDefaultHydrationTest`
+    covers for `--epic` -- `get_value`/`set_value` walk the RAW config, so
+    a config.json predating `verification.timeoutSeconds` (tolerated absent
+    by `validate_config`, same as `runners`/`worktrees`) had no in-tool path
+    to read or write that knob globally: `unknown path` every time. Fixed by
+    routing the plain CLI get/set path through the same
+    `_hydrate_optional_sections` `load_layers`'s `effective` already uses --
+    one shared mechanism for every optional key, not a timeoutSeconds
+    special case. `get` must stay a pure read (no file write, no fingerprint
+    change); `set` is an explicit write and IS supposed to move the
+    fingerprint (governance working as intended)."""
+
+    def _run(self, tmp: str, *argv: str) -> tuple[int, str]:
+        state = str(Path(tmp) / ".wdd" / "state.json")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = main(["--state", state, *argv])
+        return code, stdout.getvalue()
+
+    def _legacy_wdd(self, tmp: str) -> Path:
+        config = default_config()
+        del config["verification"]["timeoutSeconds"]
+        return _wdd_with_config(tmp, config)
+
+    def test_get_on_legacy_config_resolves_default_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._legacy_wdd(tmp)
+            code, out = self._run(tmp, "config", "get", "verification.timeoutSeconds")
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out), 600)
+
+    def test_get_matches_load_layers_default_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = self._legacy_wdd(tmp)
+            layers = load_layers(wdd, None)
+            value, source = resolve_config_source(layers, "verification.timeoutSeconds")
+            self.assertEqual(source, "default")
+            code, out = self._run(tmp, "config", "get", "verification.timeoutSeconds")
+            self.assertEqual(json.loads(out), value)
+
+    def test_get_leaves_the_saved_file_byte_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = self._legacy_wdd(tmp)
+            before = (wdd / "config.json").read_bytes()
+            code, _out = self._run(tmp, "config", "get", "verification.timeoutSeconds")
+            self.assertEqual(code, 0)
+            self.assertEqual((wdd / "config.json").read_bytes(), before)
+
+    def test_get_does_not_change_governance_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = self._legacy_wdd(tmp)
+            (wdd / "constitution.md").write_text("# Constitution\n\nBe good.\n", encoding="utf-8")
+            before = governance_fingerprint(wdd)
+            code, _out = self._run(tmp, "config", "get", "verification.timeoutSeconds")
+            self.assertEqual(code, 0)
+            self.assertEqual(governance_fingerprint(wdd), before)
+
+    def test_set_on_legacy_config_creates_the_key_and_validates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = self._legacy_wdd(tmp)
+            code, out = self._run(tmp, "config", "set", "verification.timeoutSeconds", "120")
+            self.assertEqual(code, 0)
+            payload = json.loads(out)
+            self.assertEqual(payload["value"], 120)
+            saved = load_config(wdd)
+            self.assertEqual(saved["verification"]["timeoutSeconds"], 120)
+
+    def test_set_out_of_range_on_legacy_config_is_still_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._legacy_wdd(tmp)
+            stderr = io.StringIO()
+            state = str(Path(tmp) / ".wdd" / "state.json")
+            with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                code = main(
+                    ["--state", state, "config", "set", "verification.timeoutSeconds", "0"]
+                )
+            self.assertNotEqual(code, 0)
+
+    def test_set_changes_governance_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wdd = self._legacy_wdd(tmp)
+            (wdd / "constitution.md").write_text("# Constitution\n\nBe good.\n", encoding="utf-8")
+            before = governance_fingerprint(wdd)
+            code, _out = self._run(tmp, "config", "set", "verification.timeoutSeconds", "120")
+            self.assertEqual(code, 0)
+            self.assertNotEqual(governance_fingerprint(wdd), before)
+
+    def test_set_on_legacy_config_also_backfills_other_optional_sections(self) -> None:
+        # The shared mechanism hydrates ALL optional sections at once, not
+        # just the one targeted by this set -- an explicit write is the
+        # correct moment for a legacy config.json to gain the concrete
+        # defaults it was silently missing.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = default_config()
+            del config["verification"]["timeoutSeconds"]
+            del config["runners"]
+            wdd = _wdd_with_config(tmp, config)
+            code, _out = self._run(tmp, "config", "set", "merge.surface", '"local"')
+            self.assertEqual(code, 0)
+            saved = load_config(wdd)
+            self.assertEqual(saved["verification"]["timeoutSeconds"], 600)
+            self.assertEqual(saved["runners"], {})
+
+
 class SetOverlayValueSubLeafSeedingTest(unittest.TestCase):
     """`set_overlay_value` seeds a new overlay leaf from the CURRENT
     EFFECTIVE leaf value when `dotted` targets a path BELOW an allowlisted

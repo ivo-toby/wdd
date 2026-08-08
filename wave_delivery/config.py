@@ -537,6 +537,13 @@ def _hydrate_optional_sections(config: dict[str, Any]) -> dict[str, Any]:
     pre-existing config.json lacking this key must still resolve, not
     crash). A present-but-invalid value is never touched here --
     `validate_config` still refuses it by name.
+
+    Also called directly (not via `_effective_view`/`load_layers`) by
+    cli.py's plain, non-`--epic` `config get`/`set` handlers (fix-round P2):
+    those walk `get_value`/`set_value` over a config with no overlay
+    concept at all, so they had the identical unhydrated-optional-key
+    'unknown path' failure on a legacy config.json -- one shared mechanism
+    for every optional key rather than a per-key special case.
     """
     hydrated = deepcopy(config)
     defaults = DEFAULT_CONFIG
