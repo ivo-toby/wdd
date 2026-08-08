@@ -3834,20 +3834,23 @@ class EpicOverrideReachesMergeAndDispatchTest(unittest.TestCase):
 
 class NoBareLoadConfigInGovernedMergeSettingsSitesTest(unittest.TestCase):
     """F2 audit: every `merge_settings`-feeding site in cli.py, plus
-    dispatch --task's model resolution and (epic park/resume spec) `epic
-    park`'s worktrees.root resolution, must read the admission snapshot's
-    `effective` view via `_governed_config`, never a second bare
-    `load_config` (spec Sec2 resolve-once, extended by this fix-round).
-    A textual check, not a functional one -- the functional regressions
-    above are what actually prove the behavior; this pins the count so a
-    future edit cannot silently reintroduce a bare read at one of these
-    seven sites without also updating this test."""
+    dispatch --task's model resolution, (epic park/resume spec) `epic
+    park`'s worktrees.root resolution, and (machine-verification epic, task
+    T3) `verify record --run`'s worktree/command resolution, must read the
+    admission snapshot's `effective` view via `_governed_config`, never a
+    second bare `load_config` (spec Sec2 resolve-once, extended by this
+    fix-round and by T3's own single-load_layers pin in
+    tests/test_machine_verification.py). A textual check, not a functional
+    one -- the functional regressions above are what actually prove the
+    behavior; this pins the count so a future edit cannot silently
+    reintroduce a bare read at one of these eight sites without also
+    updating this test."""
 
-    def test_seven_governed_call_sites_use_the_layered_snapshot_helper(self) -> None:
+    def test_eight_governed_call_sites_use_the_layered_snapshot_helper(self) -> None:
         import wave_delivery.cli as cli_module
 
         source = Path(cli_module.__file__).read_text(encoding="utf-8")
-        self.assertEqual(source.count("config = _governed_config(admission_layers)"), 7)
+        self.assertEqual(source.count("config = _governed_config(admission_layers)"), 8)
 
 
 # ---------------------------------------------------------------------------
